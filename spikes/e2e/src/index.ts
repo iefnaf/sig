@@ -317,9 +317,13 @@ export class Steward extends Agent<Env> {
 		this.memory.registerWorker({ workerId, threadId, deviceId, agent: "pi", mode: "write" });
 		const cmdId = `cmd_${rid()}`;
 		const cseq = (this.db.get<{ m: number | null }>(`SELECT MAX(cseq) AS m FROM outbox WHERE deviceId = ?`, deviceId)!.m ?? 0) + 1;
+		// Relay (spec §5.2): a second worker on a thread starts from the previous worker's branch.
+		const prevBranch = this.db.get<{ branch: string | null }>(
+			`SELECT branch FROM sh_worker WHERE threadId = ? AND branch IS NOT NULL ORDER BY rowid DESC LIMIT 1`, threadId,
+		)?.branch;
 		this.db.run(
 			`INSERT INTO outbox (cmdId, deviceId, cseq, kind, payload, state, ackTimeoutSec) VALUES (?, ?, ?, 'start_worker', ?, 'queued', 15)`,
-			cmdId, deviceId, cseq, JSON.stringify({ workerId, threadId, prompt }),
+			cmdId, deviceId, cseq, JSON.stringify({ workerId, threadId, prompt, ...(prevBranch && prevBranch !== `shepherd/${workerId}` ? { base: prevBranch } : {}) }),
 		);
 		this.memory.timeline(threadId, "dispatch", `派发给 ${deviceId}：${prompt}`, { cmdId, workerId });
 		if (!this.deliver(cmdId)) void this.schedule(5, "resendUnacked");

@@ -24,6 +24,7 @@ export function applyEvents(memory: Memory, batch: WorkerEvent[], now = Date.now
 		switch (e.type) {
 			case "started": {
 				memory.setWorkerState(e.workerId, "running", undefined, now);
+				if (e.branch) memory.db.run(`UPDATE sh_worker SET branch = ? WHERE workerId = ?`, e.branch, e.workerId); // relay legs build on this
 				memory.timeline(threadId, "worker_started", `worker 开始运行${e.branch ? `（分支 ${e.branch}）` : ""}`, { workerId: e.workerId });
 				break;
 			}

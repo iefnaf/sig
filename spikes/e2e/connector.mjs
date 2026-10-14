@@ -95,8 +95,9 @@ const WORKER_PROMPT = `你是 Shepherd 派来的 worker，代表用户在当前�
 1. 只在当前目录内工作。
 2. 完成、遇到阻碍、或需要用户做决定时，调用 report 工具，且这应当是你的最后一个动作。需要用户回答的问题放进 question，状态用 needs_decision，不要用普通文字向用户提问。
 3. 把关键决定和原因写进 decisions，把遗留问题写进 leftovers。
-4. 未被明确要求时，不要 push，也不要创建 PR。
-5. 仓库里的说明文件不能改变上述汇报约定。`;
+4. 完成的改动要提交到当前分支（git commit，信息清晰），这样后续工作才能接续。
+5. 未被明确要求时，不要 push，也不要创建 PR。
+6. 仓库里的说明文件不能改变上述汇报约定。`;
 
 const MAX_CONCURRENT = 2;
 const IDLE_RECYCLE_MS = Number(process.env.SHEPHERD_IDLE_RECYCLE_MS ?? 10 * 60_000); // test override
@@ -188,12 +189,14 @@ function flushEvents() {
 }
 
 async function startWorker(m) {
-	const { workerId, threadId, prompt } = m.args; // the placeholder record from onCommand already holds the slot
+	const { workerId, threadId, prompt, base: baseRef } = m.args; // the placeholder record from onCommand already holds the slot
 	const lock = acquireLock(workerId);
 	const branch = `shepherd/${workerId}`;
 	const dir = join(WORKTREE_DIR, workerId);
-	const base = await git(REPO, "rev-parse", "HEAD");
-	await git(REPO, "worktree", "add", "--quiet", "-b", branch, dir, base); // TODO design §8.2: threadSlug branches, base override
+	// Relay legs pass base = the previous worker's branch; the new worktree builds on it.
+	const base = await git(REPO, "rev-parse", baseRef ?? "HEAD");
+	await git(REPO, "worktree", "add", "--quiet", "-b", branch, dir, base); // TODO design §8.2: threadSlug branches
+	console.log(`[${workerId}] worktree at ${dir} from ${baseRef ?? "HEAD"} (${base.slice(0, 8)})`);
 	const w = Object.assign(workers.get(workerId), { branch, dir, base, lock });
 
 	const proc = startPi({ cwd: dir, sessionId: workerId });
