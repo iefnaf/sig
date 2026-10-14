@@ -43,6 +43,10 @@ export const THREADS: ThreadSpec[] = [
 	{ id: "t_i18n", title: "国际化框架接入", goal: "文案抽 key，接入 i18n", summary: "框架没定（vue-i18n 还是自制），等用户拍板", state: "waiting", ageH: 2 },
 	{ id: "t_upload", title: "大文件分片上传", goal: "分片 + 断点续传", summary: "分片逻辑写完，续传调试中", state: "running", ageH: 0.25 },
 	{ id: "t_toast", title: "全局错误提示组件", goal: "统一错误 toast", summary: "组件写完，错误码映射表差一半", state: "idle_unread", ageH: 0.5 },
+	// plan-relay cluster: the thread's deliverable is a plan doc; a follow-up that
+	// says "按 X 方案实施" must relay on this thread, not open a new one (live M3
+	// finding — a new thread drops the branch base and leg-2 starts from HEAD).
+	{ id: "t_search_plan", title: "搜索功能方案调研", goal: "调研站内搜索怎么做，产出 docs/search-plan.md", summary: "方案已写入 docs/search-plan.md：一期 PostgreSQL 全文检索，es 留到数据量上来再上", state: "idle_clean", ageH: 5 },
 ];
 
 export type Expect =
@@ -172,4 +176,12 @@ export const CASES: Case[] = [
 	{ id: 98, text: "Excel 导出加上进度条", expect: { kind: "attach", threadId: "t_export" } },
 	{ id: 99, text: "错误提示组件支持自定义文案", expect: { kind: "attach", threadId: "t_toast" } },
 	{ id: 100, text: "定时清理加上保留 7 天的策略", expect: { kind: "attach", threadId: "t_cron" } },
+
+	// G. relay / continuation onto a plan-producing thread (live M3 phrasings)
+	{ id: 101, text: "按搜索方案实施", expect: { kind: "attach", threadId: "t_search_plan" }, note: "live 案例：按 X 方案实施 → 接续调研线程，另开线程会丢掉分支接力基础" },
+	{ id: 102, text: "在刚才搜索调研的基础上把实现做了", expect: { kind: "attach", threadId: "t_search_plan" } },
+	{ id: 103, text: "回到搜索调研那条线程继续", expect: { kind: "attach", threadId: "t_search_plan" }, note: "live 验证过的显式措辞" },
+	{ id: 104, text: "搜索方案我看完了，就按 docs/search-plan.md 里的一期做", expect: { kind: "attach", threadId: "t_search_plan" } },
+	{ id: 105, text: "按产品发的交互稿把设置页做了", expect: { kind: "new" }, note: "反例：「按 X 做」但 X 是外部产物、无对应线程 → 新工作" },
+	{ id: 106, text: "搜索的方案出来了吗", expect: { kind: "chat" }, note: "边界：问方案进度不派发，方案已在汇报里" },
 ];
