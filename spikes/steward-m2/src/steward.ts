@@ -179,9 +179,17 @@ export function buildStewardExtension(ctx: StewardContext): Extension {
 	// Policy hook (steward.md §7.2, M2 subset): inferred dispatch is refused; a thread is required;
 	// one dispatch per run — a second start_worker for a different thread means the model is
 	// second-guessing itself (observed: placeholder prompt, then the real one).
+	// The extension instance outlives runs, so the guard resets when the provenance (message id)
+	// changes — never mid-run.
 	let dispatchedThread: string | undefined;
+	let guardProvenance: string | undefined;
 	const guard = hook(ToolTask, {
 		beforeTool: (call) => {
+			const p = ctx.currentProvenance();
+			if (p !== guardProvenance) {
+				guardProvenance = p;
+				dispatchedThread = undefined;
+			}
 			const args = (call as { arguments?: Record<string, unknown> }).arguments ?? {};
 			if (call.name === "start_worker") {
 				if (args.basis === "inferred") {

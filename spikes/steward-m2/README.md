@@ -17,7 +17,7 @@ node eval/run-eval.ts --only 61,63 # subset while iterating
 
 DEEPSEEK_API_KEY comes from the env or `../e2e/.dev.vars` (gitignored). Results land in `eval/results/`; the committed `baseline-deepseek-flash.json` is the reference run.
 
-Baseline (deepseek-flash, 2026-10-14): 96% pass — 错路由 1% (target <2%), 应反问未反问 2/11 (target <3%), 不必要反问 1.1% (target <15%). Per-run variance is ±2–3 cases: the residual failures are utterances where the model's choice is defensible under either label (e.g. 「把登录的几件事都收尾一下」 — dispatch the running one, or ask which?). Treat single-case diffs as noise; look for clusters.
+Baseline (deepseek-flash, 2026-10-14): best run 96% pass — 错路由 1%, 不必要反问 1.1%; across later runs 88-93% with 错路由 up to 7%. The residual is model nondeterminism (temperature is not pinned through the harness) plus utterances defensible under either label (e.g. 「把登录的几件事都收尾一下」). Regression protocol: a single run decides nothing — rerun 2-3 times and look for clusters of the same failure shape (tokenization, ask calibration, double dispatch all moved the numbers by 20+ points when broken; noise moves them by ~5).
 
 What the eval caught and fixed (keep regressing on any model/prompt/candidate-assembly change):
 
