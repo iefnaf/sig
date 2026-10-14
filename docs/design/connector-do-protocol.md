@@ -52,6 +52,7 @@ Authorization: Bearer <设备令牌>
 - 连接器每 **25 秒**发一个 WebSocket 协议级 `ping` 帧，60 秒内收不到 `pong` 视为断线并重连。运行时自动回复 `pong`，**不唤醒休眠的 DO**，成本接近零。
 - 应用层不发周期性心跳。DO 判断「机器是否在线」以连接是否存在为准；对半开连接，DO 只在需要时探测：向机器发送命令后设置确认期限（§4.2），超时则把机器标为可疑。
 - DO 在约 10 秒无事件后休眠。**休眠会清空内存**，因此协议状态（待确认命令、超时、重试）全部放 SQLite，并用 `this.schedule`（alarm）驱动，不依赖内存里的 Promise 或定时器。
+- 实测（[原型结果](../research/do-protocol-spike.md)）：每 5 秒一次的协议级 ping，DO 照常休眠、连接不断、唤醒计数不增加；休眠后的第一条消息只多约 35–50 ms。连接器不需要为了「保持 DO 在线」做任何事。
 
 ### 3.3 重连
 
@@ -116,6 +117,7 @@ outbox(cmdId PK, deviceId, workerId?, cseq, kind, payload, notAfter?,
   - `status: "rejected"`：拒绝，附 `code`（如 `not_registered_repo`、`lock_held`、`capacity`），DO 标 `failed`。
 - 命令完成后连接器发 `cmd_result{ok, data | error}`，DO 标 `done` 或 `failed`。`cmd_result` 同样可能重复，DO 按 `cmdId` 幂等处理。
 - **重发**：重连后（`welcome` 之后），DO 重发所有 `sent` 且未 `accepted` 的命令；`ackDeadline` 到期而连接仍在，也重发一次，两次失败后把机器标为可疑并通知总管。
+- **alarm 处理函数必须自己重新预约。** `schedule()` 以整秒为粒度，alarm 可能比毫秒级的 `ackDeadline` 早几百毫秒触发；处理函数醒来发现没有到期行就返回，之后再没有 alarm，命令会永远停在 `sent`。规则：处理函数结束前，只要还有处于 `sent` 的行，就再预约一次（约 1 秒后）。这是原型实测时发现的缺陷。
 - **过期**：命令可带 `notAfter`。连接器收到时已过期，回 `rejected{code:"expired"}`。默认 `notAfter = 下发时刻 + 10 分钟`，防止机器离线一天后突然执行陈旧的指令；用户明确选择「等它上线」的命令设为 `null`（不过期）。
 - **模糊状态**：连接器在 `sending` 阶段崩溃的命令，由连接器在对账时报告为 `ambiguous`（connector-pi.md §6.3），DO 把 `outbox` 标 `ambiguous` 并交给总管处理，**不自动重发**。
 
@@ -123,7 +125,7 @@ outbox(cmdId PK, deviceId, workerId?, cseq, kind, payload, notAfter?,
 
 - 每个 worker 的事件有单调递增的 `seq`（connector-pi.md §11.3）。
 - 连接器发送 `events` 批次，DO **先写入 `event_inbox`（`(workerId, seq)` 唯一）再确认**；`events_ack{workerId, upTo}` 是累积确认，表示 `≤ upTo` 的事件已持久化。DO 对确认做 500 ms 的合并。
-- 连接器收到确认后才可以截断本地日志。
+- 连接器收到确认后才可以截断本地日志。**`welcome.acks` 与 `events_ack` 等价**：重连后据此决定从哪里重放，同时截断已确认的部分，否则日志只增不减。
 - **缺口检测**：DO 发现收到的 `seq` 大于 `已收最大值 + 1`，发 `resync{workerId, from}`；连接器从 `from` 重放。若本地日志已因上限被丢弃，回 `events_gap{workerId, from, to}`，DO 在时间线上标记缺口并触发 `reconcile`。
 - **处理与持久化分离**：`event_inbox` 记录「收到」，总管处理事件（更新 Thread、通知用户）以 `processed_upto(workerId)` 为界；DO 在处理中途被逐出，下次从 `processed_upto` 继续，处理本身对同一 `(workerId, seq)` 幂等。
 
@@ -353,7 +355,7 @@ mac = HMAC-SHA256(SERVER_KEY, "st1." + deviceId + "." + epoch + "." + issuedAt)
 
 ## 8. 待决事项
 
-1. **唤醒总管的机制。** `cmd_result` 和事件到达后如何唤醒 pi-durable 里的总管任务：候选是写 document 触发 watch，或对主 conversation 提交一条 `followUp` 输入（参考 pi-durable 例 23）。需要原型验证。这也是此前遗留的「task 如何等待外部事件」的落点。
+1. ~~**唤醒总管的机制。**~~ **已解决（原型验证）。** 事件落库后，对每个需要总管处理的事件调用 `harness.submit(text, { operationId: "evt:<workerId>:<seq>", whenBusy: "followUp" })`。`operationId` 使重放和重传幂等（同一批事件发 3 次，总管输入仍只有 1 条）；`PiHarness` 为每个会话维护 alarm 心跳作业，DO 被强制重置后无需任何请求，alarm 自己重启并续跑。`cmd_result` 同理。剩余问题只是「哪些事件值得唤醒」（见第 2 项）。注意：`submit` 应在事件落库、已确认之后调用；崩溃发生在两者之间时，靠 `processed_upto` 重新处理，`operationId` 保证不会重复。
 2. **事件的处理节流。** 每个 `events` 批次都唤醒总管处理会让 DO 常醒。倾向：`progress` 只入库、不唤醒；`report/settled/lost/error/external_activity` 才唤醒处理。
 3. **大图片的传递**：connector-pi.md 允许单张图 base64 到 4 MB，超过本协议 256 KiB 的单消息上限。备选：总管端压缩到上限内（MVP 做法）；先暂存到 R2、命令里只带引用，连接器经带签名的 URL 下载（Cloudflare 内，一键部署可含）；连接器单独走 HTTP 分块上传。倾向后续用 R2 暂存。
 4. **兴趣驱动的进度级别。** 默认静默（`coarse`）；用户在网页上打开某个 worker 时，通过 `set_progress{workerId, level:"live"}` 提高频率，离开后恢复。减少无人观看时的唤醒。需要在命令集里加这一条。
@@ -364,12 +366,23 @@ mac = HMAC-SHA256(SERVER_KEY, "st1." + deviceId + "." + epoch + "." + issuedAt)
 
 ## 9. 需要原型验证的点
 
-按优先级：
+已验证（[原型结果](../research/do-protocol-spike.md)）：
 
-1. 休眠与唤醒：连接器的 `ping` 是否真的不唤醒 DO；唤醒后第一条消息的延迟；休眠中 alarm 驱动的重发是否可靠。
-2. `onBeforeConnect` 中用 Worker 密钥做 HMAC 预检，且不唤醒 DO。
-3. 自定义关闭码（4401、4403、4409）是否原样到达 Node 的 `ws` 客户端。
-4. 命令重发加连接器去重的端到端行为，包括在 `sending` 阶段杀连接器。
-5. 笔记本睡眠、网络切换后，半开连接多久被发现。
-6. 事件批量的实际唤醒频率和时长费用。
-7. 历史中继在 DO 休眠间隙的行为（`relay` 表驱动）。
+- 协议级 `ping` 不唤醒 DO，也不阻止休眠；唤醒后第一条消息只多约 35–50 ms。
+- 休眠中 alarm 驱动的重发可靠（含 alarm 早于期限触发时的重新预约）。
+- `onBeforeConnect` 中用 Worker 密钥做 HMAC 预检，坏令牌不唤醒 DO。
+- 自定义关闭码 4403、4409 原样到达 Node 的 `ws` 客户端。
+- 命令重发加连接器去重：只执行一次。
+- 事件重放：断线后 120 条各存一次，`welcome.acks` 触发截断。
+- 离线排队命令在 `hello` 之后投递。
+- 事件经 `harness.submit` 幂等地唤醒总管；DO 被强制重置后 alarm 自己续跑。
+
+仍未验证：
+
+1. 笔记本睡眠、网络切换后，半开连接多久被发现（本机经代理，无法代表真实链路）。
+2. 在 `sending` 阶段杀连接器的端到端行为（原型的模拟连接器没有实现该阶段）。
+3. 事件批量的实际唤醒频率和时长费用，需要在控制台核对账单。
+4. 历史中继在 DO 休眠间隙的行为（`relay` 表驱动），原型未实现。
+5. 接近 256 KiB 的大消息、多连接器并发、小时级长连接的稳定性。
+6. 真实模型调用期间，进行中的 I/O 对 DO 常驻时长的影响。
+7. `ctx.abort()` 之外的真实逐出（平台迁移、内存回收）下的恢复行为。
