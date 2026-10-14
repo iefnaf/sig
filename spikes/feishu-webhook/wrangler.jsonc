@@ -1,0 +1,5 @@
+{
+	"name": "shepherd-hook",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-10-10"
+}
