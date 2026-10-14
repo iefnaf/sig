@@ -1,0 +1,9 @@
+{
+  "name": "shepherd-feishu-spike",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "1.75.0",
+    "qrcode": "1.5.4"
+  }
+}

@@ -2,6 +2,8 @@
 
 日期：2026-10-14。目的：判断「部署后扫码创建飞书 bot」是否成立，以及总管的飞书适配器该怎么接。
 
+**同日实测**：全部关键问题已在实机验证（两次扫码创建、长连接收发、webhook 切换、自定义域名可达性），见文末「实测结果」一节。
+
 ## 证据来源与可信度
 
 飞书开放平台的文档站（`open.feishu.cn`、`open.larkoffice.com`）在本环境无法抓取，所以结论主要来自**官方 SDK 的源码**和第三方对接项目的文档：
@@ -138,12 +140,43 @@ Content-Type: application/x-www-form-urlencoded
 
 ## 7. 建议的实测
 
-一个小原型，需要你用飞书扫一次码：
+（以下已于 2026-10-14 完成，见下一节。）
 
-1. 本机脚本调用 `begin`，打印二维码链接；你用飞书扫码确认。
-2. 轮询得到凭据与 `open_id`；换取 `tenant_access_token`。
-3. 用官方 SDK 的长连接（先在本机跑），给 bot 发消息，确认能收到 `im.message.receive_v1`；回复一条文本和一张卡片；测试 `patch` 更新卡片、按钮回调。
-4. 尝试 `PATCH .../config` 切到 webhook，看是否被拒。
-5. 把长连接移进 Cloudflare 的 DO（手写 protobuf 帧），验证稳定性与休眠行为。
+## 8. 实测结果（2026-10-14）
 
-第 1–4 步只在本机运行，不涉及 Cloudflare；会在你的飞书账号下创建一个测试应用，测完可以在开发者后台删除。
+环境：Mac mini（macOS）+ 官方 SDK `@larksuiteoapi/node-sdk@1.75.0`；Cloudflare Worker `shepherd-hook` + 自定义域名 `shepherd-spike.iefnaf.cc`；两次扫码创建（两个不同的飞书账号）。原始脚本：[spikes/feishu](../../spikes/feishu)。
+
+### 8.1 通过的
+
+| 项 | 结果 |
+|---|---|
+| 扫码创建（两个账号各一次） | ✅ 均成功。返回 `client_id`/`client_secret`/扫码人 `open_id`。默认配置**完全一致**：36 个权限（含收发消息、卡片、机器人能力）、9 个事件（含 `im.message.receive_v1`）、websocket 回调（含 `card.action.trigger`）、自动发布版本 1.0.0，无需任何审核或管理员操作 |
+| 二维码有效期 | 实测 `expires_in=3600s`（SDK 文档写 10 分钟，以实测为准） |
+| 扫码补权限（`addons` 更新流程） | ✅ 第二个应用上成功加上 `application:application:patch`（36→37 个），**secret 不轮换**、应用不变。（第一次在另一应用上未生效，原因未定；灰度或确认页操作都有可能） |
+| 长连接全链路 | ✅ 事件到达（`im.message.receive_v1`，从消息 `create_time` 到本地收到约 **500–600 ms**）、回复文本、发送卡片、`PATCH` 更新卡片、按钮回调（`card.action.trigger`）、图片消息、`messageResource.get` 下载用户发的图（30 KB webp，约 850 ms） |
+| 引用回复路由 | ✅ 用户引用回复我们的卡片时，事件的 `parent_id` **正好等于**我们那张卡片的 `message_id`。「回复某条汇报即路由到对应 Thread」的强信号成立 |
+| 自定义域名国内可达性 | ✅ 本机不走代理直连 `https://shepherd-spike.iefnaf.cc/` 200（约 1.2 s）。连接器与详情页走自定义域名**不需要代理** |
+
+### 8.2 webhooks：能配，但投递不迁移（核心发现）
+
+1. `*.workers.dev` 从国内不可达，**对飞书服务器同样不可达**：PATCH 到 workers.dev 地址报 210042（URL 验证失败 = 飞书的验证请求到不了 Worker）。
+2. 换自定义域名后，**URL 验证通过**（日志看到飞书验证服务器 `123.58.10.238/239`（中国）的 `url_verification` 请求），PATCH 返回 success，应用配置一度显示 webhook。
+3. **但事件投递始终走长连接**：停掉长连接客户端、多次成功 PATCH（含 `add_events`）、事件就是不到 webhook；重新连上长连接，消息事件立刻从长连接到达。配置接口的「成功」与实际投递模式脱节，`callback_info.callback_type` 的显示还会在 webhook/websocket 间跳动。
+4. 尝试 `publish` 接口（提交新版本让配置上线）报 210304 缺字段，SDK 类型定义与真实参数不符，未继续。
+
+**结论：扫码创建的 PersonalAgent 应用，通过 API 切 webhook 目前不可用。MVP 用长连接**（DO 常醒，时长费用仍在含量内，见 [cloudflare-do-websocket.md](cloudflare-do-websocket.md)）。两个待试的后续：开发者后台**手动**把订阅方式改成 webhook（控制台的标准流程，大概率可用，但破坏「一次扫码」体验）；`publish` 接口带全参数重试。
+
+### 8.3 其他实测细节
+
+- `image.get` 不能下载用户发的图（返回 400），必须用 `im.messageResource.get`——与官方注释一致。
+- 创建应用的默认名会被裁短（预填 "Shepherd Spike ({user})" → 应用名 "Spike"）；多次创建会出现多个同名 bot，产品上要注意引导用户删除旧应用或命名区分。
+- `addons` 编码后的内容确实走 URL 参数（实测链接中可见 gzip+base64 的 `addons=` 段）。
+- wrangler OAuth 授权页会记住上次勾选的权限范围，重新 login 不会自动补全；远程机器上 `wrangler login` 的 localhost 回调到不了远端，需要控制台手动操作或 API Token（本次用「现有权限部署 + 控制台手动绑域名」绕过）。
+
+## 9. 对设计的影响（更新）
+
+1. **MVP 入站 = DO 托管长连接**（steward.md §9.0 已是默认），webhook 从「可选」降级为「后续验证」。
+2. 上手流程「一次扫码」成立：创建 + 默认权限 + 事件 + 自动发布，全在扫码确认页完成；补权限（如需要）也走扫码。
+3. 自定义域名仍是国内用户的必选项（连接器、详情页、以及未来 webhook），部署指引里要有可達性自检。
+4. 引用路由的强信号已验证，steward.md §3.1 的信号 1 成立。
+
