@@ -2,7 +2,7 @@
 
 状态：草案 v0.1。依据：[产品 spec](../spec.md)、[pi 对接调研](../research/pi-integration.md)。
 
-本文只设计**连接器（运行在用户机器上的守护进程）如何管理和驱动 pi worker**，以及连接器对外暴露的边界（命令与事件）。总管端（Durable Object 里的记忆、路由、task）以及连接器与 DO 之间的传输协议，另文设计。
+本文只设计**连接器（运行在用户机器上的守护进程）如何管理和驱动 pi worker**，以及连接器对外暴露的边界（命令与事件）。总管端（Durable Object 里的记忆、路由、task）另文设计；连接器与 DO 之间的传输协议见 [connector-do-protocol.md](connector-do-protocol.md)。
 
 ## 1. 目标与非目标
 
