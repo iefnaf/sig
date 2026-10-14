@@ -12,10 +12,10 @@ import * as lark from "/Users/fanfei/code/shepherd/spikes/feishu/node_modules/@l
 const cred = JSON.parse(readFileSync("/Users/fanfei/code/shepherd/spikes/feishu/.credentials.json", "utf8"));
 const client = new lark.Client({ appId: cred.client_id, appSecret: cred.client_secret, domain: lark.Domain.Feishu, loggerLevel: lark.LoggerLevel.fatal });
 
-const notifyCard = (p: { conclusion: string; did: string[]; needsYou?: string }) => ({
+const notifyCard = (p: { conclusion: string; did: string[]; needsYou?: string; tone?: string }) => ({
 	schema: "2.0",
 	config: { update_multi: true },
-	header: { title: { tag: "plain_text", content: "Shepherd 汇报" }, template: p.needsYou ? "orange" : "green" },
+	header: { title: { tag: "plain_text", content: "Shepherd 汇报" }, template: p.tone === "failure" ? "red" : p.tone === "attention" ? "orange" : "green" },
 	body: { elements: [
 		{ tag: "markdown", content: `**${p.conclusion}**` },
 		...(p.did.length ? [{ tag: "markdown", content: p.did.map((d) => `- ${d}`).join("\n") }] : []),

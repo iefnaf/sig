@@ -156,7 +156,7 @@ test("outbound: retry with backoff, then give up; quiet merge", async () => {
 			throw new Error("feishu down");
 		},
 	};
-	outbound.enqueue("o1", "feishu", "done_report", { conclusion: "a", did: ["d1"], urgency: "push" }, "t_1", 0);
+	outbound.enqueue("o1", "feishu", "done_report", { conclusion: "a", did: ["d1"], urgency: "push", tone: "success" }, "t_1", 0);
 	await outbound.flush(failing, "feishu", 0);
 	await outbound.flush(failing, "feishu", 10_000);
 	await outbound.flush(failing, "feishu", 60_000);
@@ -167,8 +167,8 @@ test("outbound: retry with backoff, then give up; quiet merge", async () => {
 	assert.equal(calls, 4);
 
 	// quiet merge
-	outbound.enqueue("q1", "feishu", "done_report", { conclusion: "第一件完成", did: ["a"], urgency: "quiet" }, "t_1", 1_000);
-	outbound.enqueue("q2", "feishu", "done_report", { conclusion: "第二件完成", did: ["b"], urgency: "quiet" }, "t_1", 5_000);
+	outbound.enqueue("q1", "feishu", "done_report", { conclusion: "第一件完成", did: ["a"], urgency: "quiet", tone: "success" }, "t_1", 1_000);
+	outbound.enqueue("q2", "feishu", "done_report", { conclusion: "第二件完成", did: ["b"], urgency: "quiet", tone: "success" }, "t_1", 5_000);
 	assert.equal(outbound.mergeQuiet(60_000), 1);
 	const adapter = new NoopAdapter();
 	await outbound.flush(adapter, "feishu", 10_000);

@@ -7,6 +7,8 @@ export interface NotifyPayload {
 	did: string[]; // <= 4 bullets
 	needsYou?: string; // <= 120 chars, omitted when nothing is needed
 	urgency: "push" | "quiet";
+	/** Message tone drives presentation (card color), independent of needsYou. */
+	tone: "success" | "attention" | "failure";
 }
 
 const clip = (s: string, n: number) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
@@ -26,6 +28,7 @@ export function renderNotify(memory: Memory, template: string, workerId: string,
 				did: did.slice(0, 4).map((d) => clip(d, 100)),
 				needsYou: !r.git?.pushed && branch ? "是否推送并开 PR？" : undefined,
 				urgency: "push",
+				tone: "success",
 			};
 		}
 		case "decision_fallback": {
@@ -35,14 +38,15 @@ export function renderNotify(memory: Memory, template: string, workerId: string,
 				did: q ? [clip(q, 200)] : ["worker 提出了一个问题，需要你的回答。"],
 				needsYou: "回复这条消息即可转达给 worker。",
 				urgency: "push",
+				tone: "attention",
 			};
 		}
 		case "error_auth":
-			return { conclusion: "任务失败：模型凭据不可用", did: ["worker 所在机器上的模型登录已失效（auth 错误）。"], needsYou: "到那台机器上重新登录模型，然后说「继续」。", urgency: "push" };
+			return { conclusion: "任务失败：模型凭据不可用", did: ["worker 所在机器上的模型登录已失效（auth 错误）。"], needsYou: "到那台机器上重新登录模型，然后说「继续」。", urgency: "push", tone: "failure" };
 		case "error_context":
-			return { conclusion: "任务暂停：上下文接近上限", did: ["这个 session 的上下文快满了，继续下去质量会下降。"], needsYou: "让总管开一个新 session 接力（会附交接简报），或直接结束。", urgency: "push" };
+			return { conclusion: "任务暂停：上下文接近上限", did: ["这个 session 的上下文快满了，继续下去质量会下降。"], needsYou: "让总管开一个新 session 接力（会附交接简报），或直接结束。", urgency: "push", tone: "attention" };
 		case "broken":
-			return { conclusion: "worker 无法自动恢复", did: [`原因：${clip(String(extra?.reason ?? "未知"), 160)}`], needsYou: "重试、换一台机器，还是放弃？", urgency: "push" };
+			return { conclusion: "worker 无法自动恢复", did: [`原因：${clip(String(extra?.reason ?? "未知"), 160)}`], needsYou: "重试、换一台机器，还是放弃？", urgency: "push", tone: "attention" };
 		default:
 			throw new Error(`unknown template ${template}`);
 	}
