@@ -13,4 +13,6 @@ Status: product spec and design stage.
 - [docs/research/feishu-channel.md](docs/research/feishu-channel.md): Feishu bot creation, event transport, messaging APIs, and open questions
 - [docs/research/do-protocol-spike.md](docs/research/do-protocol-spike.md): measured results of the protocol prototype on real Cloudflare
 - [spikes/do-protocol](spikes/do-protocol): the prototype (Worker, Durable Object, simulated connector, tests)
+- [spikes/steward-m1](spikes/steward-m1): steward M1 core (ledger, reducer, outbound, templates) with tests
+- [spikes/e2e](spikes/e2e): the full no-LLM loop, live on Cloudflare: Feishu `/派发` -> connector -> report card
 - [spikes/pi-rpc](spikes/pi-rpc): throwaway scripts behind the research
