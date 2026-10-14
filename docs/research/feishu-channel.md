@@ -157,14 +157,19 @@ Content-Type: application/x-www-form-urlencoded
 | 引用回复路由 | ✅ 用户引用回复我们的卡片时，事件的 `parent_id` **正好等于**我们那张卡片的 `message_id`。「回复某条汇报即路由到对应 Thread」的强信号成立 |
 | 自定义域名国内可达性 | ✅ 本机不走代理直连 `https://shepherd-spike.iefnaf.cc/` 200（约 1.2 s）。连接器与详情页走自定义域名**不需要代理** |
 
-### 8.2 webhooks：能配，但投递不迁移（核心发现）
+### 8.2 webhooks：可用，但切换需要「配置 + 控制台重新发布」两步（核心发现，含一次反复）
 
 1. `*.workers.dev` 从国内不可达，**对飞书服务器同样不可达**：PATCH 到 workers.dev 地址报 210042（URL 验证失败 = 飞书的验证请求到不了 Worker）。
-2. 换自定义域名后，**URL 验证通过**（日志看到飞书验证服务器 `123.58.10.238/239`（中国）的 `url_verification` 请求），PATCH 返回 success，应用配置一度显示 webhook。
-3. **但事件投递始终走长连接**：停掉长连接客户端、多次成功 PATCH（含 `add_events`）、事件就是不到 webhook；重新连上长连接，消息事件立刻从长连接到达。配置接口的「成功」与实际投递模式脱节，`callback_info.callback_type` 的显示还会在 webhook/websocket 间跳动。
-4. 尝试 `publish` 接口（提交新版本让配置上线）报 210304 缺字段，SDK 类型定义与真实参数不符，未继续。
+2. 换自定义域名后，**URL 验证通过**（日志看到飞书验证服务器 `123.58.10.238/239`（中国）的 `url_verification` 请求），PATCH 返回 success。
+3. **但仅靠 API 切换不生效**：多次成功 PATCH（含 `add_events`）、停掉长连接客户端、甚至用 API `publish` 发版（版本 1.0.1 上线，`online_version_id` 已切换），事件投递依然走长连接。期间 `callback_info.callback_type` 的显示在 webhook/websocket 间跳动，与真实投递不一致。
+4. **控制台重新发布后生效**：用户在开发者后台重新发布版本，再 PATCH 一次，`callback_type` 稳定显示 webhook，**事件投递真实切换**：
+   - `im.message.receive_v1` 从飞书服务器直达 Worker，消息创建到收到约 **400 ms**；
+   - `card.action.trigger` 按钮回调同样到达，`action.value` 自定义数据原样回传，`context.open_message_id` 指向卡片消息（回调路由强信号），`operator.open_id` 可校验操作者。
+5. `publish` API 注意：不带 `mobile_default_ability`/`pc_default_ability` 报 210042 系的 210304（缺字段）；带全 5 个字段仍报 50516，但版本会创建并上线——**API 发版与控制台发版在服务端效果不等价**，差在哪未查明。
 
-**结论：扫码创建的 PersonalAgent 应用，通过 API 切 webhook 目前不可用。MVP 用长连接**（DO 常醒，时长费用仍在含量内，见 [cloudflare-do-websocket.md](cloudflare-do-websocket.md)）。两个待试的后续：开发者后台**手动**把订阅方式改成 webhook（控制台的标准流程，大概率可用，但破坏「一次扫码」体验）；`publish` 接口带全参数重试。
+**结论：webhook 对扫码创建的应用可用**，条件是自定义域名 + 扫码补 `application:application:patch` 权限 + config PATCH + **控制台重新发布**（API 发版不能替代）。长连接作为无需控制台操作的备选。设置流程里「控制台重新发布」是唯一需要用户离开扫码流程的一步；`publish` API 与 PATCH 的正确组合顺序（先发版后 PATCH？）未穷尽，值得后续再试一次，若成立则全自动。
+
+**对实现的影响**：webhook 模式下 DO 只需一个 HTTP 端点加验签（事件带 `token` 字段可校验，回调有独立 `token`），**不需要在 DO 里手写 protobuf 长连接客户端**，实现量大幅下降，且 DO 可以休眠。MVP 默认改为 webhook，长连接作为「不想去控制台」的降级选项。
 
 ### 8.3 其他实测细节
 
@@ -175,8 +180,8 @@ Content-Type: application/x-www-form-urlencoded
 
 ## 9. 对设计的影响（更新）
 
-1. **MVP 入站 = DO 托管长连接**（steward.md §9.0 已是默认），webhook 从「可选」降级为「后续验证」。
-2. 上手流程「一次扫码」成立：创建 + 默认权限 + 事件 + 自动发布，全在扫码确认页完成；补权限（如需要）也走扫码。
-3. 自定义域名仍是国内用户的必选项（连接器、详情页、以及未来 webhook），部署指引里要有可達性自检。
-4. 引用路由的强信号已验证，steward.md §3.1 的信号 1 成立。
+1. **MVP 入站 = webhook**（2026-10-14 实测后修正）：DO 完全休眠、实现只要一个 HTTP 端点加验签；设置流程多一步「控制台重新发布」。长连接降为备选（无需控制台，但 DO 常醒且要在 DO 里实现 protobuf 帧协议）。
+2. 上手流程：扫码创建（默认权限/事件/自动发布）→ 扫码补 `application:application:patch` → config PATCH 切 webhook（URL 验证自动完成）→ 控制台重新发布。待验证 `publish` API 能否替代最后一步。
+3. 自定义域名是国内用户的必选项（连接器、详情页、webhook 全依赖它），部署指引里要有可达性自检。
+4. 引用路由的强信号已验证：文本消息的 `parent_id` 和卡片回调的 `context.open_message_id` 都指向我们的消息 ID。
 

@@ -501,17 +501,17 @@ sh_followup(followupId, threadId, dueAt, reason, createdBy: user|steward, source
 
 ## 9. 通道：飞书
 
-### 9.0 接入与事件传输（依据 [飞书调研](../research/feishu-channel.md)）
+### 9.0 接入与事件传输（依据 [飞书调研](../research/feishu-channel.md)，2026-10-14 实测修正）
 
-- **创建**：部署完成后，DO 调用飞书的应用注册设备流程（`POST accounts.feishu.cn/oauth/v1/app/registration`，`action=begin`、`archetype=PersonalAgent`），把返回的二维码链接展示在设置页；DO 用 alarm 按 `interval` 轮询 `action=poll`，成功后得到 `client_id`、`client_secret` 和扫码人的 `open_id`（`tenant_brand=lark` 时切到国际域名继续）。凭据加密存储，`open_id` 直接作为 owner。链接 10 分钟内有效、一次性。手动填 App ID 和 App Secret 作为兜底。
+- **创建**：部署完成后，DO 调用飞书的应用注册设备流程（`POST accounts.feishu.cn/oauth/v1/app/registration`，`action=begin`、`archetype=PersonalAgent`），把返回的二维码链接展示在设置页；DO 用 alarm 按 `interval` 轮询 `action=poll`，成功后得到 `client_id`、`client_secret` 和扫码人的 `open_id`（`tenant_brand=lark` 时切到国际域名继续）。凭据加密存储，`open_id` 直接作为 owner。链接实测有效 1 小时、一次性。手动填 App ID 和 App Secret 作为兜底。
 - **入站传输有两种实现**，由适配器的配置选择：
-  1. `LongConnection`（MVP 默认）：DO 作为客户端连飞书的长连接（`POST open.feishu.cn/callback/ws/endpoint` 取地址，再连 WebSocket，protobuf 帧、分片合并、ping、确认帧）。出站 WebSocket 不能休眠，DO 在连接期间常驻；DO 被重置后由 alarm 心跳拉起并重连。不需要公网地址。
-  2. `Webhook`：飞书 POST 到我们的地址，需要可被飞书访问的域名（国内大概率需要自定义域名）。扫码创建的应用能否改成 webhook 尚未验证。
+  1. `Webhook`（**MVP 默认**，实测可用）：飞书把事件 POST 到 `https://<自定义域名>/channels/feishu/events`，DO 完全休眠，只在有事件时被唤醒；实现只需 HTTP 端点加验签。切换条件：扫码补 `application:application:patch` 权限 → config PATCH（飞书自动做 URL 验证）→ **控制台重新发布版本**（实测 API `publish` 不能替代这一步）。国内用户必须使用自定义域名（`*.workers.dev` 对飞书服务器也不可达，实测）。
+  2. `LongConnection`（备选）：DO 作为客户端连飞书的长连接（protobuf 帧、分片合并、ping、确认帧），不需要控制台操作和公网地址，但出站 WebSocket 不能休眠（DO 常醒）且实现量大。
 - 国内网络下 `*.workers.dev` 不可用，用户访问网页、连接器连总管都需要自定义域名（或代理），见 spec §12。
 
 ### 9.1 入站
 
-- 路径：长连接模式下事件经由 DO 内的连接到达；webhook 模式为 `POST /channels/feishu/events`（由 Agent 的 `onRequest` 处理）。两者都要校验来源（长连接靠应用凭据；webhook 校验签名、token 与时间戳偏差）。长连接的事件帧要先回确认帧再异步处理。
+- 路径：`POST /channels/feishu/events`（由 Agent 的 `onRequest` 处理）。校验事件的 `token` 字段与存储的验证令牌一致（webhook 模式下事件体自带 `token`，卡片回调另有独立 `token`），处理 URL 验证握手（`url_verification` 回显 `challenge`），并按 OpenClaw 的做法拒绝时间戳偏差过大的请求。收到后**先持久化再返回 200**。
 - 去重：`sh_inbound(msgId)` 主键；重复的事件直接返回 200。飞书会重试事件，所以必须幂等。
 - 身份：只处理 owner 的**私聊**。owner 在首次扫码绑定时记录 `open_id`；其他来源一律忽略并记录。
 - 内容：文本、引用（父消息 ID，用于 §3.1 路由）、图片。图片由适配器经飞书 API 下载，缩放到协议的单消息上限内（协议文档 §6.2），作为 `images` 提交。
