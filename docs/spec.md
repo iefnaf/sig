@@ -304,7 +304,9 @@ MVP 做到第 3 步。
 
 - 单租户部署（每个部署只服务一位用户）。
 - 飞书渠道（扫码创建 bot、卡片、推送）。
-- 机器配对与连接器，支持至少一种 agent（优先 Claude Code），随后扩展到 Codex、pi。
+- 机器配对与连接器，支持至少一种 agent。接入顺序为 **pi → Claude Code → Codex**（Codex 待在本机核实后再定）。pi 的对接见 [调研](research/pi-integration.md) 与 [设计](design/connector-pi.md)。
+- 被驱动的 agent 必须已在该机器上安装并登录，Shepherd 不接触 agent 的账号凭据。
+- 总管只管理它自己启动的会话；用户手动启动的会话不被监控，但再次拉起前会检测外部改动。
 - Thread / session 的记忆与路由，接力式交接简报。
 - 汇报三段式，「等你」状态与未读标记。
 - 失联与恢复处理。
@@ -326,7 +328,7 @@ MVP 做到第 3 步。
 
 ## 15. 待讨论事项
 
-1. **支持哪些 agent，各自能做到什么程度。** 续会话、被远程驱动、中途插话的能力差异，决定产品承诺的上限与降级方式。
+1. **其余 agent 的对接能力。** pi 已调研（见 [research/pi-integration.md](research/pi-integration.md)）；Claude Code 的命令行有 `--resume`、`stream-json` 输入输出等选项，但运行中插话是否生效、能否得到结构化汇报尚未验证；Codex 本机未安装，未调研。各 agent 通过能力声明表达差异，产品承诺按最小共同能力撰写（见 [design/connector-pi.md](design/connector-pi.md) 第 3 节）。
 2. **输入形态。** 语音、图片、文件（如截图报 bug 直接派发）。
 3. **成本与用量可见性、预算上限。**
 4. **隐私与数据边界。** 代码内容是否经过云端，汇报能否带代码片段。
@@ -339,6 +341,7 @@ MVP 做到第 3 步。
 
 - pi-durable 提供 Cloudflare Durable Object 存储（`openDurableObjectSqliteStorage`）、可持久的 document 与 task、按 `requestId` 幂等的提交、后台子 agent 与回报模式（见 pi 仓库 `packages/durable` 的 README 与例 23）。记忆与派发预计可基于这些原语实现。
 - task 如何等待**外部事件**（连接器回报）：spec 中未找到现成原语，需原型验证，可能的路径包括基于 document 变化的等待，或把远程 worker 建模为代理会话。
+- pi 侧的大部分假设已在本机验证，见 [research/pi-integration.md](research/pi-integration.md) 与 [spikes/pi-rpc](../spikes/pi-rpc)：运行中插话、中止、杀进程后续会话、注入汇报工具、强制补报、只读限制均成立。
 - 连接器与 DO 的长连接是否支持休眠，以及休眠后 task 能否被 alarm 唤醒。
 - 派发工具涉及外部副作用，崩溃重放时必须避免重复派发，需要幂等键。
 - 飞书「扫码创建机器人」的实际能力与权限范围，个人账号能否创建。
