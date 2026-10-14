@@ -501,9 +501,17 @@ sh_followup(followupId, threadId, dueAt, reason, createdBy: user|steward, source
 
 ## 9. 通道：飞书
 
+### 9.0 接入与事件传输（依据 [飞书调研](../research/feishu-channel.md)）
+
+- **创建**：部署完成后，DO 调用飞书的应用注册设备流程（`POST accounts.feishu.cn/oauth/v1/app/registration`，`action=begin`、`archetype=PersonalAgent`），把返回的二维码链接展示在设置页；DO 用 alarm 按 `interval` 轮询 `action=poll`，成功后得到 `client_id`、`client_secret` 和扫码人的 `open_id`（`tenant_brand=lark` 时切到国际域名继续）。凭据加密存储，`open_id` 直接作为 owner。链接 10 分钟内有效、一次性。手动填 App ID 和 App Secret 作为兜底。
+- **入站传输有两种实现**，由适配器的配置选择：
+  1. `LongConnection`（MVP 默认）：DO 作为客户端连飞书的长连接（`POST open.feishu.cn/callback/ws/endpoint` 取地址，再连 WebSocket，protobuf 帧、分片合并、ping、确认帧）。出站 WebSocket 不能休眠，DO 在连接期间常驻；DO 被重置后由 alarm 心跳拉起并重连。不需要公网地址。
+  2. `Webhook`：飞书 POST 到我们的地址，需要可被飞书访问的域名（国内大概率需要自定义域名）。扫码创建的应用能否改成 webhook 尚未验证。
+- 国内网络下 `*.workers.dev` 不可用，用户访问网页、连接器连总管都需要自定义域名（或代理），见 spec §12。
+
 ### 9.1 入站
 
-- 路径：`POST /channels/feishu/events`（由 Agent 的 `onRequest` 处理）。校验飞书事件的签名与 token，处理 URL 验证握手。
+- 路径：长连接模式下事件经由 DO 内的连接到达；webhook 模式为 `POST /channels/feishu/events`（由 Agent 的 `onRequest` 处理）。两者都要校验来源（长连接靠应用凭据；webhook 校验签名、token 与时间戳偏差）。长连接的事件帧要先回确认帧再异步处理。
 - 去重：`sh_inbound(msgId)` 主键；重复的事件直接返回 200。飞书会重试事件，所以必须幂等。
 - 身份：只处理 owner 的**私聊**。owner 在首次扫码绑定时记录 `open_id`；其他来源一律忽略并记录。
 - 内容：文本、引用（父消息 ID，用于 §3.1 路由）、图片。图片由适配器经飞书 API 下载，缩放到协议的单消息上限内（协议文档 §6.2），作为 `images` 提交。
@@ -528,7 +536,7 @@ interface ChannelAdapter {
 }
 ```
 
-飞书是第一个实现。关于「扫码创建机器人」「个人账号能否创建应用」「事件订阅方式」「卡片回调」「限流与消息长度」这些细节，目前**没有调研**，写在待调研项里（§13）。
+飞书是第一个实现。「扫码创建」「长连接 / webhook」「卡片、回调、限流与消息长度」已有[调研](../research/feishu-channel.md)；其中同一用户 5 QPS、序列化消息 30 KB 上限已纳入 §6。仍未验证的点（扫码创建的应用能否改 webhook、是否需要发布审核、DO 托管长连接的稳定性、飞书到 Worker 的可达性）列在调研文档第 6 节。
 
 ## 10. 网页读模型
 
@@ -588,7 +596,9 @@ interface ChannelAdapter {
 | DO 的 SQLite 支持 FTS5、JSON 函数 | ◦（官方文档），含触发器同步的行为未验证 |
 | `ctx.storage.transactionSync` | ◦（DO 存储 API） |
 | `this.schedule(cron, ...)` 幂等 | ◦（Agents SDK 文档） |
-| 飞书：扫码创建机器人、事件订阅、卡片与回调、限流与长度限制 | ？未调研 |
+| 飞书：扫码创建（`registerApp` 设备流程） | ◦ 官方 SDK 源码；未实机扫码 |
+| 飞书：长连接协议、消息发送 / 回复 / 更新卡片、限流与长度 | ◦ 官方 SDK 源码与注释；未实机 |
+| 飞书：扫码创建的应用改 webhook、发布审核、个人账号限制、DO 内长连接稳定性 | ？未验证，见 [feishu-channel.md](../research/feishu-channel.md) §6 |
 
 ## 14. MVP 范围与里程碑
 
@@ -611,7 +621,7 @@ interface ChannelAdapter {
 5. **笔记的 `lastUsedAt` 以「被装配进上下文」近似「被使用」**，可能高估；后续可以让总管在回复里标注引用了哪些笔记。
 6. **摘要重建频率**（每 10 次）是拍脑袋值。
 7. **Thread 数量增长后**，`findCandidates` 的召回策略（加向量或加分层）。
-8. **Feishu 适配**的所有细节（§9.3 末尾），以及企业微信。
+8. **飞书适配**的未验证项（见调研 §6），以及企业微信。长连接放在 DO 里意味着 DO 常醒：时长费用仍在含量之内，但「休眠几乎不花钱」不再成立，需要在成本说明里写明。
 9. **多个 Thread 的同时汇报**怎么合并成一条，既要简短又不丢失每件事的三段，需要在真实卡片上试。
 10. **用户查看 Thread 的信号**如何可靠地得到（网页打开、回复、按钮），用于清除未读。
 11. **预算与用量**的计量来源：pi-durable 的 `pi.usage` 文档，总管的日用量如何汇总。

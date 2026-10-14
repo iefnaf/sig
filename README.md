@@ -10,6 +10,7 @@ Status: product spec and design stage.
 - [docs/design/connector-pi.md](docs/design/connector-pi.md): how the connector manages pi workers
 - [docs/design/connector-do-protocol.md](docs/design/connector-do-protocol.md): wire protocol between connector and the steward Durable Object
 - [docs/design/steward.md](docs/design/steward.md): the steward inside the Durable Object (memory module, routing, event pipeline, notifications, proactive behavior)
+- [docs/research/feishu-channel.md](docs/research/feishu-channel.md): Feishu bot creation, event transport, messaging APIs, and open questions
 - [docs/research/do-protocol-spike.md](docs/research/do-protocol-spike.md): measured results of the protocol prototype on real Cloudflare
 - [spikes/do-protocol](spikes/do-protocol): the prototype (Worker, Durable Object, simulated connector, tests)
 - [spikes/pi-rpc](spikes/pi-rpc): throwaway scripts behind the research

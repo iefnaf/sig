@@ -270,8 +270,8 @@ Thread 与 worker 的记录属于记忆模块的一部分，与背景记忆统�
 
 ### 12.1 上手流程
 
-1. 点 Deploy 部署到 Cloudflare，填入模型 API key。
-2. 部署完成，出现二维码，用飞书扫码创建 bot，扫码者成为 owner。
+1. 点 Deploy 部署到 Cloudflare，填入模型 API key。**中国大陆用户还需要给 Worker 绑定自定义域名**：`*.workers.dev` 在国内被封（已在本机实测），用户访问网页、连接器连接总管都会失败。
+2. 部署完成，出现二维码，用飞书扫码创建 bot，扫码者成为 owner（基于飞书官方的应用注册设备流程，见 [research/feishu-channel.md](research/feishu-channel.md)）。
 3. 在对话中，总管给出一条命令；在要接入的电脑终端粘贴运行，机器即出现在总管处。
 4. （加分项）总管探测该机器的 agent 与仓库，引导派第一个任务。
 
