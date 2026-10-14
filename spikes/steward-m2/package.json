@@ -3,7 +3,8 @@
 	"private": true,
 	"type": "module",
 	"scripts": {
-		"test": "node --test 'test/*.test.ts'"
+		"test": "node --test 'test/*.test.ts'",
+		"eval": "node eval/run-eval.ts"
 	},
 	"dependencies": {
 		"@earendil-works/chord": "1.2.0",

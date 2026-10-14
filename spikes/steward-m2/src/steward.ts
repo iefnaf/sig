@@ -32,17 +32,27 @@ export function buildStewardExtension(ctx: StewardContext): Extension {
 			const rows = ctx.memory.db.all<{ threadId: string; title: string; state: string; summary: string | null }>(
 				`SELECT threadId, title, state, summary FROM sh_thread WHERE archived = 0 ORDER BY lastActivityAt DESC LIMIT 30`,
 			);
-			const tokens = args.query.toLowerCase().split(/\s+/).filter((t) => t.length > 1);
+			// CJK has no spaces: score by character-bigram overlap plus latin word matches,
+			// so 「依赖升级…」 finds 「升级依赖」 and 「文档补完」 finds 「补 API 文档」.
+			const q = args.query.toLowerCase();
+			const grams = new Set<string>();
+			const chars = [...q];
+			for (let i = 0; i < chars.length - 1; i++) if (!/\s/.test(chars[i]) && !/\s/.test(chars[i + 1])) grams.add(chars[i] + chars[i + 1]);
+			const latin = q.match(/[a-z0-9_./-]{2,}/g) ?? [];
 			const scored = rows
 				.map((r) => {
 					const hay = `${r.title} ${r.summary ?? ""}`.toLowerCase();
-					const hits = tokens.filter((t) => hay.includes(t)).length;
-					return { r, score: hits + (r.state !== "idle" ? 2 : 0) };
+					const hayGrams = new Set<string>();
+					const h = [...hay];
+					for (let i = 0; i < h.length - 1; i++) if (!/\s/.test(h[i]) && !/\s/.test(h[i + 1])) hayGrams.add(h[i] + h[i + 1]);
+					const gramHits = [...grams].filter((g) => hayGrams.has(g)).length;
+					const latinHits = latin.filter((t) => hay.includes(t)).length;
+					return { r, score: gramHits + latinHits * 2 + (r.state !== "idle" ? 1 : 0) };
 				})
-				.filter((x) => x.score > 0)
+				.filter((x) => x.score >= 2)
 				.sort((a, b) => b.score - a.score)
 				.slice(0, 8)
-				.map((x) => ({ id: x.r.threadId, title: x.r.title, state: x.r.state, summary: (x.r.summary ?? "").slice(0, 120), matched: x.score }));
+				.map((x) => ({ id: x.r.threadId, title: x.r.title, state: x.r.state, summary: (x.r.summary ?? "").slice(0, 120), matched: x.score, weak: x.score <= 4 }));
 			return ok(scored.length ? JSON.stringify(scored) : "[]");
 		},
 	});
@@ -128,7 +138,10 @@ export function buildStewardExtension(ctx: StewardContext): Extension {
 		execute: async () => ({ content: [{ type: "text" as const, text: "ok" }], control: { terminate: true } }),
 	});
 
-	// Policy hook (steward.md §7.2, M2 subset): inferred dispatch is refused; a thread is required.
+	// Policy hook (steward.md §7.2, M2 subset): inferred dispatch is refused; a thread is required;
+	// one dispatch per run — a second start_worker for a different thread means the model is
+	// second-guessing itself (observed: placeholder prompt, then the real one).
+	let dispatchedThread: string | undefined;
 	const guard = hook(ToolTask, {
 		beforeTool: (call) => {
 			const args = (call as { arguments?: Record<string, unknown> }).arguments ?? {};
@@ -139,6 +152,11 @@ export function buildStewardExtension(ctx: StewardContext): Extension {
 				if (!args.threadId && !args.newTitle) {
 					return { block: "Dispatch needs a threadId (attach, from find_threads) or a newTitle (create)." };
 				}
+				const target = (args.threadId as string) ?? `new:${args.newTitle}`;
+				if (dispatchedThread && dispatchedThread !== target) {
+					return { block: `本条消息已经派发过（${dispatchedThread}）。不要在同一个回合里改派；如有疑问用 ask_user 与用户确认。` };
+				}
+				dispatchedThread = target;
 			}
 			return undefined;
 		},
@@ -159,7 +177,14 @@ const ROLE_PROMPT = `你是 Shepherd 的总管，替用户调度其机器上的�
 
 规则：
 1. 以 ⟦ 开头的输入不是用户说的话，是系统事件。事件触发的运行里不要输出面向用户的文字，无事可做就调用 no_action；需要通知用户时明确说明。
-2. 派发前先 find_threads。确定属于某件事就 attach；明显是新事就创建（newTitle 用用户的原话短语）；多个候选同样匹配、或拿不准时，必须 ask_user，不要猜。
-3. start_worker 的 basis 只能是你真正拥有的依据；禁止 inferred。
-4. 给用户的回复简短：先结论，再要点，最多几行。
-5. worker 汇报到达后（⟦event⟧），做记账：更新 thread 摘要；除非有用户必须知道的新信息，否则不再通知。`;
+2. 派发前先 find_threads。路由判据（从严到宽）：
+   - 无匹配候选，或候选都标着 weak: true 且话语没有点名它标题里的词 → 直接新建 thread（newTitle 用用户的原话短语），不要问。
+   - 有一个明显最匹配的候选 → attach 到它，并在回复里说明挂到了哪件事。
+   - 两个及以上候选**同样匹配**、或话语完全没有指代对象 → 用 ask_user 工具反问（最多 3 个选项，含「新开一件事」）。
+   挂靠的依据是**同一件事的延续**，不是"领域相近"：新功能、新需求即使和现有线程话题相关（比如都涉及 GitHub、都是接口），也是新事件，该新建就新建。
+   状态/进度类问题（"修好了吗""跑到哪了"）不派发：直接根据候选线程的汇报和状态回答。
+3. 反问必须走 ask_user 工具（用户在手机上点按钮），不要在文本里反问后结束。ask_user 之外的场合不要反问。
+4. 只有真正调用了 start_worker 并看到 dispatched 结果才算派发过；严禁在回复文本里声称已派发而实际没有调用工具。
+4. start_worker 的 basis 只能是你真正拥有的依据；禁止 inferred。
+5. 给用户的回复简短：先结论，再要点，最多几行。
+6. worker 汇报到达后（⟦event⟧），做记账：更新 thread 摘要；除非有用户必须知道的新信息，否则不再通知。`;
