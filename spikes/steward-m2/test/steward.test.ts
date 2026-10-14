@@ -15,6 +15,7 @@ function setup(route: FauxResponseStep) {
 	const memory = new Memory(db);
 	const dispatches: Array<{ threadId: string; prompt: string; basis: string; provenance?: string }> = [];
 	const asks: Array<{ question: string; options?: string[] }> = [];
+	const notifies: Array<{ text: string; threadId?: string; tone?: string }> = [];
 	let userInitiated = true;
 	let provenance: string | undefined = "om_test";
 	const ctx: StewardContext = {
@@ -26,6 +27,7 @@ function setup(route: FauxResponseStep) {
 			return { ok: true, workerId };
 		},
 		askUser: async (a) => asks.push(a),
+		notify: async (n) => notifies.push(n),
 		runIsUserInitiated: () => userInitiated,
 		currentProvenance: () => provenance,
 	};
@@ -35,7 +37,7 @@ function setup(route: FauxResponseStep) {
 	models.setProvider(faux.provider);
 	const registry = createRegistry();
 	registry.install(buildStewardExtension(ctx));
-	return { memory, dispatches, asks, ctx, faux, models, registry, setInitiated: (v: boolean) => (userInitiated = v) };
+	return { memory, dispatches, asks, notifies, ctx, faux, models, registry, setInitiated: (v: boolean) => (userInitiated = v) };
 }
 
 async function run(steward: ReturnType<typeof setup>, text: string) {
@@ -132,4 +134,39 @@ test("event wake: no_action ends the run quietly", async () => {
 	assert.equal(s.asks.length, 0);
 	// terminate ends the run at the tool round: no final text is produced at all.
 	assert.equal(reply, "");
+});
+
+test("preference: remember stores a durable note", async () => {
+	const s = setup((req) => {
+		const tr = lastToolResult(req);
+		if (tr.startsWith("noted as")) return fauxAssistantMessage([fauxText("记下了：推送前必跑测试。")]);
+		return fauxAssistantMessage([fauxToolCall("remember", { text: "推送前必须跑全量测试" })], { stopReason: "toolUse" });
+	});
+	await run(s, "以后每次推送前都必须跑全量测试再汇报");
+	const notes = s.memory.notes();
+	assert.equal(notes.length, 1);
+	assert.match(notes[0].text, /全量测试/);
+});
+
+test("event wake with must-know info: notify_user fires, final text is not needed", async () => {
+	const s = setup((req) => {
+		const tr = lastToolResult(req);
+		if (tr === "notified") return fauxAssistantMessage([fauxToolCall("no_action", { reason: "notified" })], { stopReason: "toolUse" });
+		return fauxAssistantMessage([fauxToolCall("notify_user", { text: "worker 删了测试目录，需要你确认是否保留", threadId: "t_a", tone: "attention" })], { stopReason: "toolUse" });
+	});
+	s.setInitiated(false);
+	await run(s, "⟦event⟧ thread=t_a report blocked worker 删除了 tests/ 目录");
+	assert.equal(s.notifies.length, 1);
+	assert.match(s.notifies[0].text, /测试目录|tests/);
+	assert.equal(s.notifies[0].tone, "attention");
+});
+
+test("notify_user is refused on user-initiated runs (the reply is the channel)", async () => {
+	const s = setup((req) => {
+		const tr = lastToolResult(req);
+		if (tr.startsWith("refused")) return fauxAssistantMessage([fauxText("好的，直接说了：没问题。")]);
+		return fauxAssistantMessage([fauxToolCall("notify_user", { text: "不应该走到这" })], { stopReason: "toolUse" });
+	});
+	await run(s, "帮我看看状态");
+	assert.equal(s.notifies.length, 0);
 });

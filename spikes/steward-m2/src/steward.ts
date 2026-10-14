@@ -13,6 +13,8 @@ export interface StewardContext {
 	dispatch(input: { threadId: string; prompt: string; basis: string; provenance?: string }): Promise<{ ok: boolean; workerId?: string; note?: string }>;
 	/** Ask the user a question (creates the question and pushes it). */
 	askUser(input: { threadId?: string; question: string; options?: string[] }): Promise<void>;
+	/** Push a message to the user outside the report-card flow (event wakes). */
+	notify(input: { text: string; threadId?: string; tone?: "info" | "attention" }): Promise<void>;
 	/** The current run was started by a user message (vs an event/routine). */
 	runIsUserInitiated: () => boolean;
 	/** Provenance id of the current run (user message id, routine id, ...). */
@@ -138,6 +140,42 @@ export function buildStewardExtension(ctx: StewardContext): Extension {
 		execute: async () => ({ content: [{ type: "text" as const, text: "ok" }], control: { terminate: true } }),
 	});
 
+	const notifyUser = defineTool({
+		name: "notify_user",
+		description:
+			"Push a short message to the user (event wakes only, when they must know something beyond the standard report card). " +
+			"User-initiated runs should not call this — the final reply already reaches the user.",
+		parameters: Type.Object({
+			text: Type.String({ description: "One or two sentences, conclusion first" }),
+			threadId: Type.Optional(Type.String()),
+			tone: Type.Optional(Type.Union([Type.Literal("info"), Type.Literal("attention")])),
+		}),
+		execute: async (args) => {
+			if (ctx.runIsUserInitiated()) return { content: [{ type: "text" as const, text: "refused: user run — just reply" }], isError: true };
+			await ctx.notify({ text: args.text, threadId: args.threadId, tone: args.tone });
+			return ok("notified");
+		},
+	});
+
+	const remember = defineTool({
+		name: "remember",
+		description:
+			"Store a durable note about the user's preferences, constraints, or facts (e.g. 推送前必须跑全量测试). " +
+			"Notes persist across conversations and are shown every run. Only for things true beyond the current task.",
+		parameters: Type.Object({ text: Type.String({ description: "One self-contained fact, one sentence" }) }),
+		execute: async (args) => ok(`noted as ${ctx.memory.addNote(args.text)}`),
+	});
+
+	const forget = defineTool({
+		name: "forget",
+		description: "Remove a stored note (visible forgetting). List current notes first if unsure of the id.",
+		parameters: Type.Object({ noteId: Type.String() }),
+		execute: async (args) => {
+			ctx.memory.removeNote(args.noteId);
+			return ok("forgotten");
+		},
+	});
+
 	// Policy hook (steward.md §7.2, M2 subset): inferred dispatch is refused; a thread is required;
 	// one dispatch per run — a second start_worker for a different thread means the model is
 	// second-guessing itself (observed: placeholder prompt, then the real one).
@@ -164,13 +202,20 @@ export function buildStewardExtension(ctx: StewardContext): Extension {
 
 	return defineExtension({
 		name: "shepherd-steward",
-		tools: [findThreads, getThread, updateThread, startWorker, askUser, noAction],
+		tools: [findThreads, getThread, updateThread, startWorker, askUser, noAction, notifyUser, remember, forget],
 		hooks: [guard],
 		sections: [
 			section("shepherd-role", () => ROLE_PROMPT, { tag: false }),
+			section("shepherd-notes", () => notesSection(ctx.memory), { tag: true }),
 			section("shepherd-situation", () => buildBrief(ctx.memory), { tag: true }),
 		],
 	});
+}
+
+function notesSection(memory: Memory): string {
+	const notes = memory.notes();
+	if (!notes.length) return "";
+	return ["长期备忘：", ...notes.slice(0, 20).map((n) => `- ${n.id} ${n.text}`)].join("\n");
 }
 
 const ROLE_PROMPT = `你是 Shepherd 的总管，替用户调度其机器上的编码 agent。你不亲自写代码。
@@ -187,4 +232,5 @@ const ROLE_PROMPT = `你是 Shepherd 的总管，替用户调度其机器上的�
 4. 只有真正调用了 start_worker 并看到 dispatched 结果才算派发过；严禁在回复文本里声称已派发而实际没有调用工具。
 4. start_worker 的 basis 只能是你真正拥有的依据；禁止 inferred。
 5. 给用户的回复简短：先结论，再要点，最多几行。
-6. worker 汇报到达后（⟦event⟧），做记账：更新 thread 摘要；除非有用户必须知道的新信息，否则不再通知。`;
+6. worker 汇报到达后（⟦event⟧），做记账：更新 thread 摘要；除非有用户必须知道的新信息（风险决定、需要拍板、明确失败），否则不再通知——需要时用 notify_user。
+7. 用户表达的长期偏好、约束、事实（跨任务成立的那种）用 remember 记下来；单件事的进度不要记。`;

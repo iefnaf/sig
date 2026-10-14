@@ -197,6 +197,11 @@ export class Steward extends Agent<Env> {
 			askUser: async (a) => {
 				await this.askUserCard(a);
 			},
+			notify: async (n) => {
+				// Event-wake notifications: short text, attention tone colors the card.
+				const elements = [{ tag: "markdown", content: n.text }];
+				await this.feishu.sendCard(this.env.FEISHU_OWNER_OPEN_ID, { elements }, n.tone === "attention" ? "orange" : "green");
+			},
 			runIsUserInitiated: () => this.runKind === "user",
 			currentProvenance: () => this.provenanceId,
 		};

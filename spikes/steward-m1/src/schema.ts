@@ -40,6 +40,10 @@ export const SCHEMA = [
 		id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT, template TEXT, threadId TEXT,
 		workerId TEXT, questionId TEXT, payload TEXT, status TEXT NOT NULL DEFAULT 'pending',
 		dueAt INTEGER, createdAt INTEGER)`,
+	// Resident notes (steward.md memory layer 2): durable facts/preferences the steward
+	// must keep across compaction. Hard-capped; visible forgetting via removeNote.
+	`CREATE TABLE IF NOT EXISTS sh_note (
+		id TEXT PRIMARY KEY, text TEXT, createdAt INTEGER)`,
 	`CREATE INDEX IF NOT EXISTS sh_timeline_thread ON sh_timeline (threadId, id)`,
 	`CREATE INDEX IF NOT EXISTS sh_outbound_status ON sh_outbound (status, nextAttemptAt)`,
 ];

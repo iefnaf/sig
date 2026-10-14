@@ -183,6 +183,31 @@ export class Memory {
 
 	// ---- views ----
 
+	// ---- resident notes (memory layer 2) ----
+
+	/** Hard cap: past this, remember() evicts the oldest note (visible forgetting). */
+	static readonly NOTE_CAP = 50;
+
+	notes() {
+		return this.db.all<{ id: string; text: string; createdAt: number }>(
+			`SELECT id, text, createdAt FROM sh_note ORDER BY createdAt DESC`,
+		);
+	}
+
+	addNote(text: string, now = Date.now()): string {
+		const id = `n_${crypto.randomUUID().replace(/-/g, "").slice(0, 8)}`;
+		this.db.run(`INSERT INTO sh_note (id, text, createdAt) VALUES (?, ?, ?)`, id, text, now);
+		this.db.run(
+			`DELETE FROM sh_note WHERE id IN (SELECT id FROM sh_note ORDER BY createdAt DESC LIMIT -1 OFFSET ?)`,
+			Memory.NOTE_CAP,
+		);
+		return id;
+	}
+
+	removeNote(id: string) {
+		this.db.run(`DELETE FROM sh_note WHERE id = ?`, id);
+	}
+
 	situation() {
 		const threads = this.db.all<{ threadId: string; title: string; state: string; unread: number; lastActivityAt: number }>(
 			`SELECT threadId, title, state, unread, lastActivityAt FROM sh_thread WHERE archived = 0 ORDER BY lastActivityAt DESC LIMIT 30`,
