@@ -13,6 +13,12 @@ import type { Db } from "../../steward-m1/src/db.ts";
 import type { NotifyPayload } from "../../steward-m1/src/templates.ts";
 import type { WorkerEvent } from "../../steward-m1/src/types.ts";
 import { SCHEMA } from "../../steward-m1/src/schema.ts";
+import { PiHarness } from "agents/harness/pi";
+import { createModels, createProvider } from "@earendil-works/pi-ai/models";
+import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
+import { DEEPSEEK_MODELS } from "@earendil-works/pi-ai/providers/deepseek.models";
+import { createRegistry, Harness } from "@earendil-works/pi-durable";
+import { buildStewardExtension, type StewardContext } from "../../steward-m2/src/steward.ts";
 
 interface Env {
 	Steward: DurableObjectNamespace;
@@ -43,7 +49,11 @@ async function parseToken(env: Env, token: string | null): Promise<{ deviceId: s
 	return ok ? { deviceId: parts[1], epoch: Number(parts[2]) } : null;
 }
 const bearer = (request: Request) => request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ?? null;
-const json = (body: unknown, status = 200) => Response.json(body, { status });
+const json = (body: unknown, status = 200) =>
+	new Response(JSON.stringify(body === undefined ? {} : JSON.parse(JSON.stringify(body, (_k, v) => (v === undefined ? null : v))) ?? {}), {
+		status,
+		headers: { "content-type": "application/json" },
+	});
 
 // ---- DO storage as the M1 Db facade ----
 class DoDb implements Db {
@@ -92,6 +102,19 @@ class FeishuAdapter implements ChannelAdapter {
 		return { providerMsgId: r.data!.message_id! };
 	}
 
+	async sendCard(openId: string, card: { elements: unknown[] }, template: string): Promise<{ providerMsgId: string }> {
+		const full = { schema: "2.0", config: { update_multi: true }, header: { title: { tag: "plain_text", content: "Shepherd" }, template }, body: card };
+		const t = await this.accessToken();
+		const r = await fetch("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id", {
+			method: "POST",
+			headers: { "content-type": "application/json", authorization: `Bearer ${t}` },
+			body: JSON.stringify({ receive_id: openId, msg_type: "interactive", content: JSON.stringify(full) }),
+			signal: AbortSignal.timeout(10_000),
+		}).then((x) => x.json() as Promise<{ code: number; msg?: string; data?: { message_id?: string } }>);
+		if (r.code !== 0) throw new Error(`feishu sendCard ${r.code} ${r.msg}`);
+		return { providerMsgId: r.data!.message_id! };
+	}
+
 	async send(payload: NotifyPayload & { cardTitle?: string }, openId: string): Promise<{ providerMsgId: string }> {
 		const elements: unknown[] = [{ tag: "markdown", content: `**${payload.conclusion}**` }];
 		if (payload.did.length) elements.push({ tag: "markdown", content: payload.did.map((d) => `- ${d}`).join("\n") });
@@ -125,6 +148,10 @@ export class Steward extends Agent<Env> {
 	memory: Memory;
 	outbound: Outbound;
 	feishu: FeishuAdapter;
+	harness: PiHarness;
+	initError: string | undefined;
+	runKind: "user" | "event" = "user";
+	provenanceId: string | undefined;
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -134,11 +161,52 @@ export class Steward extends Agent<Env> {
 		this.feishu = new FeishuAdapter(env);
 		for (const ddl of SCHEMA) ctx.storage.sql.exec(ddl).toArray();
 		for (const ddl of DEVICE_SCHEMA) ctx.storage.sql.exec(ddl).toArray();
+		try {
+			{
+				// Env-var auth does not work inside the Worker: pi-ai resolves keys through
+				// its own environment reader. Build the provider with the key inline instead
+				// (the pattern from the pi-durable-edge project).
+				const provider = createProvider({
+					id: "deepseek", name: "DeepSeek", baseUrl: "https://api.deepseek.com",
+					auth: { apiKey: { name: "DeepSeek API key", resolve: async () => ({ auth: { apiKey: env.DEEPSEEK_API_KEY }, source: "worker secret" }) } },
+					models: Object.values(DEEPSEEK_MODELS), api: openAICompletionsApi(),
+				} as never);
+				const models = createModels();
+				models.setProvider(provider);
+				const registry = createRegistry();
+				registry.install(buildStewardExtension(this.stewardCtx()));
+				this.harness = new PiHarness({
+					harness: ({ storage, context }) => Harness.open(storage, { models, registry }, context),
+					defaults: { model: { provider: "deepseek", id: "deepseek-flash" } },
+				});
+				this.lifecycle.use(this.harness);
+			}
+		} catch (err) {
+			this.initError = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+			console.error("steward harness init failed:", this.initError);
+		}
+	}
+
+	private stewardCtx(): StewardContext {
+		return {
+			memory: this.memory,
+			dispatch: async (i) => {
+				const r = await this.dispatchToThread(i.threadId, i.prompt);
+				return r;
+			},
+			askUser: async (a) => {
+				await this.askUserCard(a);
+			},
+			runIsUserInitiated: () => this.runKind === "user",
+			currentProvenance: () => this.provenanceId,
+		};
 	}
 
 	// ---- Feishu inbound ----
 
 	async feishuEvent(body: Record<string, any>): Promise<{ challenge?: string }> {
+		const bump = (k: string) => this.db.run(`INSERT INTO sh_meta (k, v) VALUES (?, 1) ON CONFLICT(k) DO UPDATE SET v = v + 1`, k);
+		bump("webhookCalls");
 		if (body.type === "url_verification") return { challenge: body.challenge };
 		const header = body.header ?? {};
 		const eventId = String(header.event_id ?? "");
@@ -152,8 +220,13 @@ export class Steward extends Agent<Env> {
 		if (this.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM sh_inbound WHERE channel = 'feishu' AND msgId = ?`, eventId)!.n) return {};
 		this.db.run(`INSERT INTO sh_inbound (channel, msgId, receivedAt) VALUES ('feishu', ?, ?)`, eventId, Date.now());
 
-		if (header.event_type === "im.message.receive_v1") await this.handleMessage(body.event);
-		else if (header.event_type === "card.action.trigger") await this.handleCardAction(body.event);
+		try {
+			if (header.event_type === "im.message.receive_v1") { bump("webhookMessages"); await this.handleMessage(body.event); }
+			else if (header.event_type === "card.action.trigger") await this.handleCardAction(body.event);
+		} catch (err) {
+			// Log inside the DO: the RPC error envelope masks the real cause on the caller side.
+			console.error("feishu event handling failed:", err instanceof Error ? `${err.name}: ${err.message}` : String(err), err instanceof Error && err.stack ? err.stack.split("\n").slice(1, 4).join(" | ") : "");
+		}
 		return {};
 	}
 
@@ -189,12 +262,18 @@ export class Steward extends Agent<Env> {
 			await this.dispatch(openId, prompt, msg.message_id);
 			return;
 		}
-		await this.feishu.sendText(openId, "M1 阶段只支持：/派发 <要做的事>、/状态。");
+		await this.stewardReply(openId, text, msg.message_id);
 	}
 
 	private async handleCardAction(event: any) {
 		if (event?.operator?.open_id !== this.env.FEISHU_OWNER_OPEN_ID) return;
 		const action = event?.action?.value?.action ?? "?";
+		if (action === "answer") {
+			const { qid, choice } = event?.action?.value ?? {};
+			if (qid) this.memory.answerQuestion(qid);
+			await this.feishu.sendText(this.env.FEISHU_OWNER_OPEN_ID, `已记录你的选择：${choice ?? "（空）"}`);
+			return;
+		}
 		const cardMsgId = event?.context?.open_message_id;
 		const thread = this.db.get<{ threadId: string }>(`SELECT threadId FROM sh_outbound WHERE providerMsgId = ?`, cardMsgId ?? "");
 		if (thread) {
@@ -208,20 +287,28 @@ export class Steward extends Agent<Env> {
 
 	private async dispatch(openId: string, prompt: string, fromMsgId: string) {
 		const devices = this.db.all<{ deviceId: string }>(`SELECT deviceId FROM device WHERE revoked = 0`);
-		const online = devices.filter((d) => this.connFor(d.deviceId));
 		if (!devices.length) {
 			await this.feishu.sendText(openId, "还没有已配对的机器。先运行连接器配对，再派发。");
 			return;
 		}
-		if (!online.length) {
-			await this.feishu.sendText(openId, "已配对的机器都不在线，任务已排队，机器连上后会自动开始。");
-		}
-		const deviceId = (online[0] ?? devices[0]).deviceId;
 		const threadId = `t_${rid()}`;
-		const workerId = `w_${rid()}`;
 		const title = prompt.slice(0, 16) + (prompt.length > 16 ? "…" : "");
-		this.memory.registerMachine(deviceId, "machine");
 		this.memory.createThread(threadId, title, prompt, fromMsgId);
+		const r = await this.dispatchToThread(threadId, prompt);
+		if (r.ok) await this.feishu.sendText(openId, `已创建「${title}」并派发（worker ${String(r.workerId).slice(0, 8)}）。完成后我会汇报。`);
+	}
+
+	private async dispatchToThread(threadId: string, prompt: string): Promise<{ ok: boolean; workerId?: string; note?: string }> {
+		const devices = this.db.all<{ deviceId: string }>(`SELECT deviceId FROM device WHERE revoked = 0`);
+		const online = devices.filter((d) => this.connFor(d.deviceId));
+		// A thread with history keeps its machine even offline (the command queues and resumes on reconnect).
+		const lastWorker = this.db.get<{ deviceId: string }>(`SELECT deviceId FROM sh_worker WHERE threadId = ? ORDER BY rowid DESC LIMIT 1`, threadId);
+		let deviceId: string;
+		if (lastWorker && devices.some((d) => d.deviceId === lastWorker.deviceId)) deviceId = lastWorker.deviceId;
+		else if (online.length) deviceId = online[0].deviceId;
+		else return { ok: false, note: devices.length ? "所有机器都不在线" : "还没有配对任何机器" };
+		const workerId = `w_${rid()}`;
+		this.memory.registerMachine(deviceId, "machine");
 		this.memory.registerWorker({ workerId, threadId, deviceId, agent: "pi", mode: "write" });
 		const cmdId = `cmd_${rid()}`;
 		const cseq = (this.db.get<{ m: number | null }>(`SELECT MAX(cseq) AS m FROM outbox WHERE deviceId = ?`, deviceId)!.m ?? 0) + 1;
@@ -230,8 +317,70 @@ export class Steward extends Agent<Env> {
 			cmdId, deviceId, cseq, JSON.stringify({ workerId, threadId, prompt }),
 		);
 		this.memory.timeline(threadId, "dispatch", `派发给 ${deviceId}：${prompt}`, { cmdId, workerId });
-		this.deliver(cmdId);
-		await this.feishu.sendText(openId, `已创建「${title}」并派发（worker ${workerId.slice(0, 8)}）。完成后我会汇报。`);
+		if (!this.deliver(cmdId)) void this.schedule(5, "resendUnacked");
+		return { ok: true, workerId };
+	}
+
+	// The steward's answer flow: submit durably, then poll from alarms (the webhook must
+	// return to Feishu fast; the LLM run takes seconds).
+	private async stewardReply(openId: string, text: string, msgId: string) {
+		const operationId = `user:${msgId}`;
+		this.db.run(
+			`INSERT OR REPLACE INTO sh_run (operationId, kind, replyTo, status, createdAt) VALUES (?, 'user', ?, 'open', ?)`,
+			operationId, openId, Date.now(),
+		);
+		this.runKind = "user";
+		this.provenanceId = msgId;
+		try {
+			await this.harness.submit(text, { operationId, whenBusy: "followUp" });
+			void this.schedule(1, "pollRun", { operationId });
+		} catch (err) {
+			this.db.run(`UPDATE sh_run SET status = 'failed' WHERE operationId = ?`, operationId);
+			await this.feishu.sendText(openId, `总管没能开始处理（${err instanceof Error ? err.message : String(err)}）。可以用 /派发 直接派发。`);
+		}
+	}
+
+	async pollRun(p: { operationId: string }) {
+		const row = this.db.get<{ kind: string; replyTo: string | null; status: string; createdAt: number }>(
+			`SELECT kind, replyTo, status, createdAt FROM sh_run WHERE operationId = ?`, p.operationId,
+		);
+		if (!row || row.status !== "open") return;
+		if (Date.now() - row.createdAt > 180_000) {
+			this.db.run(`UPDATE sh_run SET status = 'failed' WHERE operationId = ?`, p.operationId);
+			if (row.kind === "user" && row.replyTo) await this.feishu.sendText(row.replyTo, "总管这次超时了。可以重发，或用 /派发 直接派发。");
+			return;
+		}
+		try {
+			const pending = await this.harness.pending();
+			if (pending.some((x: { operationId: string }) => x.operationId === p.operationId)) {
+				void this.schedule(2, "pollRun", p);
+				return;
+			}
+			const res = await this.harness.wait(p.operationId);
+			if (res.status === "done") {
+				this.db.run(`UPDATE sh_run SET status = 'done' WHERE operationId = ?`, p.operationId);
+				if (row.kind === "user" && row.replyTo && res.text) await this.feishu.sendText(row.replyTo, res.text);
+			} else {
+				this.db.run(`UPDATE sh_run SET status = 'failed' WHERE operationId = ?`, p.operationId);
+				if (row.kind === "user" && row.replyTo) await this.feishu.sendText(row.replyTo, `总管没能完成（${res.reason ?? "未知原因"}）。可以重发，或用 /派发 直接派发。`);
+			}
+		} catch (err) {
+			void this.schedule(3, "pollRun", p); // transient: keep polling until the timeout above
+		}
+	}
+
+	private async askUserCard(a: { threadId?: string; question: string; options?: string[] }) {
+		const qid = `q_${rid()}`;
+		const threadId = a.threadId ?? this.memory.situation().threads[0]?.threadId;
+		if (threadId) {
+			this.memory.createQuestion(qid, threadId, null, a.question, "steward");
+			this.memory.recomputeThreadStates();
+		}
+		const elements: unknown[] = [{ tag: "markdown", content: `**${a.question}**` }];
+		for (const [i, opt] of (a.options ?? []).slice(0, 3).entries()) {
+			elements.push({ tag: "button", text: { tag: "plain_text", content: opt }, type: i === 0 ? "primary" : "default", behaviors: [{ type: "callback", value: { action: "answer", qid, choice: opt } }] });
+		}
+		await this.feishu.sendCard(this.env.FEISHU_OWNER_OPEN_ID, { elements }, "orange");
 	}
 
 	// ---- connector protocol (from the do-protocol spike) ----
@@ -270,16 +419,53 @@ export class Steward extends Agent<Env> {
 	}
 
 	async resendUnacked() {
+		// queued rows: deliver when the device is back; otherwise count sweeps and age out (~30min).
+		for (const r of this.db.all<{ cmdId: string }>(`SELECT cmdId FROM outbox WHERE state = 'queued'`)) this.deliver(r.cmdId);
+		this.db.run(`UPDATE outbox SET attempts = attempts + 1 WHERE state = 'queued'`);
+		this.db.run(`UPDATE outbox SET state = 'failed' WHERE state = 'queued' AND attempts >= 60`);
 		const due = this.db.all<{ cmdId: string; attempts: number }>(`SELECT cmdId, attempts FROM outbox WHERE state = 'sent' AND ackDeadline <= ?`, Date.now());
 		for (const r of due) {
 			if (r.attempts >= 4) this.db.run(`UPDATE outbox SET state = 'failed' WHERE cmdId = ?`, r.cmdId);
 			else this.deliver(r.cmdId);
 		}
-		if (this.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM outbox WHERE state = 'sent'`)!.n) void this.schedule(1, "resendUnacked");
+		const waiting = this.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM outbox WHERE state IN ('sent','queued')`)!.n;
+		if (waiting) void this.schedule(due.length ? 1 : 30, "resendUnacked");
 	}
 
 	shouldSendProtocolMessages() {
 		return false;
+	}
+
+	// Plain HTTP diagnostics, bypassing RPC (whose error envelope masks constructor failures).
+	async onRequest(request: Request): Promise<Response> {
+		const url = new URL(request.url);
+		if (url.pathname.endsWith("/__diag")) {
+			let conns: unknown = "err";
+			let devices: unknown = "err";
+			try {
+				conns = Array.from(this.getConnections() as any).map((c: any) => ({ id: c.id, dev: (c.state as { deviceId?: string } | null)?.deviceId ?? "?", ready: c.readyState }));
+			} catch (e) {
+				conns = e instanceof Error ? e.message : String(e);
+			}
+			try {
+				devices = this.db.all(`SELECT deviceId, name, revoked FROM device`);
+			} catch (e) {
+				devices = e instanceof Error ? e.message : String(e);
+			}
+			let outbox: unknown = "err";
+			try {
+				outbox = this.db.all(`SELECT cmdId, deviceId, cseq, state, attempts FROM outbox ORDER BY rowid DESC LIMIT 6`);
+			} catch (e) {
+				outbox = e instanceof Error ? e.message : String(e);
+			}
+			const info = { initError: this.initError ?? null, constructorOk: true, conns, devices, outbox, at: Date.now() };
+			try {
+				return new Response(JSON.stringify(info), { headers: { "content-type": "application/json" } });
+			} catch (err) {
+				return new Response(String(err), { status: 500 });
+			}
+		}
+		return new Response("shepherd e2e DO");
 	}
 
 	async getConnectionTags(_c: unknown, ctx: { request: Request }) {
@@ -330,7 +516,8 @@ export class Steward extends Agent<Env> {
 	private async handleConnectorMessage(connection: any, m: any) {
 		switch (m.t) {
 			case "hello": {
-				const pending = this.db.all<{ cmdId: string }>(`SELECT cmdId FROM outbox WHERE deviceId = ? AND state IN ('queued','sent') ORDER BY cseq`, st.deviceId);
+				const dev = ((connection.state as { deviceId?: string } | null)?.deviceId) ?? "";
+				const pending = this.db.all<{ cmdId: string }>(`SELECT cmdId FROM outbox WHERE deviceId = ? AND state IN ('queued','sent') ORDER BY cseq`, dev);
 				connection.send(JSON.stringify({ t: "welcome", re: m.id, protocol: 1, serverTime: Date.now() }));
 				for (const r of pending) this.deliver(r.cmdId);
 				return;
@@ -354,6 +541,24 @@ export class Steward extends Agent<Env> {
 					// If anything is still queued (send failed), retry from an alarm instead of
 					// relying on the next events batch to call flush again.
 					if (this.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM sh_outbound WHERE status = 'queued'`)!.n) void this.schedule(6, "retryOutbound");
+				}
+				// wake the steward for bookkeeping on report/settled (reply discarded: event runs are quiet)
+				const wakeOn = events.filter((e) => e.type === "report" || e.type === "settled").at(-1) as undefined | (typeof events)[number];
+				if (wakeOn) {
+					const w = this.memory.worker((wakeOn as { workerId: string }).workerId);
+					if (w) {
+						const desc = wakeOn.type === "report"
+							? `worker 汇报 ${wakeOn.status}：${(wakeOn as { summary?: string }).summary ?? ""}`
+							: `worker 运行结束 ${wakeOn.outcome}`;
+						const operationId = `evt:${(wakeOn as { workerId: string; seq: number }).workerId}:${(wakeOn as { seq: number }).seq}`;
+						this.db.run(`INSERT OR REPLACE INTO sh_run (operationId, kind, status, createdAt) VALUES (?, 'event', 'open', ?)`, operationId, Date.now());
+						this.runKind = "event";
+						this.provenanceId = operationId;
+						try {
+							await this.harness.submit(`⟦event⟧ thread=${w.threadId} ${desc}`, { operationId, whenBusy: "followUp" });
+							void this.schedule(3, "pollRun", { operationId });
+						} catch { this.db.run(`UPDATE sh_run SET status = 'failed' WHERE operationId = ?`, operationId); }
+					}
 				}
 				// cumulative acks back to the connector
 				const byWorker = new Set(events.map((e) => (e as any).workerId as string));
@@ -379,6 +584,8 @@ export class Steward extends Agent<Env> {
 
 	async stats() {
 		return {
+			initError: this.initError ?? null,
+			runs: this.db.all(`SELECT operationId, kind, status FROM sh_run ORDER BY createdAt DESC LIMIT 8`),
 			threads: this.memory.situation().threads,
 			outbound: this.db.all(`SELECT status, COUNT(*) AS n FROM sh_outbound GROUP BY status`),
 			commands: this.db.all(`SELECT cmdId, kind, state, attempts FROM outbox`),
@@ -407,6 +614,7 @@ const DEVICE_SCHEMA = [
 	`CREATE TABLE IF NOT EXISTS sh_meta (k TEXT PRIMARY KEY, v INTEGER)`,
 	`CREATE TABLE IF NOT EXISTS device (deviceId TEXT PRIMARY KEY, name TEXT, epoch INTEGER, revoked INTEGER DEFAULT 0, lastHello TEXT)`,
 	`CREATE TABLE IF NOT EXISTS pairing (code TEXT PRIMARY KEY, expiresAt INTEGER, used INTEGER DEFAULT 0)`,
+	`CREATE TABLE IF NOT EXISTS sh_run (operationId TEXT PRIMARY KEY, kind TEXT, replyTo TEXT, status TEXT, createdAt INTEGER)`,
 	`CREATE TABLE IF NOT EXISTS outbox (cmdId TEXT PRIMARY KEY, deviceId TEXT, cseq INTEGER, kind TEXT, payload TEXT,
 		state TEXT, attempts INTEGER DEFAULT 0, sentAt INTEGER, ackDeadline INTEGER, ackTimeoutSec INTEGER, result TEXT)`,
 ];
@@ -420,8 +628,13 @@ export default {
 		// Feishu webhook (the URL configured in the app is /feishu)
 		if (request.method === "POST" && (url.pathname === "/feishu" || url.pathname === "/channels/feishu/events")) {
 			const body = (await request.json().catch(() => ({}))) as Record<string, any>;
-			const res = await (await stub()).feishuEvent(body);
-			return json(res);
+			try {
+				const res = await (await stub()).feishuEvent(body);
+				return json(res);
+			} catch (err) {
+				console.error("feishu webhook handler failed:", err instanceof Error ? `${err.name}: ${err.message}` : String(err));
+				return json({ error: "handler failed" }, 200); // 200 so Feishu does not retry
+			}
 		}
 		if (url.pathname === "/pair" && request.method === "POST") {
 			const body = (await request.json()) as { code: string; name: string };

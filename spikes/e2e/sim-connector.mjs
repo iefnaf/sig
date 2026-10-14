@@ -17,6 +17,7 @@ console.log("paired:", pair.deviceId);
 
 const ws = new WebSocket(BASE.replace(/^http/, "ws") + "/agents/steward/owner?role=connector&proto=1", {
 	headers: { authorization: `Bearer ${pair.token}` },
+	handshakeTimeout: 8000,
 });
 const send = (o) => ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify(o));
 const workers = new Map(); // workerId -> { seq }
