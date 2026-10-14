@@ -14,6 +14,6 @@ Status: product spec and design stage.
 - [docs/research/do-protocol-spike.md](docs/research/do-protocol-spike.md): measured results of the protocol prototype on real Cloudflare
 - [spikes/do-protocol](spikes/do-protocol): the prototype (Worker, Durable Object, simulated connector, tests)
 - [spikes/steward-m1](spikes/steward-m1): steward M1 core (ledger, reducer, outbound, templates) with tests
-- [spikes/steward-m2](spikes/steward-m2): the steward as a pi-durable extension (tools, autonomy policy, situation brief) with faux-model tests
+- [spikes/steward-m2](spikes/steward-m2): the steward as a pi-durable extension (tools, autonomy policy, notes) with faux-model tests and the §3.4 routing eval (100 labeled utterances)
 - [spikes/e2e](spikes/e2e): the full loop with a real LLM, live on Cloudflare: Feishu message -> steward decides -> connector -> report card
 - [spikes/pi-rpc](spikes/pi-rpc): throwaway scripts behind the research
