@@ -32,6 +32,8 @@ if (!BASE || !REPO) {
 }
 const ROOT = process.env.SHEPHERD_HOME ?? join(homedir(), ".shepherd-spike"); // SHEPHERD_HOME: test override
 const PI_CMD = (process.env.SHEPHERD_PI_BIN ?? "pi").split(/\s+/); // SHEPHERD_PI_BIN: test override ("node test/fake-pi.mjs")
+const AGENT = process.env.SHEPHERD_AGENT ?? "pi"; // "pi" | "claude": which coding agent runs workers
+const CLAUDE_CMD = (process.env.SHEPHERD_CLAUDE_BIN ?? "claude").split(/\s+/); // SHEPHERD_CLAUDE_BIN: test override
 const DEVICE_FILE = join(ROOT, "device.json");
 const EXT_DIR = join(ROOT, "ext");
 const WORKTREE_DIR = join(ROOT, "worktrees");
@@ -102,6 +104,53 @@ const WORKER_PROMPT = `你是 Shepherd 派来的 worker，代表用户在当前�
 const MAX_CONCURRENT = 2;
 const IDLE_RECYCLE_MS = Number(process.env.SHEPHERD_IDLE_RECYCLE_MS ?? 10 * 60_000); // test override
 
+// ---- the report tool as an MCP server (for the claude agent; pi uses the extension above) ----
+const REPORT_SERVER = join(EXT_DIR, "report-server.mjs");
+writeFileSync(REPORT_SERVER, `// Installed by the Shepherd connector. Minimal MCP stdio server: one tool, report.
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+const send = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+const SCHEMA = ${JSON.stringify({
+	type: "object",
+	properties: {
+		status: { type: "string", enum: ["done", "blocked", "needs_decision"] },
+		summary: { type: "string", description: "One sentence: what was accomplished" },
+		changes: { type: "array", items: { type: "string" } },
+		decisions: { type: "array", items: { type: "string" } },
+		leftovers: { type: "array", items: { type: "string" } },
+		tests: { type: "object", properties: { ran: { type: "boolean" }, passed: { type: "boolean" }, note: { type: "string" } } },
+		question: { type: "string" },
+		next: { type: "string" },
+	},
+	required: ["status", "summary"],
+}, null, 1)};
+let buf = "";
+process.stdin.on("data", (c) => {
+	buf += c;
+	let i;
+	while ((i = buf.indexOf("\\n")) >= 0) {
+		const line = buf.slice(0, i).trim();
+		buf = buf.slice(i + 1);
+		if (!line) continue;
+		let msg; try { msg = JSON.parse(line); } catch { continue; }
+		if (msg.method === "initialize") send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: msg.params?.protocolVersion ?? "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "shepherd-report", version: "1.0" } } });
+		else if (msg.method === "tools/list") send({ jsonrpc: "2.0", id: msg.id, result: { tools: [{ name: "report", description: "Report final status to Shepherd. Must be your last action when the task is complete, blocked, or needs a user decision.", inputSchema: SCHEMA }] } });
+		else if (msg.method === "tools/call" && msg.params?.name === "report") {
+			const file = process.env.SHEPHERD_REPORT_FILE;
+			try { mkdirSync(dirname(file), { recursive: true }); writeFileSync(file, JSON.stringify(msg.params.arguments ?? {})); send({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: "report recorded" }] } }); }
+			catch (e) { send({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: \`report failed: \${e.message}\` }], isError: true } }); }
+		}
+		else if (msg.id !== undefined) send({ jsonrpc: "2.0", id: msg.id, result: {} });
+	}
+});
+`);
+function mcpConfigFor(workerId) {
+	// Outside the worktree: an in-repo .mcp.json would show up dirty in GitFacts.
+	const file = join(EXT_DIR, `mcp-${workerId}.json`);
+	writeFileSync(file, JSON.stringify({ mcpServers: { shepherd: { command: process.execPath, args: [REPORT_SERVER], env: { SHEPHERD_REPORT_FILE: join(ROOT, "reports", `${workerId}.json`) } } } }));
+	return file;
+}
+
 // ---- helpers ----
 const git = (cwd, ...args) => new Promise((resolve, reject) => {
 	execFile("git", ["-C", cwd, ...args], { maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) =>
@@ -171,6 +220,75 @@ function startPi({ cwd, sessionId }) {
 	return { child, send, stop, on: (fn) => listeners.add(fn), stderr: () => stderr };
 }
 
+// ---- ClaudeProcess: `claude -p` with stream-json output, normalized into pi's event
+// shapes so adjudication is agent-agnostic. The prompt rides on stdin; the report tool
+// comes from the MCP server above instead of a pi extension. ----
+function startClaude({ cwd, sessionId, mcpConfig }) {
+	const child = spawn(CLAUDE_CMD[0], [...CLAUDE_CMD.slice(1), "-p", "--output-format", "stream-json", "--verbose", "--mcp-config", mcpConfig, "--append-system-prompt", WORKER_PROMPT, "--dangerously-skip-permissions"], {
+		cwd, stdio: ["pipe", "pipe", "pipe"],
+	});
+	const listeners = new Set();
+	let stderr = "";
+	let sawAssistantText = false;
+	let buf = "";
+	const STOP_MAP = { end_turn: "stop", tool_use: "tool_use", max_tokens: "length", stop_sequence: "stop" };
+	const dispatch = (rec) => { for (const fn of listeners) fn(rec); };
+	child.stdout.on("data", (chunk) => {
+		buf += chunk.toString("utf8");
+		let i;
+		while ((i = buf.indexOf("\n")) >= 0) {
+			const line = buf.slice(0, i).replace(/\r$/, "");
+			buf = buf.slice(i + 1);
+			if (!line) continue;
+			let rec;
+			try { rec = JSON.parse(line); } catch { console.log(`  [${sessionId}] unparsable:`, line.slice(0, 120)); continue; }
+			switch (rec.type) {
+				case "system":
+					if (rec.subtype === "init") dispatch({ type: "agent_start" });
+					break;
+				case "assistant": {
+					const stopReason = STOP_MAP[rec.message?.stop_reason] ?? rec.message?.stop_reason ?? "stop";
+					for (const b of rec.message?.content ?? []) {
+						if (b.type === "tool_use") dispatch({ type: "tool_execution_start", toolName: b.name, args: b.input });
+						else if (b.type === "text" && b.text) {
+							sawAssistantText = true;
+							dispatch({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: b.text }], stopReason } });
+						}
+					}
+					break;
+				}
+				case "result": {
+					const errored = Boolean(rec.is_error) || String(rec.subtype ?? "").startsWith("error");
+					// settle() reads lastStop === "error" + lastAssistantText for classification
+					if (errored) dispatch({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: String(rec.result ?? rec.subtype) }], stopReason: "error" } });
+					else if (!sawAssistantText && rec.result) dispatch({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: String(rec.result) }], stopReason: "stop" } });
+					dispatch({ type: "agent_settled", aborted: rec.subtype === "cancelled" || rec.subtype === "aborted", outcome: errored ? "error" : "completed" });
+					break;
+				}
+			}
+		}
+	});
+	child.stderr.on("data", (c) => { stderr = (stderr + c.toString()).slice(-64 * 1024); });
+	child.on("exit", (code, signal) => { dispatch({ type: "__process_exit", code, signal }); });
+	const send = (cmd) =>
+		new Promise((resolve, reject) => {
+			if (cmd.type === "get_state") return resolve({ success: true, data: { sessionId } });
+			if (cmd.type === "prompt") {
+				// claude -p reads its prompt from stdin but only starts on EOF — write and close.
+				try { child.stdin.write(cmd.message + "\n"); child.stdin.end(); resolve({ success: true, data: { disposition: "started" } }); }
+				catch (e) { reject(new Error(`prompt write failed: ${e.message}`)); }
+				return;
+			}
+			resolve({ success: true, data: {} });
+		});
+	const stop = async () => {
+		try { child.stdin.end(); } catch {}
+		await sleep(3000);
+		if (child.exitCode === null) child.kill("SIGKILL");
+	};
+	return { child, send, stop, on: (fn) => listeners.add(fn), stderr: () => stderr };
+}
+
 // ---- worker lifecycle ----
 const workers = new Map(); // workerId -> record
 let sendFn = null; // set once the socket is open
@@ -199,17 +317,20 @@ async function startWorker(m) {
 	console.log(`[${workerId}] worktree at ${dir} from ${baseRef ?? "HEAD"} (${base.slice(0, 8)})`);
 	const w = Object.assign(workers.get(workerId), { branch, dir, base, lock });
 
-	const proc = startPi({ cwd: dir, sessionId: workerId });
+	const proc = AGENT === "claude"
+		? startClaude({ cwd: dir, sessionId: workerId, mcpConfig: mcpConfigFor(workerId) })
+		: startPi({ cwd: dir, sessionId: workerId });
 	w.proc = proc;
 	w.state = "running";
-	console.log(`[${workerId}] pi spawned in ${dir} (branch ${branch})`);
+	console.log(`[${workerId}] ${AGENT} spawned in ${dir} (branch ${branch})`);
 
 	// Adjudication window state (design §5.2)
 	let reported = null, lastStop = null, lastAssistantText = "", retryFailed = false, lastTool = "", lastProgressAt = 0, recycleTimer = null;
 	proc.on((rec) => {
 		switch (rec.type) {
 			case "tool_execution_start": {
-				if (rec.toolName === "report") { reported = rec.args; break; }
+				// claude namespaces MCP tools (mcp__shepherd__report); pi uses the bare name.
+				if (rec.toolName === "report" || rec.toolName?.endsWith("__report")) { reported = rec.args; break; }
 				const now = Date.now();
 				if (rec.toolName !== lastTool || now - lastProgressAt > 15_000) {
 					lastTool = rec.toolName;

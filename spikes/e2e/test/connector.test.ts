@@ -123,7 +123,8 @@ test("concurrency cap: the third worker starts only after a settle", async () =>
 		mock.startWorker({ workerId: "w_slow2", threadId: "t_test", prompt: "p2" });
 		mock.startWorker({ workerId: "w_slow3", threadId: "t_test", prompt: "p3" });
 		const firstSettle = await mock.waitFor((x) => x.type === "settled", 30000);
-		const startedBefore = mock.events().filter((x) => x.type === "started" && x.ts <= firstSettle.ts).length;
+		// dedup by worker: resent-but-unacked events arrive more than once under load
+		const startedBefore = new Set(mock.events().filter((x) => x.type === "started" && x.ts <= firstSettle.ts).map((x) => x.workerId)).size;
 		assert.ok(startedBefore <= 2, `third worker started before a settle (${startedBefore})`);
 		await mock.waitFor((x) => x.type === "started" && x.workerId === "w_slow3", 30000);
 	});
