@@ -330,9 +330,34 @@ export class Steward extends Agent<Env> {
 			`INSERT INTO outbox (cmdId, deviceId, cseq, kind, payload, state, ackTimeoutSec) VALUES (?, ?, ?, 'start_worker', ?, 'queued', 15)`,
 			cmdId, deviceId, cseq, JSON.stringify({ workerId, threadId, prompt, ...(prevBranch && prevBranch !== `shepherd/${workerId}` ? { base: prevBranch } : {}) }),
 		);
+		this.dispatchSeq++; // settle-time verify: this run really dispatched
 		this.memory.timeline(threadId, "dispatch", `派发给 ${deviceId}：${prompt}`, { cmdId, workerId });
 		if (!this.deliver(cmdId)) void this.schedule(5, "resendUnacked");
+		// Positive-side verify: if the worker never leaves 'created', redeliver once.
+		void this.schedule(150, "verifyDispatch", { workerId, cmdId, threadId });
 		return { ok: true, workerId };
+	}
+
+	// Settle-time verification (M2 eval failure mode: the steward narrates "已派活" without
+	// calling start_worker). dispatchSeq counts real dispatches per process lifetime.
+	private dispatchSeq = 0;
+	private runDispatchBase = new Map<string, number>();
+
+	/** A dispatched worker still in 'created' after 150s gets its command redelivered once. */
+	async verifyDispatch(p: { workerId: string; cmdId: string; threadId: string }) {
+		const w = this.memory.worker(p.workerId);
+		if (w && (w.state === "running" || w.state === "idle" || w.state === "unreachable")) return;
+		const row = this.db.get<{ state: string }>(`SELECT state FROM outbox WHERE cmdId = ?`, p.cmdId);
+		if (!row || row.state === "accepted" || row.state === "failed") return;
+		if (this.deliver(p.cmdId)) {
+			this.memory.timeline(p.threadId, "dispatch", "worker 未按时启动，命令已重投一次", { cmdId: p.cmdId });
+			void this.schedule(5, "resendUnacked");
+		}
+	}
+
+	/** The negative side: the reply claims a dispatch that never happened — make the steward fix it. */
+	private claimsDispatch(text: string) {
+		return /已派活|已重派|已派发|派给了|已经派出|新 worker|worker 会|worker 将/.test(text);
 	}
 
 	// The steward's answer flow: submit durably, then poll from alarms (the webhook must
@@ -345,12 +370,34 @@ export class Steward extends Agent<Env> {
 		);
 		this.runKind = "user";
 		this.provenanceId = msgId;
+		this.runDispatchBase.set(operationId, this.dispatchSeq);
 		try {
 			await this.harness.submit(text, { operationId, whenBusy: "followUp" });
 			void this.schedule(1, "pollRun", { operationId });
 		} catch (err) {
 			this.db.run(`UPDATE sh_run SET status = 'failed' WHERE operationId = ?`, operationId);
 			await this.feishu.sendText(openId, `总管没能开始处理（${err instanceof Error ? err.message : String(err)}）。可以用 /派发 直接派发。`);
+		}
+	}
+
+	/** After a user-run settles: a reply that claims a dispatch which never happened
+	 *  gets a corrective follow-up run — the steward must actually call start_worker
+	 *  or correct itself to the user (M2 eval failure mode #15/#93). */
+	private async verifyClaim(operationId: string, replyText: string, replyTo: string) {
+		const base = this.runDispatchBase.get(operationId) ?? this.dispatchSeq;
+		this.runDispatchBase.delete(operationId);
+		if (this.dispatchSeq === base || !this.claimsDispatch(replyText)) return;
+		const fixId = `fix_${operationId}`;
+		this.db.run(`INSERT OR REPLACE INTO sh_run (operationId, kind, status, createdAt) VALUES (?, 'verify', 'open', ?)`, fixId, Date.now());
+		try {
+			await this.harness.submit(
+				`⟦verify⟧ 你上一条回复声称已派发任务，但这次运行中没有发生任何 start_worker 调用（账本 dispatchSeq 未变）。请现在真正调用 start_worker 完成派发；如果其实不该派发，向用户发送一句更正（notify_user）.`,
+				{ operationId: fixId, whenBusy: "followUp" },
+			);
+			void this.schedule(2, "pollRun", { operationId: fixId });
+		} catch {
+			this.db.run(`UPDATE sh_run SET status = 'failed' WHERE operationId = ?`, fixId);
+			await this.feishu.sendText(replyTo, "（校验）上一条回复声称派发了任务但实际没有发生，自动补救也失败了。可以重发一遍任务。");
 		}
 	}
 
@@ -374,6 +421,7 @@ export class Steward extends Agent<Env> {
 			if (res.status === "done") {
 				this.db.run(`UPDATE sh_run SET status = 'done' WHERE operationId = ?`, p.operationId);
 				if (row.kind === "user" && row.replyTo && res.text) await this.feishu.sendText(row.replyTo, res.text);
+				if (row.kind === "user" && row.replyTo && res.text) void this.verifyClaim(p.operationId, res.text, row.replyTo);
 			} else {
 				this.db.run(`UPDATE sh_run SET status = 'failed' WHERE operationId = ?`, p.operationId);
 				if (row.kind === "user" && row.replyTo) await this.feishu.sendText(row.replyTo, `总管没能完成（${res.reason ?? "未知原因"}）。可以重发，或用 /派发 直接派发。`);
@@ -653,6 +701,14 @@ export class Steward extends Agent<Env> {
 			case "cmd_ack": {
 				if (m.status === "accepted") this.db.run(`UPDATE outbox SET state = 'accepted' WHERE cmdId = ? AND state IN ('sent','queued')`, m.re);
 				else if (m.status === "rejected") this.db.run(`UPDATE outbox SET state = 'failed', failReason = 'rejected' WHERE cmdId = ?`, m.re);
+				return;
+			}
+			case "cmd_result": {
+				// The connector's final verdict on a command (start_worker failures land here).
+				this.db.run(`UPDATE outbox SET result = ? WHERE cmdId = ?`, JSON.stringify(m).slice(0, 500), m.re);
+				if (m.ok === false) {
+					this.db.run(`UPDATE outbox SET state = 'failed', failReason = 'result_error' WHERE cmdId = ? AND state != 'accepted'`, m.re);
+				}
 				return;
 			}
 			case "events": {

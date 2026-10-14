@@ -338,9 +338,11 @@ function flushEvents() {
 async function startWorker(m) {
 	const { workerId, threadId, prompt, base: baseRef, repo: repoArg } = m.args; // the placeholder record from onCommand already holds the slot
 	// Multi-repo whitelist: an explicit repo in the command must match (realpath), else reject.
+	const real = (p) => { try { return realpathSync(p); } catch { return null; } };
 	let repoPath = REPO;
 	if (repoArg) {
-		const match = REPOS.find((r) => realpathSync(r) === realpathSync(repoArg));
+		const wanted = real(repoArg);
+		const match = REPOS.find((r) => real(r) === wanted);
 		if (!match) throw new Error(`repo not whitelisted on this machine: ${repoArg}`);
 		repoPath = match;
 	}

@@ -209,6 +209,16 @@ test("replayed command (same id) does not start a second worker", async () => {
 	});
 });
 
+test("multi-repo whitelist: an unlisted repo in the command is rejected", async () => {
+	await withRig("happy", async ({ mock }) => {
+		mock.startWorker({ workerId: "w_repo1", threadId: "t_test", prompt: "p1", repo: "/definitely/not/whitelisted" });
+		await new Promise((r) => setTimeout(r, 2500));
+		assert.equal(eventsOf(mock, "w_repo1", "started").length, 0, "worker must not start for an unlisted repo");
+		const rej = mock.cmdResults().find((c) => (c.error ?? "").includes("whitelisted"));
+		assert.ok(rej, `expected a whitelist rejection result: ${JSON.stringify(mock.cmdResults())}`);
+	});
+});
+
 test("startup orphan sweep reports leftover worktrees as lost and removes clean ones", async () => {
 	const f = fixture();
 	await shell("git init -q && git config user.email t@t && git config user.name t && echo hello > README.md && git add -A && git commit -qm init", f.repo);
