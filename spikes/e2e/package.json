@@ -3,7 +3,8 @@
 	"private": true,
 	"type": "module",
 	"scripts": {
-		"deploy": "wrangler deploy"
+		"deploy": "wrangler deploy",
+		"test": "node --test 'test/*.test.ts'"
 	},
 	"dependencies": {
 		"@earendil-works/chord": "1.2.0",
