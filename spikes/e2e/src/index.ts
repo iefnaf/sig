@@ -290,7 +290,22 @@ export class Steward extends Agent<Env> {
 			const q = this.memory.openQuestion(thread.threadId);
 			if (q) this.memory.answerQuestion(q.qid);
 		}
-		await this.feishu.sendText(this.env.FEISHU_OWNER_OPEN_ID, `已收到按钮「${action}」（M1 记录到此为止；按钮的实际效果由总管实现）。`);
+		if (action === "approve" && thread) {
+			// The done_report card's 同意: push the thread's branch and open a PR (pr_worker).
+			const wid = this.db.get<{ workerId: string }>(
+				`SELECT workerId FROM sh_worker WHERE threadId = ? AND branch IS NOT NULL ORDER BY rowid DESC LIMIT 1`, thread.threadId,
+			)?.workerId;
+			if (!wid) {
+				await this.feishu.sendText(this.env.FEISHU_OWNER_OPEN_ID, "这个线程没有可推送的分支。");
+				return;
+			}
+			const rep = this.memory.latestReport(wid);
+			const body = [rep?.summary, rep?.changes?.length ? `改动：${rep.changes.join("、")}` : null, rep?.leftovers?.length ? `遗留：${rep.leftovers.join("；")}` : null].filter(Boolean).join("\n\n") || "Shepherd worker 分支";
+			const r = await this.workerCommand("pr_worker" as never, { workerId: wid, body });
+			await this.feishu.sendText(this.env.FEISHU_OWNER_OPEN_ID, r.ok ? "收到，正在推送分支并开 PR…" : `推送没成：${(r as any).error ?? "未知原因"}`);
+			return;
+		}
+		await this.feishu.sendText(this.env.FEISHU_OWNER_OPEN_ID, action === "hold" ? "好，先留在分支上不推送。" : `已收到按钮「${action}」。`);
 	}
 
 	// ---- fixed-command dispatch (no LLM) ----
@@ -472,8 +487,8 @@ export class Steward extends Agent<Env> {
 		return true;
 	}
 
-	/** send_worker / interrupt_worker: address the latest worker of a thread (or a direct workerId). */
-	async workerCommand(kind: "send_worker" | "interrupt_worker", a: { workerId?: string; threadId?: string; message?: string }) {
+	/** send_worker / interrupt_worker / pr_worker: address a worker (latest of a thread, or direct workerId). */
+	async workerCommand(kind: "send_worker" | "interrupt_worker" | "pr_worker", a: { workerId?: string; threadId?: string; message?: string; body?: string }) {
 		const workerId = a.workerId ?? this.db.get<{ workerId: string }>(
 			`SELECT workerId FROM sh_worker WHERE threadId = ? ORDER BY rowid DESC LIMIT 1`, a.threadId,
 		)?.workerId;
@@ -483,8 +498,8 @@ export class Steward extends Agent<Env> {
 		const cmdId = `cmd_${rid()}`;
 		const cseq = (this.db.get<{ m: number | null }>(`SELECT MAX(cseq) AS m FROM outbox WHERE deviceId = ?`, dev.deviceId)!.m ?? 0) + 1;
 		this.db.run(
-			`INSERT INTO outbox (cmdId, deviceId, cseq, kind, payload, state, ackTimeoutSec) VALUES (?, ?, ?, ?, ?, 'queued', 15)`,
-			cmdId, dev.deviceId, cseq, kind, JSON.stringify({ workerId, message: a.message }),
+			`INSERT INTO outbox (cmdId, deviceId, cseq, kind, payload, state, ackTimeoutSec) VALUES (?, ?, ?, ?, ?, 'queued', 20)`,
+			cmdId, dev.deviceId, cseq, kind, JSON.stringify({ workerId, ...a }),
 		);
 		this.deliver(cmdId);
 		return { ok: true, cmdId, workerId };
@@ -708,6 +723,12 @@ export class Steward extends Agent<Env> {
 				this.db.run(`UPDATE outbox SET result = ? WHERE cmdId = ?`, JSON.stringify(m).slice(0, 500), m.re);
 				if (m.ok === false) {
 					this.db.run(`UPDATE outbox SET state = 'failed', failReason = 'result_error' WHERE cmdId = ? AND state != 'accepted'`, m.re);
+				}
+				// pr_worker results surface to the user directly (the card button started it).
+				const row = this.db.get<{ kind: string }>(`SELECT kind FROM outbox WHERE cmdId = ?`, m.re);
+				if (row?.kind === "pr_worker") {
+					const url = (m.data as { url?: string } | undefined)?.url;
+					await this.feishu.sendText(this.env.FEISHU_OWNER_OPEN_ID, m.ok ? `PR 已创建：${url}` : `推送/开 PR 失败：${String(m.error).slice(0, 160)}`);
 				}
 				return;
 			}

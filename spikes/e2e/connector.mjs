@@ -544,6 +544,7 @@ async function connect() {
 			if (m.kind === "start_worker") return void onCommand(m);
 			if (m.kind === "send_worker") return void onSend(m);
 			if (m.kind === "interrupt_worker") return void onInterrupt(m);
+			if (m.kind === "pr_worker") return void onPr(m);
 			sendFn({ t: "cmd_ack", re: m.id, status: "rejected" });
 			sendFn({ t: "cmd_result", re: m.id, ok: false, error: `command kind "${m.kind}" not implemented` });
 			return;
@@ -595,6 +596,35 @@ function onSend(m) {
 		.then((r) => sendFn({ t: "cmd_result", re: m.id, ok: !(r.success === false || r.error), data: r.data ?? null, error: r.error }))
 		.catch((e) => sendFn({ t: "cmd_result", re: m.id, ok: false, error: e.message }));
 }
+// pr_worker: push the worker's branch and open a PR (the 同意 button on report cards).
+function onPr(m) {
+	sendFn({ t: "cmd_ack", re: m.id, status: "accepted" });
+	const workerId = m.args.workerId;
+	const known = workers.get(workerId);
+	const dir = known?.dir ?? (existsSync(join(WORKTREE_DIR, workerId)) ? join(WORKTREE_DIR, workerId) : null);
+	const branch = known?.branch ?? `shepherd/${workerId}`;
+	if (!dir) { sendFn({ t: "cmd_result", re: m.id, ok: false, error: `no worktree for ${workerId}` }); return; }
+	if (!workers.has(workerId)) workers.set(workerId, { workerId, threadId: null, seq: 0, state: "idle" }); // for emit()
+	(async () => {
+		try {
+			await git(dir, "push", "-u", "origin", branch);
+			const title = await git(dir, "log", "-1", "--format=%s");
+			let url = "";
+			try {
+				url = await new Promise((resolve, reject) =>
+					execFile("gh", ["pr", "create", "--title", title, "--body", String(m.args.body ?? "Shepherd worker branch").slice(0, 1500)], { cwd: dir, maxBuffer: 1 << 20 }, (e, out) => (e ? reject(e) : resolve(String(out).trim().split("\n").pop()))),
+				);
+			} catch (e) {
+				url = `（已推送，但 PR 创建失败：${String(e.message).slice(0, 120)}）`;
+			}
+			emit(workerId, { type: "progress", tool: "pr", target: url.slice(0, 120) });
+			sendFn({ t: "cmd_result", re: m.id, ok: true, data: { url } });
+		} catch (e) {
+			sendFn({ t: "cmd_result", re: m.id, ok: false, error: e.message });
+		}
+	})();
+}
+
 function onInterrupt(m) {
 	sendFn({ t: "cmd_ack", re: m.id, status: "accepted" });
 	const w = workers.get(m.args.workerId);
