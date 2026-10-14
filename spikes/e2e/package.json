@@ -1,0 +1,14 @@
+{
+	"name": "shepherd-e2e-spike",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"deploy": "wrangler deploy"
+	},
+	"dependencies": {
+		"agents": "0.28.1",
+		"https-proxy-agent": "9.1.0",
+		"wrangler": "4.151.0",
+		"ws": "8.22.0"
+	}
+}

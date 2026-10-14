@@ -61,31 +61,37 @@ export class Outbound {
 		return merged;
 	}
 
-	/** Deliver due messages. Returns the number of delivery attempts made. */
+	/** Deliver due messages. Returns the number of messages actually delivered. */
 	async flush(adapter: ChannelAdapter, channel: string, now = Date.now()): Promise<number> {
 		const due = this.db.all<{ id: string; kind: string; threadId: string | null; payload: string; attempts: number }>(
 			`SELECT id, kind, threadId, payload, attempts FROM sh_outbound
 			 WHERE status = 'queued' AND channel = ? AND nextAttemptAt <= ? ORDER BY createdAt LIMIT 20`,
 			channel, now,
 		);
-		let attempts = 0;
+		let delivered = 0;
 		for (const row of due) {
-			attempts++;
+			// Claim the row before sending: concurrent flush calls (interleaved async handlers
+			// in the Durable Object) must not both deliver the same message.
+			const claim = crypto.randomUUID();
+			this.db.run(`UPDATE sh_outbound SET status = 'sending', claim = ? WHERE id = ? AND status = 'queued'`, claim, row.id);
+			const mine = this.db.get(`SELECT 1 AS x FROM sh_outbound WHERE id = ? AND claim = ?`, row.id, claim);
+			if (!mine) continue;
 			try {
 				const { providerMsgId } = await adapter.send({ id: row.id, kind: row.kind, threadId: row.threadId ?? undefined, payload: JSON.parse(row.payload) as NotifyPayload });
-				this.db.run(`UPDATE sh_outbound SET status = 'sent', providerMsgId = ? WHERE id = ?`, providerMsgId, row.id);
+				this.db.run(`UPDATE sh_outbound SET status = 'sent', providerMsgId = ?, claim = NULL WHERE id = ?`, providerMsgId, row.id);
+				delivered++;
 			} catch (err) {
 				const attemptsNow = row.attempts + 1;
 				const giveUp = attemptsNow > RETRY_DELAYS.length;
 				const delay = giveUp ? null : RETRY_DELAYS[attemptsNow - 1];
 				this.db.run(
-					`UPDATE sh_outbound SET status = ?, attempts = ?, nextAttemptAt = ? WHERE id = ?`,
+					`UPDATE sh_outbound SET status = ?, attempts = ?, nextAttemptAt = ?, claim = NULL WHERE id = ?`,
 					giveUp ? "failed" : "queued", attemptsNow, delay == null ? null : now + delay, row.id,
 				);
 				if (giveUp) console.error(`outbound ${row.id} gave up:`, err);
 			}
 		}
-		return attempts;
+		return delivered;
 	}
 
 	stats() {

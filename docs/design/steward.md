@@ -416,7 +416,7 @@ unread = 存在用户尚未查看的 report / question / error
 
 ### 6.4 汇报格式与合并
 
-`notify_user` 的参数结构本身就是三段式（spec §7.5）：
+`notify_user` 的参数结构本身就是三段式（spec §7.5），并带 `tone`（success / attention / failure）：**色调由消息性质决定，与是否附带 needsYou 无关**——完成但附带小问题的汇报仍是成功色，用户扫一眼颜色就知道有没有出事（M1 原型实测后修正）。
 
 ```
 conclusion   ≤ 80 字，一句话，成了还是没成

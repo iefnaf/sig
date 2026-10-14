@@ -18,6 +18,14 @@ export class Memory {
 	constructor(db: Db) {
 		this.db = db;
 		for (const ddl of SCHEMA) db.exec(ddl);
+		this.migrate();
+	}
+
+	/** Idempotent column additions for tables created by older schema versions. */
+	private migrate() {
+		const has = (table: string, col: string) =>
+			this.db.all<{ name: string }>(`PRAGMA table_info(${table})`).some((r) => r.name === col);
+		if (!has("sh_outbound", "claim")) this.db.exec(`ALTER TABLE sh_outbound ADD COLUMN claim TEXT`);
 	}
 
 	// ---- setup helpers for tests and callers ----

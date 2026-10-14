@@ -34,7 +34,8 @@ export const SCHEMA = [
 	`CREATE TABLE IF NOT EXISTS sh_outbound (
 		id TEXT PRIMARY KEY, channel TEXT, kind TEXT, threadId TEXT, payload TEXT,
 		urgency TEXT NOT NULL DEFAULT 'quiet', status TEXT NOT NULL DEFAULT 'queued',
-		attempts INTEGER NOT NULL DEFAULT 0, nextAttemptAt INTEGER, providerMsgId TEXT, createdAt INTEGER)`,
+		attempts INTEGER NOT NULL DEFAULT 0, nextAttemptAt INTEGER, providerMsgId TEXT, createdAt INTEGER,
+		claim TEXT)`,
 	`CREATE TABLE IF NOT EXISTS sh_intent (
 		id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT, template TEXT, threadId TEXT,
 		workerId TEXT, questionId TEXT, payload TEXT, status TEXT NOT NULL DEFAULT 'pending',
