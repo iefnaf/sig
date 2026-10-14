@@ -9,6 +9,7 @@ import { Memory } from "../../steward-m1/src/memory.ts";
 import { applyEvents } from "../../steward-m1/src/reducer.ts";
 import { Outbound, type ChannelAdapter } from "../../steward-m1/src/outbound.ts";
 import { processIntents } from "../../steward-m1/src/scheduler.ts";
+import { nextDue, renderDigest } from "../../steward-m1/src/routines.ts";
 import type { Db } from "../../steward-m1/src/db.ts";
 import type { NotifyPayload } from "../../steward-m1/src/templates.ts";
 import type { WorkerEvent } from "../../steward-m1/src/types.ts";
@@ -161,6 +162,9 @@ export class Steward extends Agent<Env> {
 		this.feishu = new FeishuAdapter(env);
 		for (const ddl of SCHEMA) ctx.storage.sql.exec(ddl).toArray();
 		for (const ddl of DEVICE_SCHEMA) ctx.storage.sql.exec(ddl).toArray();
+		// Routines survive isolate restarts through storage, but the wake does not:
+		// re-arm on every construction (duplicate wakes are harmless — due checks are idempotent).
+		if (this.db.get(`SELECT 1 FROM sh_routine WHERE enabled = 1 LIMIT 1`)) void this.schedule(15, "runRoutines");
 		try {
 			{
 				// Env-var auth does not work inside the Worker: pi-ai resolves keys through
@@ -427,6 +431,50 @@ export class Steward extends Agent<Env> {
 		if (this.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM sh_outbound WHERE status = 'queued'`)!.n) void this.schedule(30, "retryOutbound");
 	}
 
+	// ---- built-in routines (spec §8.3): deterministic, ledger-rendered, owner-created ----
+
+	async runRoutines() {
+		const now = Date.now();
+		const due = this.db.all<{ id: string; kind: string; schedule: string }>(
+			`SELECT id, kind, schedule FROM sh_routine WHERE enabled = 1 AND nextDueAt <= ?`, now,
+		);
+		for (const r of due) {
+			let payload: NotifyPayload | null = null;
+			if (r.kind === "digest") payload = renderDigest(this.memory);
+			if (payload) {
+				// A quiet routine with nothing to say stays quiet (renderDigest returns null).
+				this.outbound.enqueue(`routine_${r.id}_${now}`, "feishu", `routine:${r.kind}`, payload);
+				try {
+					const n = await this.outbound.flush(this.feishuProxy, "feishu");
+					if (n) this.bump("feishuSent", n);
+				} catch (e) {
+					console.error("routine flush failed:", e instanceof Error ? e.message : String(e));
+					void this.schedule(10, "retryOutbound"); // the queue retries on its own alarm
+				}
+			}
+			this.db.run(`UPDATE sh_routine SET lastRunAt = ?, nextDueAt = ? WHERE id = ?`, now, nextDue(r.schedule, now), r.id);
+		}
+		const next = this.db.get<{ m: number | null }>(`SELECT MIN(nextDueAt) AS m FROM sh_routine WHERE enabled = 1`)?.m;
+		if (next) void this.schedule(Math.max(1, Math.ceil((next - Date.now()) / 1000)), "runRoutines");
+	}
+
+	async createRoutine(schedule: string, kind = "digest") {
+		const id = `rt_${rid()}`;
+		const nd = nextDue(schedule);
+		this.db.run(`INSERT INTO sh_routine (id, kind, schedule, enabled, nextDueAt) VALUES (?, ?, ?, 1, ?)`, id, kind, schedule, nd);
+		void this.schedule(Math.max(1, Math.ceil((nd - Date.now()) / 1000)), "runRoutines");
+		return { id, kind, schedule, nextDueAt: nd };
+	}
+
+	async listRoutines() {
+		return this.db.all(`SELECT id, kind, schedule, enabled, lastRunAt, nextDueAt FROM sh_routine ORDER BY nextDueAt`);
+	}
+
+	async disableRoutine(id: string) {
+		this.db.run(`UPDATE sh_routine SET enabled = 0 WHERE id = ?`, id);
+		return { id, enabled: 0 };
+	}
+
 	async resendUnacked() {
 		// queued rows: deliver when the device is back; otherwise count sweeps and age out (~30min).
 		for (const r of this.db.all<{ cmdId: string }>(`SELECT cmdId FROM outbox WHERE state = 'queued'`)) this.deliver(r.cmdId);
@@ -656,6 +704,19 @@ export default {
 			if (url.pathname === "/admin/stats") return json(await s.stats());
 			if (url.pathname === "/admin/pairing") return json(await s.createPairing());
 			if (url.pathname === "/admin/flush") { await s.retryOutbound(); return json(await s.stats()); }
+			if (url.pathname === "/admin/routine") {
+				if (request.method === "POST") {
+					const body = (await request.json().catch(() => ({}))) as { schedule?: string; kind?: string };
+					try { return json(await s.createRoutine(body.schedule ?? "every@300", body.kind ?? "digest")); }
+					catch (e) { return json({ error: e instanceof Error ? e.message : String(e) }, 400); }
+				}
+				if (request.method === "DELETE") {
+					const id = url.searchParams.get("id");
+					if (!id) return json({ error: "id required" }, 400);
+					return json(await s.disableRoutine(id));
+				}
+				return json(await s.listRoutines());
+			}
 			return json({ error: "not found" }, 404);
 		}
 		const routed = await routeAgentRequest(request, env as any, {

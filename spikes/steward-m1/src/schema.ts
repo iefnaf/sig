@@ -44,6 +44,11 @@ export const SCHEMA = [
 	// must keep across compaction. Hard-capped; visible forgetting via removeNote.
 	`CREATE TABLE IF NOT EXISTS sh_note (
 		id TEXT PRIMARY KEY, text TEXT, createdAt INTEGER)`,
+	// Built-in routines (spec §8.3): proactive behavior needs a recorded origin — a row
+	// here is that origin. Rendered deterministically from the ledger, never via the LLM.
+	`CREATE TABLE IF NOT EXISTS sh_routine (
+		id TEXT PRIMARY KEY, kind TEXT, schedule TEXT, enabled INTEGER DEFAULT 1,
+		lastRunAt INTEGER, nextDueAt INTEGER)`,
 	`CREATE INDEX IF NOT EXISTS sh_timeline_thread ON sh_timeline (threadId, id)`,
 	`CREATE INDEX IF NOT EXISTS sh_outbound_status ON sh_outbound (status, nextAttemptAt)`,
 ];
