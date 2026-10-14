@@ -3,11 +3,14 @@
 // connector's adjudication, progress throttling, and lost-detection can be tested without
 // tokens. Scenario comes from FAKE_PI_SCENARIO; --session-id is parsed from argv.
 import { randomUUID } from "node:crypto";
+import { existsSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 const sessionId = (() => {
 	const i = process.argv.indexOf("--session-id");
 	return i >= 0 ? process.argv[i + 1] : `fake_${Date.now()}`;
 })();
+const markerPath = join(process.cwd(), ".stall-once-marker");
 const SCENARIO = process.env.FAKE_PI_SCENARIO ?? "happy";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -71,12 +74,29 @@ const runs = {
 		[2500, { type: "tool_execution_start", toolName: "report", args: { status: "done", summary: "slow run done" } }],
 		[20, { type: "agent_settled", aborted: false, outcome: "completed" }],
 	],
+	// wedged after a tool start: no further output ever (stall-watchdog tests)
+	stall: [
+		[50, { type: "agent_start" }],
+		[80, { type: "tool_execution_start", toolName: "bash", args: { command: "sleep 600" } }],
+	],
+	// stalls on the first invocation only; the respawn (same worktree) sees the marker and runs clean
+	stall_once: [
+		[50, { type: "agent_start" }],
+		[80, { type: "tool_execution_start", toolName: "report", args: { status: "done", summary: "recovered after stall" } }],
+		[50, { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "已恢复并汇报。" }], stopReason: "stop" } }],
+		[20, { type: "agent_settled", aborted: false, outcome: "completed" }],
+	],
 };
 
 let running = false;
 async function runScenario() {
 	if (running) return; // steer/follow_up during a run: ignored by the fake
 	running = true;
+	if (SCENARIO === "stall_once" && !existsSync(markerPath)) {
+		writeFileSync(markerPath, "1");
+		send({ type: "tool_execution_start", toolName: "bash", args: { command: "sleep 600" } });
+		return; // wedged: no further output; the watchdog kills and respawns
+	}
 	for (const [delay, ev] of runs[SCENARIO] ?? runs.happy) {
 		await sleep(delay);
 		if (ev === "EXIT") process.exit(1);
@@ -102,6 +122,10 @@ process.stdin.on("data", (chunk) => {
 			case "prompt":
 				respond(cmd, { data: { disposition: "started" } });
 				void runScenario();
+				break;
+			case "abort":
+				respond(cmd, { data: { aborted: true } });
+				if (running) { running = false; send({ type: "agent_settled", aborted: true, outcome: "aborted" }); }
 				break;
 			default:
 				respond(cmd, { data: {} });

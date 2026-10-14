@@ -11,7 +11,7 @@
 // connector and report `lost`), no orphan-process sweep, no send/interrupt commands.
 import { spawn, execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, basename } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -25,9 +25,10 @@ const arg = (name) => {
 const BASE = arg("url");
 const NAME = arg("name") ?? basename(homedir());
 const CODE = arg("code");
-const REPO = arg("repo");
+const REPOS = process.argv.flatMap((a, i) => (a === "--repo" ? [process.argv[i + 1]] : [])); // repeatable whitelist
+const REPO = REPOS[0];
 if (!BASE || !REPO) {
-	console.error("usage: node connector.mjs --url <https://...> --repo /path/to/repo [--name <machine>] [--code <pairingCode>]");
+	console.error("usage: node connector.mjs --url <https://...> --repo /path/to/repo [--repo /path/to/another] [--name <machine>] [--code <pairingCode>]");
 	process.exit(2);
 }
 const ROOT = process.env.SHEPHERD_HOME ?? join(homedir(), ".shepherd-spike"); // SHEPHERD_HOME: test override
@@ -38,7 +39,30 @@ const DEVICE_FILE = join(ROOT, "device.json");
 const EXT_DIR = join(ROOT, "ext");
 const WORKTREE_DIR = join(ROOT, "worktrees");
 const LOCK_DIR = join(ROOT, "locks");
+const CMDLOG_FILE = join(ROOT, "cmdlog.json");
+const SEQ_FILE = join(ROOT, "seqs.json");
 for (const d of [ROOT, EXT_DIR, WORKTREE_DIR, LOCK_DIR]) mkdirSync(d, { recursive: true });
+
+// A worker's agent process is declared stalled when it has produced no stdout for
+// STALL_MS while sitting at ~0 CPU (a busy build/test is quiet but hot, so CPU is the
+// discriminator — both observed stalls idled at <1.5%). One automatic respawn, then
+// the worker settles as error:stall. SHEPHERD_STALL_MS: test override.
+const STALL_MS = Number(process.env.SHEPHERD_STALL_MS ?? 8 * 60_000);
+const STALL_CPU_PCT = 5;
+const WATCHDOG_TICK_MS = Math.max(5_000, Math.min(30_000, Math.ceil(STALL_MS / 4)));
+
+// Command idempotency: the DO may redeliver a command (failed-row retry on hello). A
+// start_worker replayed into a fresh connector process would re-run the whole task, so
+// seen ids persist here and replays are acked without effect.
+function loadSeenCmds() {
+	try { return new Set(JSON.parse(readFileSync(CMDLOG_FILE, "utf8"))); } catch { return new Set(); }
+}
+const seenCmds = loadSeenCmds();
+function rememberCmd(id) {
+	seenCmds.add(id);
+	try { writeFileSync(CMDLOG_FILE, JSON.stringify([...seenCmds].slice(-500))); } catch {}
+}
+const seqs = (() => { try { return JSON.parse(readFileSync(SEQ_FILE, "utf8")); } catch { return {}; } })();
 
 // ---- the report extension (design §7.1/§7.2), written outside any repo ----
 const EXT_FILE = join(EXT_DIR, "report.ts");
@@ -297,8 +321,13 @@ const pendingStarts = [];
 
 function emit(workerId, obj) {
 	const w = workers.get(workerId);
-	w.seq++;
-	emitQueue.push({ workerId, seq: w.seq, ts: Date.now(), ...obj });
+	// Seq persists across connector restarts: the DO dedups on (workerId, seq), so a
+	// post-restart emit (orphan-sweep lost, resumed reporting) must not restart at 1.
+	const seq = (seqs[workerId] ?? 0) + 1;
+	seqs[workerId] = seq;
+	w.seq = seq;
+	try { writeFileSync(SEQ_FILE, JSON.stringify(seqs)); } catch {}
+	emitQueue.push({ workerId, seq, ts: Date.now(), ...obj });
 	flushEvents();
 }
 function flushEvents() {
@@ -307,26 +336,29 @@ function flushEvents() {
 }
 
 async function startWorker(m) {
-	const { workerId, threadId, prompt, base: baseRef } = m.args; // the placeholder record from onCommand already holds the slot
+	const { workerId, threadId, prompt, base: baseRef, repo: repoArg } = m.args; // the placeholder record from onCommand already holds the slot
+	// Multi-repo whitelist: an explicit repo in the command must match (realpath), else reject.
+	let repoPath = REPO;
+	if (repoArg) {
+		const match = REPOS.find((r) => realpathSync(r) === realpathSync(repoArg));
+		if (!match) throw new Error(`repo not whitelisted on this machine: ${repoArg}`);
+		repoPath = match;
+	}
 	const lock = acquireLock(workerId);
 	const branch = `shepherd/${workerId}`;
 	const dir = join(WORKTREE_DIR, workerId);
 	// Relay legs pass base = the previous worker's branch; the new worktree builds on it.
-	const base = await git(REPO, "rev-parse", baseRef ?? "HEAD");
-	await git(REPO, "worktree", "add", "--quiet", "-b", branch, dir, base); // TODO design §8.2: threadSlug branches
+	const base = await git(repoPath, "rev-parse", baseRef ?? "HEAD");
+	await git(repoPath, "worktree", "add", "--quiet", "-b", branch, dir, base); // TODO design §8.2: threadSlug branches
 	console.log(`[${workerId}] worktree at ${dir} from ${baseRef ?? "HEAD"} (${base.slice(0, 8)})`);
-	const w = Object.assign(workers.get(workerId), { branch, dir, base, lock });
+	const w = Object.assign(workers.get(workerId), { branch, dir, base, lock, repo: repoPath });
 
-	const proc = AGENT === "claude"
-		? startClaude({ cwd: dir, sessionId: workerId, mcpConfig: mcpConfigFor(workerId) })
-		: startPi({ cwd: dir, sessionId: workerId });
-	w.proc = proc;
-	w.state = "running";
-	console.log(`[${workerId}] ${AGENT} spawned in ${dir} (branch ${branch})`);
+	// Adjudication window state (design §5.2). resetWindow() gives a respawn a clean slate.
+	let reported = null, lastStop = null, lastAssistantText = "", retryFailed = false, lastTool = "", lastProgressAt = 0, recycleTimer = null, lastOutputAt = Date.now();
+	const resetWindow = () => { reported = null; lastStop = null; lastAssistantText = ""; retryFailed = false; lastOutputAt = Date.now(); };
 
-	// Adjudication window state (design §5.2)
-	let reported = null, lastStop = null, lastAssistantText = "", retryFailed = false, lastTool = "", lastProgressAt = 0, recycleTimer = null;
-	proc.on((rec) => {
+	const onRec = (rec) => {
+		lastOutputAt = Date.now(); // any stdout line means the agent is alive
 		switch (rec.type) {
 			case "tool_execution_start": {
 				// claude namespaces MCP tools (mcp__shepherd__report); pi uses the bare name.
@@ -355,6 +387,7 @@ async function startWorker(m) {
 				break;
 			case "agent_settled": {
 				w.state = "idle"; // a settled worker's later process exit (idle recycle) is not "lost"
+				clearInterval(watchdogTimer);
 				(async () => {
 					try { await settle(workerId, rec, { reported, lastStop, lastAssistantText, retryFailed }); }
 					catch (err) { console.error(`[${workerId}] settle failed:`, err.message); }
@@ -362,6 +395,7 @@ async function startWorker(m) {
 				break;
 			}
 			case "__process_exit":
+				clearInterval(watchdogTimer);
 				if (w.state === "running") {
 					console.log(`[${workerId}] process exited unexpectedly (code=${rec.code})`);
 					w.state = "lost";
@@ -375,7 +409,63 @@ async function startWorker(m) {
 			clearTimeout(recycleTimer);
 			recycleTimer = setTimeout(() => { void w.proc.stop(); rmSync(lock, { force: true }); }, IDLE_RECYCLE_MS).unref();
 		}
+	};
+
+	const attach = (proc) => { w.proc = proc; proc.on(onRec); };
+	const proc = AGENT === "claude"
+		? startClaude({ cwd: dir, sessionId: workerId, mcpConfig: mcpConfigFor(workerId) })
+		: startPi({ cwd: dir, sessionId: workerId });
+	attach(proc);
+	w.state = "running";
+	console.log(`[${workerId}] ${AGENT} spawned in ${dir} (branch ${branch})`);
+
+	// Stall watchdog: no stdout for STALL_MS at ~0 CPU twice in a row -> wedged. One
+	// automatic respawn (same worktree, same session id, continuation note in the
+	// prompt); a second stall settles as error:stall for the ledger to surface.
+	const cpuPct = (pid) => new Promise((resolve) => {
+		if (!pid) return resolve(0);
+		execFile("ps", ["-p", String(pid), "-o", "%cpu="], (err, out) => resolve(err || !out.trim() ? 0 : Number.parseFloat(out)));
 	});
+	let watchdogTimer = null; // eslint-disable-line prefer-const
+	const checkStall = async () => {
+		if (w.state !== "running") return;
+		const silentMs = Date.now() - lastOutputAt;
+		if (silentMs <= STALL_MS) return;
+		const pid = w.proc?.child?.pid;
+		if (!pid) return;
+		const c1 = await cpuPct(pid);
+		await sleep(2_500);
+		const c2 = await cpuPct(pid);
+		if (c1 >= STALL_CPU_PCT || c2 >= STALL_CPU_PCT) { lastOutputAt = Date.now(); return; } // quiet but busy: legitimate long tool
+		const why = `无输出 ${Math.round(silentMs / 1000)}s 且 CPU≈0（${c1}/${c2}%）`;
+		w.stallRetries = (w.stallRetries ?? 0) + 1;
+		console.log(`[${workerId}] stall watchdog: ${why} — retry ${w.stallRetries}`);
+		clearInterval(watchdogTimer);
+		if (w.stallRetries === 1) {
+			emit(workerId, { type: "progress", tool: "stall-watchdog", target: `自动重启（${why}）` });
+			w.state = "restarting";
+			try {
+				await w.proc.stop();
+				resetWindow();
+				attach(AGENT === "claude"
+					? startClaude({ cwd: dir, sessionId: workerId, mcpConfig: mcpConfigFor(workerId) })
+					: startPi({ cwd: dir, sessionId: workerId }));
+				w.state = "running";
+				watchdogTimer = setInterval(() => { void checkStall(); }, WATCHDOG_TICK_MS).unref();
+				const r = await w.proc.send({ type: "prompt", message: `${prompt}\n\n（系统注：前一次运行因 ${why} 中断，从中断处继续，不要重做已完成的部分。）` });
+				if (r.success === false || r.error) throw new Error(`respawn prompt rejected: ${JSON.stringify(r).slice(0, 200)}`);
+			} catch (err) {
+				console.error(`[${workerId}] respawn failed:`, err.message);
+				w.state = "idle";
+				emit(workerId, { type: "settled", outcome: "error", errorClass: "stall", lastText: `stall watchdog respawn failed: ${err.message}` });
+			}
+		} else {
+			await w.proc.stop();
+			w.state = "idle";
+			emit(workerId, { type: "settled", outcome: "error", errorClass: "stall", lastText: `stall watchdog: ${why}，自动重启后仍挂死` });
+		}
+	};
+	watchdogTimer = setInterval(() => { void checkStall(); }, WATCHDOG_TICK_MS).unref();
 
 	const st = await proc.send({ type: "get_state" }, 5_000);
 	if (st.success === false || st.error) throw new Error(`get_state failed: ${JSON.stringify(st).slice(0, 200)}`);
@@ -431,10 +521,11 @@ async function pair() {
 const device = existsSync(DEVICE_FILE) ? JSON.parse(readFileSync(DEVICE_FILE, "utf8")) : await pair();
 
 async function connect() {
-	const ws = new WebSocket(BASE.replace(/^http/, "ws") + "/agents/steward/owner?role=connector&proto=1", {
-		headers: { authorization: `Bearer ${device.token}` },
-		handshakeTimeout: 10_000,
-	});
+	let ws = null;
+	try { ws = new WebSocket(BASE.replace(/^http/, "ws") + "/agents/steward/owner?role=connector&proto=1", { headers: { authorization: `Bearer ${device.token}` }, handshakeTimeout: 10_000 }); }
+	catch (e) { throw e; }
+	wsRef = ws;
+	lastServerSeen = Date.now();
 	sendFn = (o) => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(o)); };
 	ws.on("open", () => {
 		console.log("ws open, saying hello");
@@ -442,11 +533,17 @@ async function connect() {
 		flushEvents(); // resends everything unacked; the DO dedups on (workerId, seq)
 	});
 	ws.on("message", (data) => {
+		lastServerSeen = Date.now(); // any frame (pong, ack, cmd) proves the downlink is alive
 		const m = JSON.parse(data.toString());
-		if (m.t === "cmd" && m.kind === "start_worker") return void onCommand(m);
-		if (m.t === "cmd" && m.kind !== "start_worker") {
+		if (m.t === "cmd") {
+			// Idempotency: the DO redelivers failed rows on hello; a replay must not re-run.
+			if (seenCmds.has(m.id)) { sendFn({ t: "cmd_ack", re: m.id, status: "accepted" }); return; }
+			rememberCmd(m.id);
+			if (m.kind === "start_worker") return void onCommand(m);
+			if (m.kind === "send_worker") return void onSend(m);
+			if (m.kind === "interrupt_worker") return void onInterrupt(m);
 			sendFn({ t: "cmd_ack", re: m.id, status: "rejected" });
-			sendFn({ t: "cmd_result", re: m.id, ok: false, error: `command kind "${m.kind}" not implemented in the M2 connector` });
+			sendFn({ t: "cmd_result", re: m.id, ok: false, error: `command kind "${m.kind}" not implemented` });
 			return;
 		}
 		if (m.t === "events_ack") {
@@ -483,9 +580,85 @@ async function runStart(m) {
 	}
 }
 
-console.log(`connector running: ${NAME}, repo ${REPO}, device ${device.deviceId} (Ctrl-C to stop)`);
+// send_worker: a follow-up message to a running worker (pi queues it after the current
+// turn). interrupt_worker: abort the run — pi via the abort command, claude via SIGINT.
+function onSend(m) {
+	sendFn({ t: "cmd_ack", re: m.id, status: "accepted" });
+	const w = workers.get(m.args.workerId);
+	if (!w || w.state !== "running") {
+		sendFn({ t: "cmd_result", re: m.id, ok: false, error: `worker ${m.args.workerId} not running (state ${w?.state ?? "unknown"})` });
+		return;
+	}
+	w.proc.send({ type: "follow_up", message: m.args.message })
+		.then((r) => sendFn({ t: "cmd_result", re: m.id, ok: !(r.success === false || r.error), data: r.data ?? null, error: r.error }))
+		.catch((e) => sendFn({ t: "cmd_result", re: m.id, ok: false, error: e.message }));
+}
+function onInterrupt(m) {
+	sendFn({ t: "cmd_ack", re: m.id, status: "accepted" });
+	const w = workers.get(m.args.workerId);
+	if (!w || w.state !== "running") {
+		sendFn({ t: "cmd_result", re: m.id, ok: false, error: `worker ${m.args.workerId} not running (state ${w?.state ?? "unknown"})` });
+		return;
+	}
+	if (AGENT === "claude") {
+		try { w.proc.child.kill("SIGINT"); setTimeout(() => { if (w.proc.child.exitCode === null) w.proc.child.kill("SIGKILL"); }, 5_000).unref(); } catch {}
+		sendFn({ t: "cmd_result", re: m.id, ok: true, data: { interrupted: true } });
+		return;
+	}
+	w.proc.send({ type: "abort" }, 10_000)
+		.then((r) => sendFn({ t: "cmd_result", re: m.id, ok: !(r.success === false || r.error), data: r.data ?? null, error: r.error }))
+		.catch((e) => sendFn({ t: "cmd_result", re: m.id, ok: false, error: e.message }));
+}
+
+// Startup orphan sweep (design TODO): worktrees left by a previous connector process.
+// A leftover lock means the worker was live when that process died — its death was never
+// reported, so emit lost (the DO's ledger still calls it running). Clean worktrees are
+// removed either way; dirty ones stay on disk (the work may matter).
+async function sweepOrphans() {
+	let entries = [];
+	try { entries = readdirSync(WORKTREE_DIR); } catch { return; }
+	for (const workerId of entries) {
+		if (!workerId.startsWith("w_")) continue;
+		const dir = join(WORKTREE_DIR, workerId);
+		const lock = join(LOCK_DIR, `${workerId}.lock`);
+		let wasLive = false;
+		if (existsSync(lock)) {
+			wasLive = true;
+			try {
+				const { pid } = JSON.parse(readFileSync(lock, "utf8"));
+				try { process.kill(pid, 0); continue; } catch {} // process still alive (another connector): not ours
+			} catch {}
+			rmSync(lock, { force: true });
+		}
+		if (wasLive) {
+			console.log(`[orphan] ${workerId}: previous connector's worker was live at crash — reporting lost`);
+			workers.set(workerId, { workerId, threadId: null, seq: 0, state: "lost" });
+			emit(workerId, { type: "lost", reason: "orphan_sweep:connector_restart" });
+		} else {
+			console.log(`[orphan] ${workerId}: leftover worktree, no lock — cleaning up`);
+		}
+		const dirty = await git(dir, "status", "--porcelain").then((s) => Boolean(s)).catch(() => true);
+		if (!dirty) await git(REPO, "worktree", "remove", "--force", dir).catch(() => {});
+		else console.log(`[orphan] ${workerId}: worktree kept (uncommitted changes)`);
+	}
+}
+
+let wsRef = null; // current socket, for heartbeat-forced teardown
+let lastServerSeen = Date.now();
+console.log(`connector running: ${NAME}, repos [${REPOS.join(", ")}], device ${device.deviceId} (Ctrl-C to stop)`);
+await sweepOrphans().catch((e) => console.error("orphan sweep failed:", e.message));
 await connect().catch((e) => { console.error("connect failed:", e.message); process.exit(1); });
-setInterval(() => { try { if (sendFn) sendFn({ t: "ping" }); } catch {} }, 25_000); // keepalive; the DO tolerates unknown frames
+const PING_MS = Number(process.env.SHEPHERD_PING_MS ?? 25_000);
+setInterval(() => { try { if (sendFn) sendFn({ t: "ping", id: randomUUID() }); } catch {} }, PING_MS); // uplink heartbeat; DO replies pong
+// Downlink liveness: a socket where no frame arrives for DEAD_MS is half-dead (the DO's
+// sends buffer silently) — tear it down so the reconnect loop gets a fresh one.
+const DEAD_MS = Number(process.env.SHEPHERD_DEAD_MS ?? 90_000);
+setInterval(() => {
+	if (sendFn && wsRef && Date.now() - lastServerSeen > DEAD_MS) {
+		console.log("ws dead (no frames for " + Math.round(DEAD_MS / 1000) + "s) — forcing reconnect");
+		try { wsRef.terminate(); } catch {}
+	}
+}, 15_000);
 // drain the start queue as workers settle
 setInterval(() => {
 	while (pendingStarts.length && busyCount() < MAX_CONCURRENT) {

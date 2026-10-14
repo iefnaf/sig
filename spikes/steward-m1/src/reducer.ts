@@ -64,12 +64,23 @@ export function applyEvents(memory: Memory, batch: WorkerEvent[], now = Date.now
 						memory.createQuestion(qid, threadId, e.workerId, "上下文接近上限，建议开新接力 session（附交接简报）。", "settled:error:context", now);
 						intents.push({ type: "notify", template: "error_context", threadId, workerId: e.workerId, payload: { workerId: e.workerId } });
 						intents.push({ type: "wake", threadId, priority: "high", payload: { reason: "error:context" } });
+					} else if (e.errorClass === "stall") {
+						// The connector's watchdog already tried one automatic respawn; a second
+						// stall means the machine/agent cannot make progress on its own.
+						const qid = `q_${e.workerId}_${e.seq}_stall`;
+						memory.createQuestion(qid, threadId, e.workerId, "worker 连续挂死（自动重启后仍无输出）。", "settled:error:stall", now);
+						intents.push({ type: "notify", template: "broken", threadId, workerId: e.workerId, payload: { workerId: e.workerId, reason: "连续挂死（stall watchdog 两次触发，自动重启无效）" } });
+						intents.push({ type: "wake", threadId, priority: "high", payload: { reason: "error:stall" } });
 					}
 					// transient: the connector auto-resumes; nothing to tell the user
 				} else if (e.outcome === "unreported") {
 					memory.markThreadUnread(threadId);
 					const qid = `q_${e.workerId}_${e.seq}_unrep`;
-					memory.createQuestion(qid, threadId, e.workerId, `worker 结束但没有汇报。它最后说：${(e.lastText ?? "（无输出）").slice(0, 200)}`, "settled:unreported", now);
+					const lastText = (e.lastText ?? "（无输出）").slice(0, 200);
+					memory.createQuestion(qid, threadId, e.workerId, `worker 结束但没有汇报。它最后说：${lastText}`, "settled:unreported", now);
+					// Event-driven steward runs are quiet (their reply is discarded), so the
+					// question itself must reach the user without waiting for the next message.
+					intents.push({ type: "notify", template: "decision_fallback", threadId, workerId: e.workerId, payload: { workerId: e.workerId, question: `worker 结束但没有汇报，要重派吗？它最后说：${lastText}` } });
 					intents.push({ type: "wake", threadId, priority: "high", payload: { reason: "unreported", lastText: e.lastText } });
 				}
 				memory.timeline(threadId, "settled", `运行结束：${e.outcome}${e.errorClass ? `（${e.errorClass}）` : ""}`, { workerId: e.workerId, seq: e.seq });

@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { execFile } from "node:child_process";
-import { mkdtempSync, rmSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -31,11 +31,12 @@ async function withRig(scenario, fn, opts = {}) {
 	await shell("git init -q && git config user.email t@t && git config user.name t && echo hello > README.md && git add -A && git commit -qm init", f.repo);
 	const mock = startMockSteward();
 	if (opts.swallow) mock.swallowAcks = true;
+	if (opts.swallowFrames) mock.swallowAllFrames = true;
 	const port = await mock.listen();
 	const proc = execFile(
 		process.execPath,
 		[CONNECTOR, "--url", `http://127.0.0.1:${port}`, "--name", "test-box", "--repo", f.repo, "--code", "X"],
-		{ env: { ...process.env, SHEPHERD_HOME: f.home, SHEPHERD_PI_BIN: `${process.execPath} ${FAKE_PI}`, FAKE_PI_SCENARIO: scenario, ...(opts.idleMs ? { SHEPHERD_IDLE_RECYCLE_MS: String(opts.idleMs) } : {}) } },
+		{ env: { ...process.env, SHEPHERD_HOME: f.home, SHEPHERD_PI_BIN: `${process.execPath} ${FAKE_PI}`, FAKE_PI_SCENARIO: scenario, ...(opts.idleMs ? { SHEPHERD_IDLE_RECYCLE_MS: String(opts.idleMs) } : {}), ...(opts.stallMs ? { SHEPHERD_STALL_MS: String(opts.stallMs) } : {}), ...(opts.deadMs ? { SHEPHERD_DEAD_MS: String(opts.deadMs) } : {}), ...(opts.pingMs ? { SHEPHERD_PING_MS: String(opts.pingMs) } : {}) } },
 	);
 	try {
 		await mock.waitConnected(10_000);
@@ -153,4 +154,96 @@ test("idle recycle after a settle emits no lost event", async () => {
 		await new Promise((r) => setTimeout(r, 3000));
 		assert.equal(eventsOf(mock, "w_recycle1", "lost").length, 0, "idle recycle must not look like a lost worker");
 	}, { idleMs: 1200 });
+});
+
+test("stall watchdog: a wedged run is respawned once and then completes", async () => {
+	await withRig("stall_once", async ({ mock }) => {
+		mock.startWorker({ workerId: "w_stallrec1", threadId: "t_test", prompt: "do the thing" });
+		const restarted = await mock.waitFor((x) => x.type === "progress" && x.tool === "stall-watchdog", 40_000);
+		assert.match(restarted.target ?? "", /自动重启/);
+		const settled = await mock.waitFor((x) => x.type === "settled" && x.workerId === "w_stallrec1", 40_000);
+		assert.equal(settled.outcome, "reported");
+	}, { stallMs: 4000 });
+});
+
+test("stall watchdog: a second stall settles as error:stall", async () => {
+	await withRig("stall", async ({ mock }) => {
+		mock.startWorker({ workerId: "w_stall2", threadId: "t_test", prompt: "do the thing" });
+		const settled = await mock.waitFor((x) => x.type === "settled" && x.workerId === "w_stall2", 60_000);
+		assert.equal(settled.outcome, "error");
+		assert.equal(settled.errorClass, "stall");
+		assert.ok(eventsOf(mock, "w_stall2", "progress").some((p) => p.tool === "stall-watchdog"), "restart was announced");
+	}, { stallMs: 4000 });
+});
+
+test("send_worker relays a follow-up to a running worker", async () => {
+	await withRig("slow", async ({ mock }) => {
+		mock.startWorker({ workerId: "w_send1", threadId: "t_test", prompt: "p1" });
+		await mock.waitFor((x) => x.type === "started" && x.workerId === "w_send1", 15000);
+		mock.sendCmd("send_worker", { workerId: "w_send1", message: "补充要求：顺便跑一下 lint" });
+		await new Promise((r) => setTimeout(r, 1500));
+		assert.ok(mock.cmdResults().some((c) => c.ok === true), `send_worker result ok: ${JSON.stringify(mock.cmdResults())}`);
+		await mock.waitFor((x) => x.type === "settled" && x.workerId === "w_send1", 30000);
+	});
+});
+
+test("interrupt_worker aborts a running worker", async () => {
+	await withRig("slow", async ({ mock }) => {
+		mock.startWorker({ workerId: "w_int1", threadId: "t_test", prompt: "p1" });
+		await mock.waitFor((x) => x.type === "started" && x.workerId === "w_int1", 15000);
+		await new Promise((r) => setTimeout(r, 300));
+		mock.sendCmd("interrupt_worker", { workerId: "w_int1" });
+		const settled = await mock.waitFor((x) => x.type === "settled" && x.workerId === "w_int1", 30000);
+		assert.equal(settled.outcome, "aborted");
+	});
+});
+
+test("replayed command (same id) does not start a second worker", async () => {
+	await withRig("slow", async ({ mock }) => {
+		const id = mock.sendCmd("start_worker", { workerId: "w_dedup1", threadId: "t_test", prompt: "p1" }, "cmd_fixed_id_1");
+		await mock.waitFor((x) => x.type === "started" && x.workerId === "w_dedup1", 15000);
+		mock.sendCmd("start_worker", { workerId: "w_dedup1", threadId: "t_test", prompt: "p1" }, id); // exact replay
+		await new Promise((r) => setTimeout(r, 2000));
+		const starts = mock.events().filter((x) => x.type === "started" && x.workerId === "w_dedup1");
+		assert.equal(starts.length, 1, `expected exactly one started, saw ${starts.length}`);
+	});
+});
+
+test("startup orphan sweep reports leftover worktrees as lost and removes clean ones", async () => {
+	const f = fixture();
+	await shell("git init -q && git config user.email t@t && git config user.name t && echo hello > README.md && git add -A && git commit -qm init", f.repo);
+	mkdirSync(join(f.home, "worktrees"), { recursive: true });
+	mkdirSync(join(f.home, "locks"), { recursive: true });
+	await shell(`git worktree add -q -b shepherd/w_orphan1 ${f.home}/worktrees/w_orphan1`, f.repo);
+	writeFileSync(join(f.home, "locks", "w_orphan1.lock"), JSON.stringify({ pid: 999_999, startedAt: "x" })); // dead pid
+	const mock = startMockSteward();
+	const port = await mock.listen();
+	const proc = execFile(
+		process.execPath,
+		[CONNECTOR, "--url", `http://127.0.0.1:${port}`, "--name", "test-box", "--repo", f.repo, "--code", "X"],
+		{ env: { ...process.env, SHEPHERD_HOME: f.home, SHEPHERD_PI_BIN: `${process.execPath} ${FAKE_PI}`, FAKE_PI_SCENARIO: "happy" } },
+	);
+	try {
+		await mock.waitConnected(10_000);
+		const lost = await mock.waitFor((x) => x.type === "lost" && x.workerId === "w_orphan1", 15_000);
+		assert.match(lost.reason, /^orphan_sweep/);
+		await new Promise((r) => setTimeout(r, 1000));
+		assert.ok(!existsSync(join(f.home, "worktrees", "w_orphan1")), "clean orphan worktree removed");
+	} finally {
+		proc.kill("SIGKILL");
+		await mock.close();
+		f.cleanup();
+	}
+});
+
+test("half-dead socket (no frames) is torn down and reconnected", async () => {
+	await withRig("happy", async ({ mock }) => {
+		// mock swallows every frame after the upgrade: no welcome, no pongs
+		const t0 = mock.upgrades();
+		await new Promise((resolve) => {
+			const tick = () => (mock.upgrades() > t0 ? resolve() : setTimeout(tick, 200));
+			setTimeout(tick, 100);
+		});
+		assert.ok(mock.pings() >= 2, "connector kept pinging the dead socket");
+	}, { swallowFrames: true, deadMs: 3000, pingMs: 1000 });
 });

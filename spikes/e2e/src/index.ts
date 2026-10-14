@@ -165,6 +165,7 @@ export class Steward extends Agent<Env> {
 		// Routines survive isolate restarts through storage, but the wake does not:
 		// re-arm on every construction (duplicate wakes are harmless — due checks are idempotent).
 		if (this.db.get(`SELECT 1 FROM sh_routine WHERE enabled = 1 LIMIT 1`)) void this.schedule(15, "runRoutines");
+		void this.schedule(300, "reapWorkers"); // self-perpetuating reap sweep
 		try {
 			{
 				// Env-var auth does not work inside the Worker: pi-ai resolves keys through
@@ -400,6 +401,8 @@ export class Steward extends Agent<Env> {
 
 	private ensureDeviceSchema() {
 		for (const ddl of DEVICE_SCHEMA) this.ctx.storage.sql.exec(ddl).toArray();
+		// Idempotent column migration (CREATE IF NOT EXISTS won't add it to a live table).
+		try { this.ctx.storage.sql.exec(`ALTER TABLE outbox ADD COLUMN failReason TEXT`).toArray(); } catch { /* already there */ }
 	}
 
 	private connFor(deviceId: string) {
@@ -419,6 +422,24 @@ export class Steward extends Agent<Env> {
 		this.db.run(`UPDATE outbox SET state = 'sent', attempts = attempts + 1, sentAt = ?, ackDeadline = ? WHERE cmdId = ?`, now, now + row.ackTimeoutSec * 1000, cmdId);
 		void this.schedule(row.ackTimeoutSec, "resendUnacked");
 		return true;
+	}
+
+	/** send_worker / interrupt_worker: address the latest worker of a thread (or a direct workerId). */
+	async workerCommand(kind: "send_worker" | "interrupt_worker", a: { workerId?: string; threadId?: string; message?: string }) {
+		const workerId = a.workerId ?? this.db.get<{ workerId: string }>(
+			`SELECT workerId FROM sh_worker WHERE threadId = ? ORDER BY rowid DESC LIMIT 1`, a.threadId,
+		)?.workerId;
+		if (!workerId) return { ok: false, error: "no worker found" };
+		const dev = this.db.get<{ deviceId: string }>(`SELECT deviceId FROM sh_worker WHERE workerId = ?`, workerId);
+		if (!dev || !this.connFor(dev.deviceId)) return { ok: false, error: "worker's machine is offline" };
+		const cmdId = `cmd_${rid()}`;
+		const cseq = (this.db.get<{ m: number | null }>(`SELECT MAX(cseq) AS m FROM outbox WHERE deviceId = ?`, dev.deviceId)!.m ?? 0) + 1;
+		this.db.run(
+			`INSERT INTO outbox (cmdId, deviceId, cseq, kind, payload, state, ackTimeoutSec) VALUES (?, ?, ?, ?, ?, 'queued', 15)`,
+			cmdId, dev.deviceId, cseq, kind, JSON.stringify({ workerId, message: a.message }),
+		);
+		this.deliver(cmdId);
+		return { ok: true, cmdId, workerId };
 	}
 
 	async retryOutbound() {
@@ -479,10 +500,10 @@ export class Steward extends Agent<Env> {
 		// queued rows: deliver when the device is back; otherwise count sweeps and age out (~30min).
 		for (const r of this.db.all<{ cmdId: string }>(`SELECT cmdId FROM outbox WHERE state = 'queued'`)) this.deliver(r.cmdId);
 		this.db.run(`UPDATE outbox SET attempts = attempts + 1 WHERE state = 'queued'`);
-		this.db.run(`UPDATE outbox SET state = 'failed' WHERE state = 'queued' AND attempts >= 60`);
+		this.db.run(`UPDATE outbox SET state = 'failed', failReason = 'timeout' WHERE state = 'queued' AND attempts >= 60`);
 		const due = this.db.all<{ cmdId: string; attempts: number }>(`SELECT cmdId, attempts FROM outbox WHERE state = 'sent' AND ackDeadline <= ?`, Date.now());
 		for (const r of due) {
-			if (r.attempts >= 4) this.db.run(`UPDATE outbox SET state = 'failed' WHERE cmdId = ?`, r.cmdId);
+			if (r.attempts >= 4) this.db.run(`UPDATE outbox SET state = 'failed', failReason = 'timeout' WHERE cmdId = ?`, r.cmdId);
 			else this.deliver(r.cmdId);
 		}
 		const waiting = this.db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM outbox WHERE state IN ('sent','queued')`)!.n;
@@ -550,12 +571,14 @@ export class Steward extends Agent<Env> {
 			if ((other as any).id !== connection.id) (other as any).close(4409, "superseded");
 		}
 		connection.setState({ deviceId: auth.deviceId, role: "connector" });
+		void this.schedule(60, "sweepConns"); // heartbeat sweep while any conn lives
 	}
 
 	async onMessage(connection: any, raw: string | ArrayBuffer) {
 		if (typeof raw !== "string") return;
 		const st = connection.state as { deviceId?: string } | null;
 		if (!st?.deviceId) return;
+		this.connLastSeen.set(connection.id, Date.now()); // any frame proves the uplink lives
 		let m: any;
 		try {
 			m = JSON.parse(raw);
@@ -570,10 +593,58 @@ export class Steward extends Agent<Env> {
 		}
 	}
 
+	// Heartbeat sweep: a connector whose socket went half-dead (no close frame) still shows
+	// as a live connection here, so dispatch trusts it and commands vanish (bug 10). The
+	// connector pings every 25s; silence past the window means the socket is dead — close
+	// it so connFor() stops lying and resendUnacked can fail the queued rows honestly.
+	private connLastSeen = new Map<string, number>();
+	async sweepConns() {
+		const now = Date.now();
+		for (const c of this.getConnections() as unknown as { id: string; close: (c: number, r: string) => void }[]) {
+			const seen = this.connLastSeen.get(c.id) ?? now;
+			if (now - seen > 150_000) {
+				try { c.close(4410, "heartbeat_timeout"); } catch {}
+				this.connLastSeen.delete(c.id);
+			}
+		}
+		if (this.getConnections().length) void this.schedule(60, "sweepConns");
+	}
+
+	// DO-side reap (safety net under the connector's own orphan sweep): a worker stuck in
+	// running whose machine is offline, or whose machine is online but silent for 45 min
+	// (the connector restarted and forgot it — the exact t_41aed061fb failure), is marked
+	// lost so its thread stops pretending to be active.
+	async reapWorkers() {
+		const now = Date.now();
+		const running = this.db.all<{ workerId: string; threadId: string; deviceId: string; lastEventAt: number | null }>(
+			`SELECT workerId, threadId, deviceId, lastEventAt FROM sh_worker WHERE state = 'running'`,
+		);
+		let reaped = 0;
+		for (const w of running) {
+			const silentMs = now - (w.lastEventAt ?? now);
+			const online = Boolean(this.connFor(w.deviceId));
+			if (online ? silentMs < 45 * 60_000 : silentMs < 10 * 60_000) continue;
+			this.memory.setWorkerState(w.workerId, "unreachable", "reaped", now);
+			this.memory.timeline(w.threadId, "lost", online ? "机器在线但 worker 长时间无事件，视为失联（DO 兜底）" : "机器长时间离线，worker 视为失联（DO 兜底）", { workerId: w.workerId });
+			reaped++;
+		}
+		if (reaped) this.memory.recomputeThreadStates();
+		void this.schedule(300, "reapWorkers");
+		return { reaped };
+	}
+
 	private async handleConnectorMessage(connection: any, m: any) {
 		switch (m.t) {
+			case "ping":
+				connection.send(JSON.stringify({ t: "pong", re: m.id }));
+				return;
 			case "hello": {
 				const dev = ((connection.state as { deviceId?: string } | null)?.deviceId) ?? "";
+				// Timeout-failed commands get one more life on every hello: the connector
+				// dedups by cmdId, so a task that actually ran never re-runs.
+				for (const r of this.db.all<{ cmdId: string }>(`SELECT cmdId FROM outbox WHERE state = 'failed' AND failReason = 'timeout'`)) {
+					this.db.run(`UPDATE outbox SET state = 'queued', attempts = 0, failReason = NULL WHERE cmdId = ?`, r.cmdId);
+				}
 				const pending = this.db.all<{ cmdId: string }>(`SELECT cmdId FROM outbox WHERE deviceId = ? AND state IN ('queued','sent') ORDER BY cseq`, dev);
 				connection.send(JSON.stringify({ t: "welcome", re: m.id, protocol: 1, serverTime: Date.now() }));
 				for (const r of pending) this.deliver(r.cmdId);
@@ -581,7 +652,7 @@ export class Steward extends Agent<Env> {
 			}
 			case "cmd_ack": {
 				if (m.status === "accepted") this.db.run(`UPDATE outbox SET state = 'accepted' WHERE cmdId = ? AND state IN ('sent','queued')`, m.re);
-				else if (m.status === "rejected") this.db.run(`UPDATE outbox SET state = 'failed' WHERE cmdId = ?`, m.re);
+				else if (m.status === "rejected") this.db.run(`UPDATE outbox SET state = 'failed', failReason = 'rejected' WHERE cmdId = ?`, m.re);
 				return;
 			}
 			case "events": {
@@ -716,6 +787,14 @@ export default {
 					return json(await s.disableRoutine(id));
 				}
 				return json(await s.listRoutines());
+			}
+			if (url.pathname === "/admin/send" && request.method === "POST") {
+				const body = (await request.json().catch(() => ({}))) as { workerId?: string; threadId?: string; message?: string };
+				return json(await s.workerCommand("send_worker", body));
+			}
+			if (url.pathname === "/admin/interrupt" && request.method === "POST") {
+				const body = (await request.json().catch(() => ({}))) as { workerId?: string; threadId?: string };
+				return json(await s.workerCommand("interrupt_worker", body));
 			}
 			return json({ error: "not found" }, 404);
 		}
