@@ -1,89 +1,89 @@
-# pi 对接调研
+# pi Integration Research
 
-日期：2026-10-14。对象：pi 的 RPC 模式（`pi --mode rpc`），作为 Shepherd 连接器驱动的第一个 agent。
+Date: 2026-10-14. Subject: pi's RPC mode (`pi --mode rpc`), the first agent the Shepherd connector drives.
 
-证据分三类：
+Evidence falls into three classes:
 
-- **实测**：在本机用 pi 1.2.0 和默认模型 `zhipu/glm-5.3` 跑过，脚本见 [spikes/pi-rpc](../../spikes/pi-rpc)。样本量小，多数只跑一次。
-- **源码 / 文档**：读 `earendil-works/pi` 仓库（`packages/coding-agent`）得出，未实测。
-- **未验证**：见最后一节。
+- **Measured**: run locally with pi 1.2.0 and the default model `zhipu/glm-5.3`; scripts at `spike-final:spikes/pi-rpc`. Small samples — most things ran once.
+- **Source/docs**: read from the `earendil-works/pi` repo (`packages/coding-agent`); not measured.
+- **Unverified**: see the last section.
 
-## 1. 对接方式
+## 1. Integration options
 
-| 方式 | 形态 | 结论 |
+| Option | Shape | Verdict |
 |---|---|---|
-| `pi --print` / `--mode json` | 一次性进程 | 不适合需要插话和续上的场景 |
-| **`pi --mode rpc`** | 常驻子进程，stdin 收 JSONL 命令，stdout 出响应和事件 | **采用** |
-| SDK（`createAgentSession`） | 进程内调用 | 无进程隔离，会话共享进程与默认的文件型设置和凭据，文档建议隔离场景用 RPC。不采用 |
+| `pi --print` / `--mode json` | one-shot process | wrong for a flow that needs interruption and continuation |
+| **`pi --mode rpc`** | resident child process; JSONL commands on stdin, responses and events on stdout | **adopted** |
+| SDK (`createAgentSession`) | in-process | no process isolation; sessions share the process and the default file-based settings and credentials; the docs recommend RPC for isolated setups. Not adopted |
 
-RPC 要求严格的 LF 分帧（不能用按 Unicode 行分隔符切分的读取器），stdout 只放协议记录，日志走 stderr，客户端必须持续读 stdout，否则会被背压卡住。
+RPC demands strict LF framing (not a reader split on Unicode line separators), protocol records only on stdout (logs go to stderr), and the client must keep draining stdout or it stalls on backpressure.
 
-## 2. 实测结论
+## 2. Measured results
 
-| # | 结论 | 实验 |
+| # | Finding | Experiment |
 |---|---|---|
-| 1 | `--extension <path>` 可按进程注入扩展；agent 能调用注入的 `report` 工具，结构化参数完整回传 | A |
-| 2 | `steer` 不会打断正在执行的工具，要等本批工具跑完才生效（`sleep 8` 期间发出的 steer，在 sleep 结束后才改变行为）；`follow_up` 在全部结束后才处理 | B |
-| 3 | `abort` 响应约 3 ms，会杀掉 bash 子进程，事件为 `agent_settled{aborted:true}`，进程仍可接新指令 | E |
-| 4 | 对 pi 发 SIGKILL 后会话已落盘；用 `--session` 起新进程可读回对话，末尾悬空的工具调用（有调用无结果）不影响继续 | C |
-| 5 | 连接器被 SIGKILL 后，pi 和它的 `sleep` 子进程在 2 秒内全部退出，没有孤儿 | H |
-| 6 | 5 个 pi 并发：就绪约 350 ms；空闲约 135 MB RSS，跑完一个小任务后约 153 MB；共用一个会话目录互不冲突（各一个文件） | G |
-| 7 | `new_session`、`switch_session`、`fork` 可用；`new_session` 产生新的 sessionId 和新文件 | F |
-| 8 | `get_entries` 在一个很小的会话（9 条）就有约 15 KB（含系统提示）；`limit` 参数被忽略 | F |
-| 9 | 图片输入：base64 PNG 被接收并原样保存；256x256 纯红图回答 "Red"。16x16 的图模型答非所问，属模型侧问题 | J |
-| 10 | 无界面时，项目本地 `.pi/` 扩展默认**不执行**，不弹确认，不发 `extension_ui_request`；加 `--approve` 才执行；`--no-approve` 与默认行为一致。**`AGENTS.md` 无论信任与否都会加载** | L |
-| 11 | `report` 调用率：仅靠工具描述 5/6（另一轮 3/4）；加 `agent_before_settle` 钩子强制补一次后 6/6，其中 1 次由钩子补救，无重复调用 | I、spike3 |
-| 12 | 不注入扩展、模型用文字提问时，协议里只有 `agent_settled` 和最后一条文字，没有「在提问」信号 | I |
-| 13 | 模型调用失败（403）**没有错误事件**，只在最后一条 assistant 消息上有 `stopReason:"error"` 和 `errorMessage` | A |
-| 14 | 一个很小的任务，stdout 约 55–76 KB、49–90 条 `message_update` | I |
-| 15 | **pi 自己被 SIGKILL 后，它启动的工具子进程（`sleep 33`）仍然存活**（6 秒后仍在），成为孤儿。与 #5 对比：连接器被杀时 pi 会因 stdin 关闭而优雅退出并清理子进程，但 pi 被直接杀时不会 | K |
-| 16 | `--tools read,grep,find,ls,report` 能把 agent 限制为只读：被要求建文件时它没有可用工具，如实说明并调用 `report` 报告受阻，文件未创建；注入扩展的工具名也能出现在 `--tools` 白名单中 | M |
+| 1 | `--extension <path>` injects an extension per process; the agent can call the injected `report` tool and structured parameters round-trip intact | A |
+| 2 | `steer` does not interrupt a running tool — it takes effect only after the current tool batch finishes (a steer sent during `sleep 8` changed behavior only after the sleep); `follow_up` is processed after everything ends | B |
+| 3 | `abort` responds in ~3 ms, kills bash subprocesses, emits `agent_settled{aborted:true}`, and the process accepts new commands afterwards | E |
+| 4 | After SIGKILL on pi the session is already on disk; starting a new process with `--session` reads the conversation back; a dangling tool call at the end (call without result) does not impede continuation | C |
+| 5 | After SIGKILL on the connector, pi and its `sleep` subprocesses all exit within 2 seconds — no orphans | H |
+| 6 | 5 concurrent pi processes: ready in ~350 ms; ~135 MB RSS idle, ~153 MB after a small task; sharing one session directory causes no conflicts (one file each) | G |
+| 7 | `new_session`, `switch_session`, `fork` work; `new_session` produces a new sessionId and file | F |
+| 8 | `get_entries` on a tiny session (9 entries) is already ~15 KB (system prompt included); the `limit` parameter is ignored | F |
+| 9 | Image input: a base64 PNG is accepted and stored verbatim; a 256x256 solid-red image is answered "Red". A 16x16 image gets an off-topic answer — a model-side issue | J |
+| 10 | Without a UI, project-local `.pi/` extensions do **not** run by default — no confirmation prompt, no `extension_ui_request`; add `--approve` to run them; `--no-approve` matches the default. **`AGENTS.md` loads regardless of trust** | L |
+| 11 | `report` call rate: tool description alone gets 5/6 (another round 3/4); adding an `agent_before_settle` hook that forces one final attempt gets 6/6, with 1 rescued by the hook and no duplicate calls | I, spike3 |
+| 12 | With no extension injected and the model asking a question in plain text, the protocol carries only `agent_settled` and the final text — no "asking" signal | I |
+| 13 | A model call failure (403) produces **no error event** — only `stopReason:"error"` and `errorMessage` on the last assistant message | A |
+| 14 | A very small task: ~55–76 KB of stdout, 49–90 `message_update` records | I |
+| 15 | **After SIGKILL on pi itself, tool subprocesses it started (`sleep 33`) stay alive** (still there 6 seconds later) as orphans. Contrast with #5: when the connector is killed, pi exits gracefully on stdin close and cleans up its children; kill pi directly and it can't | K |
+| 16 | `--tools read,grep,find,ls,report` restricts the agent to read-only: asked to create a file, it has no tool for that, says so honestly, and calls `report` to flag the blockage; the file is not created; injected extension tools can appear in the `--tools` whitelist too | M |
 
-## 3. 源码与文档结论（未实测）
+## 3. Source and docs findings (not measured)
 
-**RpcClient**（`src/modes/rpc/rpc-client.ts`）：从主入口导出，但把命令写死为 `spawn("node", [cliPath, ...])`，`cliPath` 默认 `dist/cli.js`，不能直接启动已安装的 `pi` 二进制；stderr 无上限累积；崩溃后不自动重启，需先 `stop()` 再 `start()`；`stop()` 清空待处理请求而不拒绝它们。包 `@earendil-works/pi-coding-agent` 是否已发布到 npm，仓库里说不清。
+**RpcClient** (`src/modes/rpc/rpc-client.ts`): exported from the main entry, but it hardcodes the command as `spawn("node", [cliPath, ...])` with `cliPath` defaulting to `dist/cli.js` — it cannot launch an installed `pi` binary directly; stderr accumulates without bound; no auto-restart after a crash (you must `stop()` then `start()`); `stop()` clears pending requests without rejecting them. Whether `@earendil-works/pi-coding-agent` is published to npm is unclear from the repo.
 
-**命令集**（`rpc-types.ts`）：`prompt{message, images?, streamingBehavior?}`、`steer`、`follow_up`、`abort`、`clear_queue`、`new_session`、`get_state`、`get_messages`、`get_entries{since?}`、`get_tree`、`get_fork_messages`、`get_last_assistant_text`、`get_session_stats`、`switch_session`、`fork`、`clone`、`set_model`、`set_thinking_level`、`compact`、`set_auto_retry`、`abort_retry`、`bash`、`abort_bash`、`set_session_name`、`get_commands` 等。
+**Command set** (`rpc-types.ts`): `prompt{message, images?, streamingBehavior?}`, `steer`, `follow_up`, `abort`, `clear_queue`, `new_session`, `get_state`, `get_messages`, `get_entries{since?}`, `get_tree`, `get_fork_messages`, `get_last_assistant_text`, `get_session_stats`, `switch_session`, `fork`, `clone`, `set_model`, `set_thinking_level`, `compact`, `set_auto_retry`, `abort_retry`, `bash`, `abort_bash`, `set_session_name`, `get_commands`, and more.
 
-**会话**：
-- 存储在 `~/.pi/agent/sessions/--<cwd 路径转义>--/<时间戳>_<sessionId>.jsonl`；JSONL 第一行是 header，其余是带 `id/parentId` 的树状条目（`message`、`model_change`、`compaction`、`custom`、`custom_message` 等）。
-- `--session <path|id>`：含 `/` 或以 `.jsonl` 结尾视为路径，否则按 ID 或 ID 前缀在当前项目内找，再全局找。
-- `--session-id <id>`：用确切 ID 在当前项目内打开或创建；允许字符为字母、数字、`.`、`_`、`-`，首尾须为字母或数字。
-- **没有文件锁**，写入是普通追加；同一会话文件被两个进程同时打开是未定义行为。
-- 不启动 agent 也能读：`SessionManager.list/open` 静态方法，或直接解析 JSONL。
-- `get_entries` 的 `since`（某个条目之后）是唯一的增量读取；其余读取命令无分页、无过滤。
+**Sessions**:
+- Stored at `~/.pi/agent/sessions/--<cwd path escaped>--/<timestamp>_<sessionId>.jsonl`; the first JSONL line is a header, the rest are tree entries with `id/parentId` (`message`, `model_change`, `compaction`, `custom`, `custom_message`, …).
+- `--session <path|id>`: treated as a path if it contains `/` or ends with `.jsonl`; otherwise matched by ID or ID prefix in the current project, then globally.
+- `--session-id <id>`: opens or creates with an exact ID in the current project; allowed characters are letters, digits, `.`, `_`, `-`, with letters/digits at both ends.
+- **No file locking**; writes are plain appends; two processes opening the same session file is undefined behavior.
+- Sessions are readable without starting an agent: `SessionManager.list/open` static methods, or parse the JSONL directly.
+- `get_entries`'s `since` (everything after a given entry) is the only incremental read; the other read commands have no pagination or filtering.
 
-**事件**：`agent_end` 之后可能还有重试、压缩、队列消息，**真正结束看 `agent_settled`**。重试事件为 `auto_retry_start{attempt,maxAttempts,delayMs,errorMessage}` 和 `auto_retry_end{success,attempt,finalError?}`，默认最多重试 3 次。没有专门的「运行失败」标志。
+**Events**: after `agent_end` there may still be retries, compaction, or queued messages — **the true end is `agent_settled`**. Retry events are `auto_retry_start{attempt,maxAttempts,delayMs,errorMessage}` and `auto_retry_end{success,attempt,finalError?}` with a default of at most 3 retries. There is no dedicated "run failed" flag.
 
-**扩展钩子**：`agent_before_settle` 是「最后一个可操作的边界」，可返回 `{entries:[custom_message...], continue:true}` 追加条目并强制再发一次模型请求，文档提醒必须防循环；`agent_settled` 只是通知。扩展在进程内运行，拥有完整的操作系统权限，可写文件。
+**Extension hooks**: `agent_before_settle` is "the last operable boundary" — it can return `{entries:[custom_message...], continue:true}` to append entries and force one more model request; the docs warn you must guard against loops. `agent_settled` is notification-only. Extensions run in-process with full OS permissions and can write files.
 
-**系统提示**：`--system-prompt` 替换，`--append-system-prompt` 追加（可重复）；扩展可在 `before_agent_start` 中修改。
+**System prompt**: `--system-prompt` replaces, `--append-system-prompt` appends (repeatable); extensions may modify it in `before_agent_start`.
 
-**关机**：stdin 关闭 → dispose → `abortBash()`、`agent.abort()` → `killProcessTree`。`SIGTERM/SIGHUP` 额外清理 detached 子进程。bash 子进程以 `detached: true` 启动，**pi 自己被 SIGKILL 时它们不会被回收**（未实测）。
+**Shutdown**: stdin close → dispose → `abortBash()`, `agent.abort()` → `killProcessTree`. `SIGTERM/SIGHUP` additionally clean up detached subprocesses. bash subprocesses start with `detached: true`, so **a SIGKILL on pi itself leaves them unreaped** (not measured).
 
-**信任**（`src/core/project-trust.ts`）：无界面时 `hasUI=false`，不阻塞。顺序：`--approve/--no-approve` → 无受保护资源则信任 → 用户级扩展的 `project_trust` 事件 → `~/.pi/agent/trust.json` 中最近的记录 → `defaultProjectTrust` 设置 → 否则不信任。受保护资源是 `.pi/` 下的 `settings.json`、`mcp.json`、`extensions`、`skills`、`prompts`、`themes`、`SYSTEM.md`、`APPEND_SYSTEM.md`，以及 `.agents/skills`。`AGENTS.md`、`CLAUDE.md` 不受保护。
+**Trust** (`src/core/project-trust.ts`): without a UI `hasUI=false` and nothing blocks. Order: `--approve/--no-approve` → trusted if no protected resources → `project_trust` event from user-level extensions → the most recent record in `~/.pi/agent/trust.json` → the `defaultProjectTrust` setting → otherwise untrusted. Protected resources are `.pi/`'s `settings.json`, `mcp.json`, `extensions`, `skills`, `prompts`, `themes`, `SYSTEM.md`, `APPEND_SYSTEM.md`, plus `.agents/skills`. `AGENTS.md` and `CLAUDE.md` are not protected.
 
-**用量**：`get_session_stats` 返回 `tokens{input,output,cacheRead,cacheWrite,total}`、`cost`、调用计数和 `contextUsage`；每条 assistant 消息带 `usage`。
+**Usage**: `get_session_stats` returns `tokens{input,output,cacheRead,cacheWrite,total}`, `cost`, call counts, and `contextUsage`; every assistant message carries `usage`.
 
-**图片**：`prompt/steer/follow_up` 的 `images` 为 `{type:"image", data(base64), mimeType}`；RPC 层未发现大小限制，`read` 工具默认缩放到 2000x2000 px、4.5 MB base64，prompt 图片是否经同样缩放未确认；RPC 不支持 `@file`。
+**Images**: `images` on `prompt/steer/follow_up` is `{type:"image", data(base64), mimeType}`; no size limit found at the RPC layer; the `read` tool scales to 2000x2000 px / 4.5 MB base64 by default — whether prompt images get the same scaling is unconfirmed; RPC does not support `@file`.
 
-**仓库内现有集成**：没有现成的远程编排或网页 UI。`packages/env`（经 SSH 的远程工具执行）和 `packages/chord`（多进程可观察状态）是相关积木。
+**Existing integrations in the repo**: no ready-made remote orchestration or web UI. `packages/env` (remote tool execution over SSH) and `packages/chord` (multi-process observable state) are relevant building blocks.
 
-## 4. 对设计的约束
+## 4. Constraints on the design
 
-1. 连接器自己写薄的 RPC 客户端，不用 `RpcClient`。
-2. 「完成 / 受阻 / 需要决策」靠 `report` 工具加 `agent_before_settle` 强制补一次；文字提问兜底分类仍需保留。
-3. 失败检测必须检查最后一条 assistant 消息的 `stopReason` 与 `auto_retry_end`，只看 `agent_end` 或 `agent_settled` 会把失败当成完成。
-4. 一个会话文件同一时刻只能有一个 pi 进程，由连接器保证。可用 `--session-id <workerId>`。
-5. 默认 `--no-approve`；用户明确授权的仓库才用 `--approve`。`AGENTS.md` 始终会被读取，是提示注入面。
-6. 每台机器限制并发 worker 数（约 150 MB 每个）。pi 异常死亡会留下孤儿工具进程，连接器要有进程组追踪和启动时的清理。只读任务用 `--tools` 白名单实现。
-7. 原始事件在连接器内压缩后再上报；L3 原始过程按需用 `get_entries since` 或读 JSONL 拉取。
-8. 「马上停」走 `abort` 加续上；「换个方向」走 `steer`，但要等当前工具结束。
+1. The connector writes its own thin RPC client; don't use `RpcClient`.
+2. "Done / blocked / needs a decision" comes from the `report` tool plus an `agent_before_settle` hook forcing one final attempt; keep the plain-text fallback classification for questions.
+3. Failure detection must check the last assistant message's `stopReason` and `auto_retry_end` — watching only `agent_end` or `agent_settled` reads failures as completions.
+4. One session file, one pi process at a time — the connector guarantees it. `--session-id <workerId>` works.
+5. Default to `--no-approve`; use `--approve` only for repos the user has explicitly trusted. `AGENTS.md` is always loaded — it's a prompt-injection surface.
+6. Cap concurrent workers per machine (~150 MB each). A pi crash leaves orphaned tool processes — the connector needs process-group tracking and startup cleanup. Read-only tasks use the `--tools` whitelist.
+7. Compress raw events in the connector before reporting up; pull the L3 raw transcript on demand via `get_entries since` or by reading the JSONL.
+8. "Stop now" goes through `abort` plus continuation; "change direction" goes through `steer` — but it waits for the current tool to finish.
 
-## 5. 未验证
+## 5. Unverified
 
-- 其他模型（Claude、GPT 等）上 `report` 的调用率和钩子行为。
-- 长时间运行（数小时）的内存增长；运行中压缩对事件流的影响。
-- `get_entries since`、`--session-id`、`auto_retry` 事件的实际表现。
-- 机器睡眠 / 唤醒后 pi 进程与连接器连接的行为。
-- 注入扩展时 `AGENTS.md` 中的指令与 `report` 约定冲突的情况。
+- `report` call rates and hook behavior on other models (Claude, GPT, …).
+- Memory growth over hours-long runs; the effect of mid-run compaction on the event stream.
+- Real-world behavior of `get_entries since`, `--session-id`, and `auto_retry` events.
+- pi process and connector connection behavior across machine sleep/wake.
+- Conflicts between instructions in `AGENTS.md` and the `report` convention when an extension is injected.

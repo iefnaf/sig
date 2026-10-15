@@ -1,66 +1,66 @@
-# 设计：总管（Durable Object 内部）
+# Design: the steward (Durable Object internals)
 
-状态：草案 v0.1。依据：[产品 spec](../spec.md)、[连接器与 DO 的协议](connector-do-protocol.md)、[协议原型实测](../research/do-protocol-spike.md)。
+Status: draft v0.1. Based on: the [product spec](../spec.md), the [connector–DO protocol](connector-do-protocol.md), and [protocol spike field tests](../research/do-protocol-spike.md).
 
-本文设计 Durable Object 内部的一半：**记忆模块、路由、Thread 管理、事件处理、通知策略、主动行为，以及总管（LLM）怎么使用它们**。连接器一侧见 [connector-pi.md](connector-pi.md)，传输协议见 [connector-do-protocol.md](connector-do-protocol.md)。
+This document designs the half that lives inside the Durable Object: **the memory module, routing, Thread management, event processing, notification policy, proactive behavior, and how the steward (the LLM) uses them**. The connector side is in [connector-pi.md](connector-pi.md); the transport protocol is in [connector-do-protocol.md](connector-do-protocol.md).
 
-## 0. 先给结论
+## 0. Conclusions up front
 
-1. **对话只是工作缓冲区，账本才是记忆。** 总管的 pi-durable 对话会被压缩、会变长，所以所有「事」的事实（Thread、worker、报告、笔记）放在我们自己的 SQLite 表里，由独立的记忆模块管理。总管每一轮从账本取最新情况，而不是靠翻对话历史。
-2. **能确定的事不交给 LLM。** 事件到达后的状态推导（进行中 / 等你 / 空闲、未读、待回答的问题）是确定性的 reducer；`done` 类汇报由核心直接按模板发给用户，**不依赖 LLM 在线或预算**。LLM 负责判断：路由、回答 worker 的事实性提问、更新摘要、记笔记。
-3. **「默认安静」由结构保证，而不是靠提示词。** 事件触发的运行，总管的普通文字输出一律丢弃；只有显式调用 `notify_user` / `ask_user` 才会打扰用户。
-4. **「主动行为必须有出处」由工具参数强制。** 每个会启动工作的工具都必须带 `provenance`（用户消息、例程、跟进或巡视的 ID），没有就被拒绝。
-5. **记忆模块有窄接口，整体可替换。** 总管、网页、飞书适配器只通过这个接口读写；分层、容量、检索、遗忘怎么实现，对外不可见。
+1. **The conversation is just a working buffer; the ledger is the memory.** The steward's pi-durable conversation gets compacted and grows long, so the facts of every "matter" (Threads, workers, reports, notes) live in our own SQLite tables, managed by a separate memory module. Each turn, the steward reads the latest state from the ledger instead of paging through conversation history.
+2. **Anything deterministic is not handed to the LLM.** Deriving state after events arrive (running / waiting for you / idle, unread, open questions) is a deterministic reducer; `done`-class reports are sent to the user by the core straight from a template, **with no dependence on the LLM being up or on budget**. The LLM handles judgment: routing, answering workers' factual questions, updating summaries, taking notes.
+3. **"Quiet by default" is guaranteed by structure, not by prompting.** In event-triggered runs, the steward's ordinary text output is always discarded; only explicit calls to `notify_user` / `ask_user` ever disturb the user.
+4. **"Proactive behavior must have provenance" is enforced by tool parameters.** Every tool that can start work must carry a `provenance` (the ID of a user message, routine, follow-up, or watch); without one it is rejected.
+5. **The memory module has a narrow interface and is replaceable as a whole.** The steward, the web app, and the Feishu adapter read and write only through it; how layering, capacity, retrieval, and forgetting are implemented is invisible from outside.
 
-## 1. 在 DO 里的位置
+## 1. Position inside the DO
 
 ```
- 飞书 / 网页 / 连接器                    （其余层见协议与连接器设计）
+ Feishu / web / connectors              (remaining layers: see the protocol and connector designs)
         │
- ┌──────▼───────────────────────────────────────────────────────────────┐
- │ Shepherd DO（单例 "owner"，Agents SDK 的 Agent）                       │
- │                                                                      │
- │  Channel 适配器      协议网关                    Web 读模型            │
- │  (入口去重、出口发送)  (连接器/浏览器连接、outbox)   (时间线、记忆页)      │
- │        │                  │                          ▲                │
- │        ▼                  ▼                          │                │
- │  ┌────────────────────────────────────────────────────────────────┐  │
- │  │ 核心（确定性）                                                   │  │
- │  │   事件 reducer ─ 通知策略 ─ 出站队列(outbound) ─ 调度器(alarm)    │  │
- │  └───────┬──────────────────────────────┬─────────────────────────┘  │
- │          │ 窄接口                        │ wake / tools              │
- │  ┌───────▼──────────────┐       ┌───────▼──────────────────────────┐ │
- │  │ 记忆模块 Memory       │◀──────│ 总管 Steward（PiHarness 对话）    │ │
- │  │  账本 Ledger          │ tools │  工具、系统提示、策略钩子          │ │
- │  │  笔记 Notes           │       └──────────────────────────────────┘ │
- │  │  检索 / 遗忘 / 摘要    │                                            │
- │  └──────────────────────┘                                            │
- │              同一个 SQLite（Shepherd 的表 + pi-durable 自己的表）        │
- └──────────────────────────────────────────────────────────────────────┘
+ ┌──────▼───────────────────────────────────────────────────────────────────────────────┐
+ │ Shepherd DO (singleton "owner", an Agents SDK Agent)                                   │
+ │                                                                                        │
+ │  Channel adapters        Protocol gateway             Web read model                   │
+ │  (dedup in, send out)    (connector/browser, outbox)  (timeline, memory page)          │
+ │       │                       │                             ▲                          │
+ │       ▼                       ▼                             │                          │
+ │  ┌──────────────────────────────────────────────────────────────────────────────────┐  │
+ │  │ Core (deterministic)                                                             │  │
+ │  │  event reducer ─ notification policy ─ outbound queue ─ alarm scheduler          │  │
+ │  └───────┬───────────────────────────────────────────┬──────────────────────────────┘  │
+ │          │ narrow interface                          │ wake / tools                    │
+ │  ┌───────▼──────────────────────────────┐       ┌────▼───────────────────────────────┐ │
+ │  │ Memory module                        │◀──────│ Steward (PiHarness conversation)   │ │
+ │  │   Ledger                             │ tools │  tools, system prompt, policy hooks│ │
+ │  │   Notes                              │       └────────────────────────────────────┘ │
+ │  │   retrieval / forgetting / summaries │                                              │
+ │  └──────────────────────────────────────┘                                              │
+ │          one shared SQLite (Shepherd's tables + pi-durable's own tables)               │
+ └──────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-- **核心**是确定性代码，没有 LLM，可单测。
-- **总管**是 `PiHarness` 的根会话，持有一组工具；它不直接写 SQL，只通过工具调用记忆模块和协议网关。
-- 两者共享同一个 SQLite 数据库。核心内部用 `ctx.storage.transactionSync` 做原子更新；与 pi-durable 的提交之间**不跨事务**，靠幂等键保证一致（§11）。
+- **The core** is deterministic code with no LLM, unit-testable.
+- **The steward** is the root session of a `PiHarness`, holding a set of tools; it never writes SQL directly — it reaches the memory module and the protocol gateway only through tool calls.
+- The two share one SQLite database. The core uses `ctx.storage.transactionSync` for atomic updates; there is **no cross-transaction** between these and pi-durable's commits — consistency rests on idempotency keys (§11).
 
-## 2. 记忆模块
+## 2. The memory module
 
-### 2.1 职责与边界
+### 2.1 Responsibilities and boundaries
 
-记忆模块 = 账本（事实）+ 笔记（知识）+ 检索 + 生命周期（遗忘、摘要）。它回答三类问题：
+The memory module = ledger (facts) + notes (knowledge) + retrieval + lifecycle (forgetting, summarization). It answers three kinds of questions:
 
-- **这句话属于哪件事？**（路由）
-- **现在各处什么情况？**（情况简报）
-- **我该知道哪些背景？**（偏好、项目约定）
+- **Which matter does this utterance belong to?** (routing)
+- **What is the situation everywhere right now?** (situation brief)
+- **What context should I know?** (preferences, project conventions)
 
-对外只暴露下面这组接口，**调用方不得绕过它读写表**：
+It exposes only the interface below, and **callers must not read or write the tables around it**:
 
 ```ts
 interface Memory {
-  // ---- 账本 ----
+  // ---- ledger ----
   threads: {
     create(input: NewThread): Thread;
-    get(id: ThreadId): ThreadView;                        // 含摘要、worker、待回答的问题、相关项目笔记
+    get(id: ThreadId): ThreadView;                        // includes summary, workers, open questions, related project notes
     list(filter: { state?: ThreadState[]; repoId?: RepoId; limit: number }): ThreadSummary[];
     findCandidates(q: RouteQuery): RouteCandidates;        // §3
     update(id: ThreadId, patch: { title?: string; goal?: string; summary?: string }): void;
@@ -68,319 +68,319 @@ interface Memory {
   };
   workers: { register(w: NewWorker): Worker; get(id: WorkerId): Worker; listByThread(id: ThreadId): Worker[] };
   machines: { upsertFromHello(h: Hello): void; setOnline(deviceId: DeviceId, online: boolean): void; list(): MachineView[] };
-  events: { apply(batch: WorkerEvent[]): ReduceResult };   // §5：落库 + reducer，一个事务
+  events: { apply(batch: WorkerEvent[]): ReduceResult };   // §5: persist to the ledger + reducer, one transaction
   handoff: { build(threadId: ThreadId, fromWorker?: WorkerId): HandoffBrief };   // §2.6
 
-  // ---- 笔记 ----
+  // ---- notes ----
   notes: {
-    context(scope: { repoIds: RepoId[] }): NotesContext;   // 常驻层 + 相关项目层，带字数预算
-    propose(n: NoteDraft): ProposeResult;                  // 返回相似/冲突候选，不直接写入
+    context(scope: { repoIds: RepoId[] }): NotesContext;   // resident layer + related project layers, with a character budget
+    propose(n: NoteDraft): ProposeResult;                  // returns similar/conflicting candidates; does not write directly
     commit(n: NoteDraft, opts: { replaces?: NoteId[] }): { note: Note; changes: ChangeReport[] };
     pin(id: NoteId, pinned: boolean): void;
     remove(id: NoteId): void;
     search(q: string, opts?: { scope?: NoteScope[] }): Note[];
   };
 
-  // ---- 生命周期 ----
-  maintenance(now: number): ChangeReport[];                // 衰减、降级、容量检查，由 alarm 调用
+  // ---- lifecycle ----
+  maintenance(now: number): ChangeReport[];                // decay, demotion, capacity checks; called by the alarm
 
-  // ---- 视图 ----
+  // ---- views ----
   views: { situation(): SituationBrief; timeline(id: ThreadId, since?: Cursor): TimelinePage; memoryPage(): MemoryPage };
 }
 ```
 
-`ChangeReport` 是记忆模块**主动告知**的变动（记下、淘汰、降级、覆盖、被用户固定）。总管必须把它们转达给用户（§9），这是「遗忘对用户可见」的实现点。
+A `ChangeReport` is a change the memory module **proactively reports** (noted, evicted, demoted, superseded, pinned by the user). The steward must relay these to the user (§9) — this is where "forgetting is visible to the user" gets implemented.
 
-### 2.2 账本的数据模型
+### 2.2 The ledger's data model
 
-表名统一前缀 `sh_`。下面只列语义，不列全部列。
+Table names all carry the `sh_` prefix. Only semantics are listed below, not every column.
 
-| 表 | 关键字段 | 说明 |
+| Table | Key fields | Notes |
 |---|---|---|
-| `sh_machine` | `deviceId, name, online, lastSeen, capabilities, reliability` | 机器。`reliability` 记在线习惯，MVP 只记录 |
-| `sh_repo` | `repoId, deviceId, path, name, defaultBranch, remote` | 连接器上报的仓库 |
-| `sh_thread` | `threadId, title, goal, summary, summaryAt, state, unread, lastActivityAt, archived, createdFromMsg` | `state` 是**派生**值（§5），不由 LLM 或用户直接设置 |
-| `sh_thread_repo` | `threadId, repoId` | 一件事涉及哪些仓库，路由的强线索 |
-| `sh_worker` | `workerId, threadId, deviceId, repoId, agent, mode, state, sessionId, branch, parentWorker, lastOutcome, lastEventAt` | 一个 worker 一条记录。`parentWorker` 记录接力关系 |
-| `sh_report` | `workerId, seq, status, summary, changes, decisions, leftovers, tests, question, next, git` | worker 的结构化收尾报告（协议中的 `report` 事件），交接简报的素材 |
-| `sh_timeline` | `id, threadId, ts, kind, text, refs` | 供 L2 查看的摘要级时间线：用户指令、派发、汇报、提问、系统说明。不含原始过程 |
-| `sh_question` | `qid, threadId, workerId, text, options, status, askedAt, answeredAt` | 待回答的问题，是「等你」状态的依据 |
-| `sh_event` / `sh_worker_ack` | 协议层的事件收件箱与水位 | 见协议文档；这里增加 `processedUpTo` |
-| `sh_inbound` | `channel, msgId, receivedAt` | 入站消息去重 |
-| `sh_outbound` | `id, channel, kind, threadId, payload, urgency, status, attempts, providerMsgId` | 出站消息队列，兼作「回复某条消息 → 哪个 Thread」的映射 |
-| `sh_routine` / `sh_watch` / `sh_followup` | 见 §8 | 主动行为 |
-| `sh_command` | 协议层 `outbox` | 增加 `provenance` 列用于审计 |
+| `sh_machine` | `deviceId, name, online, lastSeen, capabilities, reliability` | Machines. `reliability` tracks online habits; in the MVP it is record-only |
+| `sh_repo` | `repoId, deviceId, path, name, defaultBranch, remote` | Repositories reported by connectors |
+| `sh_thread` | `threadId, title, goal, summary, summaryAt, state, unread, lastActivityAt, archived, createdFromMsg` | `state` is a **derived** value (§5), never set directly by the LLM or the user |
+| `sh_thread_repo` | `threadId, repoId` | Which repos a matter involves; a strong routing clue |
+| `sh_worker` | `workerId, threadId, deviceId, repoId, agent, mode, state, sessionId, branch, parentWorker, lastOutcome, lastEventAt` | One row per worker. `parentWorker` records the relay relationship |
+| `sh_report` | `workerId, seq, status, summary, changes, decisions, leftovers, tests, question, next, git` | A worker's structured closing report (the `report` event in the protocol); raw material for handoff briefs |
+| `sh_timeline` | `id, threadId, ts, kind, text, refs` | A summary-level timeline for L2 viewing: user instructions, dispatches, reports, questions, system notes. Contains no raw transcripts |
+| `sh_question` | `qid, threadId, workerId, text, options, status, askedAt, answeredAt` | Open questions; the basis of the "waiting for you" state |
+| `sh_event` / `sh_worker_ack` | Protocol-layer event inbox and watermark | See the protocol doc; we add `processedUpTo` |
+| `sh_inbound` | `channel, msgId, receivedAt` | Inbound message dedup |
+| `sh_outbound` | `id, channel, kind, threadId, payload, urgency, status, attempts, providerMsgId` | The outbound message queue; doubles as the "reply to this message → which Thread" mapping |
+| `sh_routine` / `sh_watch` / `sh_followup` | See §8 | Proactive behavior |
+| `sh_command` | Protocol-layer `outbox` | Adds a `provenance` column for auditing |
 
-线程的全文索引：`sh_thread_fts`（FTS5，覆盖 `title + goal + summary + 最近一次 report.summary`），触发器同步。FTS5 在 DO 的 SQLite 中受支持（官方文档）。
+Full-text index for threads: `sh_thread_fts` (FTS5, covering `title + goal + summary + the latest report.summary`), kept in sync by triggers. FTS5 is supported in the DO's SQLite (official docs).
 
-### 2.3 笔记的数据模型与分层
+### 2.3 Notes: data model and layering
 
 ```
 sh_note(noteId, layer, scope_repoId?, kind, text, bytes,
         source, evidence, confirmed, pinned,
         createdAt, lastUsedAt, useCount, status, supersededBy)
 sh_note_fts(text)                     -- FTS5
-sh_note_log(ts, op, noteId, reason)   -- 所有变动，驱动 ChangeReport
+sh_note_log(ts, op, noteId, reason)   -- all changes; drives ChangeReport
 ```
 
-| 层 | `layer` | 内容 | 容量 | 加载方式 |
+| Layer | `layer` | Contents | Capacity | How it loads |
 |---|---|---|---|---|
-| 常驻层 | `resident` | 用户偏好、全局约定 | **2,400 字符**硬上限 | 每次对话都渲染进系统提示的一个段落 |
-| 项目层 | `project` | 某个仓库的约定、机器上的注意事项 | 每个仓库 **1,500 字符** | 涉及该仓库的 Thread 被取出时，随工具结果注入 |
-| 归档层 | `archive` | 被降级的旧条目、淘汰的历史版本 | 不限，不删除 | 只通过 `notes.search` 按需取 |
+| Resident layer | `resident` | User preferences, global conventions | Hard cap of **2,400 characters** | Rendered into a system-prompt section on every conversation turn |
+| Project layer | `project` | A repo's conventions, machine-specific caveats | **1,500 characters** per repo | Injected alongside tool results whenever a Thread involving that repo is fetched |
+| Archive layer | `archive` | Demoted old entries, evicted historical versions | Unlimited, never deleted | Fetched on demand via `notes.search` only |
 
-`kind`：`preference`（偏好）、`convention`（项目约定）、`environment`（环境事实）、`fact`（其他会影响调度的事实）。纯聊天不进笔记（spec §10.1）。
+`kind`: `preference` (a preference), `convention` (a project convention), `environment` (an environment fact), `fact` (any other fact that affects scheduling). Pure chat never becomes a note (spec §10.1).
 
-`source` 与可信度（spec §10.3，防记忆投毒）：
+`source` and trust level (spec §10.3, anti memory-poisoning):
 
-| `source` | 含义 | 可信度 | 能进常驻层？ |
+| `source` | Meaning | Trust | Allowed into the resident layer? |
 |---|---|---|---|
-| `user_said` | 用户亲口说的，`evidence` 为消息 ID | 高 | 是 |
-| `connector` | 连接器上报的环境事实（仓库路径、已装 agent） | 高 | 否，只进项目层；以实时上报为准，不依赖笔记 |
-| `worker_reported` | 来自 worker 的 `report.decisions` 等 | 低 | **否**，需用户确认后才升级 |
-| `inferred` | 总管推断 | 低 | **否**，需用户确认后才升级 |
+| `user_said` | Said by the user directly; `evidence` is a message ID | High | Yes |
+| `connector` | Environment facts reported by a connector (repo paths, installed agents) | High | No — project layer only; live reports are the source of truth, notes are not relied on |
+| `worker_reported` | From a worker's `report.decisions` and the like | Low | **No** — promoted only after the user confirms |
+| `inferred` | Inferred by the steward | Low | **No** — promoted only after the user confirms |
 
-`confirmed=false` 的低可信条目只存在于项目层（标记为「待确认」），不出现在常驻层；用户说「对」或总管发起确认并得到肯定回答后，才把 `confirmed` 置真并允许升级。
+Low-trust entries with `confirmed=false` live only in the project layer (marked "pending confirmation") and never appear in the resident layer; only after the user says "yes" — or the steward asks for confirmation and receives an affirmative answer — is `confirmed` set to true and promotion allowed.
 
-### 2.4 记下、冲突与覆盖：两段式
+### 2.4 Noting, conflicts, and supersession: the two-phase write
 
-模块是确定性的，**语义判断留给总管**，所以写入分两步：
+The module is deterministic and **semantic judgment is left to the steward**, so writes happen in two steps:
 
-1. `notes.propose(draft)`：模块做规范化去重（完全相同则只增加 `useCount`），并用 FTS 找出最相近的若干条，返回 `ProposeResult { duplicate?: NoteId, similar: Note[], needsEviction?: Note[] }`。
-2. 总管看完候选，决定 `commit(draft, { replaces })`：相同含义的覆盖旧条目（旧条目进归档，保留历史版本），不同的并存。
+1. `notes.propose(draft)`: the module normalizes and dedupes (an exact match only bumps `useCount`) and uses FTS to find the closest few existing entries, returning `ProposeResult { duplicate?: NoteId, similar: Note[], needsEviction?: Note[] }`.
+2. The steward reviews the candidates and decides on `commit(draft, { replaces })`: same-meaning entries supersede the old one (the old entry moves to the archive, preserving the historical version); different ones coexist.
 
-容量处理：若写入会使常驻层超过 2,400 字符，`propose` 返回 `needsEviction`（按 §2.5 的分数从低到高排序，**排除已固定**）；总管选择淘汰哪些并在 `commit.replaces` 里带上，模块强制执行上限，超出则拒绝。总管不处理时，`maintenance` 会按同一分数自动淘汰最低的并生成 `ChangeReport`。
+Capacity handling: if a write would push the resident layer past 2,400 characters, `propose` returns `needsEviction` (sorted by the §2.5 score, lowest first, **pinned entries excluded**); the steward picks which to evict and carries them in `commit.replaces`. The module enforces the cap and rejects anything over it. If the steward does not handle it, `maintenance` evicts the lowest-scoring entry automatically by the same score and emits a `ChangeReport`.
 
-### 2.5 遗忘
+### 2.5 Forgetting
 
-三种触发（spec §10.2）：
+Three triggers (spec §10.2):
 
-1. **容量压力**：写入时淘汰（上面）。淘汰 = 降级到 `archive`，不删除。
-2. **冲突覆盖**：`replaces`。旧条目 `supersededBy` 指向新条目。
-3. **长期未被用到**：`maintenance` 每天由 alarm 运行一次，规则：
-   - 项目层条目 `lastUsedAt` 超过 60 天且未固定 → 降级到归档。
-   - 常驻层条目超过 90 天未使用且未固定 → 产生「建议降级」的 `ChangeReport`，**不自动降级**，由总管问用户（常驻层条目影响面大）。
+1. **Capacity pressure**: eviction at write time (above). Eviction = demotion to `archive`, not deletion.
+2. **Conflict supersession**: `replaces`. The old entry's `supersededBy` points to the new entry.
+3. **Long unused**: `maintenance` runs once a day via alarm, with these rules:
+   - A project-layer entry whose `lastUsedAt` is over 60 days old and not pinned → demoted to the archive.
+   - A resident-layer entry unused for over 90 days and not pinned → emits a `ChangeReport` suggesting demotion but **does not demote automatically**; the steward asks the user (resident-layer entries have broad impact).
 
-保留分数（用于选择淘汰对象，越低越先淘汰）：
+Retention score (used to pick eviction victims; the lower, the earlier evicted):
 
 ```
 score = recency(lastUsedAt) × (1 + log(1 + useCount)) × sourceWeight × (confirmed ? 1 : 0.5)
 sourceWeight: user_said 1.0 | connector 0.9 | worker_reported 0.4 | inferred 0.3
-pinned 条目不参与
+pinned entries do not participate
 ```
 
-`lastUsedAt` 在条目被装配进总管上下文时更新；这是「被使用」的近似，足够 MVP。
+`lastUsedAt` is updated when an entry is assembled into the steward's context; this approximates "being used", which is good enough for the MVP.
 
-每次变动写入 `sh_note_log`，`ChangeReport` 由它生成。用户在网页记忆页的编辑、删除、固定走同一套接口，同样记录。
+Every change is written to `sh_note_log`, and `ChangeReport`s are generated from it. The user's edits, deletions, and pins on the web memory page go through the same interface and are logged the same way.
 
-### 2.6 摘要与交接简报
+### 2.6 Summaries and handoff briefs
 
-**Thread 摘要**是路由和情况简报的主要素材，所以要防止失真：
+**Thread summaries** are the main raw material for routing and the situation brief, so distortion must be prevented:
 
-- 总管在处理 `report`/`settled`/`external_activity` 等唤醒时，调用 `threads.update(summary)`。摘要上限 600 字符。
-- 模块保留最近 5 个摘要版本。每累计更新 10 次，提示总管**重写**而不是在旧摘要上修改（从时间线和报告重建），抑制漂移。
-- 原始来源始终可回溯：`sh_timeline`、`sh_report`、以及连接器上的原始会话。
+- While handling wakes such as `report` / `settled` / `external_activity`, the steward calls `threads.update(summary)`. Summaries are capped at 600 characters.
+- The module keeps the last 5 summary versions. Every 10 cumulative updates, the steward is prompted to **rewrite from scratch** rather than edit the old summary (rebuilt from the timeline and reports), to suppress drift.
+- Original sources stay traceable: `sh_timeline`, `sh_report`, and the raw session on the connector.
 
-**交接简报**由 `handoff.build` 确定性地装配，总管再补上本次任务：
+The **handoff brief** is assembled deterministically by `handoff.build`; the steward then adds the current task:
 
 ```
-目标        ← thread.goal
-当前状态    ← thread.summary
-关键决定    ← 该 Thread 下所有 sh_report.decisions，去重，附来源 worker
-遗留问题    ← 最新 sh_report.leftovers
-指针        ← 分支、提交、改动文件（来自连接器的 git 事实，不是模型自述）
-本次要做的  ← 总管撰写
+Goal             ← thread.goal
+Current state    ← thread.summary
+Key decisions    ← all sh_report.decisions under the Thread, deduplicated, with the source worker
+Leftovers        ← the latest sh_report.leftovers
+Pointers         ← branch, commits, changed files (git facts from the connector, not the model's own account)
+Task at hand     ← written by the steward
 ```
 
-简报放**指针而不是内容**（connector-pi.md §5.3 / spec §5.3）。
+Briefs carry **pointers, not content** (connector-pi.md §5.3 / spec §5.3).
 
-## 3. 路由
+## 3. Routing
 
-目标（spec §0 与原则）：宁可多问一次，也不要路由错。
+Goal (spec §0 and principles): better to ask one extra time than to route wrong.
 
-### 3.1 信号，由强到弱
+### 3.1 Signals, strongest to weakest
 
-1. **显式引用**：用户在飞书里**回复/引用**了某条汇报或提问（飞书消息带父消息 ID），通过 `sh_outbound.providerMsgId → threadId` 直接确定 Thread。卡片按钮同理，按钮的回调数据里带 `threadId`。这类信号**不经 LLM 判断**，置信度最高。
-2. **明确指代**：消息里出现 Thread 的标题、短 ID、或已登记的仓库名/机器名。
-3. **语义匹配**：用户的描述与候选 Thread 的标题、目标、摘要相符。
-4. **时间与状态**：最近活动的 Thread、状态为「等你」的 Thread 优先。
+1. **Explicit reference**: the user **replied to / quoted** a specific report or question in Feishu (Feishu messages carry a parent message ID); the Thread is resolved directly via `sh_outbound.providerMsgId → threadId`. Card buttons work the same way — the button's callback data carries `threadId`. These signals **never pass through LLM judgment** and carry the highest confidence.
+2. **Explicit mention**: the message contains a Thread's title, short ID, or a registered repo or machine name.
+3. **Semantic match**: the user's description matches a candidate Thread's title, goal, or summary.
+4. **Recency and state**: recently active Threads, and Threads in the "waiting for you" state, rank first.
 
-### 3.2 候选集
+### 3.2 The candidate set
 
-`threads.findCandidates({ text, hints })`：
+`threads.findCandidates({ text, hints })`:
 
-1. 先应用 §3.1 的 1、2 两类信号，命中则只返回该 Thread，`confidence: "explicit"`。
-2. 否则装配候选：全部「进行中」和「等你」的 Thread（通常很少）+ 对 `text` 做 FTS 召回的前 8 个其余 Thread + 最近活动的前 5 个；去重，上限 **12** 个。若 `hints` 里有仓库或机器，先据此过滤。
-3. 每个候选返回：`threadId, title, 一句话摘要, 仓库, 状态, 最近活动时间, 匹配原因`。
+1. Apply signal classes 1 and 2 from §3.1 first; on a hit, return only that Thread with `confidence: "explicit"`.
+2. Otherwise assemble candidates: all "running" and "waiting for you" Threads (usually few) + the top 8 remaining Threads recalled by FTS over `text` + the 5 most recently active; deduplicated, capped at **12**. If `hints` contain a repo or machine, filter on that first.
+3. Each candidate returns `threadId, title, one-line summary, repos, state, last activity time, match reason`.
 
-个人规模下，整个候选列表几十行文字，直接让总管（LLM）在上下文里选，**不需要向量检索**。如果以后 Thread 规模增长，在 `findCandidates` 内部加向量召回，接口不变。
+At personal scale the whole candidate list is a few dozen lines of text, so the steward (LLM) simply picks from it in context — **no vector retrieval needed**. If Thread counts grow later, add vector recall inside `findCandidates`; the interface stays unchanged.
 
-### 3.3 决策规则
+### 3.3 Decision rules
 
-总管调用 `find_threads` 拿到候选，然后选择：`attach`（接到某个 Thread）、`create`（新建）或 `ask`。由**确定性策略钩子**在其后把关（§7.2）：
+The steward calls `find_threads` to get candidates, then chooses `attach` (join a Thread), `create` (start a new one), or `ask`. A **deterministic policy hook** gates the choice afterwards (§7.2):
 
-- 候选中有 `explicit` 信号 → 允许直接 `attach`。
-- 否则要求总管同时给出 `confidence ∈ {high, medium, low}` 和理由。
-  - `high` 且唯一候选 → 允许，汇报里带一句「我把它接到了 xx」。
-  - 其余 → 钩子拒绝执行，要求改为 `ask_user`（列出最多 3 个候选 + 「新开一件事」）。
-- **新建 Thread 的条件**：派发了 agent 的事才建；纯聊天不建（spec §13）。
+- An `explicit` signal among the candidates → direct `attach` is allowed.
+- Otherwise the steward must also give `confidence ∈ {high, medium, low}` and a reason.
+  - `high` with a unique candidate → allowed; the report includes a line "I attached it to xx".
+  - Anything else → the hook blocks execution and demands `ask_user` instead (listing up to 3 candidates + "start a new matter").
+- **When to create a Thread**: only for matters that dispatch an agent; never for pure chat (spec §13).
 
-「接到已空闲的旧 Thread」时，汇报里要说明（spec §5.2）：「我把它接到了之前的 xx」。
+When attaching to an old Thread that has gone idle, the report must say so (spec §5.2): "I attached it to the earlier xx".
 
-### 3.4 路由评测
+### 3.4 Routing evaluation
 
-路由是产品价值的核心，必须有可度量的标准。构造一个固定的评测集：20–30 个模拟 Thread（含相似标题、同仓库多事件、已空闲多天），100 条话语，标注真实归属或「应当反问」。指标：
+Routing is the core of the product's value and needs a measurable bar. Build a fixed evaluation set: 20–30 simulated Threads (including similar titles, multiple events in the same repo, idle for many days) and 100 utterances, each labeled with the true target or "should ask back". Metrics:
 
-| 指标 | 目标 |
+| Metric | Target |
 |---|---|
-| 错路由率（自动接到错误的 Thread） | < 2% |
-| 应反问却未反问 | < 3% |
-| 不必要的反问率 | < 15% |
+| Mis-routing rate (auto-attached to the wrong Thread) | < 2% |
+| Should have asked back but did not | < 3% |
+| Unnecessary ask-back rate | < 15% |
 
-在换模型、改提示、改候选装配规则时回归这个评测集。
+Re-run this evaluation set whenever the model, prompts, or candidate-assembly rules change.
 
-## 4. 总管（LLM）
+## 4. The steward (LLM)
 
-### 4.1 形态
+### 4.1 Form
 
-- `PiHarness` 的**根会话**，永不结束；上下文由 pi-durable 自动压缩。
-- 通过一个 pi-durable 扩展（`shepherd-steward`）提供：系统提示段落、工具、钩子。
-- 每一轮看到的信息：
+- The **root session** of a `PiHarness`; it never ends, and pi-durable compacts the context automatically.
+- A pi-durable extension (`shepherd-steward`) supplies the system-prompt sections, tools, and hooks.
+- What each turn sees:
 
-| 内容 | 放哪里 | 理由 |
+| Content | Where | Why |
 |---|---|---|
-| 角色、规则、自主度、汇报格式 | 系统提示（静态段） | 很少变化，提示缓存友好 |
-| 常驻层笔记 | 系统提示的一个段落 | 变化少；变化时只追加差异 |
-| **情况简报**（各 Thread 状态、机器在线情况、待回答的问题） | `beforeRequest` 钩子在**单次请求**里注入，不写入对话 | 每轮最新，不让对话膨胀 |
-| 涉及仓库的项目层笔记 | `get_thread` 等工具的返回值 | 只在相关时出现 |
-| 本轮输入 | 用户消息或系统事件 | |
+| Role, rules, autonomy, report format | System prompt (static sections) | Rarely changes; prompt-cache friendly |
+| Resident-layer notes | One section of the system prompt | Changes rarely; when it changes, only the delta is appended |
+| **Situation brief** (per-Thread state, machine online status, open questions) | Injected by the `beforeRequest` hook into the **single request**, not written into the conversation | Freshest every turn without bloating the conversation |
+| Project-layer notes for the repos involved | Return values of tools like `get_thread` | Appears only when relevant |
+| This turn's input | A user message or a system event | |
 
-`beforeRequest` 钩子能替换单次请求的消息列表（pi-durable README，Generation hooks）；是否能满足「只追加一个简报块、不持久化」需要原型验证。退路：把情况简报放进输入文本前缀。
+The `beforeRequest` hook can replace a single request's message list (pi-durable README, Generation hooks); whether it satisfies "append just one brief block, persist nothing" needs prototype validation. Fallback: put the situation brief into an input-text prefix.
 
-### 4.2 输入的两种来源
+### 4.2 The two input sources
 
-PiHarness 的 `submit` 只接收内容，不支持自定义条目类型（`pi-durable@1.1.0` 的 `input` 不允许带 `entry`；更新版本 README 中允许，需要验证）。MVP 用**内容标记**区分：
+PiHarness's `submit` takes content only and does not support custom entry types (`pi-durable@1.1.0`'s `input` does not allow an `entry`; the repo README for newer versions says it does — needs verification). The MVP distinguishes them with **content markers**:
 
 ```
-用户消息:  <原文>                                        operationId = user:<channel message id>
-系统事件:  ⟦event⟧ thread=<id> ...（紧凑文本）              operationId = evt:<batch id>
-例程触发:  ⟦routine R⟧ <指令>                              operationId = routine:<id>:<fireTime>
-跟进到期:  ⟦followup F⟧ <原因>                             operationId = followup:<id>
+User message:   <raw text>                                  operationId = user:<channel message id>
+System event:   ⟦event⟧ thread=<id> ... (compact text)      operationId = evt:<batch id>
+Routine fire:   ⟦routine R⟧ <instruction>                   operationId = routine:<id>:<fireTime>
+Follow-up due:  ⟦followup F⟧ <reason>                       operationId = followup:<id>
 ```
 
-核心在提交时就知道输入类型，并把它记入 `sh_run(operationId, kind, replyTo)`，用于出站决策（§6）。系统提示说明这些标记的含义：以 `⟦` 开头的不是用户说的话。
+The core knows the input type at submit time and records it in `sh_run(operationId, kind, replyTo)` for outbound decisions (§6). The system prompt explains what the markers mean: anything starting with `⟦` is not something the user said.
 
-### 4.3 工具
+### 4.3 Tools
 
-分五组。所有工具的返回都是紧凑文本加少量结构化字段。「重放」一栏是 pi-durable 的 `replay` 属性：`safe` 表示崩溃后可以重跑，`unsafe` 表示不可重跑，模型会看到「被中断」。
+Five groups. Every tool returns compact text plus a few structured fields. The "Replay" column is pi-durable's `replay` attribute: `safe` means it can re-run after a crash; `unsafe` means it cannot re-run, and the model sees "interrupted".
 
-**记忆与查询**
+**Memory and lookup**
 
-| 工具 | 作用 | 重放 |
+| Tool | Purpose | Replay |
 |---|---|---|
-| `situation()` | 返回当前情况简报（兜底，通常已由钩子注入） | safe |
-| `find_threads(text, hints?)` | §3 的候选 | safe |
-| `get_thread(threadId)` | 摘要、worker、待回答的问题、项目层笔记、最近时间线 | safe |
-| `update_thread(threadId, {title?, goal?, summary?})` | 更新摘要 | safe（覆盖写，幂等） |
-| `notes_propose(draft)` / `notes_commit(draft, replaces?)` / `notes_pin(id, pinned)` / `notes_remove(id)` | §2.4 两段式写入 | propose: safe；commit: safe（以 `taskId` 作幂等键） |
-| `notes_search(q)` | 查归档层 | safe |
+| `situation()` | Returns the current situation brief (a fallback; usually already injected by the hook) | safe |
+| `find_threads(text, hints?)` | Candidates from §3 | safe |
+| `get_thread(threadId)` | Summary, workers, open questions, project-layer notes, recent timeline | safe |
+| `update_thread(threadId, {title?, goal?, summary?})` | Updates the summary | safe (idempotent overwrite) |
+| `notes_propose(draft)` / `notes_commit(draft, replaces?)` / `notes_pin(id, pinned)` / `notes_remove(id)` | Two-phase writes from §2.4 | propose: safe; commit: safe (idempotency key is the `taskId`) |
+| `notes_search(q)` | Search the archive layer | safe |
 
-**派发与控制（经协议网关）**
+**Dispatch and control (via the protocol gateway)**
 
-| 工具 | 作用 | 重放 |
+| Tool | Purpose | Replay |
 |---|---|---|
-| `start_worker(threadId, repoId, mode, prompt, base?, provenance, basis)` | 创建 worker 命令（connector-pi `start_worker`） | **unsafe** |
-| `send_to_worker(workerId, text, intent, provenance, basis)` | 追加指示 | unsafe |
-| `interrupt_worker(workerId, then?, basis)` | 中止并可选地续上 | unsafe |
-| `resume_worker(workerId, reason)` | 手动续上 | unsafe |
-| `worker_status(workerId?)` / `machine_status()` | 只读状态 | safe |
+| `start_worker(threadId, repoId, mode, prompt, base?, provenance, basis)` | Creates a worker command (connector-pi `start_worker`) | **unsafe** |
+| `send_to_worker(workerId, text, intent, provenance, basis)` | Appends instructions | unsafe |
+| `interrupt_worker(workerId, then?, basis)` | Interrupts, optionally resuming afterwards | unsafe |
+| `resume_worker(workerId, reason)` | Manual resume | unsafe |
+| `worker_status(workerId?)` / `machine_status()` | Read-only status | safe |
 
-`unsafe` 工具的命令 ID 取自工具任务 ID：`cmdId = "tool:" + api.taskId`，使崩溃后即使重放同一个调用也只会产生同一个命令（协议文档 §7.1）。
+For `unsafe` tools the command ID is taken from the tool task ID: `cmdId = "tool:" + api.taskId`, so even a replay of the same call after a crash produces only the same command (protocol doc §7.1).
 
-**与用户沟通**
+**Communicating with the user**
 
-| 工具 | 作用 |
+| Tool | Purpose |
 |---|---|
-| `notify_user({ threadId?, conclusion, did[], needsYou?, urgency })` | 按固定三段式发送；`urgency: push \| quiet`；链接由系统自动附加 |
-| `ask_user({ threadId?, question, options?[≤3] })` | 创建 `sh_question`、状态变「等你」、推送；**终止本轮**（`control.terminate`） |
-| `no_action(reason)` | 明确记录「醒来后无需动作」，终止本轮 |
+| `notify_user({ threadId?, conclusion, did[], needsYou?, urgency })` | Sends in the fixed three-part format; `urgency: push \| quiet`; links are appended by the system |
+| `ask_user({ threadId?, question, options?[≤3] })` | Creates an `sh_question`, flips the state to "waiting for you", pushes; **terminates the turn** (`control.terminate`) |
+| `no_action(reason)` | Explicitly records "woke up, nothing to do" and terminates the turn |
 
-**主动行为**（§8）：`create_routine`、`create_watch`、`set_followup`、`list_schedules`、`cancel_schedule`。创建例程和巡视需要 `basis = user_explicit`。
+**Proactive behavior** (§8): `create_routine`, `create_watch`, `set_followup`, `list_schedules`, `cancel_schedule`. Creating routines and watches requires `basis = user_explicit`.
 
-**回答 worker 的提问**
+**Answering workers' questions**
 
-| 工具 | 作用 |
+| Tool | Purpose |
 |---|---|
-| `answer_worker(workerId, text, evidence)` | 总管自己回答 worker 的事实性提问。`evidence` 必须是笔记 ID 或用户消息 ID，没有就被钩子拒绝，只能 `ask_user` |
+| `answer_worker(workerId, text, evidence)` | The steward answers a worker's factual question itself. `evidence` must be a note ID or user message ID; without one the hook rejects it and only `ask_user` remains |
 
-### 4.4 系统提示的要点
+### 4.4 System prompt essentials
 
-（正文在实现时撰写，这里记录必须包含的规则）
+(The actual text is written at implementation time; these are the rules it must contain.)
 
-1. 你是 Shepherd 的总管：不亲自写代码，只调度和记忆。
-2. 以 `⟦` 开头的输入不是用户说的话，是系统事件。事件触发的运行里，**不要输出面向用户的文字**，需要通知时调用 `notify_user`，无事可做调用 `no_action`。
-3. 每次动作前先看情况简报；路由不确定必须 `ask_user`，不要猜。
-4. 汇报只有三段，固定格式，简短。
-5. 自主度三档（spec §6），以及哪些事必须问用户。
-6. 记笔记的标准：「如果总管不知道这个，它会派错、问多、或说错话吗？」会才记；记下后要在汇报中告知用户；`worker_reported` 和 `inferred` 来源不得放入常驻层。
-7. 不要代用户下「这件事结束了」的结论。
+1. You are Shepherd's steward: you never write code yourself; you only dispatch and remember.
+2. Input starting with `⟦` is not something the user said — it is a system event. In event-triggered runs, **do not emit user-facing text**: call `notify_user` when the user must be notified, `no_action` when there is nothing to do.
+3. Read the situation brief before every action; when routing is uncertain you must `ask_user` — never guess.
+4. Reports have exactly three parts, in a fixed format, kept short.
+5. The three autonomy levels (spec §6), and which matters must be put to the user.
+6. The bar for taking a note: "if the steward did not know this, would it dispatch wrongly, over-ask, or misspeak?" Only then is it noted; once noted, the user is told in the report; `worker_reported` and `inferred` sources must never enter the resident layer.
+7. Never conclude "this matter is finished" on the user's behalf.
 
-## 5. 事件处理管线
+## 5. The event-processing pipeline
 
-### 5.1 管线
+### 5.1 Pipeline
 
 ```
-events 批次（协议层）
-   │ 1. 去重落库、更新水位、回 events_ack          —— 协议层已验证
+events batch (protocol layer)
+   │ 1. dedup and persist to the ledger, advance the watermark, reply events_ack   —— verified at the protocol layer
    ▼
-reducer（确定性，一个 transactionSync）
-   │ 2. 更新 worker / thread / question / timeline / report
-   │ 3. 重算 thread 派生状态、unread
-   │ 4. 写 notification_intent 与 wake_request（持久队列）
+reducer (deterministic, one transactionSync)
+   │ 2. update worker / thread / question / timeline / report
+   │ 3. recompute thread derived state, unread
+   │ 4. write notification_intent and wake_request (durable queue)
    ▼
-调度（alarm，合并窗口 3 秒）
-   ├─▶ 通知意图 → outbound（确定性模板，§6）
-   └─▶ wake_request → harness.submit(...)（operationId 幂等）
+scheduler (alarm, 3-second merge window)
+   ├─▶ notification intents → outbound (deterministic templates, §6)
+   └─▶ wake_request → harness.submit(...) (operationId idempotent)
 ```
 
-第 4 步把「要做什么」写进队列，再由 alarm 取出执行。进程在任何一步崩溃，重启后队列里的行仍然在，执行是幂等的。
+Step 4 writes "what to do" into a queue, and the alarm later picks it up and executes it. If the process crashes at any step, the queued rows are still there after restart, and execution is idempotent.
 
-### 5.2 Thread 派生状态
+### 5.2 Thread derived state
 
-纯函数，**每次状态变化后重算，不由 LLM 或用户设置**（spec §5.2）：
+A pure function, **recomputed after every state change, never set by the LLM or the user** (spec §5.2):
 
 ```
-if 任一 worker.state ∈ {starting, running, recovering}      → running
-elif 存在 status=open 的 sh_question                         → waiting_you
-else                                                          → idle
-unread = 存在用户尚未查看的 report / question / error
+if any worker.state ∈ {starting, running, recovering}       → running
+elif an sh_question with status=open exists                 → waiting_you
+else                                                        → idle
+unread = there is a report / question / error the user has not yet viewed
 ```
 
-`lost` / `broken` 状态的 worker 不计入 running；`broken` 会产生一个 question（「怎么处理」）从而使 Thread 变为 `waiting_you`。
+Workers in the `lost` / `broken` states do not count as running; `broken` produces a question ("how to handle it"), which flips the Thread to `waiting_you`.
 
-### 5.3 事件规则表
+### 5.3 Event rules table
 
-| 事件 | reducer 动作 | 通知意图 | 唤醒总管 |
+| Event | Reducer action | Notification intent | Wake the steward? |
 |---|---|---|---|
-| `started` | worker→running | 无 | 否 |
-| `progress` | 更新 `lastEventAt` 与最近进展 | 无 | 否 |
-| `report` done | 记 `sh_report`、timeline | **`done` 汇报（确定性）**，3 秒合并窗口 | 是（普通优先级，做记账：摘要、笔记） |
-| `report` blocked / needs_decision | 记 report，创建 `sh_question` | 先不发，进入 **90 秒窗口**，期间由总管处理 | **是（高优先级）** |
-| `settled` error:auth | 创建 question | 立即推送（用户必须处理机器上的凭据） | 是 |
-| `settled` error:transient | timeline | 无（连接器自动续上） | 否 |
-| `settled` error:context | 创建 question 建议换新 session | 推送 | 是 |
-| `settled` unreported | 创建 question | 无 | 是（总管读最后一句话分类） |
-| `lost` / `resumed` | timeline | 无 | 否 |
-| `broken` | 创建 question | 推送 | 是 |
-| `external_activity` | timeline | 无 | 是（低优先级，更新摘要，合并窗口 10 分钟） |
-| 机器离线 / 上线 | 标记其上 worker 的 `unreachable` | 仅当有进行中任务受影响，去抖 2 分钟 | 否 |
-| 停滞（§8.4） | timeline | 汇报一次「X 已 N 分钟没有动静」 | 否 |
+| `started` | worker→running | none | no |
+| `progress` | Update `lastEventAt` and latest progress | none | no |
+| `report` done | Record `sh_report`, timeline | **`done` report (deterministic)**, 3-second merge window | yes (normal priority; bookkeeping: summary, notes) |
+| `report` blocked / needs_decision | Record the report, create an `sh_question` | Held at first — enters the **90-second window** for the steward to handle | **yes (high priority)** |
+| `settled` error:auth | Create a question | Push immediately (the user must fix credentials on the machine) | yes |
+| `settled` error:transient | timeline | none (the connector resumes automatically) | no |
+| `settled` error:context | Create a question suggesting a fresh session | push | yes |
+| `settled` unreported | Create a question | none | yes (the steward reads the last utterance and classifies it) |
+| `lost` / `resumed` | timeline | none | no |
+| `broken` | Create a question | push | yes |
+| `external_activity` | timeline | none | yes (low priority; update the summary; 10-minute merge window) |
+| Machine offline / online | Mark that machine's workers `unreachable` | Only when in-flight tasks are affected; 2-minute debounce | no |
+| Stall (§8.4) | timeline | Reports once: "X has shown no activity for N minutes" | no |
 
-**90 秒窗口**：`needs_decision` / `blocked` 的汇报先交给总管，让它按自主度第一档尝试自己回答事实性问题（`answer_worker`，必须带证据）。总管在窗口内调用 `ask_user`、`answer_worker` 或 `notify_user` 之一即视为已处理；窗口到期仍无动作（LLM 不可用、预算用尽、模型出错），核心**回退为确定性推送**，把 worker 的问题原样转给用户。这样「需要用户决策」永远不会因为 LLM 而丢失。
+**The 90-second window**: `needs_decision` / `blocked` reports go to the steward first, letting it try to answer factual questions itself per the first autonomy tier (`answer_worker`, evidence required). If the steward calls `ask_user`, `answer_worker`, or `notify_user` within the window, the report counts as handled; if the window expires with no action (LLM unavailable, budget spent, model error), the core **falls back to a deterministic push** and forwards the worker's question to the user verbatim. A pending user decision can therefore never get lost because of the LLM.
 
-### 5.4 唤醒文本
+### 5.4 Wake-up text
 
-多个事件在 3 秒内合并成一次唤醒，文本形如：
+Multiple events within 3 seconds merge into a single wake-up. The text looks like this (kept in Chinese — it is real input data; English gloss below):
 
 ```
 ⟦event⟧ thread=t_8f2 「登录 bug」
@@ -392,236 +392,236 @@ unread = 存在用户尚未查看的 report / question / error
 请做记账：更新摘要；如有值得记住的约定，走 notes_propose。无需再通知用户，除非有新的信息要补充。
 ```
 
-这种文本由核心生成，不由 LLM 生成，内容来自 `sh_report` 和 git 事实。
+This text is generated by the core, not by the LLM; its content comes from `sh_report` and git facts. (Gloss of the example: on thread t_8f2 「登录 bug」 ("login bug"), worker w_a1 (pi@mac-studio, write task) reports done — fixed the token-expiry-without-refresh issue; changes: 2 files including auth/session.ts, tests pass, branch shepherd/login-1, not pushed; decision: keep the session approach because…; leftovers: none. The user was already notified via the done-report template; the steward is asked to update the summary and to propose notes for any convention worth keeping, and not to notify the user again unless there is new information.)
 
-## 6. 通知与出站
+## 6. Notification and outbound
 
-### 6.1 出站队列
+### 6.1 The outbound queue
 
-所有发给用户的内容都经过 `sh_outbound`，由投递任务（alarm 驱动，指数退避重试）调用渠道适配器。每条出站消息有稳定 ID，重试不重复发送；成功后记录 `providerMsgId`，供「回复某条消息 → Thread」路由使用（§3.1）。
+Everything sent to the user goes through `sh_outbound`; a delivery task (alarm-driven, exponential-backoff retries) calls the channel adapter. Each outbound message has a stable ID, so retries never double-send; on success the `providerMsgId` is recorded for "reply to this message → Thread" routing (§3.1).
 
-### 6.2 谁能产生出站
+### 6.2 Who can produce outbound messages
 
-只有三个来源：
+Only three sources:
 
-1. **核心模板**：`done` 汇报、回退推送、停滞提醒、机器状态。内容来自数据，确定性生成，不依赖 LLM。
-2. **`notify_user` / `ask_user`**：总管显式调用。
-3. **用户消息的回复**：由用户消息触发的运行，其最终文字回复自动发出（`sh_run.kind = user`）。
+1. **Core templates**: `done` reports, fallback pushes, stall reminders, machine status. Content comes from data, generated deterministically, with no dependence on the LLM.
+2. **`notify_user` / `ask_user`**: explicit calls by the steward.
+3. **Replies to user messages**: in runs triggered by a user message, the final text reply is sent automatically (`sh_run.kind = user`).
 
-由事件、例程、跟进触发的运行，**总管的普通文字输出被丢弃**（记在对话里，不发给用户）。这是「默认安静」的结构保证。
+In runs triggered by events, routines, or follow-ups, **the steward's ordinary text output is discarded** (kept in the conversation, not sent to the user). That is the structural guarantee of "quiet by default".
 
-### 6.3 回复的获取
+### 6.3 Getting the reply
 
-用户消息的回复需要拿到运行的最终文字。`harness.wait(operationId)` 返回 `PiOperationResult { status, reason, text }`。做法：提交用户消息时写入 `sh_run(operationId, kind=user, replyTo=<渠道消息 ID>, status=open)`；一个 alarm 驱动的任务在存在未结算的 `sh_run` 期间每 2 秒检查一次，结算后写 `sh_outbound` 并标记完成。这依赖已验证的 `submit` 与 `PiHarness` 的 alarm 心跳；`wait` 本身只在类型声明中看到，需要原型验证。
+Replying to a user message requires the run's final text. `harness.wait(operationId)` returns `PiOperationResult { status, reason, text }`. The approach: when submitting a user message, write `sh_run(operationId, kind=user, replyTo=<channel message ID>, status=open)`; an alarm-driven task checks every 2 seconds while unsettled `sh_run` rows exist, and on settlement writes `sh_outbound` and marks it done. This relies on the already-verified `submit` and on `PiHarness`'s alarm heartbeat; `wait` itself has only been seen in type declarations and needs prototype validation.
 
-### 6.4 汇报格式与合并
+### 6.4 Report format and merging
 
-`notify_user` 的参数结构本身就是三段式（spec §7.5），并带 `tone`（success / attention / failure）：**色调由消息性质决定，与是否附带 needsYou 无关**——完成但附带小问题的汇报仍是成功色，用户扫一眼颜色就知道有没有出事（M1 原型实测后修正）。
+`notify_user`'s parameter structure is itself the three parts (spec §7.5), plus a `tone` (success / attention / failure): **the tone is decided by the nature of the message, independent of whether needsYou is attached** — a completion that comes with minor caveats still gets the success tone, so one glance at the color tells the user whether anything went wrong (corrected after live testing in the M1 prototype).
 
 ```
-conclusion   ≤ 80 字，一句话，成了还是没成
-did[]        ≤ 4 条，每条 ≤ 100 字
-needsYou?    ≤ 120 字
+conclusion   ≤ 80 chars, one sentence: succeeded or not
+did[]        ≤ 4 items, each ≤ 100 chars
+needsYou?    ≤ 120 chars
 ```
 
-超出长度的由工具拒绝并要求改写。链接（Thread 时间线）由系统附加，指向带一次性签名的网页地址。
+Over-length input is rejected by the tool with a demand to rewrite. The link (the Thread timeline) is appended by the system and points to a one-time-signed web URL.
 
-合并规则：同一个渠道内，`urgency: quiet` 的多条通知在 60 秒窗口内合并为一条；`urgency: push` 立即发送；`waiting_you` 相关的一律 `push`。
+Merging rules: within one channel, multiple `urgency: quiet` notifications merge into one over a 60-second window; `urgency: push` sends immediately; anything related to `waiting_you` is always `push`.
 
-### 6.5 用户查看与未读
+### 6.5 User views and unread
 
-用户在网页打开 Thread，或回复其汇报，清除 `unread`。卡片按钮点击视为已读加一次回复。
+Opening a Thread on the web, or replying to its report, clears `unread`. A card button click counts as both read and one reply.
 
-## 7. 自主度的落地
+## 7. Making autonomy concrete
 
-### 7.1 工具参数里的依据
+### 7.1 Basis in tool parameters
 
-会产生副作用的工具都带 `basis`，描述总管这样做的依据：
+Every side-effecting tool carries a `basis` describing what authorizes the steward's action:
 
-| `basis` | 含义 |
+| `basis` | Meaning |
 |---|---|
-| `user_explicit` | 用户明确说了要这样做 |
-| `user_reply_to` | 用户回复/点击了特定消息或按钮 |
-| `memory` | 依据笔记里的偏好或约定（`evidence` 为笔记 ID） |
-| `routine` / `followup` / `watch` | 来自用户之前创建的主动任务（`provenance` 为其 ID） |
-| `inferred` | 总管自己推断 |
+| `user_explicit` | The user explicitly asked for this |
+| `user_reply_to` | The user replied to / clicked a specific message or button |
+| `memory` | Based on a preference or convention in the notes (`evidence` is a note ID) |
+| `routine` / `followup` / `watch` | From a proactive task the user created earlier (`provenance` is its ID) |
+| `inferred` | Inferred by the steward itself |
 
-### 7.2 策略钩子
+### 7.2 Policy hooks
 
-`beforeTool` 钩子（pi-durable 的 `hook(ToolTask, { beforeTool })`）在工具执行前查表，返回 `{ block: "原因" }` 则模型看到拒绝理由：
+The `beforeTool` hook (pi-durable's `hook(ToolTask, { beforeTool })`) consults the table below before a tool runs; returning `{ block: "reason" }` lets the model see the rejection reason:
 
-| 动作 | 允许的 `basis` | 额外条件 |
+| Action | Allowed `basis` | Extra conditions |
 |---|---|---|
-| `start_worker` | 全部 | `provenance` 必填；仓库或机器有歧义（多个候选）时不允许 `inferred` |
-| `send_to_worker` | 全部 | 路由置信度低时不允许 |
-| `interrupt_worker` | `user_explicit`、`user_reply_to` | spec §6：中断必须先问用户或有明确指示 |
-| `answer_worker` | `memory`、`user_explicit` | `evidence` 必填 |
-| `create_routine` / `create_watch` | `user_explicit` | 必须关联创建它的用户消息 ID |
-| `resume_worker` | 全部 | 同一 worker 每小时自动续上 ≤ 2 次（与连接器一致） |
-| 范围扩大（派发超出用户原话的事） | 无 | 一律改为 `ask_user` |
+| `start_worker` | all | `provenance` required; `inferred` not allowed when the repo or machine is ambiguous (multiple candidates) |
+| `send_to_worker` | all | Not allowed when routing confidence is low |
+| `interrupt_worker` | `user_explicit`, `user_reply_to` | spec §6: an interrupt must first ask the user or follow an explicit instruction |
+| `answer_worker` | `memory`, `user_explicit` | `evidence` required |
+| `create_routine` / `create_watch` | `user_explicit` | Must reference the user message that created it |
+| `resume_worker` | all | Auto-resume of the same worker ≤ 2 times per hour (consistent with the connector) |
+| Scope expansion (dispatching beyond what the user literally said) | none | Always diverted to `ask_user` |
 
-`provenance` 规则（spec §8.3）：由事件触发的运行里调用 `start_worker`/`send_to_worker`，`provenance` 必须是一个存在的例程、跟进、巡视 ID 或用户消息 ID；为空一律拒绝。这使得总管无法「凭空」决定做事。
+The `provenance` rule (spec §8.3): in event-triggered runs, calling `start_worker`/`send_to_worker` requires a `provenance` that is an existing routine, follow-up, or watch ID, or a user message ID; an empty value is always rejected. This makes it impossible for the steward to decide to act "out of thin air".
 
-自主度开关（谨慎 / 平衡 / 放手）= 这张策略表的三套取值；MVP 只实现「平衡」，表结构为替换留好位置。
+The autonomy switch (cautious / balanced / hands-off) = three settings of this policy table; the MVP implements only "balanced", and the table structure leaves room for swapping in the others.
 
-## 8. 主动行为
+## 8. Proactive behavior
 
-### 8.1 数据
+### 8.1 Data
 
 ```
 sh_routine(routineId, createdFromMsg NOT NULL, schedule(cron|once), instruction,
            repoId?, threadId?, enabled, lastRunAt, lastResult)
-sh_watch(watchId, createdFromMsg NOT NULL, kind, spec, actionPolicy, enabled)   -- MVP 仅定义，事件源后续接入
+sh_watch(watchId, createdFromMsg NOT NULL, kind, spec, actionPolicy, enabled)   -- MVP: definition only; event sources wired up later
 sh_followup(followupId, threadId, dueAt, reason, createdBy: user|steward, sourceRef, status)
 ```
 
-`createdFromMsg` 非空是 spec「每个主动行为必须有出处」的数据层保证。
+A non-null `createdFromMsg` is the data-layer guarantee of the spec's rule that "every proactive behavior must have provenance".
 
-### 8.2 例程
+### 8.2 Routines
 
-- 创建：用户说「每个工作日早上 9 点……」，总管复述并确认后调用 `create_routine`。
-- 触发：用 Agents SDK 的 `this.schedule(cron, "fireRoutine", { routineId })`（cron 调度幂等）。触发后核心提交 `⟦routine R⟧ <指令>`，`operationId = routine:<id>:<fireTime>`，重复触发不会重复处理。
-- 总管收到后按指令执行，`provenance = routine:<id>`；没有要做的就 `no_action`。
+- Creation: the user says 「每个工作日早上 9 点……」 ("every workday at 9 a.m., …"); the steward repeats it back, confirms, then calls `create_routine`.
+- Triggering: via the Agents SDK's `this.schedule(cron, "fireRoutine", { routineId })` (cron scheduling is idempotent). On fire, the core submits `⟦routine R⟧ <instruction>` with `operationId = routine:<id>:<fireTime>`, so duplicate fires are never processed twice.
+- The steward executes per the instruction with `provenance = routine:<id>`; if there is nothing to do, `no_action`.
 
-### 8.3 跟进（自己给自己设闹钟）
+### 8.3 Follow-ups (setting an alarm for yourself)
 
-`set_followup(threadId, after, reason)`：写入 `sh_followup` 并 `schedule`。到期提交 `⟦followup F⟧`。总管可用来「两小时后再看一眼那个任务」。创建者是总管时，`sourceRef` 必须指向触发它的用户消息或例程。
+`set_followup(threadId, after, reason)`: writes `sh_followup` and calls `schedule`. When due, it submits `⟦followup F⟧`. The steward can use it to "take another look at that task in two hours". When the creator is the steward, `sourceRef` must point to the user message or routine that triggered it.
 
-### 8.4 停滞检测
+### 8.4 Stall detection
 
-每个 running 的 worker 对应一个 alarm：`lastEventAt + 20 分钟`（可配置）。事件到达就改写这个时间。到期且 worker 仍无任何事件 → 核心生成一次停滞通知（模板），并写 timeline；同一次停滞只通知一次，worker 再有事件后重置。`progress` 事件在连接器端已节流，所以持续 20 分钟完全无事件意味着 agent 卡在一个很长的工具调用上或进程已死，值得提醒。
+Every running worker gets an alarm at `lastEventAt + 20 minutes` (configurable). Every arriving event rewrites that time. If the alarm fires and the worker still has no events → the core emits one stall notification (template) and writes a timeline entry; a given stall notifies only once, and the timer resets once the worker emits again. `progress` events are already throttled on the connector side, so 20 straight minutes of total silence means the agent is stuck in a very long tool call or the process is dead — worth a nudge.
 
-### 8.5 建议新例程
+### 8.5 Suggesting new routines
 
-总管观察到重复模式（例如每周都让它查一次某事）时，可以**建议**创建例程：只发出建议并附按钮；用户确认（`user_reply_to`）后才调用 `create_routine`。
+When the steward notices a repeating pattern (e.g. being asked to check something every week), it may **suggest** creating a routine: it only sends the suggestion with a button; `create_routine` is called only after the user confirms (`user_reply_to`).
 
-### 8.6 默认什么都不做
+### 8.6 Default to doing nothing
 
-被唤醒后的默认结论是 `no_action`。每次主动唤醒都应有可审计的结果：`sh_routine.lastResult`、timeline 条目。
+The default conclusion after a wake-up is `no_action`. Every proactive wake-up should leave an auditable result: `sh_routine.lastResult`, a timeline entry.
 
-## 9. 通道：飞书
+## 9. Channels: Feishu
 
-### 9.0 接入与事件传输（依据 [飞书调研](../research/feishu-channel.md)，2026-10-14 实测修正）
+### 9.0 Onboarding and event transport (based on the [Feishu research](../research/feishu-channel.md); corrected against live tests on 2026-10-14)
 
-- **创建**：部署完成后，DO 调用飞书的应用注册设备流程（`POST accounts.feishu.cn/oauth/v1/app/registration`，`action=begin`、`archetype=PersonalAgent`），把返回的二维码链接展示在设置页；DO 用 alarm 按 `interval` 轮询 `action=poll`，成功后得到 `client_id`、`client_secret` 和扫码人的 `open_id`（`tenant_brand=lark` 时切到国际域名继续）。凭据加密存储，`open_id` 直接作为 owner。链接实测有效 1 小时、一次性。手动填 App ID 和 App Secret 作为兜底。
-- **入站传输有两种实现**，由适配器的配置选择：
-  1. `Webhook`（**MVP 默认**，实测可用）：飞书把事件 POST 到 `https://<自定义域名>/channels/feishu/events`，DO 完全休眠，只在有事件时被唤醒；实现只需 HTTP 端点加验签。切换条件：扫码补 `application:application:patch` 权限 → config PATCH（飞书自动做 URL 验证）→ **控制台重新发布版本**（实测 API `publish` 不能替代这一步）。国内用户必须使用自定义域名（`*.workers.dev` 对飞书服务器也不可达，实测）。
-  2. `LongConnection`（备选）：DO 作为客户端连飞书的长连接（protobuf 帧、分片合并、ping、确认帧），不需要控制台操作和公网地址，但出站 WebSocket 不能休眠（DO 常醒）且实现量大。
-- 国内网络下 `*.workers.dev` 不可用，用户访问网页、连接器连总管都需要自定义域名（或代理），见 spec §12。
+- **Creation**: after deployment, the DO calls Feishu's app-registration device flow (`POST accounts.feishu.cn/oauth/v1/app/registration`, `action=begin`, `archetype=PersonalAgent`) and shows the returned QR-code link on the settings page; the DO uses the alarm to poll `action=poll` at the `interval`, and on success obtains the `client_id`, `client_secret`, and the `open_id` of the user who scanned (switching to the international domain to continue when `tenant_brand=lark`). Credentials are stored encrypted, and the `open_id` serves directly as the owner. In live testing the link is valid for 1 hour and is one-time. Manually filling in the App ID and App Secret is the fallback.
+- **Inbound transport has two implementations**, selected by the adapter's configuration:
+  1. `Webhook` (**MVP default**, verified working): Feishu POSTs events to `https://<custom domain>/channels/feishu/events`; the DO sleeps entirely and is woken only when events arrive; the implementation is just an HTTP endpoint plus signature verification. Switching requires: granting the `application:application:patch` scope via a scan → config PATCH (Feishu automatically performs URL verification) → **republishing the version in the console** (live testing shows the API `publish` cannot replace this step). Mainland-China users must use a custom domain (`*.workers.dev` is unreachable even from Feishu's servers, verified in testing).
+  2. `LongConnection` (alternative): the DO connects as a client to Feishu's long connection (protobuf frames, shard reassembly, ping, ack frames); it needs no console operations and no public address, but an outbound WebSocket cannot sleep (the DO stays permanently awake), and the implementation effort is large.
+- On mainland networks `*.workers.dev` is unavailable; both the user reaching the web app and connectors reaching the steward need a custom domain (or a proxy); see spec §12.
 
-### 9.1 入站
+### 9.1 Inbound
 
-- 路径：`POST /channels/feishu/events`（由 Agent 的 `onRequest` 处理）。校验事件的 `token` 字段与存储的验证令牌一致（webhook 模式下事件体自带 `token`，卡片回调另有独立 `token`），处理 URL 验证握手（`url_verification` 回显 `challenge`），并按 OpenClaw 的做法拒绝时间戳偏差过大的请求。收到后**先持久化再返回 200**。
-- 去重：`sh_inbound(msgId)` 主键；重复的事件直接返回 200。飞书会重试事件，所以必须幂等。
-- 身份：只处理 owner 的**私聊**。owner 在首次扫码绑定时记录 `open_id`；其他来源一律忽略并记录。
-- 内容：文本、引用（父消息 ID，用于 §3.1 路由）、图片。图片由适配器经飞书 API 下载，缩放到协议的单消息上限内（协议文档 §6.2），作为 `images` 提交。
-- 提交：`harness.submit(text, { operationId: "user:" + msgId })`，同时写 `sh_run`。
-- 卡片按钮回调：转成带 `threadId` 的结构化输入，`basis = user_reply_to`。
+- Path: `POST /channels/feishu/events` (handled by the Agent's `onRequest`). Verify that the event's `token` field matches the stored verification token (in webhook mode the event body carries a `token`; card callbacks have a separate `token`), handle the URL-verification handshake (`url_verification` echoes the `challenge`), and — following OpenClaw's practice — reject requests whose timestamps deviate too far. **Persist first, then return 200.**
+- Dedup: `sh_inbound(msgId)` as primary key; duplicate events simply return 200. Feishu retries events, so this must be idempotent.
+- Identity: only the owner's **direct messages** are processed. The owner's `open_id` is recorded at first scan binding; every other source is ignored and logged.
+- Content: text, quotes (parent message ID, used for §3.1 routing), and images. The adapter downloads images via the Feishu API, scales them to within the protocol's per-message limit (protocol doc §6.2), and submits them as `images`.
+- Submit: `harness.submit(text, { operationId: "user:" + msgId })`, plus a row in `sh_run`.
+- Card button callbacks: converted into structured input carrying `threadId`, with `basis = user_reply_to`.
 
-### 9.2 出站
+### 9.2 Outbound
 
-- 访问令牌（`tenant_access_token`）缓存并由 alarm 刷新。
-- 发送文本或卡片；遵守长度和频率限制，失败走 §6.1 的重试。
-- `notify_user` 渲染成卡片：结论加粗，要点列表，需要用户决定时带按钮（选项来自 `ask_user.options`）。
+- The access token (`tenant_access_token`) is cached and refreshed by an alarm.
+- Sends text or cards; respects length and rate limits; failures retry via §6.1.
+- `notify_user` renders as a card: the conclusion in bold, a bullet list, and buttons when a user decision is needed (options from `ask_user.options`).
 
-### 9.3 适配器接口
+### 9.3 Adapter interface
 
-渠道是可替换的：
+Channels are replaceable:
 
 ```ts
 interface ChannelAdapter {
-  verifyAndParse(req: Request): Promise<InboundEvent | Response>;   // 校验、握手、去重键
+  verifyAndParse(req: Request): Promise<InboundEvent | Response>;   // verification, handshake, dedup key
   send(out: OutboundMessage): Promise<{ providerMsgId: string }>;
   fetchAttachment(ref: AttachmentRef): Promise<Uint8Array>;
 }
 ```
 
-飞书是第一个实现。「扫码创建」「长连接 / webhook」「卡片、回调、限流与消息长度」已有[调研](../research/feishu-channel.md)；其中同一用户 5 QPS、序列化消息 30 KB 上限已纳入 §6。仍未验证的点（扫码创建的应用能否改 webhook、是否需要发布审核、DO 托管长连接的稳定性、飞书到 Worker 的可达性）列在调研文档第 6 节。
+Feishu is the first implementation. "QR-code creation", "long connection vs webhook", and "cards, callbacks, rate limits, and message length" are already covered by [research](../research/feishu-channel.md); of these, the 5 QPS per user and the 30 KB serialized-message cap are folded into §6. Still-unverified points (whether a QR-created app can switch to webhook, whether a publish review is required, the stability of a DO-hosted long connection, and Feishu-to-Worker reachability) are listed in section 6 of the research doc.
 
-## 10. 网页读模型
+## 10. The web read model
 
-网页是配套详情页（spec §7.3），只读加少量管理动作，全部走记忆模块的 `views` 与管理接口：
+The web app is the companion detail view (spec §7.3): read-only plus a few management actions, all through the memory module's `views` and management interfaces:
 
-| 页面 | 来源 |
+| Page | Source |
 |---|---|
-| Thread 列表 | `threads.list`、`views.situation` |
-| 时间线 | `views.timeline` |
-| 原始过程 | 协议的 `history` 中继，不在 DO 存储 |
-| 记忆页 | `views.memoryPage`：按层列出，编辑、删除、固定走 `notes.*` |
-| 例程列表 | `sh_routine`，可暂停、删除 |
-| 机器管理 | 协议层的 device，可撤销 |
+| Thread list | `threads.list`, `views.situation` |
+| Timeline | `views.timeline` |
+| Raw transcripts | Relayed from the protocol's `history`; not stored in the DO |
+| Memory page | `views.memoryPage`: listed by layer; edit, delete, and pin go through `notes.*` |
+| Routine list | `sh_routine`; can be paused and deleted |
+| Machine management | Protocol-layer devices; revocable |
 
-登录由 IM 下发的一次性签名链接换取会话，另文设计。网页发出的写操作同样记入 `sh_note_log` / audit，保证「遗忘与变动对用户可见」。
+Login exchanges an IM-delivered one-time signed link for a session; it is designed in a separate document. Write operations issued from the web are likewise logged to `sh_note_log` / audit, keeping "forgetting and changes visible to the user".
 
-## 11. 一致性与幂等
+## 11. Consistency and idempotency
 
-两个存储（我们的表、pi-durable 的表）之间没有跨存储事务，所以靠**幂等键**和**持久队列**：
+There is no cross-store transaction between the two stores (our tables and pi-durable's tables), so we rely on **idempotency keys** and a **durable queue**:
 
-| 场景 | 幂等键 | 崩溃后的行为 |
+| Scenario | Idempotency key | Behavior after a crash |
 |---|---|---|
-| 飞书事件重试 | `sh_inbound.msgId`、`operationId=user:<msgId>` | 重复事件被丢弃 |
-| 连接器事件重传 | `(workerId, seq)`、`operationId=evt:<batch>` | 已验证：重传 3 次仍只有 1 条总管输入 |
-| 总管工具重放 | `cmdId = tool:<taskId>` | `unsafe` 工具不重跑；重放得到同一个命令 ID |
-| reducer 与唤醒之间崩溃 | `wake_request` 持久化，`operationId` 幂等 | 重启后从队列继续 |
-| 出站重试 | `sh_outbound.id` | 同一条只发一次，成功后记 `providerMsgId` |
-| 例程重复触发 | `routine:<id>:<fireTime>` | 去重 |
+| Feishu event retry | `sh_inbound.msgId`, `operationId=user:<msgId>` | Duplicate events dropped |
+| Connector event retransmission | `(workerId, seq)`, `operationId=evt:<batch>` | Verified: 3 retransmissions still produce only 1 steward input |
+| Steward tool replay | `cmdId = tool:<taskId>` | `unsafe` tools do not re-run; the replay yields the same command ID |
+| Crash between reducer and wake | `wake_request` persisted, `operationId` idempotent | Resumes from the queue after restart |
+| Outbound retry | `sh_outbound.id` | Each entry is sent only once; `providerMsgId` recorded on success |
+| Duplicate routine fire | `routine:<id>:<fireTime>` | Deduplicated |
 
-注意 pi-durable 的 `submit` 在提交成功后才返回，崩溃发生在「队列行已写、`submit` 未调用」之间时，队列行仍待处理，会再次调用，`operationId` 保证不重复。
+Note that pi-durable's `submit` returns only after the submission succeeds. If a crash happens between "queue row written" and "`submit` called", the row is still pending and will be submitted again; the `operationId` guarantees no duplication.
 
-## 12. 成本与降级
+## 12. Cost and degradation
 
-| 杠杆 | 做法 |
+| Lever | Approach |
 |---|---|
-| 少调用 LLM | 只有用户消息、需要判断的事件、例程、跟进才唤醒；`progress` 永不唤醒；3 秒合并窗口；`external_activity` 10 分钟窗口 |
-| 少用 token | 情况简报有字数预算；常驻层 2,400 字符、项目层 1,500 字符的硬上限；Thread 摘要 600 字符 |
-| 便宜的模型处理例行事件 | 后续可按输入类型选模型（用户消息用强模型，事件记账用便宜模型）。MVP 一个模型 |
-| 预算上限 | 日预算软上限：超出后事件不再唤醒总管，`done` 汇报与回退推送照常；用户消息仍处理，并提示预算状态 |
-| 无 LLM 也能用 | 核心模板保证 `done` 汇报、`needs_decision` 回退、停滞提醒、机器状态永远可发出 |
+| Call the LLM less | Wake only for user messages, events needing judgment, routines, and follow-ups; `progress` never wakes; 3-second merge window; `external_activity` 10-minute window |
+| Use fewer tokens | The situation brief has a character budget; hard caps of 2,400 characters (resident layer) and 1,500 (project layer); 600-character Thread summaries |
+| Cheap model for routine events | Later, model choice per input type (strong model for user messages, cheap model for event bookkeeping). One model in the MVP |
+| Budget cap | A soft daily budget: past it, events no longer wake the steward, while `done` reports and fallback pushes continue; user messages are still processed, with the budget state noted |
+| Works without the LLM | Core templates guarantee that `done` reports, the `needs_decision` fallback, stall reminders, and machine status can always be sent |
 
-## 13. 依赖的 API 与验证状态
+## 13. Depended-on APIs and verification status
 
-图例：✓ 已在协议原型中实测；◦ 仅见于文档或类型声明；？未验证。
+Legend: ✓ verified in the protocol spike; ◦ seen only in docs or type declarations; ? unverified.
 
-| 依赖 | 状态 |
+| Dependency | Status |
 |---|---|
-| `PiHarness.submit(text, { operationId, whenBusy })` 幂等 | ✓ |
-| 事件触发 `submit` 并在 DO 被重置后由 alarm 续跑 | ✓ |
-| `PiHarness.pending()`、`messages()` | ✓ |
-| `PiHarness.wait(operationId)` 返回最终文字 | ◦（类型声明） |
-| 扩展里 `defineTool`、`section`、`hook(ToolTask, beforeTool)` | ◦（pi-durable README、`pi-durable-edge` 示例） |
-| 工具里 `api.taskId` 在重放中稳定，可作幂等键 | ◦（README 例 22/23 的用法） |
-| `beforeRequest` 钩子只替换单次请求、不持久化 | ◦（README） |
-| 工具结果 `control.terminate` 结束本轮 | ◦（README） |
-| `input` 带自定义 `entry`（区分用户与事件） | ？`pi-durable@1.1.0` 类型不允许，仓库 README 允许；`PiHarness.submit` 不暴露。MVP 用内容标记 |
-| DO 的 SQLite 支持 FTS5、JSON 函数 | ◦（官方文档），含触发器同步的行为未验证 |
-| `ctx.storage.transactionSync` | ◦（DO 存储 API） |
-| `this.schedule(cron, ...)` 幂等 | ◦（Agents SDK 文档） |
-| 飞书：扫码创建（`registerApp` 设备流程） | ◦ 官方 SDK 源码；未实机扫码 |
-| 飞书：长连接协议、消息发送 / 回复 / 更新卡片、限流与长度 | ◦ 官方 SDK 源码与注释；未实机 |
-| 飞书：扫码创建的应用改 webhook、发布审核、个人账号限制、DO 内长连接稳定性 | ？未验证，见 [feishu-channel.md](../research/feishu-channel.md) §6 |
+| `PiHarness.submit(text, { operationId, whenBusy })` idempotent | ✓ |
+| Event-triggered `submit` resumes via alarm after the DO is reset | ✓ |
+| `PiHarness.pending()`, `messages()` | ✓ |
+| `PiHarness.wait(operationId)` returns the final text | ◦ (type declarations) |
+| `defineTool`, `section`, `hook(ToolTask, beforeTool)` in extensions | ◦ (pi-durable README, `pi-durable-edge` examples) |
+| `api.taskId` inside tools is stable across replays and usable as an idempotency key | ◦ (usage in README examples 22/23) |
+| The `beforeRequest` hook replaces only the single request and persists nothing | ◦ (README) |
+| A tool result's `control.terminate` ends the turn | ◦ (README) |
+| `input` with a custom `entry` (distinguishing user vs event) | ? `pi-durable@1.1.0` types disallow it, the repo README allows it; `PiHarness.submit` does not expose it. The MVP uses content markers |
+| DO SQLite supports FTS5 and JSON functions | ◦ (official docs); trigger-sync behavior unverified |
+| `ctx.storage.transactionSync` | ◦ (DO storage API) |
+| `this.schedule(cron, ...)` idempotent | ◦ (Agents SDK docs) |
+| Feishu: QR-code creation (`registerApp` device flow) | ◦ official SDK source; no live scan performed |
+| Feishu: long-connection protocol, message send / reply / card update, rate limits and lengths | ◦ official SDK source and comments; not exercised live |
+| Feishu: switching a QR-created app to webhook, publish review, personal-account limits, long-connection stability inside the DO | ? unverified; see [feishu-channel.md](../research/feishu-channel.md) §6 |
 
-## 14. MVP 范围与里程碑
+## 14. MVP scope and milestones
 
-| 里程碑 | 内容 | 验证方式 |
+| Milestone | Contents | How it is verified |
 |---|---|---|
-| M1 账本与核心 | 表结构、reducer、派生状态、出站队列、核心模板汇报、飞书收发（无 LLM，用固定指令词触发派发） | 单测 + 与协议原型的模拟连接器联调 |
-| M2 总管与路由 | `PiHarness` 总管、工具、策略钩子、`find_threads`、情况简报注入、`ask_user`、回复获取 | 路由评测集（§3.4） |
-| M3 笔记与遗忘 | 笔记两段式写入、分层、ChangeReport、maintenance | 笔记容量、冲突、降级的单测；人工评审 |
-| M4 主动行为 | 例程、跟进、停滞检测、90 秒窗口回退 | 故障注入：LLM 失败、DO 重置 |
-| M5 网页 | 时间线、记忆页、机器管理、一次性链接登录 | 手工 |
+| M1 Ledger and core | Table schemas, reducer, derived state, outbound queue, core-template reports, Feishu send/receive (no LLM; dispatch triggered by fixed command phrases) | Unit tests + joint debugging with a mock connector against the protocol spike |
+| M2 Steward and routing | `PiHarness` steward, tools, policy hooks, `find_threads`, situation-brief injection, `ask_user`, reply retrieval | The routing evaluation set (§3.4) |
+| M3 Notes and forgetting | Two-phase note writes, layering, ChangeReport, maintenance | Unit tests for note capacity, conflicts, and demotion; manual review |
+| M4 Proactive behavior | Routines, follow-ups, stall detection, the 90-second-window fallback | Fault injection: LLM failure, DO reset |
+| M5 Web | Timeline, memory page, machine management, one-time-link login | Manual |
 
-不包含：多租户、事件源（GitHub、CI 等）、语音、自主度开关、便宜模型分流、向量检索。
+Not included: multi-tenancy, event sources (GitHub, CI, etc.), voice, the autonomy switch, cheap-model routing, vector retrieval.
 
-## 15. 待决事项
+## 15. Pending decisions
 
-1. **`beforeRequest` 能否只在单次请求里追加情况简报。** 不行则改为输入前缀，代价是对话膨胀由压缩承担。
-2. **事件与用户消息的区分。** 内容标记够用但脆弱（用户消息里恰好出现 `⟦` 如何处理）：入站时转义用户文本里的标记字符。升级 pi-durable 到支持 `input.entry` 的版本后改用结构化条目。
-3. **90 秒窗口的长度**，以及总管在窗口内自己回答的比例，需要真实使用数据。
-4. **常驻层 2,400 字符、项目层 1,500 字符**是否合适，取决于笔记的实际形态。
-5. **笔记的 `lastUsedAt` 以「被装配进上下文」近似「被使用」**，可能高估；后续可以让总管在回复里标注引用了哪些笔记。
-6. **摘要重建频率**（每 10 次）是拍脑袋值。
-7. **Thread 数量增长后**，`findCandidates` 的召回策略（加向量或加分层）。
-8. **飞书适配**的未验证项（见调研 §6），以及企业微信。长连接放在 DO 里意味着 DO 常醒：时长费用仍在含量之内，但「休眠几乎不花钱」不再成立，需要在成本说明里写明。
-9. **多个 Thread 的同时汇报**怎么合并成一条，既要简短又不丢失每件事的三段，需要在真实卡片上试。
-10. **用户查看 Thread 的信号**如何可靠地得到（网页打开、回复、按钮），用于清除未读。
-11. **预算与用量**的计量来源：pi-durable 的 `pi.usage` 文档，总管的日用量如何汇总。
+1. **Whether `beforeRequest` can append the situation brief to the single request only.** If not, switch to an input prefix, at the cost of conversation growth that compaction has to absorb.
+2. **Distinguishing events from user messages.** Content markers work but are fragile (what if `⟦` happens to appear in a user message): escape the marker characters in user text on inbound. Once pi-durable is upgraded to a version supporting `input.entry`, switch to structured entries.
+3. **The length of the 90-second window**, and the share of questions the steward answers itself within it, need real usage data.
+4. **Whether 2,400 characters (resident layer) and 1,500 (project layer)** are right depends on what notes actually look like.
+5. **Approximating a note's "use" by "assembled into context" for `lastUsedAt`** may overcount; later, the steward could annotate which notes a reply cited.
+6. **The summary rebuild frequency** (every 10 updates) is a guess.
+7. **When Thread counts grow**, the recall strategy of `findCandidates` (add vectors or add tiering).
+8. **Feishu integration's** unverified items (see research §6), plus WeCom. Hosting the long connection inside the DO means the DO stays permanently awake: duration billing still falls within the included allowance, but "sleeping costs almost nothing" no longer holds, and this must be stated in the cost notes.
+9. **Simultaneous reports from multiple Threads**: how to merge them into one message that stays short without losing any matter's three parts needs to be tried on real cards.
+10. **The user-viewed-a-Thread signal**: how to capture it reliably (web open, reply, button) for clearing unread.
+11. **Budget and usage metering**: the pi-durable `pi.usage` docs, and how the steward's daily usage is aggregated.

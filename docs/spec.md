@@ -1,359 +1,359 @@
-# Shepherd 产品需求文档（Spec）
+# Shepherd Product Requirements Document (Spec)
 
-> 状态：草案 v0.1，产品讨论阶段的结论汇总。
-> 本文只定义**产品需求与边界**，不涉及具体技术实现方案。技术相关的假设与待验证项集中记录在「待验证事项」一节。
+> Status: draft v0.1, a consolidation of conclusions from the product discussion phase.
+> This document defines only **product requirements and boundaries** and does not cover specific technical implementation approaches. Technology-related assumptions and items to verify are collected in the "Items to Verify" section.
 
-## 1. 概述
+## 1. Overview
 
-Shepherd 是一个部署在 Cloudflare Durable Object 上、7×24 小时在线的个人 agent「总管」。
+Shepherd is a personal agent "steward" deployed on a Cloudflare Durable Object, online 24/7.
 
-它不亲自写代码。它的工作是：
+It does not write code itself. Its job is:
 
-1. 连接用户分散在不同机器上的编码 agent（Claude Code、Codex、pi 等）。
-2. 记住每件事分配给了哪台机器的哪个 agent、在哪个 session 中。
-3. 用户随时用一句话下达或追加任务，它路由到正确的地方。
-4. 事情有进展、完成、卡住时，简短地汇报给用户。
+1. Connect the coding agents scattered across the user's machines (Claude Code, Codex, pi, etc.).
+2. Remember which agent on which machine each matter was assigned to, and in which session.
+3. Let the user issue or append to a task at any time with a single sentence, and route it to the right place.
+4. Report briefly to the user when something progresses, completes, or gets stuck.
 
-产品基于 [pi-durable](https://github.com/earendil-works/pi)（`@earendil-works/pi-durable`）构建，以开源项目形式发布：用户 fork 之后一键部署到自己的 Cloudflare 账号，数据全部留在自己手里。
+The product is built on [pi-durable](https://github.com/earendil-works/pi) (`@earendil-works/pi-durable`) and released as an open-source project: users fork it and one-click deploy to their own Cloudflare account, with all data staying in their own hands.
 
-## 2. 目标用户与使用场景
+## 2. Target Users and Use Cases
 
-**目标用户**：已经在使用 Claude Code、Codex、pi 等编码 agent 的开发者，主要在手机上使用 Shepherd。
+**Target users**: developers already using coding agents such as Claude Code, Codex, and pi, who use Shepherd mainly on their phones.
 
-核心洞察：在电脑前，用户可以直接操作具体的 agent；不在电脑前时，用户希望对总管说一句话，事情就有人办，办完有人回报，而不必事无巨细地与 agent 交流。
+Core insight: at the computer, the user can operate a specific agent directly; away from the computer, the user wants to say one sentence to the steward, have the matter handled and get a report back when it is done, without going back and forth with an agent over every detail.
 
-典型场景：
+Typical scenarios:
 
-1. **派活**：「在 mac-studio 上让 claude code 把 xx 仓库的登录 bug 修了。」
-2. **续上之前的事**：隔天说「昨天那个登录 bug，补一下单测。」总管路由回对应的机器和 session。
-3. **被动汇报**：任务完成或卡住时，用户收到简短汇报。
-4. **查进度**：「现在各台机器上都在干嘛？」
-5. **干预**：「停掉那个」「改成用 pnpm」。
-6. **没有明确归属的新事**：总管挑合适的机器和 agent，或反问用户。
-7. **定时与巡视**：「每个工作日 9 点汇总昨晚各机器的进展」「帮我盯着 xx 仓库的 CI」。
+1. **Dispatching work**: "Have claude code fix the login bug in the xx repo on mac-studio."
+2. **Picking up an earlier matter**: the next day, say "About that login bug from yesterday, add unit tests." The steward routes back to the corresponding machine and session.
+3. **Passive reporting**: when a task completes or gets stuck, the user receives a brief report.
+4. **Checking progress**: "What are the machines all doing right now?"
+5. **Intervention**: "Stop that one." "Switch to pnpm instead."
+6. **New matters with no clear home**: the steward picks a suitable machine and agent, or asks the user back.
+7. **Scheduled tasks and patrols**: "Every workday at 9, summarize last night's progress across the machines." "Keep an eye on the CI of the xx repo for me."
 
-## 3. 设计原则
+## 3. Design Principles
 
-1. **总管不干活，只调度和记忆。** MVP 阶段总管不配备任何自己的执行环境（浏览器、沙箱、电话），所有执行都派给用户机器上的 agent。
-2. **宁可多问一次，也不要路由错。** 归属不确定时必须反问。
-3. **默认安静。** 只在完成、卡住、需要决策时打扰用户。
-4. **一切可追溯。** 任何一条汇报都能下钻到时间线，再到 agent 的原始过程。
-5. **主动行为必须有出处。** 总管的每个主动行为，都能追溯到用户说过的一句话。
-6. **记忆对用户可见、可控。** 记什么、忘什么，用户都能知道并干预。
+1. **The steward does no work itself; it only schedules and remembers.** In the MVP phase the steward has no execution environment of its own (browser, sandbox, phone); all execution is dispatched to agents on the user's machines.
+2. **Better to ask once more than to route wrongly.** When ownership is uncertain, it must ask back.
+3. **Quiet by default.** Disturb the user only on completion, when stuck, or when a decision is needed.
+4. **Everything is traceable.** Every report can be drilled down into the timeline, and from there into the agent's raw process.
+5. **Proactive behavior must have a source.** Every proactive action by the steward can be traced back to something the user said.
+6. **Memory is visible and controllable by the user.** What gets remembered and what gets forgotten — the user can see and intervene in both.
 
-差异化：Grok Bot、Dots 等产品把能力做在云端；Shepherd 的能力在**用户自己的机器上**，能访问真实的代码、文件、登录状态和本地环境。
+Differentiation: products like Grok Bot and Dots put their capabilities in the cloud; Shepherd's capabilities live **on the user's own machines**, with access to real code, files, logged-in state, and the local environment.
 
-## 4. 核心概念
+## 4. Core Concepts
 
-| 概念 | 定义 |
+| Concept | Definition |
 |---|---|
-| **Machine（机器）** | 用户的一台电脑，运行连接器后接入总管。有在线状态，以及能力声明（装了哪些 agent、有哪些仓库）。 |
-| **Thread（一件事）** | 用户心智里的「事」，是记忆与路由的核心单位。有目标、摘要、涉及的仓库与机器。 |
-| **Worker session** | 某个 agent 在某台机器上的一个具体会话，隶属于某个 Thread。一个 Thread 可以先后挂多个 session。 |
-| **Routine（例程）** | 用户交代过的、固定触发条件加固定动作的主动任务。 |
-| **Watch（巡视）** | 用户给了关注点，由总管判断是否需要处理的主动任务。 |
-| **Handoff brief（交接简报）** | 新 session 接手一件事时，总管提供的上下文摘要。 |
+| **Machine** | One of the user's computers, connected to the steward by running the connector. Has an online status and a capability declaration (which agents are installed, which repos exist). |
+| **Thread** | The "matter" in the user's mental model; the core unit of memory and routing. Has a goal, a summary, and the repos and machines involved. |
+| **Worker session** | A concrete session of a given agent on a given machine, belonging to a Thread. A Thread can have several sessions in succession. |
+| **Routine** | A proactive task the user has prescribed: a fixed trigger condition plus a fixed action. |
+| **Watch (patrol)** | A proactive task where the user states a concern and the steward decides whether it needs handling. |
+| **Handoff brief** | A context summary the steward provides when a new session takes over a matter. |
 
-## 5. Thread 与 Session
+## 5. Threads and Sessions
 
-### 5.1 一件事的单位
+### 5.1 The Unit of a Matter
 
-用户可见的单位是 **Thread**（目标），下挂多个 session。仓库和机器是路由的强线索：Thread 记录它涉及的仓库与机器，用户提到时先据此收窄候选，再按目标描述精确匹配。
+The unit visible to the user is the **Thread** (the goal), with multiple sessions attached under it. Repos and machines are strong routing signals: a Thread records the repos and machines it involves; when the user mentions them, candidates are narrowed down on that basis first, then matched precisely against the goal description.
 
-### 5.2 状态模型
+### 5.2 State Model
 
-Thread 只有三种**派生状态**，由系统根据事实推出，**不由用户手动操作**：
+A Thread has only three **derived states**, inferred by the system from facts and **never set manually by the user**:
 
-| 状态 | 判断依据 |
+| State | Basis |
 |---|---|
-| **进行中** | 有 worker 正在运行 |
-| **等你** | 有未回应的提问，或失败需要用户决定 |
-| **空闲** | 没有任何在跑或在等的东西 |
+| **In progress** | A worker is currently running |
+| **Waiting on you** | There is an unanswered question, or a failure that needs a user decision |
+| **Idle** | Nothing is running and nothing is waiting |
 
-另有一个**未读标记**：有用户还没看过的汇报。
+There is also an **unread flag**: there is a report the user has not yet seen.
 
-**没有显式的「已完成」状态。** 「做完了」只来源于 worker 自己的汇报，是一条事件，不是 Thread 的状态。总管不替用户下「这件事结束了」的结论。主视图按最近活动时间排序，旧的事自然沉下去。空闲的 Thread 随时可被追加指示并回到进行中，也始终可被路由命中（优先级随时间降低）。可选的手动归档仅作为清理工具。
+**There is no explicit "completed" state.** "Done" comes only from the worker's own report; it is an event, not a Thread state. The steward does not declare "this matter is over" on the user's behalf. The main view is sorted by recent activity, so old matters sink naturally. An idle Thread can receive further instructions at any time and return to in progress, and it always remains routable (with priority decaying over time). Optional manual archiving serves only as a cleanup tool.
 
-### 5.3 接力式上下文
+### 5.3 Relay-Style Context
 
-MVP 只支持**接力式**（A 做完，B 在其成果上继续）。并行拆分与对比式暂不支持。
+The MVP supports only the **relay style** (A finishes, B continues on top of A's results). Parallel splitting and comparison-style work are not supported yet.
 
-多个 session 之间**不共享对话上下文**，共享的是 Thread 层的交接简报和代码本身：
+Multiple sessions **do not share conversation context**; what is shared is the Thread-level handoff brief and the code itself:
 
-1. **能续就续。** 同一 agent、同一机器上的追加请求，resume 原 session。
-2. **需要新开 session 的情形**：换 agent、换机器、原 session 上下文臃肿、需要不带成见的新视角（如独立 review）。
-3. **新开时提供交接简报**，内容为：目标；已完成与当前状态；关键决定及原因；指针（分支、改动文件、关键 commit）；本次要做的事。简报放**指针而不是内容**，让新 agent 自己读代码与 diff。
-4. **简报素材来自 worker 自己的收尾报告**，要求每个 worker 在完成或暂停时给出结构化报告（做了什么、决定了什么、遗留什么、改动位置），总管收进 Thread 摘要，不靠猜。
+1. **Resume when possible.** Follow-up requests to the same agent on the same machine resume the original session.
+2. **Cases that need a new session**: switching agent, switching machine, a bloated original session context, or needing a fresh, unbiased perspective (e.g. an independent review).
+3. **Provide a handoff brief when starting new**, containing: the goal; what is done and the current state; key decisions and why; pointers (branch, changed files, key commits); what this session is to do. The brief carries **pointers, not content**, letting the new agent read the code and diff itself.
+4. **The brief's material comes from the worker's own wrap-up report**: every worker is required to produce a structured report when completing or pausing (what it did, what it decided, what is left, where the changes are), which the steward folds into the Thread summary rather than guessing.
 
-已知代价：简报有损；摘要多轮更新可能失真，需保留可回溯的原始过程；总管只知道 worker 汇报过的内容。
+Known costs: the brief is lossy; summaries revised over many rounds may drift, so the traceable raw process must be kept; the steward knows only what the worker has reported.
 
-## 6. 总管的自主度
+## 6. The Steward's Autonomy
 
-按「判断错了的代价」和「能否事后撤销」划线：
+Draw the line by "the cost of being wrong" and "whether it can be undone afterwards":
 
-| 档位 | 内容 |
+| Tier | Content |
 |---|---|
-| **自己决定，不打扰用户** | 重试（限次数）；有明确依据的选机器、选 agent（用户说过偏好，或只有一台机器有该仓库）；回答纯事实性的提问（测试命令是什么、文件在哪） |
-| **先做，汇报中说明** | 置信度较高的路由（汇报带一句「我把它接到了 xx」，让用户有机会纠正） |
-| **必须先问用户** | 路由置信度低、存在多个候选；涉及取舍和方向的提问（如「用 JWT 还是 session」）；中断正在运行的任务；任何超出用户原话范围的事 |
+| **Decides on its own, without disturbing the user** | Retries (limited count); machine or agent choice with clear grounds (the user stated a preference, or only one machine has the repo); answering purely factual questions (what the test command is, where a file is) |
+| **Acts first, explains in the report** | Higher-confidence routing (the report adds a line like "I hooked it up to xx", giving the user a chance to correct it) |
+| **Must ask the user first** | Low routing confidence with multiple candidates; questions involving trade-offs and direction (e.g. "JWT or session"); interrupting a running task; anything beyond the scope of the user's own words |
 
-关键规则：总管只回答它能从**用户说过的话或 Thread 记录**里找到依据的问题，找不到依据就转给用户。
+Key rule: the steward answers only questions for which it can find grounds in **what the user has said or the Thread records**; anything without grounds is passed to the user.
 
-MVP 先固定一档（平衡）；设计上预留「谨慎 / 平衡 / 放手」自主度开关，以及后续接入决策模型做审批判断的入口。
+The MVP fixes a single tier (balanced) for now; the design reserves an autonomy switch — "cautious / balanced / hands-off" — plus an entry point for plugging in a decision model for approval judgments later.
 
-子 agent 的权限策略：MVP 默认全自动（yolo），在 agent 适配层预留审批请求的钩子。
+Sub-agent permission policy: fully automatic (yolo) by default in the MVP, with a hook for approval requests reserved in the agent adaptation layer.
 
-## 7. 交互与界面
+## 7. Interaction and Interface
 
-### 7.1 主入口：与总管的一条持续对话
+### 7.1 Main Entry: One Continuous Conversation with the Steward
 
-用户始终面对同一个总管、同一条对话。下指令、听汇报、做纠正都在其中完成。Thread 在对话背后流转，用户不需要在多个聊天窗口间切换。汇报直接出现在这条对话里，不设单独的收件箱；需要用户处理的事通过推送与标记提醒。
+The user always faces the same steward and the same conversation. Giving instructions, hearing reports, and making corrections all happen there. Threads flow behind the conversation, and the user never switches between chat windows. Reports appear directly in this conversation — there is no separate inbox; items that need the user are surfaced through push and flags.
 
-### 7.2 渠道
+### 7.2 Channels
 
-- **第一个渠道：飞书。** 部署完成后生成二维码，用户扫码创建 bot。扫码者绑定为 owner，只响应其私聊。
-- 渠道抽象为适配器，后续可加企业微信、Telegram、Slack 等。
-- 汇报可做成**带按钮的卡片**，「等你」类决策直接点按钮。
-- 不自建原生 app，也不优先做 PWA。重要通知同样由 IM 承担，推送可靠性依赖 IM 平台。
+- **The first channel: Feishu.** After deployment completes, a QR code is generated and the user scans it to create a bot. The scanner is bound as the owner; only their direct messages are answered.
+- Channels are abstracted as adapters; WeCom, Telegram, Slack, etc. can be added later.
+- Reports can take the form of **cards with buttons**; "waiting on you" decisions become a single tap.
+- No native app of our own, and no PWA first either. Important notifications are likewise carried by the IM; push reliability depends on the IM platform.
 
-### 7.3 配套网页（详情页）
+### 7.3 Companion Web Pages (Detail Pages)
 
-聊天放不下的内容，点链接到网页查看。网页不是主入口：
+Content that does not fit in chat is viewed on the web via a link. The web is not the main entry:
 
-- Thread 时间线。
-- worker 的原始过程（只读）。
-- 记忆页（查看、编辑、删除、固定）。
-- 例程与巡视列表（查看、暂停、删除）。
-- 机器管理（配对、撤销）。
+- Thread timelines.
+- A worker's raw process (read-only).
+- Memory page (view, edit, delete, pin).
+- Routine and patrol list (view, pause, delete).
+- Machine management (pair, revoke).
 
-登录由 IM 解决：总管发出的链接带一次性签名，点开即登录。
+Login is handled by the IM: links the steward issues carry a one-time signature; opening one logs you in.
 
-### 7.4 可见性分层
+### 7.4 Visibility Layers
 
-| 层 | 内容 | 位置 |
+| Layer | Content | Where |
 |---|---|---|
-| L1 总览 | Thread 列表：标题、状态、机器与 agent、最近进展、未读标记 | 对话中按需查询，或网页 |
-| L2 时间线 | 一个 Thread 的摘要级事件 | 网页 |
-| L3 原始过程 | 某个 worker 的完整对话与工具调用 | 网页，只读，手机上降级处理 |
+| L1 Overview | Thread list: title, status, machine and agent, recent progress, unread flag | Queried on demand in the conversation, or the web |
+| L2 Timeline | Summary-level events of one Thread | Web |
+| L3 Raw process | One worker's full conversation and tool calls | Web, read-only, degraded on mobile |
 
-介入有两种：**经总管**（默认，记忆不断）和**直接对某个 worker 说话**（逃生通道）。直接介入期间的对话同样记入 Thread 时间线，总管作为旁观者持续更新摘要但不插手。手机上直接介入优先级最低。
+There are two ways to step in: **through the steward** (the default; memory stays unbroken) and **talking directly to a specific worker** (the escape hatch). Conversations during direct intervention are also recorded in the Thread timeline; the steward keeps updating the summary as a bystander but does not interfere. Direct intervention has the lowest priority on mobile.
 
-### 7.5 汇报格式
+### 7.5 Report Format
 
-固定三段，严格控制长度：
+A fixed three-part format, with length strictly controlled:
 
-1. **结论**：一句话，成了还是没成。
-2. **做了什么**：两到四条要点，包含改动位置与验证情况。
-3. **需要你做什么**：没有则不写。
+1. **Outcome**: one sentence — did it work or not.
+2. **What was done**: two to four bullets, covering where things changed and how they were verified.
+3. **What you need to do**: omitted when there is nothing.
 
-附「查看详情」入口。失败与卡住的汇报同样三段，结论直说，并给出建议动作（重试、换 agent、放弃）。短时间内多个任务完成时合并成一条。
+A "view details" entry is attached. Failure and stuck reports use the same three parts, state the outcome plainly, and suggest a next action (retry, switch agent, give up). When several tasks complete within a short window, they are merged into one report.
 
-示例：
+Example:
 
-> 登录 bug 已修复，测试通过。
-> - 问题在 `auth/session.ts`，token 过期后没有刷新
-> - 改了 2 个文件，新增 1 个测试
-> - 在 mac-studio 的 `fix/login` 分支，尚未推送
+> Login bug fixed, tests pass.
+> - The problem was in `auth/session.ts`: the token was not refreshed after expiring
+> - Changed 2 files, added 1 test
+> - On the `fix/login` branch on mac-studio, not pushed yet
 >
-> 需要你决定：是否推送并开 PR？
+> Your decision: push it and open a PR?
 
-### 7.6 推送策略
+### 7.6 Push Policy
 
-只推送「等你」和重要完成。普通进展只在对话中静默出现，不震动手机。
+Push only "waiting on you" and important completions. Ordinary progress appears silently in the conversation and does not buzz the phone.
 
-## 8. 主动行为
+## 8. Proactive Behavior
 
-### 8.1 唤醒来源（眼睛与耳朵）
+### 8.1 Wake-Up Sources (Eyes and Ears)
 
-| 来源 | 举例 | 阶段 |
+| Source | Examples | Phase |
 |---|---|---|
-| 时间 | 每个工作日 9 点做某事；总管给自己设的闹钟（「两小时后再看看那个任务」） | MVP |
-| 内部状态变化 | worker 完成、卡住、停滞、机器掉线 | MVP |
-| 外部事件 | GitHub 新 issue、CI 失败、邮件、日历 | 后续，逐个接入 |
-| 机器侧观察 | 用户在电脑上手动开了 agent 会话，连接器发现 | 后续，需确认可行性 |
+| Time | Do something every workday at 9; an alarm the steward sets for itself ("look at that task again in two hours") | MVP |
+| Internal state changes | A worker completes, gets stuck, or stalls; a machine goes offline | MVP |
+| External events | New GitHub issue, CI failure, email, calendar | Later, added one by one |
+| Machine-side observation | The user manually starts an agent session at the computer, and the connector notices | Later, feasibility to be confirmed |
 
-### 8.2 两种主动
+### 8.2 Two Kinds of Proactivity
 
-- **例程（Routine）**：用户定下的固定动作，如「每天早上 9 点让 Claude Code 在 xx 仓库跑依赖检查，有问题告诉我」。可预期，易信任。
-- **巡视（Watch）**：用户给关注点，总管判断是否处理，按第 6 节自主度分档。
+- **Routine**: a fixed action the user has set, e.g. "Every morning at 9, have Claude Code run a dependency check in the xx repo and tell me if anything comes up." Predictable, easy to trust.
+- **Watch (patrol)**: the user states a concern, and the steward decides whether to act on it, tiered by the autonomy rules in Section 6.
 
-**醒来后的默认结论是什么都不做。** 否则主动性会变成噪音。
+**The default conclusion upon waking is to do nothing.** Otherwise proactivity becomes noise.
 
-### 8.3 授权边界
+### 8.3 Authorization Boundary
 
-总管的每个主动行为都必须能追溯到用户说过的话（例程、巡视，或对已交代任务的跟进）。总管可以**建议**新的例程，但创建需用户同意。
+Every proactive action by the steward must be traceable to something the user said (a routine, a patrol, or follow-up on an already-assigned task). The steward may **suggest** new routines, but creating one requires the user's consent.
 
-创建方式：用对话（「每个工作日早上 9 点，汇总昨晚各机器的进展发给我」），总管复述确认后保存；网页提供列表用于查看、暂停、删除。
+How they are created: through conversation ("Every workday at 9 in the morning, summarize last night's progress across the machines and send it to me"); the steward repeats it back for confirmation and saves it. The web provides a list for viewing, pausing, and deleting.
 
-### 8.4 MVP 范围
+### 8.4 MVP Scope
 
-停滞提醒与机器状态通知（与用户任务相关时）属于「对已交代的事负责」，纳入 MVP。定时例程是刚需，需尽早设计。事件触发与机器侧观察放到后续。
+Stall reminders and machine-status notifications (when related to the user's tasks) count as "staying responsible for assigned matters" and are in the MVP. Scheduled routines are a hard requirement and must be designed early. Event triggers and machine-side observation are deferred.
 
-## 9. 机器离线与恢复
+## 9. Machine Offline and Recovery
 
-核心：**把「机器暂时不在」和「任务失败」区分开。**
+The core idea: **distinguish "the machine is temporarily away" from "the task failed".**
 
-| 情形 | 处理 |
+| Situation | Handling |
 |---|---|
-| 派发时机器离线 | 立即告知用户，给出选择：等它上线后自动开始，或换一台有该仓库的机器。不替用户默默决定。选择等待则任务排队，上线时自动执行并通知 |
-| 任务进行中掉线 | worker 标记为「失联」，不是失败。总管不重试也不宣布失败，等待；失联过久才在汇报中提醒 |
-| 机器回来 | 连接器上报仍在运行与已结束的任务，总管对账。仍在跑则恢复；已结束则补收结果；中断则**自动尝试续上原 session，续不上再问用户** |
+| Machine offline at dispatch time | Tell the user immediately and offer the choice: start automatically once it comes back online, or switch to another machine that has the repo. Never decide silently for the user. If the user chooses to wait, the task is queued and runs automatically on reconnect, with a notification |
+| Connection drops mid-task | The worker is marked "lost contact", not failed. The steward neither retries nor declares failure; it waits, and only mentions it in a report if the loss of contact drags on |
+| The machine comes back | The connector reports tasks still running and tasks already finished, and the steward reconciles. Still running: resumed. Finished: results collected late. Interrupted: **automatically try to resume the original session, and ask the user only if that fails** |
 
-记忆中保留各机器的在线习惯（常在线 vs 常离线）。MVP 仅记录，派长任务时的自动选择后续再做。
+Memory keeps each machine's online habits (usually online vs. usually offline). The MVP only records this; automatic selection when dispatching long tasks comes later.
 
-## 10. 记忆
+## 10. Memory
 
-记忆是总管最大的价值，也是最需要迭代的部分，因此**作为独立模块**，总管其余部分仅通过窄接口使用它，不关心内部存储、检索与遗忘策略。
+Memory is the steward's greatest value and the part most in need of iteration, so it is **a standalone module**: the rest of the steward uses it only through a narrow interface and does not care about internal storage, retrieval, or forgetting policy.
 
-### 10.1 记什么
+### 10.1 What to Remember
 
-原则：**只记会影响调度决策的东西。** 试金石：如果总管不知道这个，它会派错、问多、或说错话吗？会就记。
+Principle: **remember only what affects scheduling decisions.** Litmus test: if the steward did not know this, would it dispatch wrongly, ask too much, or say something wrong? If yes, remember it.
 
-| 类别 | 内容 | 写入方 |
+| Category | Content | Written by |
 |---|---|---|
-| 事务 | Thread、session 映射、进展摘要、用户指示 | 系统 |
-| 环境 | 机器、已装 agent、仓库路径、机器在线习惯 | 连接器上报，自动更新 |
-| 项目约定 | 「这个仓库用 pnpm」「测试命令是 xx」 | 从用户指示与 worker 汇报中提炼 |
-| 用户偏好 | 「重构类的活给 Codex」「汇报要简短」 | 从用户的话中提炼 |
+| Work items | Threads, session mappings, progress summaries, user instructions | System |
+| Environment | Machines, installed agents, repo paths, machine online habits | Connector reports, auto-updated |
+| Project conventions | "This repo uses pnpm", "the test command is xx" | Distilled from user instructions and worker reports |
+| User preferences | "Give refactoring work to Codex", "keep reports short" | Distilled from the user's words |
 
-「人和事的线索」（通用个人知识库）**不做**，边界要守住。纯聊天不建 Thread、不进长期记忆，除非用户明说「记住」。
+"Clues about people and matters" (a general-purpose personal knowledge base) is explicitly **out of scope**; hold the boundary. Pure chat creates no Thread and enters no long-term memory unless the user explicitly says "remember this".
 
-### 10.2 分层与遗忘
+### 10.2 Layers and Forgetting
 
-| 层 | 内容 | 遗忘规则 |
+| Layer | Content | Forgetting rules |
 |---|---|---|
-| 常驻层 | 用户偏好、全局约定，约一两千字 | **硬上限**，写满必须淘汰最不重要的；每次对话都可见 |
-| 项目层 | 每个仓库的约定与笔记 | 仅涉及该仓库时加载；每个仓库各有小上限；长期不被用到的条目自动降级到归档层 |
-| 归档层 | Thread 完整历史、旧条目 | 不常驻，按需检索；不删除，只沉底 |
+| Resident layer | User preferences, global conventions, about one to two thousand characters | **Hard cap**: when full, the least important entries must be evicted; visible in every conversation |
+| Project layer | Conventions and notes for each repo | Loaded only when that repo is involved; a small cap per repo; entries unused for a long time are demoted automatically to the archive layer |
+| Archive layer | Full Thread history, old entries | Not resident; retrieved on demand; never deleted, only sinks |
 
-遗忘的三个触发：
+Three triggers for forgetting:
 
-1. **容量压力**：写新的就得淘汰旧的，总管自己选，并告知用户「为了腾位置，我忘掉了 xx」。
-2. **冲突覆盖**：新信息与旧条目矛盾时，新的取代旧的，旧的保留历史版本。
-3. **长期未被用到**：降级到归档层。
+1. **Capacity pressure**: writing something new requires evicting something old. The steward chooses and tells the user, "to make room, I forgot xx".
+2. **Conflict override**: when new information contradicts an old entry, the new replaces the old, and the old is kept as a historical version.
+3. **Unused for a long time**: demoted to the archive layer.
 
-用户可以**固定（pin）**条目，被固定的条目不参与自动淘汰。
+The user can **pin** entries; pinned entries are exempt from automatic eviction.
 
-### 10.3 可见与可控
+### 10.3 Visible and Controllable
 
-- 总管提炼出新记忆时，在汇报中带一句「已记住：xx」，用户不满意可当场纠正。静默记忆不可接受。
-- 提供记忆页：按类别列出所有条目，可编辑、删除、固定。
-- 每条记忆带**来源**（哪次对话、谁说的）和**日期**；区分「用户亲口说的」与「从 agent 汇报或外部内容推断的」，后者权重较低、升级为常驻需用户确认，以防记忆投毒。
-- 环境类记忆以连接器实时上报为准；约定与偏好类在与当前事实冲突时，以事实为准并更新记忆。
+- When the steward distills a new memory, the report includes a line "remembered: xx"; the user can correct it on the spot if unsatisfied. Silent memory is unacceptable.
+- A memory page is provided: all entries listed by category, editable, deletable, pinnable.
+- Every memory carries a **source** (which conversation, who said it) and a **date**; "said by the user in person" is distinguished from "inferred from agent reports or external content" — the latter weighs less and needs user confirmation before promotion to the resident layer, to guard against memory poisoning.
+- Environment memories defer to the connector's real-time reports; when conventions or preferences conflict with current facts, facts win and the memory is updated.
 
-### 10.4 模块边界（职责，不定实现）
+### 10.4 Module Boundary (Responsibilities, Not Implementation)
 
-| 能力 | 调用方 |
+| Capability | Caller |
 |---|---|
-| 取上下文（常驻内容 + 与当前话题相关的项目记忆） | 每次对话开始 |
-| 查找（这句话可能属于哪个 Thread，返回候选与置信度） | 路由 |
-| 记下（内容、类别、来源、置信度；由模块决定存哪、是否淘汰旧条目） | 总管提炼出新信息时 |
-| 更新或作废 | 发现冲突、用户纠正时 |
-| 管理（列出、编辑、删除、固定） | 记忆页 |
-| 报告变动（淘汰了什么、降级了什么） | 模块主动告知，由总管转告用户 |
+| Get context (resident content + project memory relevant to the current topic) | At the start of every conversation |
+| Find (which Thread this utterance may belong to; returns candidates and confidence) | Routing |
+| Record (content, category, source, confidence; the module decides where it is stored and whether old entries are evicted) | When the steward distills new information |
+| Update or invalidate | On conflict discovery or user correction |
+| Manage (list, edit, delete, pin) | Memory page |
+| Report changes (what was evicted, what was demoted) | The module reports proactively; the steward relays it to the user |
 
-Thread 与 worker 的记录属于记忆模块的一部分，与背景记忆统一管理。具体设计见 [design/steward.md](design/steward.md)。
+Thread and worker records are part of the memory module and are managed together with background memory. For the detailed design see [design/steward.md](design/steward.md).
 
-## 11. 并发与隔离
+## 11. Concurrency and Isolation
 
-同一个仓库同时有多件事时，**改动类任务默认各用独立的 git worktree**，对用户完全隐藏该细节：
+When several matters run at the same time on the same repo, **each change-making task defaults to its own git worktree**, with the detail entirely hidden from the user:
 
-- 并行成为安全的默认选项，适合在手机上随手派活。
-- 与接力式兼容：后一个 session 可从前一个的分支继续。
-- 汇报自然带分支信息。
-- 允许按仓库配置为「串行」或「直接在主目录工作」，适应不适合 worktree 的项目。
-- 任务结束后 worktree 保留，直到用户确认合并或手动清理。
+- Parallelism becomes a safe default, suited to dispatching work casually from a phone.
+- Compatible with the relay style: a later session can continue from the earlier one's branch.
+- Reports naturally carry branch information.
+- A repo can be configured as "serial" or "work directly in the main checkout", for projects where worktrees do not fit.
+- After a task ends, the worktree is kept until the user confirms the merge or cleans it up manually.
 
-**只读任务**（调研、问答、review）不隔离。总管派发时区分两者，拿不准按「会改动」处理。
+**Read-only tasks** (research, Q&A, review) are not isolated. The steward tells the two apart at dispatch time; when unsure, it treats the task as "will make changes".
 
-## 12. 上手、安全与成本
+## 12. Onboarding, Security, and Cost
 
-### 12.1 上手流程
+### 12.1 Onboarding Flow
 
-1. 点 Deploy 部署到 Cloudflare，填入模型 API key。**中国大陆用户还需要给 Worker 绑定自定义域名**：`*.workers.dev` 在国内被封（已在本机实测），用户访问网页、连接器连接总管都会失败。
-2. 部署完成，出现二维码，用飞书扫码创建 bot，扫码者成为 owner（基于飞书官方的应用注册设备流程，见 [research/feishu-channel.md](research/feishu-channel.md)）。
-3. 在对话中，总管给出一条命令；在要接入的电脑终端粘贴运行，机器即出现在总管处。
-4. （加分项）总管探测该机器的 agent 与仓库，引导派第一个任务。
+1. Click Deploy to deploy to Cloudflare and fill in the model API key. **Users in mainland China must additionally bind a custom domain to the Worker**: `*.workers.dev` is blocked in mainland China (verified on this machine), which breaks both the user's access to the web pages and the connector's connection to the steward.
+2. When deployment completes, a QR code appears; scan it with Feishu to create a bot, and the scanner becomes the owner (based on Feishu's official app-registration device flow; see [research/feishu-channel.md](research/feishu-channel.md)).
+3. In the conversation, the steward gives a command; paste and run it in a terminal on the computer to connect, and the machine shows up with the steward.
+4. (Nice to have) The steward probes that machine's agents and repos and walks the user through dispatching the first task.
 
-MVP 做到第 3 步。
+The MVP goes up to step 3.
 
-### 12.2 安全
+### 12.2 Security
 
-连接器等于一个远程代码执行入口，且默认全自动，必须从一开始就按安全问题设计：
+The connector is effectively a remote-code-execution entry point and is fully automatic by default, so it must be designed as a security problem from the start:
 
-- **身份**：由飞书账号体系承担，只响应 owner 的私聊。
-- **机器配对**：命令内含一次性配对码，用过即失效；每台机器有独立凭据，可在网页单独撤销。
-- **网页访问**：由 IM 下发的一次性签名链接登录。
-- **模型 key**：加密存放在用户自己的 Cloudflare 账号中，不经过第三方。
-- 外部来源的内容（agent 汇报、未来的外部事件）不被当作可信指令。
+- **Identity**: carried by the Feishu account system; only the owner's direct messages are answered.
+- **Machine pairing**: the command embeds a one-time pairing code that expires once used; each machine has its own credentials, revocable individually on the web.
+- **Web access**: login via one-time signed links issued through the IM.
+- **Model keys**: stored encrypted in the user's own Cloudflare account, never passing through a third party.
+- Content from external sources (agent reports, future external events) is never treated as a trusted instruction.
 
-### 12.3 成本透明
+### 12.3 Cost Transparency
 
-总管大部分时间应休眠、不产生费用。文档需明确说明 Cloudflare 侧的费用量级，以及模型调用成本的驱动因素（对话次数、摘要生成），避免用户被账单吓到。
+The steward should be dormant, costing nothing, most of the time. The documentation must clearly state the order of magnitude of Cloudflare-side costs and the drivers of model-call cost (conversation count, summary generation), so users are not startled by the bill.
 
-## 13. 总管的能力边界
+## 13. The Steward's Capability Boundaries
 
-- 总管自己只用语言能力回答简单问题（常识、翻译、解释报错）。
-- 需要真正执行的事，一律派发给用户机器上的 agent。
-- MVP 不给总管配任何自己的执行环境。云端浏览器仅作为后续可选能力，用于不需要登录的公开网页轻量查询；打电话明确不在近期范围。
-- 只有派发了 agent 的事才建 Thread。
+- The steward itself answers simple questions with language ability alone (common sense, translation, explaining error messages).
+- Anything that truly needs execution is always dispatched to agents on the user's machines.
+- The MVP gives the steward no execution environment of its own. A cloud browser is only an optional later capability for lightweight queries on public pages that need no login; phone calls are explicitly out of near-term scope.
+- A Thread is created only for matters dispatched to an agent.
 
-## 14. MVP 范围
+## 14. MVP Scope
 
-**包含**
+**Included**
 
-- 单租户部署（每个部署只服务一位用户）。
-- 飞书渠道（扫码创建 bot、卡片、推送）。
-- 机器配对与连接器，支持至少一种 agent。接入顺序为 **pi → Claude Code → Codex**（Codex 待在本机核实后再定）。pi 的对接见 [调研](research/pi-integration.md) 与 [设计](design/connector-pi.md)。
-- 被驱动的 agent 必须已在该机器上安装并登录，Shepherd 不接触 agent 的账号凭据。
-- 总管只管理它自己启动的会话；用户手动启动的会话不被监控，但再次拉起前会检测外部改动。
-- Thread / session 的记忆与路由，接力式交接简报。
-- 汇报三段式，「等你」状态与未读标记。
-- 失联与恢复处理。
-- 记忆模块（分层、遗忘、可见可控）。
-- 改动类任务的 worktree 隔离。
-- 定时例程、停滞提醒、机器状态通知。
-- 配套网页：时间线、原始过程（只读）、机器管理，其余页面后补。
+- Single-tenant deployment (each deployment serves one user).
+- Feishu channel (QR-code bot creation, cards, push).
+- Machine pairing and the connector, supporting at least one agent. The onboarding order is **pi → Claude Code → Codex** (Codex to be confirmed on this machine before it is finalized). For the pi integration see the [research](research/pi-integration.md) and the [design](design/connector-pi.md).
+- The driven agent must already be installed and logged in on that machine; Shepherd never touches the agent's account credentials.
+- The steward manages only the sessions it started itself; sessions the user starts manually are not monitored, but external changes are detected before one is spun up again.
+- Thread / session memory and routing, relay-style handoff briefs.
+- Three-part reports, the "waiting on you" state, and unread flags.
+- Lost-contact and recovery handling.
+- Memory module (layers, forgetting, visible and controllable).
+- Worktree isolation for change-making tasks.
+- Scheduled routines, stall reminders, machine-status notifications.
+- Companion web pages: timeline, raw process (read-only), machine management; the remaining pages come later.
 
-**暂不包含**
+**Not included for now**
 
-- 多用户 / 多租户。
-- 并行拆分、对比式协作、agent 间互相 review。
-- 事件触发与外部系统接入。
-- 机器侧观察用户手动启动的会话。
-- 总管自己的执行环境（浏览器、沙箱、电话）。
-- 原生 app、PWA。
-- 自主度开关、审批决策模型（仅预留入口）。
-- 跨机器文件同步、复杂任务编排、计费。
+- Multi-user / multi-tenant.
+- Parallel splitting, comparison-style collaboration, agents reviewing each other.
+- Event triggers and integration with external systems.
+- Machine-side observation of sessions the user starts manually.
+- The steward's own execution environment (browser, sandbox, phone).
+- Native app, PWA.
+- Autonomy switch, approval decision model (only the entry point is reserved).
+- Cross-machine file sync, complex task orchestration, billing.
 
-## 15. 待讨论事项
+## 15. Open Questions
 
-1. **其余 agent 的对接能力。** pi 已调研（见 [research/pi-integration.md](research/pi-integration.md)）；Claude Code 的命令行有 `--resume`、`stream-json` 输入输出等选项，但运行中插话是否生效、能否得到结构化汇报尚未验证；Codex 本机未安装，未调研。各 agent 通过能力声明表达差异，产品承诺按最小共同能力撰写（见 [design/connector-pi.md](design/connector-pi.md) 第 3 节）。
-2. **输入形态。** 语音、图片、文件（如截图报 bug 直接派发）。
-3. **成本与用量可见性、预算上限。**
-4. **隐私与数据边界。** 代码内容是否经过云端，汇报能否带代码片段。
-5. **多用户的远期形态。**
-6. **人设与说话风格。**
+1. **Integration capability of the other agents.** pi has been researched (see [research/pi-integration.md](research/pi-integration.md)); the Claude Code CLI has options such as `--resume` and `stream-json` input/output, but whether interjecting mid-run takes effect and whether a structured report can be obtained are unverified; Codex is not installed on this machine and has not been researched. Agents express their differences through capability declarations, and product promises are written against the smallest common capability (see Section 3 of [design/connector-pi.md](design/connector-pi.md)).
+2. **Input forms.** Voice, images, files (e.g. dispatch a bug straight from a screenshot).
+3. **Cost and usage visibility, budget caps.**
+4. **Privacy and data boundaries.** Whether code content passes through the cloud; whether reports may carry code snippets.
+5. **The long-term shape of multi-user support.**
+6. **Persona and speaking style.**
 
-## 16. 待验证事项（技术假设）
+## 16. Items to Verify (Technical Assumptions)
 
-以下是讨论过程中形成的假设，尚未验证，**不属于产品需求**，仅作记录：
+The following are assumptions formed during discussion, not yet verified. They are **not product requirements** and are recorded here only for reference:
 
-- pi-durable 提供 Cloudflare Durable Object 存储（`openDurableObjectSqliteStorage`）、可持久的 document 与 task、按 `requestId` 幂等的提交、后台子 agent 与回报模式（见 pi 仓库 `packages/durable` 的 README 与例 23）。记忆与派发预计可基于这些原语实现。
-- task 如何等待**外部事件**（连接器回报）：spec 中未找到现成原语，需原型验证，可能的路径包括基于 document 变化的等待，或把远程 worker 建模为代理会话。
-- pi 侧的大部分假设已在本机验证，见 [research/pi-integration.md](research/pi-integration.md) 与 [spikes/pi-rpc](../spikes/pi-rpc)：运行中插话、中止、杀进程后续会话、注入汇报工具、强制补报、只读限制均成立。
-- 连接器与 DO 的长连接是否支持休眠，以及休眠后 task 能否被 alarm 唤醒。
-- 派发工具涉及外部副作用，崩溃重放时必须避免重复派发，需要幂等键。
-- 飞书「扫码创建机器人」的实际能力与权限范围，个人账号能否创建。
-- 各编码 agent 能否以独立于连接器的方式运行，以降低「失联」变成「中断」的概率。
-- Claude Code、Codex、pi 的 resume 与外部驱动能力。
-- 项目名 Shepherd 的 npm、GitHub、域名重名情况尚未检查。
+- pi-durable provides Cloudflare Durable Object storage (`openDurableObjectSqliteStorage`), persistable documents and tasks, idempotent commits keyed by `requestId`, and background sub-agents with a report-back pattern (see the README and Example 23 of `packages/durable` in the pi repo). Memory and dispatch are expected to be built on these primitives.
+- How a task waits for an **external event** (the connector reporting back): no ready-made primitive was found in the spec; it needs prototype validation. Possible paths include waiting based on document changes, or modeling the remote worker as a proxy session.
+- Most pi-side assumptions have been verified on this machine; see [research/pi-integration.md](research/pi-integration.md) and [spikes/pi-rpc](../spikes/pi-rpc): interjecting mid-run, aborting, resuming a session after the process is killed, injecting a reporting tool, forcing a catch-up report, and read-only restrictions all hold.
+- Whether the long connection between the connector and the DO supports hibernation, and whether a task can be woken by an alarm after hibernating.
+- The dispatch tool has external side effects; crash replay must avoid duplicate dispatches, so an idempotency key is needed.
+- The actual capability and permission scope of Feishu's "scan QR code to create a bot", and whether a personal account can create one.
+- Whether each coding agent can run independently of the connector, to reduce the chance of "lost contact" turning into an "interrupt".
+- The resume and external-drive capabilities of Claude Code, Codex, and pi.
+- Name collisions for the project name Shepherd on npm, GitHub, and domains have not been checked yet.
 
-## 17. 参考
+## 17. References
 
-- Grok Bot（xAI）：以命名 Bot 名册为中心，配置靠对话，任务细节放右侧栏，Bot 可按描述互相路由。
-- Dots（OpenAI）：每个 dot 有自己的云端电脑，可随时打开查看；入口复用现有聊天界面；后台主动调研默认只读。
-- Hermes Agent（Nous Research）：核心记忆有硬容量上限，写满即淘汰；常驻记忆小而高价值，旧内容通过检索按需召回；存在记忆投毒风险。
-- Cloudflare：Browser Run、Sandboxes / Containers、`@cloudflare/computer`、`@cloudflare/voice`（电话线路需第三方）。
+- Grok Bot (xAI): centered on a roster of named bots, configured through conversation, task details in a side panel; bots can route to each other by description.
+- Dots (OpenAI): each dot has its own cloud computer that can be opened and inspected at any time; the entry reuses the existing chat interface; background proactive research is read-only by default.
+- Hermes Agent (Nous Research): core memory has a hard capacity cap and evicts when full; resident memory is small and high-value, with older content recalled on demand through retrieval; there is a memory-poisoning risk.
+- Cloudflare: Browser Run, Sandboxes / Containers, `@cloudflare/computer`, `@cloudflare/voice` (phone lines require a third party).
 
-以上竞品与产品信息来自公开资料摘要，未经亲自实测，落地前需核实官方文档。
+The competitor and product information above comes from summaries of public sources and has not been tested first-hand; verify against the official documentation before building on it.

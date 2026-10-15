@@ -1,107 +1,107 @@
-# 设计：连接器与总管（Durable Object）之间的协议
+# Design: the protocol between the connector and the steward (Durable Object)
 
-状态：草案 v0.1。依据：[产品 spec](../spec.md)、[连接器与 pi 的对接设计](connector-pi.md)、[Cloudflare DO WebSocket 调研](../research/cloudflare-do-websocket.md)。
+Status: draft v0.1. Based on: [product spec](../spec.md), [connector–pi integration design](connector-pi.md), [Cloudflare DO WebSocket research](../research/cloudflare-do-websocket.md).
 
-本文定义连接器（用户机器上的守护进程）与总管（Cloudflare Durable Object）之间的**传输、鉴权、配对、可靠投递和消息格式**。命令与事件的语义来自 [connector-pi.md](connector-pi.md)，这里只规定它们如何在线上传输。总管端如何处理事件、更新记忆和通知用户，另文设计。
+This document defines the **transport, authentication, pairing, reliable delivery, and message formats** between the connector (a daemon on the user's machine) and the steward (a Cloudflare Durable Object). The semantics of commands and events come from [connector-pi.md](connector-pi.md); this document specifies only how they travel over the wire. How the steward side processes events, updates memory, and notifies the user is designed in a separate document.
 
-## 1. 目标与非目标
+## 1. Goals and non-goals
 
-目标：
+Goals:
 
-1. 连接器只需**出站**连接，不需要公网地址、端口转发或隧道。
-2. 命令和事件都**至少一次投递，处理时幂等**，断线、休眠、重启之后不丢不重。
-3. 总管 DO 能休眠：保活几乎不花钱，机器静默时 DO 不被唤醒。
-4. 配对简单，凭据可单台撤销；被偷走的凭据影响面可控。
-5. 协议可演进：版本协商、未知消息的处理规则明确。
-6. 同一个传输还要承载「按需读取原始过程」的流式中继。
+1. The connector needs only **outbound** connections — no public address, port forwarding, or tunnels.
+2. Commands and events are both **delivered at least once and processed idempotently**; nothing is lost or duplicated across disconnects, sleep, or restarts.
+3. The steward DO can sleep: keep-alive costs almost nothing, and the DO is not woken while a machine is quiet.
+4. Pairing is simple, credentials can be revoked per machine, and a stolen credential has a bounded blast radius.
+5. The protocol can evolve: version negotiation, and clear rules for handling unknown messages.
+6. The same transport also carries the streaming relay for on-demand reads of raw transcripts.
 
-非目标（MVP）：多租户；端到端加密（连接器与浏览器之间）；连接器之间互相通信；二进制编码（使用 JSON）。
+Non-goals (MVP): multi-tenancy; end-to-end encryption (between connector and browser); connector-to-connector communication; binary encoding (JSON is used).
 
-## 2. 总体形态
+## 2. Overall shape
 
 ```
- 飞书 / 网页 ─────────────┐
-                          ▼
-连接器 A ──wss──▶  Worker（入口、预检）──▶  Shepherd DO（单例 "owner"）
-连接器 B ──wss──▶                                ├─ 连接管理（标签：connector / web）
-                                                 ├─ outbox：待投递命令
-                                                 ├─ event_inbox：已收事件
-                                                 └─ 记忆模块、总管的 pi-durable 任务
+ Feishu / web ─────────────┐
+                           ▼
+Connector A ──wss──▶  Worker (entry, pre-check)──▶  Shepherd DO (singleton "owner")
+Connector B ──wss──▶                                     ├─ connection management (tags: connector / web)
+                                                         ├─ outbox: commands pending delivery
+                                                         ├─ event_inbox: received events
+                                                         └─ memory module, the steward's pi-durable tasks
 ```
 
-- 每台机器一个连接器，**每个连接器一条 WebSocket**，由连接器发起。
-- DO 是单例（实例名固定，如 `owner`），所有连接器和所有浏览器连接都落在这个实例上。
-- 同一个 Agent 类同时服务连接器连接与浏览器连接，用**连接标签**区分角色，并按角色限制可发的消息类型（§5.1）。
+- One connector per machine, **one WebSocket per connector**, initiated by the connector.
+- The DO is a singleton (fixed instance name, e.g. `owner`); all connectors and all browser connections land on this one instance.
+- A single Agent class serves both connector connections and browser connections, telling the roles apart with a **connection tag** and restricting the message types each role may send (§5.1).
 
-## 3. 传输
+## 3. Transport
 
-### 3.1 连接
+### 3.1 Connection
 
 ```
 wss://<worker-host>/agents/shepherd/owner?role=connector&proto=1
-Authorization: Bearer <设备令牌>
+Authorization: Bearer <device token>
 ```
 
-- 令牌放在请求头，不放在 URL，避免进入访问日志。连接器是 Node 客户端，可以设置请求头。
-- 角色用查询参数声明，仅用于路由和标签；**角色是否合法由令牌决定**，不信任参数。
-- 对连接器连接关闭 SDK 默认的协议帧（`shouldSendProtocolMessages` 返回 `false`），否则每次连接都会收到与本协议无关的帧。
-- 一台机器同一时刻只允许一条有效连接（§3.4）。
+- The token goes in a request header, not the URL, so it never lands in access logs. The connector is a Node client and can set request headers.
+- The role is declared with a query parameter and used only for routing and tagging; **whether the role is legitimate is decided by the token** — the parameter is not trusted.
+- For connector connections, the SDK's default protocol frames are turned off (`shouldSendProtocolMessages` returns `false`); otherwise every connection would receive frames unrelated to this protocol.
+- A machine may have only one active connection at a time (§3.4).
 
-### 3.2 保活与休眠
+### 3.2 Keep-alive and sleep
 
-- 连接器每 **25 秒**发一个 WebSocket 协议级 `ping` 帧，60 秒内收不到 `pong` 视为断线并重连。运行时自动回复 `pong`，**不唤醒休眠的 DO**，成本接近零。
-- 应用层不发周期性心跳。DO 判断「机器是否在线」以连接是否存在为准；对半开连接，DO 只在需要时探测：向机器发送命令后设置确认期限（§4.2），超时则把机器标为可疑。
-- DO 在约 10 秒无事件后休眠。**休眠会清空内存**，因此协议状态（待确认命令、超时、重试）全部放 SQLite，并用 `this.schedule`（alarm）驱动，不依赖内存里的 Promise 或定时器。
-- 实测（[原型结果](../research/do-protocol-spike.md)）：每 5 秒一次的协议级 ping，DO 照常休眠、连接不断、唤醒计数不增加；休眠后的第一条消息只多约 35–50 ms。连接器不需要为了「保持 DO 在线」做任何事。
+- The connector sends a WebSocket protocol-level `ping` frame every **25 seconds**; if no `pong` arrives within 60 seconds it treats the link as dead and reconnects. The runtime auto-replies `pong` and **does not wake a sleeping DO** — near-zero cost.
+- There is no periodic application-level heartbeat. The DO judges "is the machine online" purely by whether a connection exists; for half-open connections the DO probes only when needed: after sending a command to a machine it sets an ack deadline (§4.2), and on timeout marks the machine suspect.
+- The DO sleeps after roughly 10 seconds without events. **Sleeping wipes memory**, so all protocol state (unacked commands, timeouts, retries) lives in SQLite and is driven by `this.schedule` (alarms), with no reliance on in-memory Promises or timers.
+- Measured ([spike results](../research/do-protocol-spike.md)): with a protocol-level ping every 5 seconds, the DO sleeps as usual, the connection stays up, and the wake count does not grow; the first message after a sleep costs only about 35–50 ms more. The connector need not do anything to "keep the DO online".
 
-### 3.3 重连
+### 3.3 Reconnection
 
-指数退避加抖动：1 s、2 s、4 s … 上限 60 s，成功连接并完成握手后重置。关闭码决定是否重连（§3.5）：授权类关闭码不重连。
+Exponential backoff with jitter: 1 s, 2 s, 4 s … capped at 60 s; reset after a successful connection and completed handshake. The close code decides whether to reconnect (§3.5): authorization-related close codes do not reconnect.
 
-### 3.4 单连接约束
+### 3.4 Single-connection constraint
 
-每个连接带 `connEpoch`（连接器每次建立连接前自增并持久化的计数器）。DO 为每个 `deviceId` 只保留 `connEpoch` 最大的连接：新连接建立后，旧连接以 `4409 superseded` 关闭。这解决「网络切换时新旧连接重叠」的竞态。
+Every connection carries a `connEpoch` (a counter the connector increments and persists before establishing each connection). For each `deviceId` the DO keeps only the connection with the largest `connEpoch`: once a new connection is established, the old one is closed with `4409 superseded`. This resolves the race where the old and new connections overlap during a network switch.
 
-### 3.5 关闭码
+### 3.5 Close codes
 
-| 码 | 含义 | 连接器行为 |
+| Code | Meaning | Connector behavior |
 |---|---|---|
-| 1000 / 1001 | 正常关闭、服务重启 | 重连 |
-| 4401 | 令牌无效或缺失 | 不重连，提示重新配对 |
-| 4403 | 设备已被撤销 | 不重连，清除本地凭据，提示用户 |
-| 4409 | 被同设备的新连接取代 | 不重连（新连接已存在） |
-| 4426 | 协议版本不被接受 | 不重连，提示升级连接器 |
-| 4429 | 速率受限 | 按 `retryAfterMs` 退避后重连 |
-| 4500 | 服务端内部错误 | 重连 |
+| 1000 / 1001 | Normal close, service restart | Reconnect |
+| 4401 | Token invalid or missing | Do not reconnect; prompt for re-pairing |
+| 4403 | Device has been revoked | Do not reconnect; clear local credentials and notify the user |
+| 4409 | Superseded by a new connection from the same device | Do not reconnect (the new connection already exists) |
+| 4426 | Protocol version not accepted | Do not reconnect; prompt to upgrade the connector |
+| 4429 | Rate limited | Reconnect after backing off per `retryAfterMs` |
+| 4500 | Server internal error | Reconnect |
 
-### 3.6 消息大小与批量
+### 3.6 Message size and batching
 
-- 单条 JSON 消息上限 **256 KiB**。服务端接收上限是 32 MiB，但 SQLite 单行只有 2 MB，且大消息拖慢 JSON 解析；所有分块都远小于此。
-- 事件批量发送：连接器累积 **250 ms** 或 **50 条** 或 **64 KiB**，先到先发。WebSocket 消息按 20:1 折算请求计费，批量主要是为了少唤醒 DO，而不是省钱。
-- 可再生的 `progress` 事件在连接器端合并（见 connector-pi.md §11.2），不会因批量而放大。
+- A single JSON message is capped at **256 KiB**. The server-side receive limit is 32 MiB, but a SQLite row is only 2 MB and large messages slow JSON parsing; every chunk is far below this.
+- Events are sent in batches: the connector accumulates **250 ms** or **50 items** or **64 KiB**, whichever comes first. WebSocket messages are billed as requests at 20:1, so batching is mainly about waking the DO less often, not about saving money.
+- Regenerable `progress` events are coalesced on the connector side (see connector-pi.md §11.2) and are not amplified by batching.
 
-## 4. 信封与可靠性
+## 4. Envelope and reliability
 
-### 4.1 信封
+### 4.1 Envelope
 
-所有消息都是 JSON 对象：
+All messages are JSON objects:
 
 ```json
-{ "t": "cmd", "id": "01J…", "re": null, "ts": 1791965696285, "...": "载荷" }
+{ "t": "cmd", "id": "01J…", "re": null, "ts": 1791965696285, "...": "payload" }
 ```
 
-| 字段 | 含义 |
+| Field | Meaning |
 |---|---|
-| `t` | 消息类型，见 §6 |
-| `id` | 消息 ID（ULID）。需要确认或回复的消息必须带 |
-| `re` | 回复的目标消息 ID，仅回复类消息带 |
-| `ts` | 发送方时钟，毫秒；**仅供诊断，不用于排序或去重** |
+| `t` | Message type, see §6 |
+| `id` | Message ID (ULID). Required on any message that needs an ack or a reply |
+| `re` | ID of the message this replies to; only present on reply-type messages |
+| `ts` | Sender clock, milliseconds; **diagnostics only — not used for ordering or dedup** |
 
-未知 `t`：若消息带 `"opt": true` 则忽略，否则回复 `error{code:"unsupported"}`。未知字段一律忽略。
+Unknown `t`: if the message carries `"opt": true` it is ignored; otherwise the reply is `error{code:"unsupported"}`. Unknown fields are always ignored.
 
-### 4.2 命令流（DO → 连接器）：至少一次，连接器去重
+### 4.2 Command flow (DO → connector): at-least-once, connector dedups
 
-DO 的 `outbox` 表：
+The DO's `outbox` table:
 
 ```
 outbox(cmdId PK, deviceId, workerId?, cseq, kind, payload, notAfter?,
@@ -109,88 +109,88 @@ outbox(cmdId PK, deviceId, workerId?, cseq, kind, payload, notAfter?,
        attempts, sentAt, ackDeadline, result?)
 ```
 
-- `cseq` 是该设备上单调递增的序号，**同一 `workerId` 的命令按 `cseq` 顺序处理**，不同 worker 之间可并行。
-- 命令先写入 `outbox`（状态 `queued`），再发送（`sent`），设置 `ackDeadline`（15 秒）。
-- 连接器收到后先落盘（connector-pi.md §6.3 的 `command` 表），再回 `cmd_ack`。`cmd_ack` 只表示**已接收并持久化**：
-  - `status: "accepted"`：新命令，已排队处理。
-  - `status: "duplicate"`：已见过，附带原结果（若已完成）。
-  - `status: "rejected"`：拒绝，附 `code`（如 `not_registered_repo`、`lock_held`、`capacity`），DO 标 `failed`。
-- 命令完成后连接器发 `cmd_result{ok, data | error}`，DO 标 `done` 或 `failed`。`cmd_result` 同样可能重复，DO 按 `cmdId` 幂等处理。
-- **重发**：重连后（`welcome` 之后），DO 重发所有 `sent` 且未 `accepted` 的命令；`ackDeadline` 到期而连接仍在，也重发一次，两次失败后把机器标为可疑并通知总管。
-- **alarm 处理函数必须自己重新预约。** `schedule()` 以整秒为粒度，alarm 可能比毫秒级的 `ackDeadline` 早几百毫秒触发；处理函数醒来发现没有到期行就返回，之后再没有 alarm，命令会永远停在 `sent`。规则：处理函数结束前，只要还有处于 `sent` 的行，就再预约一次（约 1 秒后）。这是原型实测时发现的缺陷。
-- **过期**：命令可带 `notAfter`。连接器收到时已过期，回 `rejected{code:"expired"}`。默认 `notAfter = 下发时刻 + 10 分钟`，防止机器离线一天后突然执行陈旧的指令；用户明确选择「等它上线」的命令设为 `null`（不过期）。
-- **模糊状态**：连接器在 `sending` 阶段崩溃的命令，由连接器在对账时报告为 `ambiguous`（connector-pi.md §6.3），DO 把 `outbox` 标 `ambiguous` 并交给总管处理，**不自动重发**。
+- `cseq` is a monotonically increasing sequence number on the device; **commands for the same `workerId` are processed in `cseq` order**, while different workers may run in parallel.
+- A command is first written to `outbox` (state `queued`), then sent (marked `sent`), with an `ackDeadline` of 15 seconds.
+- On receiving one, the connector persists it first (the `command` table, connector-pi.md §6.3), then replies `cmd_ack`. `cmd_ack` means only **received and persisted**:
+  - `status: "accepted"`: a new command, queued for processing.
+  - `status: "duplicate"`: seen before, with the original result attached (if already completed).
+  - `status: "rejected"`: rejected, with a `code` (e.g. `not_registered_repo`, `lock_held`, `capacity`); the DO marks it `failed`.
+- When the command completes, the connector sends `cmd_result{ok, data | error}` and the DO marks it `done` or `failed`. `cmd_result` may equally be duplicated; the DO handles it idempotently by `cmdId`.
+- **Re-send**: after a reconnect (once `welcome` is done), the DO re-sends every command that is `sent` but not `accepted`; when the `ackDeadline` expires while the connection is still up, it re-sends once more — after two failures it marks the machine suspect and notifies the steward.
+- **The alarm handler must re-schedule itself.** `schedule()` has whole-second granularity, so an alarm may fire a few hundred milliseconds before the millisecond-precision `ackDeadline`; if the handler wakes, finds no due rows, and returns, there will be no further alarm and the command stays in `sent` forever. Rule: before the handler finishes, as long as any row is still `sent`, schedule one more alarm (about 1 second out). This is a defect found during spike testing.
+- **Expiry**: a command may carry `notAfter`. If it is already expired when the connector receives it, it replies `rejected{code:"expired"}`. The default is `notAfter = 下发时刻 + 10 分钟` (issuance time + 10 minutes), so a machine that was offline for a day does not suddenly execute stale instructions; commands where the user explicitly chose "wait for it to come online" are set to `null` (no expiry).
+- **Ambiguous state**: a command during whose `sending` phase the connector crashed is reported by the connector as `ambiguous` during reconciliation (connector-pi.md §6.3); the DO marks the `outbox` row `ambiguous` and hands it to the steward — **no automatic re-send**.
 
-### 4.3 事件流（连接器 → DO）：至少一次，DO 去重
+### 4.3 Event flow (connector → DO): at-least-once, DO dedups
 
-- 每个 worker 的事件有单调递增的 `seq`（connector-pi.md §11.3）。
-- 连接器发送 `events` 批次，DO **先写入 `event_inbox`（`(workerId, seq)` 唯一）再确认**；`events_ack{workerId, upTo}` 是累积确认，表示 `≤ upTo` 的事件已持久化。DO 对确认做 500 ms 的合并。
-- 连接器收到确认后才可以截断本地日志。**`welcome.acks` 与 `events_ack` 等价**：重连后据此决定从哪里重放，同时截断已确认的部分，否则日志只增不减。
-- **缺口检测**：DO 发现收到的 `seq` 大于 `已收最大值 + 1`，发 `resync{workerId, from}`；连接器从 `from` 重放。若本地日志已因上限被丢弃，回 `events_gap{workerId, from, to}`，DO 在时间线上标记缺口并触发 `reconcile`。
-- **处理与持久化分离**：`event_inbox` 记录「收到」，总管处理事件（更新 Thread、通知用户）以 `processed_upto(workerId)` 为界；DO 在处理中途被逐出，下次从 `processed_upto` 继续，处理本身对同一 `(workerId, seq)` 幂等。
+- Each worker's events carry a monotonically increasing `seq` (connector-pi.md §11.3).
+- The connector sends `events` batches; the DO **writes them to `event_inbox` (unique on `(workerId, seq)`) before acking**. `events_ack{workerId, upTo}` is a cumulative ack meaning all events `≤ upTo` are persisted. The DO coalesces acks over 500 ms.
+- Only after receiving an ack may the connector truncate its local log. **`welcome.acks` is equivalent to `events_ack`**: after a reconnect it decides where replay starts, and the acknowledged portion is truncated at the same time — otherwise the log only ever grows.
+- **Gap detection**: when the DO receives a `seq` greater than `已收最大值 + 1` (max received + 1), it sends `resync{workerId, from}`; the connector replays from `from`. If the local log has already been dropped due to the size cap, it replies `events_gap{workerId, from, to}`, and the DO marks the gap on the timeline and triggers `reconcile`.
+- **Processing decoupled from persistence**: `event_inbox` records "received"; the steward processes events (updating threads, notifying the user) bounded by `processed_upto(workerId)`. If the DO is evicted mid-processing, it resumes from `processed_upto` next time, and the processing itself is idempotent per `(workerId, seq)`.
 
-### 4.4 为什么不是 exactly-once
+### 4.4 Why not exactly-once
 
-两端都可能在任意时刻崩溃，exactly-once 做不到。取舍是：**命令至少一次投递，但由连接器按 `cmdId` 去重，并且遇到无法判定的情形宁可报告 `ambiguous` 也不重发**；事件至少一次，由 `(workerId, seq)` 去重。结果在语义上等同于 exactly-once，且崩溃场景有明确归宿。
+Both ends can crash at any moment; exactly-once is unattainable. The trade-off: **commands are delivered at least once, deduplicated by the connector on `cmdId`, and in undecidable cases the connector reports `ambiguous` rather than re-sending**; events are at-least-once, deduplicated on `(workerId, seq)`. The result is semantically equal to exactly-once, and every crash scenario has a well-defined outcome.
 
-## 5. 鉴权与配对
+## 5. Authentication and pairing
 
-### 5.1 设备令牌
+### 5.1 Device token
 
-令牌由 DO 在配对时签发，格式：
+The token is issued by the DO at pairing time, in the format:
 
 ```
 st1.<deviceId>.<epoch>.<issuedAt>.<mac>
 mac = HMAC-SHA256(SERVER_KEY, "st1." + deviceId + "." + epoch + "." + issuedAt)
 ```
 
-- `SERVER_KEY` 是部署时生成并存放于 Worker 密钥的随机值。
-- **Worker 层预检**（`onBeforeConnect`，不唤醒 DO）：校验格式和 `mac`，不通过直接返回 401。乱撞的请求到不了 DO，也不会触发 DO 计费。
-- **DO 层检查**（`onConnect`）：查 `device` 表，确认设备存在、`epoch` 与当前一致、未被撤销，否则以 `4401` / `4403` 关闭。
-- 撤销 = 把该设备的 `epoch` 加一并关闭其连接，之前签发的令牌随即失效，无需维护黑名单。
-- 令牌是**持有者令牌**：被偷走即可冒充该设备。缓解：传输只用 TLS；本地以 `0600` 权限保存；撤销简单；后续可升级为设备密钥对加签名挑战，协议已为此预留（`hello.auth` 扩展字段）。
+- `SERVER_KEY` is a random value generated at deploy time and stored as a Worker secret.
+- **Worker-layer pre-check** (`onBeforeConnect`, does not wake the DO): validates the format and the `mac`, returning 401 outright on failure. Blindly probed requests never reach the DO and trigger no DO billing.
+- **DO-layer check** (`onConnect`): consults the `device` table and confirms the device exists, its `epoch` matches the current one, and it has not been revoked; otherwise it closes with `4401` / `4403`.
+- Revocation = increment the device's `epoch` and close its connection; every previously issued token becomes invalid at once, so there is no blacklist to maintain.
+- The token is a **bearer token**: whoever steals it can impersonate the device. Mitigations: transport is TLS-only; it is stored locally with `0600` permissions; revocation is cheap; it can later be upgraded to a device key pair with a signed challenge — the protocol already reserves room for that (the `hello.auth` extension field).
 
-### 5.2 配对流程
+### 5.2 Pairing flow
 
 ```
-用户(飞书/网页)      DO                         连接器(用户机器)
-   │ "添加机器"        │                              │
-   │─────────────────▶│ 创建 pairing{code, 10min}     │
-   │◀── 命令提示 ──────│                              │
-   │  npx shepherd connect <url> <code>              │
-   │ ………………………………在目标机器终端粘贴运行 ……………………………▶│
-   │                  │◀── POST /pair {code, machine}─│
-   │                  │ 校验 code：存在、未过期、未用过   │
-   │                  │ 创建 device，签发令牌           │
-   │                  │─── {deviceId, token, wsUrl} ─▶│ 保存凭据 0600
-   │                  │◀──────── wss 连接 + hello ────│
-   │◀── "mac-studio 已连接" ─│                          │
+User (Feishu/web)                                  DO                                          Connector (user's machine)
+   │ "添加机器" ("add machine")                    │                                           │
+   │──────────────────────────────────────────────▶│ create pairing{code, 10min}               │
+   │◀── command hint ──────────────────────────────│                                           │
+   │  npx shepherd connect <url> <code>                                                        │
+   │ ………… 在目标机器终端粘贴运行 ("paste & run on the target machine") ……………………………………………………………▶│
+   │                                               │◀── POST /pair {code, machine}─────────────│
+   │                                               │ validate code: exists, unexpired, unused  │
+   │                                               │ create device, issue token                │
+   │                                               │─── {deviceId, token, wsUrl} ─────────────▶│ save credentials 0600
+   │                                               │◀──────── wss connect + hello ─────────────│
+   │◀ "mac-studio 已连接" ("mac-studio connected")─│                                           │
 ```
 
-- 配对码：8 位 Crockford Base32（40 比特），**仅在用户发起「添加机器」后的 10 分钟内有效，一次性**。
-- `/pair` 是 Worker 上唯一的未认证入口。限流：同一来源 IP 与全局都有失败次数上限（如 5 次失败后锁定 15 分钟），码的熵加上短有效期使暴力枚举不可行。
-- 配对只发生一次；之后连接器只用令牌。连接器保存 `{serverUrl, deviceId, token}`，服务器地址写入后**不允许降级到非 TLS**（本地开发除外）。
-- 命令提示由总管在聊天里发给用户，用户在要接入的电脑上执行，因为配对必须由机器所有者在本机完成。
+- Pairing code: 8 characters of Crockford Base32 (40 bits), **valid only for the 10 minutes after the user initiates "add machine", single-use**.
+- `/pair` is the only unauthenticated entry point on the Worker. Rate limits: both per source IP and globally there is a cap on failures (e.g. locked for 15 minutes after 5 failures); the code's entropy plus the short validity window makes brute-force enumeration infeasible.
+- Pairing happens exactly once; after that the connector uses only the token. The connector stores `{serverUrl, deviceId, token}`, and once the server address has been written, **downgrading to non-TLS is not allowed** (local development excepted).
+- The command hint is sent to the user by the steward in chat, and the user runs it on the computer being enrolled, because pairing must be completed by the machine's owner on that machine.
 
-### 5.3 角色与权限
+### 5.3 Roles and permissions
 
-| 角色 | 如何识别 | 可发送 | 可接收 |
+| Role | How it is identified | May send | May receive |
 |---|---|---|---|
-| `connector` | 令牌有效 | `hello`、`cmd_ack`、`cmd_result`、`events`、`history_chunk`、`machine_update`、`error` | `welcome`、`cmd`、`events_ack`、`resync`、`history_req` 等 |
-| `web` | 由 IM 下发的一次性链接换取的会话（另文设计） | `subscribe`、`history_open` 等浏览器类消息 | 状态推送、历史块 |
+| `connector` | Valid token | `hello`, `cmd_ack`, `cmd_result`, `events`, `history_chunk`, `machine_update`, `error` | `welcome`, `cmd`, `events_ack`, `resync`, `history_req`, etc. |
+| `web` | A session exchanged for a one-time link issued by the IM (designed separately) | `subscribe`, `history_open`, and other browser-type messages | State pushes, history chunks |
 
-连接器连接发送浏览器类消息，或浏览器连接发送连接器类消息，一律回 `error{code:"forbidden"}` 并计数；多次违规可关闭连接。
+A connector connection sending browser-type messages, or a browser connection sending connector-type messages, always gets `error{code:"forbidden"}` back and the violation is counted; repeated violations may get the connection closed.
 
-### 5.4 命令的信任
+### 5.4 Trust in commands
 
-- 连接器只接受**自己这条已认证连接**上的命令。
-- 仓库白名单、`approveProject` 仅限本机设置等约束在连接器本地强制执行（connector-pi.md §8.1、§13），不因命令来自「可信的总管」而放松。这是对总管端被攻破的最后一道防线。
+- The connector accepts commands only on **its own authenticated connection**.
+- Constraints such as the repository whitelist and `approveProject` being settable only on the local machine are enforced locally by the connector (connector-pi.md §8.1, §13) and are not relaxed just because a command comes from the "trusted steward". This is the last line of defense against a compromised steward side.
 
-## 6. 消息目录
+## 6. Message catalog
 
-### 6.1 握手
+### 6.1 Handshake
 
-**`hello`**（连接器 → DO，连接后第一条）
+**`hello`** (connector → DO, first message after connecting)
 
 ```json
 {
@@ -207,10 +207,10 @@ mac = HMAC-SHA256(SERVER_KEY, "st1." + deviceId + "." + epoch + "." + issuedAt)
 }
 ```
 
-- `bootId`：连接器进程每次启动随机生成。DO 据此区分「网络闪断重连」（同一 `bootId`）和「连接器重启」（新 `bootId`，期间所有 pi 进程已退出）。
-- `workers` 是连接器视角的全量快照，用于对账。
+- `bootId`: randomly generated at each start of the connector process. The DO uses it to tell "reconnect after a network blip" (same `bootId`) from "connector restart" (new `bootId`; all pi processes exited in between).
+- `workers` is a full snapshot from the connector's point of view, used for reconciliation.
 
-**`welcome`**（DO → 连接器）
+**`welcome`** (DO → connector)
 
 ```json
 {
@@ -221,34 +221,34 @@ mac = HMAC-SHA256(SERVER_KEY, "st1." + deviceId + "." + epoch + "." + issuedAt)
 }
 ```
 
-- `acks`：DO 已持久化的每个 worker 的最大 `seq`。连接器从其后重放。
-- 协商失败：`4426`，并在关闭原因里给出支持的版本范围。
+- `acks`: the highest `seq` per worker already persisted by the DO. The connector replays from after it.
+- Failed negotiation: `4426`, with the supported version range given in the close reason.
 
-随后 DO 重发 `outbox` 里未确认的命令（§4.2）。
+The DO then re-sends the unacknowledged commands in `outbox` (§4.2).
 
-### 6.2 命令（DO → 连接器）
+### 6.2 Commands (DO → connector)
 
-统一外壳：
+Common envelope:
 
 ```json
 { "t": "cmd", "id": "<cmdId>", "cseq": 118, "kind": "start_worker",
   "workerId": "w…", "notAfter": 1791966296285, "args": { … } }
 ```
 
-| `kind` | `args` | 说明 |
+| `kind` | `args` | Notes |
 |---|---|---|
-| `start_worker` | `threadId, repoId, mode, base?, prompt, images?, model?` | 对应 connector-pi.md §6.1；`repoId` 必须在连接器的白名单内 |
+| `start_worker` | `threadId, repoId, mode, base?, prompt, images?, model?` | Maps to connector-pi.md §6.1; `repoId` must be in the connector's whitelist |
 | `send` | `text, images?, intent` | `intent: now \| after \| auto` |
-| `interrupt` | `then?: { text }` | 中止，可选地接一条新指示 |
+| `interrupt` | `then?: { text }` | Abort, optionally followed by one new instruction |
 | `resume` | `reason` | |
-| `stop_process` | 无 | |
+| `stop_process` | none | |
 | `cleanup_worktree` | `force?` | |
-| `reconcile` | 无 | 要求重发 `hello.workers` 的快照 |
-| `diag` | 无 | 要求返回诊断信息 |
+| `reconcile` | none | Ask for a fresh `hello.workers` snapshot |
+| `diag` | none | Ask for diagnostic information |
 
-图片以 base64 放在 `images`，连同整条命令必须不超过 256 KiB（约 190 KB 的图片字节）。超出的由总管端在下发前压缩（缩小或转 JPEG）；仍放不下则拒绝并告知用户。更大图片的传递方式见 §8 待决事项第 3 项，MVP 不实现。
+Images ride base64-encoded in `images` and must fit, together with the whole command, within 256 KiB (about 190 KB of image bytes). Anything larger is compressed on the steward side before dispatch (downscaled or converted to JPEG); if it still does not fit, the command is rejected and the user is told. Ways to pass larger images: open question 3 in §8; not implemented in the MVP.
 
-### 6.3 命令确认与结果（连接器 → DO）
+### 6.3 Command ack and result (connector → DO)
 
 ```json
 { "t": "cmd_ack", "re": "<cmdId>", "status": "accepted" }
@@ -258,9 +258,9 @@ mac = HMAC-SHA256(SERVER_KEY, "st1." + deviceId + "." + epoch + "." + issuedAt)
 { "t": "cmd_result", "re": "<cmdId>", "ok": false, "error": { "code": "lock_held", "message": "…", "retriable": false } }
 ```
 
-`start_worker` 的 `cmd_result` 在 worker 进入 `running` 后发出（不等任务完成）；任务进展与结束走事件流。
+The `cmd_result` for `start_worker` is sent once the worker enters `running` (it does not wait for the task to finish); task progress and completion travel on the event stream.
 
-### 6.4 事件（连接器 → DO）
+### 6.4 Events (connector → DO)
 
 ```json
 { "t": "events", "id": "…", "batch": [
@@ -270,119 +270,119 @@ mac = HMAC-SHA256(SERVER_KEY, "st1." + deviceId + "." + epoch + "." + issuedAt)
 ] }
 ```
 
-事件类型和载荷见 connector-pi.md §11.1，此处不重复。`events_ack{workerId, upTo}` 为反向确认。`resync` 与 `events_gap` 见 §4.3。
+Event types and payloads are in connector-pi.md §11.1 and are not repeated here. `events_ack{workerId, upTo}` is the ack in the opposite direction. `resync` and `events_gap` are covered in §4.3.
 
-### 6.5 机器状态
+### 6.5 Machine status
 
-**`machine_update`**（连接器 → DO）：仓库增删、资源变化、连接器升级等。
+**`machine_update`** (connector → DO): repositories added or removed, resource changes, connector upgrades, and the like.
 
 ```json
 { "t": "machine_update", "repos": [ ], "limits": { "maxWorkers": 4, "running": 2 }, "memFreeMB": 18000 }
 ```
 
-仅在变化时发送。
+Sent only when something changes.
 
-### 6.6 历史（原始过程）中继
+### 6.6 History (raw transcript) relay
 
-网页要查看某个 worker 的原始过程时，DO 作为**中继**，不存储内容。
+When the web wants to view a worker's raw transcript, the DO acts as a **relay** and stores no content.
 
-1. 浏览器连接发 `history_open{workerId, since?, maxBytes}`。
-2. DO 写入 `relay(reqId, webConnId, workerId, expiresAt)`，向连接器发 `history_req`（外壳同 `cmd`，`kind:"history"`，但不进入 `outbox`、不重发）。
-3. 连接器返回若干 `history_chunk`：
+1. The browser connection sends `history_open{workerId, since?, maxBytes}`.
+2. The DO writes `relay(reqId, webConnId, workerId, expiresAt)` and sends `history_req` to the connector (same envelope as `cmd`, `kind:"history"`, but it does not enter `outbox` and is not re-sent).
+3. The connector returns a number of `history_chunk` messages:
 
 ```json
 { "t": "history_chunk", "re": "<reqId>", "n": 0, "entries": [ { "role": "assistant", "text": "…", "tools": [ ] } ], "cursor": "e91…", "done": false }
 ```
 
-4. DO 查 `relay` 找到对应的浏览器连接并转发，收到浏览器的确认后（`history_ack{reqId, n}`）才通知连接器发下一块（简单的窗口控制，窗口大小 2）。
-5. 结束条件：`done: true`、浏览器关闭连接、超时（60 秒）或累计超过 `maxBytes`（默认 2 MB）。
+4. The DO looks up `relay` to find the corresponding browser connection and forwards; only after the browser's ack (`history_ack{reqId, n}`) does it tell the connector to send the next chunk (simple window control, window size 2).
+5. Termination: `done: true`, the browser closing the connection, timeout (60 seconds), or the cumulative total exceeding `maxBytes` (default 2 MB).
 
-约束：
+Constraints:
 
-- 每块 ≤ 256 KiB。
-- `relay` 放 SQLite，因为 DO 可能在两块之间休眠。
-- 内容**经过 DO 内存，但不落盘**。日志里不记录内容。
-- 机器离线时 DO 直接对浏览器返回 `machine_offline`。
+- Each chunk ≤ 256 KiB.
+- `relay` lives in SQLite, because the DO may sleep between chunks.
+- Content **passes through DO memory but is never written to disk**. Logs record no content.
+- If the machine is offline, the DO returns `machine_offline` to the browser directly.
 
-### 6.7 错误
+### 6.7 Errors
 
 ```json
 { "t": "error", "re": "<msgId>", "code": "forbidden", "message": "…", "retriable": false }
 ```
 
-`code` 取值：`bad_request`、`unauthorized`、`forbidden`、`not_found`、`conflict`、`busy`、`expired`、`unsupported`、`too_large`、`rate_limited`、`internal`。
+Values for `code`: `bad_request`, `unauthorized`, `forbidden`, `not_found`, `conflict`, `busy`, `expired`, `unsupported`, `too_large`, `rate_limited`, `internal`.
 
-## 7. 关键流程
+## 7. Key flows
 
-### 7.1 派发一个任务
-
-```
-总管任务(pi-durable)   DO outbox/协议层         连接器                  pi
-   │ dispatch(start)     │                         │                      │
-   │────────────────────▶│ 写 outbox(queued)       │                      │
-   │                     │ cmd{start_worker}──────▶│ 落盘 command 表        │
-   │                     │◀──── cmd_ack(accepted) ─│ 建 worktree，拉起 pi ──▶│
-   │                     │◀──── cmd_result(ok) ────│ 发 prompt            │
-   │◀── 唤醒总管(结果) ───│ outbox 标 done           │                      │
-   │                     │◀── events(progress…) ───│◀──── 事件流 ───────────│
-   │                     │ 写 event_inbox，events_ack│                      │
-   │                     │◀── events(report, settled)                      │
-   │◀── 唤醒总管(汇报) ───│                          │                      │
-```
-
-幂等键：总管工具调用把 `cmdId` 取自工具调用 ID（或 `requestId`），崩溃后重放同一调用得到同一个 `cmdId`，`outbox` 的主键保证不会产生第二条命令（与 pi-durable 的 `requestId` 幂等机制配合）。
-
-### 7.2 断线重连与重放
+### 7.1 Dispatching a task
 
 ```
-连接断开 ─▶ 连接器退避重连 ─▶ wss + 令牌 ─▶ hello(workers, 各 lastSeq, pendingAcks)
-                                                 │
-                    DO: 校验、取代旧连接 ◀────────┘
-                    DO ─▶ welcome(acks) ─▶ 连接器从 acks 之后重放事件
-                    DO ─▶ 重发 outbox 中 sent 未 accepted 的命令
-                    连接器: 对已处理的返回 cmd_ack(duplicate)
+Steward task (pi-durable)      DO outbox/protocol layer        Connector                     pi
+   │ dispatch(start)           │                               │                             │
+   │──────────────────────────▶│ write outbox(queued)          │                             │
+   │                           │ cmd{start_worker}────────────▶│ persist to command table    │
+   │                           │◀──── cmd_ack(accepted) ───────│ create worktree, start pi ─▶│
+   │                           │◀──── cmd_result(ok) ──────────│ send prompt                 │
+   │◀─ wake steward (result) ──│ mark outbox done              │                             │
+   │                           │◀── events(progress…) ─────────│◀──── event stream ──────────│
+   │                           │ write event_inbox, events_ack │                             │
+   │                           │◀── events(report, settled)                                  │
+   │◀─ wake steward (report) ──│                               │                             │
 ```
 
-### 7.3 机器离线时下发命令
+Idempotency key: the steward's tool invocation takes `cmdId` from the tool-call ID (or `requestId`); replaying the same invocation after a crash yields the same `cmdId`, and `outbox`'s primary key guarantees no second command is created (in concert with pi-durable's `requestId` idempotency mechanism).
 
-- DO 发现机器无有效连接：命令写入 `outbox`（`queued`），同时立即对总管返回「机器离线」，由总管问用户「等它上线，还是换一台」（spec §9）。
-- 用户选「等」：命令的 `notAfter` 设为 `null`，机器上线后 `welcome` 之后自动投递。
-- 用户选「换」：该命令标 `expired`，另建新命令发往其他机器。
+### 7.2 Disconnect, reconnect, and replay
 
-### 7.4 中止
+```
+connection drops ─▶ connector reconnects with backoff ─▶ wss + token ─▶ hello(workers, each lastSeq, pendingAcks)
+                                                                        │
+                    DO: validate, supersede old connection ◀────────────┘
+                    DO ─▶ welcome(acks) ─▶ connector replays events after acks
+                    DO ─▶ re-send outbox commands that are sent but not accepted
+                    Connector: reply cmd_ack(duplicate) for already-processed commands
+```
 
-`interrupt` 命令作为普通命令走 `outbox`，不享受优先通道。`abort` 本身是毫秒级操作，网络往返是主要延迟。若连接器有多条排队命令，`interrupt` 在其所属 worker 的队列里仍按 `cseq` 顺序执行，但**连接器在收到 `interrupt` 时应立即对该 worker 执行 `abort`**，把队列里排在它前面、尚未开始投递的 `send` 视为被取代（返回 `result{ok:false, code:"superseded"}`）。
+### 7.3 Dispatching commands while a machine is offline
 
-## 8. 待决事项
+- The DO finds the machine has no active connection: the command is written to `outbox` (`queued`) and "machine offline" is returned to the steward immediately; the steward asks the user "wait for it to come online, or switch to another machine" (spec §9).
+- User picks "wait": the command's `notAfter` is set to `null`; it is delivered automatically after `welcome` once the machine comes online.
+- User picks "switch": the command is marked `expired` and a new command is created for another machine.
 
-1. ~~**唤醒总管的机制。**~~ **已解决（原型验证）。** 事件落库后，对每个需要总管处理的事件调用 `harness.submit(text, { operationId: "evt:<workerId>:<seq>", whenBusy: "followUp" })`。`operationId` 使重放和重传幂等（同一批事件发 3 次，总管输入仍只有 1 条）；`PiHarness` 为每个会话维护 alarm 心跳作业，DO 被强制重置后无需任何请求，alarm 自己重启并续跑。`cmd_result` 同理。剩余问题只是「哪些事件值得唤醒」（见第 2 项）。注意：`submit` 应在事件落库、已确认之后调用；崩溃发生在两者之间时，靠 `processed_upto` 重新处理，`operationId` 保证不会重复。
-2. **事件的处理节流。** 每个 `events` 批次都唤醒总管处理会让 DO 常醒。倾向：`progress` 只入库、不唤醒；`report/settled/lost/error/external_activity` 才唤醒处理。
-3. **大图片的传递**：connector-pi.md 允许单张图 base64 到 4 MB，超过本协议 256 KiB 的单消息上限。备选：总管端压缩到上限内（MVP 做法）；先暂存到 R2、命令里只带引用，连接器经带签名的 URL 下载（Cloudflare 内，一键部署可含）；连接器单独走 HTTP 分块上传。倾向后续用 R2 暂存。
-4. **兴趣驱动的进度级别。** 默认静默（`coarse`）；用户在网页上打开某个 worker 时，通过 `set_progress{workerId, level:"live"}` 提高频率，离开后恢复。减少无人观看时的唤醒。需要在命令集里加这一条。
-5. **设备密钥对**（Ed25519 签名挑战）何时替换持有者令牌；`hello.auth` 已预留。
-6. **`web` 角色的会话**如何由 IM 链接换取（一次性链接、有效期、与 owner 的绑定），属于配套网页设计。
-7. **同一 DO 内处理浏览器连接与连接器连接的负载隔离**：消息类型多了之后，是否拆分为两个 Agent 类，并共用同一个 SQLite（不可行，不同 DO 不共享存储），因此倾向保持一个类，用角色分发。
-8. **时钟**：`ts` 仅诊断。`notAfter` 依赖连接器时钟与 DO 时钟的差，可在 `welcome.serverTime` 里让连接器计算偏移并在本地校正。
+### 7.4 Interruption
 
-## 9. 需要原型验证的点
+The `interrupt` command travels through `outbox` like any other command, with no priority lane. `abort` itself is a millisecond-scale operation; the network round trip is the dominant latency. If the connector has several queued commands, `interrupt` still executes in `cseq` order within its worker's queue, but **on receiving `interrupt` the connector should immediately run `abort` for that worker**, treating `send` commands queued ahead of it whose delivery has not started as superseded (returning `result{ok:false, code:"superseded"}`).
 
-已验证（[原型结果](../research/do-protocol-spike.md)）：
+## 8. Open questions
 
-- 协议级 `ping` 不唤醒 DO，也不阻止休眠；唤醒后第一条消息只多约 35–50 ms。
-- 休眠中 alarm 驱动的重发可靠（含 alarm 早于期限触发时的重新预约）。
-- `onBeforeConnect` 中用 Worker 密钥做 HMAC 预检，坏令牌不唤醒 DO。
-- 自定义关闭码 4403、4409 原样到达 Node 的 `ws` 客户端。
-- 命令重发加连接器去重：只执行一次。
-- 事件重放：断线后 120 条各存一次，`welcome.acks` 触发截断。
-- 离线排队命令在 `hello` 之后投递。
-- 事件经 `harness.submit` 幂等地唤醒总管；DO 被强制重置后 alarm 自己续跑。
+1. ~~**Mechanism for waking the steward.**~~ **Resolved (verified in the spike).** After events are committed to storage, call `harness.submit(text, { operationId: "evt:<workerId>:<seq>", whenBusy: "followUp" })` for each event that needs the steward. The `operationId` makes replay and retransmission idempotent (send the same event batch 3 times and the steward still gets only 1 input); `PiHarness` maintains an alarm heartbeat job per session, so after the DO is force-reset no request is needed — the alarm restarts itself and carries on. The same applies to `cmd_result`. The only remaining question is "which events are worth waking for" (item 2). Note: `submit` must be called after the events are committed and acked; if a crash happens in between, `processed_upto` triggers reprocessing, and `operationId` guarantees no duplication.
+2. **Throttling event processing.** Waking the steward for every `events` batch keeps the DO constantly awake. Leaning toward: `progress` is only committed, no wake; only `report/settled/lost/error/external_activity` wake processing.
+3. **Passing large images**: connector-pi.md allows a single image up to 4 MB base64, beyond this protocol's 256 KiB per-message cap. Options: compress on the steward side to fit within the cap (the MVP approach); stage in R2 first with the command carrying only a reference, the connector downloading over a signed URL (inside Cloudflare, can ship with the one-click deploy); or the connector uploading separately over HTTP in chunks. Leaning toward R2 staging later.
+4. **Interest-driven progress levels.** Silent by default (`coarse`); when the user opens a worker in the web UI, raise the frequency via `set_progress{workerId, level:"live"}` and restore it when they leave. This reduces wake-ups while nobody is watching. This command needs to be added to the command set.
+5. **Device key pairs** (Ed25519 signing challenge): when to replace bearer tokens; `hello.auth` already reserves the room.
+6. **The `web` role's session**: how it is exchanged for an IM link (one-time link, validity period, binding to the owner) belongs to the companion web design.
+7. **Load isolation between browser and connector connections inside one DO**: as message types multiply, whether to split into two Agent classes sharing one SQLite (not feasible — different DOs do not share storage); hence the lean toward keeping one class and dispatching by role.
+8. **Clocks**: `ts` is diagnostics only. `notAfter` depends on the offset between the connector clock and the DO clock; `welcome.serverTime` can let the connector compute the offset and correct locally.
 
-仍未验证：
+## 9. Points requiring spike validation
 
-1. 笔记本睡眠、网络切换后，半开连接多久被发现（本机经代理，无法代表真实链路）。
-2. 在 `sending` 阶段杀连接器的端到端行为（原型的模拟连接器没有实现该阶段）。
-3. 事件批量的实际唤醒频率和时长费用，需要在控制台核对账单。
-4. 历史中继在 DO 休眠间隙的行为（`relay` 表驱动），原型未实现。
-5. 接近 256 KiB 的大消息、多连接器并发、小时级长连接的稳定性。
-6. 真实模型调用期间，进行中的 I/O 对 DO 常驻时长的影响。
-7. `ctx.abort()` 之外的真实逐出（平台迁移、内存回收）下的恢复行为。
+Verified ([spike results](../research/do-protocol-spike.md)):
+
+- Protocol-level `ping` neither wakes the DO nor prevents sleep; the first message after a wake costs only about 35–50 ms more.
+- Alarm-driven re-send during sleep is reliable (including re-scheduling when the alarm fires before the deadline).
+- The HMAC pre-check with the Worker secret in `onBeforeConnect`: bad tokens do not wake the DO.
+- Custom close codes 4403 and 4409 arrive unchanged at Node's `ws` client.
+- Command re-send plus connector dedup: executed exactly once.
+- Event replay: 120 events after a disconnect, each stored once; `welcome.acks` triggers truncation.
+- Offline-queued commands are delivered after `hello`.
+- Events wake the steward idempotently via `harness.submit`; after the DO is force-reset the alarm carries on by itself.
+
+Not yet verified:
+
+1. How quickly half-open connections are noticed after laptop sleep or a network switch (this machine sits behind a proxy and cannot stand in for a real link).
+2. End-to-end behavior when the connector is killed during the `sending` phase (the spike's mock connector did not implement that phase).
+3. The real wake-up frequency and duration cost of event batching; bills need checking in the console.
+4. History relay behavior across DO sleep gaps (driven by the `relay` table); not implemented in the spike.
+5. Stability with messages close to 256 KiB, several connectors in parallel, and multi-hour long-lived connections.
+6. The impact of in-flight I/O on how long the DO stays resident while real model calls are in progress.
+7. Recovery behavior under real evictions other than `ctx.abort()` (platform migration, memory reclamation).

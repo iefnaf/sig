@@ -2,18 +2,16 @@
 
 An always-on personal agent steward. It runs on Cloudflare Durable Objects, remembers which work went to which coding agent on which of your machines, and routes what you say next to the right place.
 
-Status: product spec and design stage.
+Status: spec and design complete, spike phase concluded — ready for the real implementation.
 
 - [docs/spec.md](docs/spec.md): product requirements
+- [docs/spike-conclusions.md](docs/spike-conclusions.md): what the spike phase validated, the integration pitfalls it uncovered, and the handover gaps
 - [docs/research/pi-integration.md](docs/research/pi-integration.md): findings from driving `pi --mode rpc`
 - [docs/research/cloudflare-do-websocket.md](docs/research/cloudflare-do-websocket.md): Durable Object WebSocket facts and limits
+- [docs/research/do-protocol-spike.md](docs/research/do-protocol-spike.md): measured results of the protocol prototype on real Cloudflare
+- [docs/research/feishu-channel.md](docs/research/feishu-channel.md): Feishu bot creation, event transport, messaging APIs, and open questions
 - [docs/design/connector-pi.md](docs/design/connector-pi.md): how the connector manages pi workers
 - [docs/design/connector-do-protocol.md](docs/design/connector-do-protocol.md): wire protocol between connector and the steward Durable Object
 - [docs/design/steward.md](docs/design/steward.md): the steward inside the Durable Object (memory module, routing, event pipeline, notifications, proactive behavior)
-- [docs/research/feishu-channel.md](docs/research/feishu-channel.md): Feishu bot creation, event transport, messaging APIs, and open questions
-- [docs/research/do-protocol-spike.md](docs/research/do-protocol-spike.md): measured results of the protocol prototype on real Cloudflare
-- [spikes/do-protocol](spikes/do-protocol): the prototype (Worker, Durable Object, simulated connector, tests)
-- [spikes/steward-m1](spikes/steward-m1): steward M1 core (ledger, reducer, outbound, templates) with tests
-- [spikes/steward-m2](spikes/steward-m2): the steward as a pi-durable extension (tools, autonomy policy, notes) with faux-model tests and the §3.4 routing eval (100 labeled utterances)
-- [spikes/e2e](spikes/e2e): the full loop with a real LLM, live on Cloudflare: Feishu message -> steward decides -> connector -> report card
-- [spikes/pi-rpc](spikes/pi-rpc): throwaway scripts behind the research
+
+The spike code (protocol prototype, steward M1/M2, full e2e loop, pi-rpc scripts) was removed after the phase concluded; it is sealed under git tag `spike-final` for reference.

@@ -1,54 +1,54 @@
-# 协议原型实测：Durable Object 上的连接器协议
+# Protocol Prototype, Measured: The Connector Protocol on a Durable Object
 
-日期：2026-10-14。原型代码：[spikes/do-protocol](../../spikes/do-protocol)。对应设计：[connector-do-protocol.md](../design/connector-do-protocol.md)。
+Date: 2026-10-14. Prototype code: `spike-final:spikes/do-protocol`. Corresponding design: [connector-do-protocol.md](../design/connector-do-protocol.md).
 
-## 环境与方法
+## Environment and method
 
-- 部署到真实的 Cloudflare：Worker `shepherd-spike`（含一个 SQLite 后端的 Durable Object，基于 `agents@0.28.1`，`wrangler@4.151.0`），测试后已删除。
-- 测试客户端是 Node 的 `ws@8.22.0` 加一个模拟连接器，位于用户本机。**这台机器的网络封锁了 `*.workers.dev`（DNS 污染，TLS 按 SNI 重置），所有真实环境的测试都经本地代理（`127.0.0.1:7897`）完成**，因此下面的往返时延包含代理的开销，只能用于比较，不能当作绝对值。
-- 同一套测试也在本地 `wrangler dev`（workerd）上跑过，功能结果一致；休眠、alarm、唤醒计数只以真实环境为准。
-- 总管的模型用 pi-ai 的 faux provider（脚本化回复），没有调用真实模型。
-- 每项测试通常只跑了一次，没有统计意义。
+- Deployed to real Cloudflare: Worker `shepherd-spike` (with one SQLite-backed Durable Object, `agents@0.28.1`, `wrangler@4.151.0`), deleted after testing.
+- The test client was Node's `ws@8.22.0` plus a simulated connector, on the user's machine. **That machine's network blocks `*.workers.dev` (DNS poisoning, TLS reset by SNI), so all real-environment tests went through a local proxy (`127.0.0.1:7897`)** — the round-trip latencies below include proxy overhead and are good only for comparison, not as absolute values.
+- The same tests also ran on local `wrangler dev` (workerd) with identical functional results; hibernation, alarms, and wake counts are taken from the real environment only.
+- The steward's model used pi-ai's faux provider (scripted replies); no real model was called.
+- Each test typically ran once — no statistical significance.
 
-## 原型实现了什么
+## What the prototype implemented
 
-Worker 入口做 HMAC 令牌预检和 `/pair`、`/admin/*`；DO（`Steward`）实现：设备与配对表、`onConnect` 鉴权（4401/4403）、同设备取代旧连接（4409）、`hello/welcome`、`outbox`（命令）加 alarm 重发、`event_inbox` 加累积 ack 与 `resync`、以及接入 `PiHarness`（`agents/harness/pi`）让 `report` 事件驱动总管运行。协议字段与设计文档一致。
+The Worker entry does the HMAC token pre-check and serves `/pair`, `/admin/*`; the DO (`Steward`) implements: device and pairing tables, `onConnect` auth (4401/4403), same-device connection takeover (4409), `hello/welcome`, the `outbox` (commands) with alarm-driven resend, `event_inbox` with cumulative acks and `resync`, and the `PiHarness` integration (`agents/harness/pi`) that lets `report` events drive steward runs. Protocol fields match the design doc.
 
-## 结果
+## Results
 
-| # | 验证项 | 结果 |
+| # | What was verified | Result |
 |---|---|---|
-| T1 | 坏令牌是否唤醒 DO | **不会。** 先让 DO 被逐出（`instanceId` 变化），再发 10 次带篡改令牌的连接，Worker 层直接返回 HTTP 401；随后读取唤醒计数只多 1，那一次是读取本身 |
-| T1 | 令牌校验 | 无令牌、篡改令牌均 401；有效令牌握手成功；错误的配对码被拒绝 |
-| T2 | 自定义关闭码 | 4409（被新连接取代）、4403（撤销）都**原样到达 Node 的 `ws` 客户端**；撤销后用旧令牌重连，Worker 预检通过，DO 在 `onConnect` 以 4403 关闭 |
-| T3 | 命令重发与去重 | 第一次投递的 ack 和结果被故意丢弃；DO 的 alarm 在确认期限后重发，连接器按 `cmdId` 识别重复并返回 `duplicate`；命令终态 `done`，`attempts=2`，连接器**只执行了 1 次** |
-| T4 | 事件重放 | 发出第一批后直接 `terminate()` 连接；重连后 `welcome.acks` 指出 DO 已有的位置，连接器据此重放；120 条事件各存一次，累积 ack 到 120，连接器日志清空 |
-| T5 | 离线排队 | 设备离线时入队保持 `queued`，上线 `hello` 之后自动投递并完成，执行 1 次 |
-| T6 | 休眠与 ping | 空闲 40 秒内 DO 被逐出（`instanceId` 变化），连接**未断开**。**每 5 秒发一次 WebSocket 协议 ping，DO 同样被逐出**；唤醒计数每次只多 1。结论：协议级 ping 既不唤醒 DO，也不阻止休眠 |
-| T6 | 冷热时延 | 热：173、172、174、177 ms；休眠后的第一条消息：207、224 ms。唤醒开销约 35–50 ms，被网络和代理时延掩盖 |
-| T7 | 休眠后 alarm | 命令发出后 DO 休眠，20 秒后 alarm 把它唤醒并重发，命令完成，执行 1 次 |
-| T8 | 事件驱动总管 | 一条 `report` 事件经 `harness.submit(..., {operationId})` 产生一次总管输入，总管给出回复；**同一批事件重传 3 次，总管输入仍只有 1 条**，`accepted=false` 被正确识别 |
-| T8 | 崩溃恢复 | 总管运行进行到一半时用 `ctx.abort()` 强制重置 DO（`instanceId` 变化），之后 60 秒内**不对 DO 发任何请求**；再查看时运行已完成、`pending` 为空 |
+| T1 | Do bad tokens wake the DO | **No.** First let the DO be evicted (`instanceId` changes), then make 10 connections with tampered tokens; the Worker layer returns HTTP 401 outright. Reading the wake counter afterwards showed +1 — that one was the read itself |
+| T1 | Token validation | Missing and tampered tokens both 401; a valid token completes the handshake; a wrong pairing code is rejected |
+| T2 | Custom close codes | 4409 (superseded by a new connection) and 4403 (revoked) both **arrive verbatim at Node's `ws` client**; after revocation, reconnecting with the old token passes the Worker pre-check and the DO closes with 4403 in `onConnect` |
+| T3 | Command resend and dedup | The first delivery's ack and result were deliberately dropped; the DO's alarm resends after the ack deadline; the connector recognizes the duplicate by `cmdId` and returns `duplicate`; the command reaches terminal state `done` with `attempts=2`, and the connector **executed it exactly once** |
+| T4 | Event replay | After emitting the first batch the connection was `terminate()`d; on reconnect `welcome.acks` indicates what the DO already has, and the connector replays from there; 120 events each stored once, cumulative ack reaches 120, the connector log drains |
+| T5 | Offline queuing | Queued while the device is offline the command stays `queued`; after the device comes online, `hello` triggers delivery and completion, executed once |
+| T6 | Hibernation and ping | Within 40 idle seconds the DO is evicted (`instanceId` changes) while the connection **stays open**. **Sending a WebSocket protocol ping every 5 seconds, the DO is evicted all the same**; the wake counter goes up by exactly 1 per read. Conclusion: protocol-level pings neither wake the DO nor prevent hibernation |
+| T6 | Warm vs. cold latency | Warm: 173, 172, 174, 177 ms; first message after hibernation: 207, 224 ms. Wake overhead is ~35–50 ms, swamped by network and proxy latency |
+| T7 | Alarm after hibernation | A command is sent, the DO hibernates; 20 seconds later an alarm wakes it and resends; the command completes, executed once |
+| T8 | Event-driven steward | A `report` event goes through `harness.submit(..., {operationId})` and produces one steward input; the steward replies. **Re-transmitting the same event batch 3 times still yields exactly 1 steward input**; `accepted=false` is recognized correctly |
+| T8 | Crash recovery | Mid-steward-run, `ctx.abort()` hard-resets the DO (`instanceId` changes); for 60 seconds **no request touches the DO**; on the next look the run has completed and `pending` is empty |
 
-## 原型中发现并修复的问题
+## Issues found and fixed in the prototype
 
-1. **alarm 可能早于毫秒级期限触发。** `schedule()` 以整秒为粒度，我的 `ackDeadline` 是毫秒。alarm 处理函数醒来发现「还没到期」就直接返回，之后没有任何 alarm，命令永远停在 `sent`。修复：处理函数在仍有待确认行时**自己重新预约**一次。这条已写入设计文档。
-2. **`welcome.acks` 也是一次累积确认。** 连接器重连后拿到 `acks`，除了决定从哪里重放，还必须据此截断本地日志，否则日志只增不减。已写入设计文档。
-3. **模拟器自身的问题**（断线后未清空发送队列，造成重复事件计数偏高）：与协议无关，已修，DO 端去重一直是正确的。
+1. **An alarm can fire before a millisecond-precision deadline.** `schedule()` works in whole seconds while my `ackDeadline` was in milliseconds. The alarm handler wakes, sees "not due yet", returns — and with no further alarm ever scheduled, the command sits in `sent` forever. Fix: when un-acked rows remain, the handler **reschedules itself**. Written into the design doc.
+2. **`welcome.acks` is also a cumulative ack.** After reconnecting, the connector must use `acks` not only to decide where to replay from but also to truncate its local log — otherwise the log only grows. Written into the design doc.
+3. **A simulator bug of our own** (send queue not drained on disconnect, inflating duplicate event counts): unrelated to the protocol; fixed; the DO-side dedup was correct throughout.
 
-## 对设计的结论
+## Conclusions for the design
 
-- 「事件如何唤醒总管任务」有了可行答案：**连接器事件落库后，对每个值得处理的事件调用 `harness.submit(text, { operationId: "evt:<workerId>:<seq>", whenBusy: "followUp" })`**。`operationId` 使重放和重传天然幂等；`PiHarness` 为每个会话维护 alarm 心跳作业，DO 被逐出后由 alarm 重启并续跑。
-- 保活只需连接器的协议级 ping（或不发，DO 休眠时连接也不断）。应用层心跳不需要。
-- Worker 层 HMAC 预检有效，扫描和暴力尝试不会唤醒 DO，也不会产生 DO 时长费用。
+- "How events wake the steward" has a workable answer: **after persisting connector events, call `harness.submit(text, { operationId: "evt:<workerId>:<seq>", whenBusy: "followUp" })` for every event worth handling.** The `operationId` makes replays and re-transmissions naturally idempotent; `PiHarness` maintains an alarm heartbeat per session, so an evicted DO restarts and resumes via alarm.
+- Keepalive needs only the connector's protocol-level ping (or nothing — the connection survives DO hibernation). No application-level heartbeat required. *(Spike-phase note, 2026-10-15: the e2e spike later found half-dead TCP where protocol pings kept flowing — an application-level heartbeat proved necessary after all; see [spike-conclusions.md](../spike-conclusions.md) §2.)*
+- The Worker-layer HMAC pre-check works: scans and brute-force attempts neither wake the DO nor incur DO duration cost.
 
-## 局限与未验证
+## Limitations and unverified
 
-- `ctx.abort()` 是对崩溃的模拟，不等同于平台真实的逐出或宿主迁移。
-- 没有测大消息（接近 256 KiB）、多连接器并发、长时间（小时级）连接的稳定性。
-- 没有测半开连接多久被发现（笔记本睡眠、网络切换）；本机经代理，无法代表真实链路。
-- 休眠阈值只确认「40 秒内」，没有测准确值。
-- 没有核对账单：唤醒次数与时长费用只能靠官方定价文档估算，没有在控制台验证。
-- 总管用的是 faux 模型。真实模型调用时的 I/O 保持 DO 在内存中的时长、以及 15 分钟的待处理 I/O 上限，都没有测。
-- 经代理的时延不能用于评估真实的唤醒延迟。
-- `https-proxy-agent` 只用于绕开本机网络限制，不属于设计的一部分。
+- `ctx.abort()` simulates a crash; it is not the platform's real eviction or host migration.
+- Large messages (near 256 KiB), concurrent connectors, and multi-hour connection stability were not tested.
+- How quickly a half-open connection is noticed (laptop sleep, network switch) was not tested; this machine went through a proxy and cannot represent a real path.
+- The hibernation threshold is only confirmed as "within 40 seconds"; the exact value is unknown.
+- Billing was not checked: wake counts and duration cost are estimates from pricing docs, not verified in the console.
+- The steward used the faux model. How long real-model I/O keeps the DO in memory, and the 15-minute pending-I/O ceiling, were not tested.
+- Proxy latencies cannot be used to judge real wake delays.
+- `https-proxy-agent` was only for bypassing this machine's network restrictions; it is not part of the design.

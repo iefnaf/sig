@@ -1,103 +1,103 @@
-# Spike 阶段结论
+# Spike-Phase Conclusions
 
-> 状态：**已收官**（2026-10-15）。本文是 `spikes/` 全部验证工作的结论沉淀，写给正式实现的执行者（人或 agent）：读完本文 + [spec](spec.md) + [design](design/) 即可开工，**不需要阅读 spike 代码**。所有代码封存在 git tag `spike-final`，按需 `git show spike-final:<path>` 查证。
+> Status: **concluded** (2026-10-15). This document distills everything the `spikes/` phase validated, written for whoever implements the real system (human or agent): read this plus the [spec](spec.md) and the [design docs](design/) and you can start building — **no spike code reading required**. All code is sealed under git tag `spike-final`; consult it on demand with `git show spike-final:<path>`.
 
-## 0. 总结论
+## 0. Bottom line
 
-设计的关键假设**全部实证通过**：DO 上的总管协议、真模型路由、pi/Claude Code 双 agent 裁决与分支接力、可靠性层（看门狗/心跳/孤儿清扫/reap）、飞书卡片交互（含同意门控）、一键部署、无 LLM 例程。系统在生产环境跑过完整闭环，并扛过一次 4 小时云平台故障（零数据丢失，自动恢复）。**正式实现可以开工**；本文第 2、3 节是用真实代价换来的答案，优先读。
+Every critical design assumption was **validated in practice**: the steward protocol on Durable Objects, real-model routing, adjudication and branch relay across pi and Claude Code workers, the reliability layer (watchdog/heartbeat/orphan sweep/reap), Feishu card interactions (including the consent gate), one-click deploy, and no-LLM routines. The system ran the full loop live in production and survived a 4-hour cloud platform incident (zero data loss, automatic recovery). **The real implementation can begin.** Sections 2 and 3 below are the answers bought with real pain — read them first.
 
-## 1. 各 spike 验证范围
+## 1. What each spike validated
 
-| Spike | 验证了什么 | 关键产出 |
+| Spike | What it validated | Key output |
 |---|---|---|
-| `do-protocol` | DO↔连接器 WebSocket 协议骨架（配对、outbox、ack、重发） | 协议设计修正，见 [research/do-protocol-spike.md](research/do-protocol-spike.md) |
-| `pi-rpc` | pi `--mode rpc` 的事件与控制面 | 事件形状、adjudication 输入 |
-| `feishu-webhook` / `feishu` | 飞书入站 webhook、出站卡片、按钮回调 | 通道方案 [research/feishu-channel.md](research/feishu-channel.md) |
-| `steward-m1` | 总管核心：账本（SQLite on DO）、reducer、汇报模板、outbound 队列 | 15/15 测试；`sh_*` 表结构雏形 |
-| `steward-m2` | 总管作为 pi-durable 扩展：工具集、policy hook、真模型路由 | 路由 eval **100/106 (94.3%)**；settle-time 派发核验 |
-| `e2e` | 全链路部署上线：Feishu → 总管 → 连接器 → 真实 worker → 卡片 | 一键 bootstrap；M3 可靠性层；11 条 bug 清单 |
+| `do-protocol` | DO↔connector WebSocket protocol skeleton (pairing, outbox, acks, resend) | Protocol design corrections; see [research/do-protocol-spike.md](research/do-protocol-spike.md) |
+| `pi-rpc` | pi `--mode rpc` event and control surfaces | Event shapes; adjudication inputs |
+| `feishu-webhook` / `feishu` | Feishu inbound webhook, outbound cards, button callbacks | Channel approach; [research/feishu-channel.md](research/feishu-channel.md) |
+| `steward-m1` | Steward core: ledger (SQLite on DO), reducer, report templates, outbound queue | 15/15 tests; the `sh_*` table prototypes |
+| `steward-m2` | The steward as a pi-durable extension: tool set, policy hooks, real-model routing | Routing eval **100/106 (94.3%)**; settle-time dispatch verification |
+| `e2e` | The full loop deployed live: Feishu → steward → connector → real worker → card | One-command bootstrap; the M3 reliability layer; the 11-bug list |
 
-## 2. 集成层的坑（设计文档里没有、必须带走的答案）
+## 2. Integration pitfalls (answers the design docs don't contain)
 
-每一条都是实测踩出来的，正式实现直接按此处理：
+Every item below was hit live. The real implementation should handle these up front:
 
 **pi RPC**
-- 响应用 `success` 字段，**不是 `ok`**；判 `r.success === false || r.error`。
-- 事件流：`agent_start` / `tool_execution_start{toolName,args}` / `message_end` / `auto_retry_end` / `agent_settled{aborted,outcome}`。
+- Responses use the `success` field, **not `ok`**; check `r.success === false || r.error`.
+- Event stream: `agent_start` / `tool_execution_start{toolName,args}` / `message_end` / `auto_retry_end` / `agent_settled{aborted,outcome}`.
 
 **Claude Code headless**
-- 命令形态：`claude -p --output-format stream-json --verbose --mcp-config <cfg> --append-system-prompt <text>`（权限放行按产品决定，spike 用了 `--dangerously-skip-permissions`）。
-- **stdin 的 prompt 只在 EOF 后才开始处理**：写完必须 `stdin.end()`，否则进程永远挂着（实测栽过）。
-- MCP 工具调用到达时**带命名空间**（`mcp__shepherd__report`），不能按裸名 `report` 匹配；用 `endsWith("__report")` 这类后缀匹配。
-- stream 事件 `system/init`、`assistant{message:{content:[tool_use|text]}}`、`result{subtype,is_error}`；stop_reason 映射 `{end_turn→stop, tool_use→tool_use, max_tokens→length}`。
-- 自定义 MCP server（如 report 工具）只需 LF 分隔的 JSON-RPC over stdio：initialize → tools/list → tools/call，~40 行。
-- Claude worker 与 pi worker 可在同一账本混跑，裁决路径完全一致（实测：接力分支跨 agent 类型传递）。
+- Invocation shape: `claude -p --output-format stream-json --verbose --mcp-config <cfg> --append-system-prompt <text>` (permission bypass is a product decision; the spike used `--dangerously-skip-permissions`).
+- **The stdin prompt is only processed on EOF**: after writing you must call `stdin.end()`, or the process hangs forever (hit this in practice).
+- MCP tool calls arrive **namespaced** (`mcp__shepherd__report`); never match on the bare name `report` — use suffix matching like `endsWith("__report")`.
+- Stream events: `system/init`, `assistant{message:{content:[tool_use|text]}}`, `result{subtype,is_error}`; stop_reason maps as `{end_turn→stop, tool_use→tool_use, max_tokens→length}`.
+- A custom MCP server (e.g. the report tool) is just LF-delimited JSON-RPC over stdio: initialize → tools/list → tools/call, ~40 lines.
+- Claude workers and pi workers can mix in one ledger with an identical adjudication path (verified: a relay branch handed off across agent types).
 
-**Cloudflare DO 部署现实**
-- **常驻 isolate 会钉住旧代码与旧 secrets**：`wrangler deploy` 返回后几分钟内，被 WebSocket/alarm 挂住的 DO 仍跑旧版本。轮换 secret 后必须让它被逐出（断连+空闲）再验证。病态 isolate 的恢复手法：同代码重部署强制逐出。
-- `CREATE TABLE IF NOT EXISTS` 不会给已存在的表加列——线上迁移要幂等的 `ALTER TABLE`。
-- DO 存储挂了（平台故障）表现为全量 1101，**Worker 脚本本身的路由仍正常**——用这个区分故障层。
-- pi-ai 在 Workers 里别用 env-var 认证：`createProvider` + 内联 `auth.apiKey.resolve`；`PiModel` 是 `{provider, id}`。
+**Cloudflare DO deployment reality**
+- **A resident isolate pins old code and old secrets**: minutes after `wrangler deploy` returns, a DO held alive by WebSockets/alarms still runs the previous version. After rotating secrets, evict it (disconnect + idle) before verifying. Recovery for a sick isolate: redeploy the same code to force eviction.
+- `CREATE TABLE IF NOT EXISTS` does not add columns to existing tables — live migrations need idempotent `ALTER TABLE`.
+- When DO storage fails (platform incident) every request 1101s while **plain Worker routes keep working** — use this to tell the layers apart.
+- Don't use env-var auth for pi-ai inside Workers: `createProvider` with inline `auth.apiKey.resolve`; `PiModel` is `{provider, id}`.
 
-**连接器可靠性（最重要的四条）**
-- **TCP 半死是常态**：两端 `send()` 都不报错，字节就是不到。唯一解：双向应用层心跳（上行 ping / 下link pong + 帧间超时强制断开重连），加 cmdId 幂等去重 + `failed` 状态命令在 hello 时重投。实测一次真实断网靠这个自愈。
-- **DO 按事件去重**，所以连接器重启后事件 seq **必须续号**（持久化 seqs.json），从 1 重来会被全部吞掉。
-- **stall 判定**：无 stdout 达阈值 **且** CPU 两次采样 <5%（`ps -p PID -o %cpu=`）才算挂死——安静但 CPU 高的是编译，不是 stall。一次自动重启（同 worktree，注入「从中断处继续」提示），二次 → `error:stall` 结案。
-- 连接器崩溃/重启时，在跑的 worker 靠**锁文件 + worktree 残留**被识别为孤儿：锁在=崩溃时活着→报 lost；干净 worktree 直接清掉。DO 侧兜底 reap（running + 离线 10 分钟，或在线沉默 45 分钟 → lost）。
+**Connector reliability (the four that matter most)**
+- **Half-dead TCP is the norm**: both ends' `send()` raises nothing, the bytes just never arrive. The only cure: bidirectional application-level heartbeats (uplink ping / downlink pong + inter-frame timeout forcing teardown and reconnect), plus idempotent cmdId dedup and re-delivery of `failed` commands at hello. A real home-network outage self-healed through exactly this path.
+- **The DO dedups events**, so after a connector restart the event sequence **must continue** (persist seqs.json) — restarting at 1 gets every event silently dropped.
+- **Stall detection**: no stdout for the threshold **and** two CPU samples <5% (`ps -p PID -o %cpu=`) — quiet-but-hot is a build, not a stall. One automatic respawn (same worktree, injecting a "continue from where it broke" note), second strike → settle as `error:stall`.
+- On connector crash/restart, in-flight workers are recognized as orphans via **lock files + leftover worktrees**: lock present = alive at crash → report lost; clean worktrees get removed. The DO-side backstop is the reap sweep (running + offline 10 min, or online-but-silent 45 min → lost).
 
-**接力（relay）依赖线程路由**
-- 分支接力是线程级查找：接续消息如果路由去了**新线程**，base 查不到，leg-2 从 HEAD 重来——计划文档根本不在盘上。
-- 解法在提示词层：总管规则明确「按 X 方案实施 / 接着 X 继续 / 在 X 基础上做（X 是某线程产出）→ attach 该线程」；反例（X 是外部文档）仍应新建。eval 6 个接力案例 6/6。
-- worker 接力机制：DO 在 start_worker 时带 `base = 该线程最近一次 worker 的分支`，连接器 `git worktree add -b shepherd/<id> <dir> <base>`。
+**Relay depends on thread routing**
+- Branch relay is a thread-scoped lookup: if a continuation message routes to a **new thread**, the base lookup finds nothing and leg-2 starts from HEAD — the plan document isn't even on disk.
+- The fix lives in the prompt: an explicit steward rule — "implement per plan X / continue X / build on X, where X is a thread's output → attach to that thread" — while counter-examples (X is an external document) still create new threads. 6/6 relay eval cases pass.
+- The relay mechanism itself: the DO sends `base = the thread's latest worker branch` with start_worker; the connector runs `git worktree add -b shepherd/<id> <dir> <base>`.
 
-**飞书卡片交互**
-- 按钮回调里只有 `open_message_id`——用出站记录表 `providerMsgId` **反查线程**，不要把线程 id 塞进按钮 value（卡片 JSON 会被飞书转述，塞多了乱）。
-- 同意门控形态：汇报卡 [同意]/[先不要] → callback → `pr_worker` 命令（推分支 + `gh pr create`）→ 结果异步回到聊天。**happy path 未线上点击验证**（设计上必须用户本人点）。
-- digest 例程走**无 LLM 的确定性渲染**（running/questions/unread → 卡片），quiet 时静默；`every@Ns` / `daily@HH:MM UTC` 两种调度，自调度 alarm 续命，owner 可停用。
+**Feishu card interactions**
+- A button callback only carries `open_message_id` — resolve the thread by looking it up in the outbound table via `providerMsgId`; don't stuff the thread id into the button value (Feishu rewrites card JSON and it gets messy).
+- Consent gate shape: report card [同意] ("approve") / [先不要] ("not yet") → callback → `pr_worker` command (push branch + `gh pr create`) → result lands back in the chat asynchronously. **The happy path was never click-verified live** (by design it requires the user's own click).
+- Digest routines render **deterministically without an LLM** (running/questions/unread → card), stay silent when there's nothing to say; schedules are `every@Ns` / `daily@HH:MM UTC`, the routine reschedules its own alarm, and the owner can disable it.
 
-**协议杂项**
-- outbox 命令状态机：`queued → sent → acked / failed(timeout|rejected)`；hello 重投 queued+sent，**timeout-failed 也要重投**（半死连接的产物），靠 cmdId 去重防重放。
-- 双 send 竞态：出站投递用 claim token（条件 UPDATE + 属主校验）。
-- 派发后 settle-time 核验：对照 dispatchSeq 计数与回复文本里的「已派发」声明，不符 → 纠正性 follow-up run。实测无假阳性。
+**Protocol odds and ends**
+- Outbox command state machine: `queued → sent → acked / failed(timeout|rejected)`; hello re-delivers queued+sent, **and timeout-failed too** (half-dead connection debris), with cmdId dedup against replays.
+- Double-send race: outbound delivery uses claim tokens (conditional UPDATE + ownership check).
+- Post-dispatch settle-time verification: compare the dispatchSeq counter against "dispatched" claims in reply text; on mismatch, run a corrective follow-up. Zero false positives observed.
 
-## 3. Bug 清单 → 正式实现的回归测试用例
+## 3. Bug list → regression tests for the real implementation
 
-spike 期间线上踩到并修掉的（细节见 tag `spike-final` 的 `spikes/e2e/README.md`）：
+All hit and fixed live during the spike (details: `spike-final`'s `spikes/e2e/README.md`):
 
-1. 双 send 竞态重复投递 → claim token。
-2. `CREATE TABLE IF NOT EXISTS` 不迁移已有表 → 幂等 ALTER。
-3. Feishu send 无超时无重试，挂死事件处理 → 10s 超时 + alarm 驱动重试。
-4. 派发选中死设备（isolate 换掉后 socket 静默消失）→ 线程记住上次的机器，离线时排队等重连。
-5. queued 命令永不重试 → 周期 sweep，设备回来即投，空闲 ~30 分钟判 failed。
-6. 常驻 DO 钉住旧 secrets/代码 → 逐出后再验证部署。
-7. pi-ai 在 Workers 的 provider 构造姿势（见上）。
-8. pi RPC `success` vs `ok`（见上）。
-9. 单回合派发守卫泄漏到下一回合 → 守卫随 provenance 重置。
-10. **下行也能静默死**：DO 看似连接健康、命令 ack 超时报 failed、hello 不重投 failed → 永久丢失。修：双向心跳 + failed 重投 + cmdId 去重。
-11. **路由决定接力是否存在**：「按 X 方案实施」开新线程 → 接力基础丢失。修：提示词接续规则 + eval 案例。
+1. Double-send race duplicating deliveries → claim tokens.
+2. `CREATE TABLE IF NOT EXISTS` doesn't migrate existing tables → idempotent ALTER.
+3. Feishu sends with no timeout and no retry hung event handling → 10s timeouts + alarm-driven retries.
+4. Dispatch picked a dead device (isolate swap silently drops the socket) → a thread remembers its last machine and queues while offline.
+5. Queued commands never retried → periodic sweep, deliver on device return, fail after ~30 idle minutes.
+6. A resident DO pins old secrets/code → evict before judging a deploy.
+7. pi-ai provider construction inside Workers (see above).
+8. pi RPC `success` vs `ok` (see above).
+9. The one-dispatch guard leaked across runs → the guard resets with provenance.
+10. **The downlink can also die silently**: the DO sees a healthy connection, the command ack-times-out into failed, hello doesn't re-deliver failed → permanently lost. Fix: bidirectional heartbeat + failed re-delivery + cmdId dedup.
+11. **Routing decides whether relay ever happens**: "implement per plan X" opening a new thread → the relay base is lost. Fix: the continuation rule in the prompt + eval cases.
 
-## 4. 量化结果（正式实现的基线）
+## 4. Quantified results (the baseline for the real implementation)
 
-- 路由 eval（deepseek-flash，106 例）：**94.3% 通过**，错路由 1.9%（目标 <2%），漏反问 0%，多余反问 4.2%（目标 <15%）。数据集在 `spike-final:spikes/steward-m2/eval/dataset.ts`——**106 条带理由标注的案例，建议正式实现直接继承当回归集**。
-- 契约测试：connector 19/19，steward-m1 15/15，steward-m2 7/7。fake-pi 场景（happy/unreported/error×3/aborted/crash/throttle/stall×2/…）与 mock-steward（ping 计数、吞帧、断连）是测试基建的样板。
-- 线上：digest 例程准点复现；send 改变运行中 worker 的交付物；interrupt 秒级打断；孤儿清扫回收 5 个丢失事件；reap 修复卡死线程。
+- Routing eval (deepseek-flash, 106 cases): **94.3% pass**, wrong-route 1.9% (target <2%), missed asks 0%, unnecessary asks 4.2% (target <15%). Dataset at `spike-final:spikes/steward-m2/eval/dataset.ts` — **106 labeled cases with rationales; inherit them directly as the regression set**.
+- Contract tests: connector 19/19, steward-m1 15/15, steward-m2 7/7. The fake-pi scenarios (happy/unreported/error×3/aborted/crash/throttle/stall×2/…) and mock-steward (ping counting, frame swallowing, disconnects) are good templates for the test infrastructure.
+- Live: digest routines fired on schedule; a send changed a running worker's deliverable; an interrupt flipped a thread idle within seconds; the orphan sweep recovered 5 lost events; the reap sweep unstuck a wedged thread.
 
-## 5. 实战事件
+## 5. Field incidents
 
-- **4 小时云平台故障**（Cloudflare「Elevated Errors in China Network Colos」，2026-10-15）：DO 全量 1101、重部署无效（非 isolate 问题）、Worker 路由正常。连接器 5s 重试全程自愈，恢复即重连 + hello，落库数据零丢失，恢复窗口内 daily digest 准点发出。**结论：DB-backed 队列 + 幂等重试的设计正确，这类故障不需要任何人工干预。**
-- 两次真实 worker 挂死（1.4% CPU 沉默 20 分钟）→ 看门狗设计由此而来。
-- 一次真实家庭网络中断 → 心跳路径自愈。
+- **4-hour cloud platform incident** (Cloudflare "Elevated Errors in China Network Colos", 2026-10-15): every DO request 1101'd, redeploying didn't help (not an isolate problem), plain Worker routes stayed fine. The connector's 5s retry loop self-healed throughout — reconnect + hello the moment the DO returned, zero persisted-data loss, and the daily digest fired on time inside the recovery window. **Conclusion: DB-backed queues + idempotent retries is the right design; this class of outage needs no human intervention.**
+- Two real worker stalls (1.4% CPU, silent for 20 minutes) → this is where the watchdog design came from.
+- One real home-network outage → healed via the heartbeat path.
 
-## 6. 移交正式实现的缺口（按优先级）
+## 6. Handover gaps for the real implementation (by priority)
 
-1. **连接器重启自动续跑**：现在重启=报 lost（孤儿/reap），用户需重新派发。需要把「锁文件 + 进程指纹」升级为可恢复的 session 续接。
-2. **聊天内干预入口**：send/interrupt 目前只有 `/admin/*` HTTP 路由；要变成飞书内的自然语句（「停掉那个」「改成用 pnpm」→ 总管调 interrupt/send）。
-3. **pr_worker happy path**：等一次真实的 [同意] 点击完成闭环验证（门控设计保留）。
-4. **安装与分发形态**：现在连接器是 nohup 挂的裸脚本。要决定 npm 包 / Tauri / launchd 服务，以及开机自启、升级。
-5. **多机调度策略**：白名单已有多仓库；跨机器选机（负载、在线、亲和）未做。
-6. **安全加固**：admin token 走 HTTP 头（无轮换）、SERVER_KEY 长期有效、飞书回调验签的密钥管理。
-7. settle-time verify 的自然触发统计（目前零假阳性，样本还小）。
+1. **Auto-resume on connector restart**: today a restart reports lost (orphan/reap sweeps) and the user re-dispatches. Upgrade the lock-file + process fingerprint into resumable session continuation.
+2. **In-chat intervention**: send/interrupt are HTTP admin routes only today; they should become natural phrases in Feishu ("stop that one" / "use pnpm instead" → the steward calls interrupt/send).
+3. **pr_worker happy path**: awaits one real [同意] ("approve") click to close the loop (keep the consent-gate design).
+4. **Install and distribution**: the connector today is a bare script under nohup. Decide npm package / Tauri / launchd service, plus autostart and upgrades.
+5. **Multi-machine scheduling**: the whitelist already supports multiple repos; cross-machine selection (load, online state, affinity) is unimplemented.
+6. **Security hardening**: admin token over HTTP headers (no rotation), long-lived SERVER_KEY, key management for Feishu callback signature verification.
+7. Natural-occurrence statistics for settle-time verification (zero false positives so far, but the sample is small).
 
-## 7. 代码处置
+## 7. Code disposition
 
-`spikes/` 整体从工作树移除（结论已沉淀本文），git tag `spike-final` 保留全部历史以备查证。线上部署的 `shepherd-hook` worker 与本机连接器进程在正式实现接管前可继续运行（见第 5 节，故障期也无需照看）。
+`spikes/` was removed from the working tree (conclusions live in this document); git tag `spike-final` preserves the full history for reference. The local connector process has been stopped. The `shepherd-hook` worker remains deployed on Cloudflare with the Feishu webhook pointed at it — tear it down with `wrangler delete` (or leave it as a reference) when the real implementation takes over; `~/.shepherd-spike/` still holds the device token and two worktrees with untracked worker deliverables, pending cleanup.

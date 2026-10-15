@@ -1,187 +1,187 @@
-# 飞书渠道调研
+# Feishu Channel Research
 
-日期：2026-10-14。目的：判断「部署后扫码创建飞书 bot」是否成立，以及总管的飞书适配器该怎么接。
+Date: 2026-10-14. Purpose: determine whether "create a Feishu bot by scanning a QR code after deployment" holds up, and how the steward's Feishu adapter should be wired in.
 
-**同日实测**：全部关键问题已在实机验证（两次扫码创建、长连接收发、webhook 切换、自定义域名可达性），见文末「实测结果」一节。
+**Same-day live testing**: every key question has since been verified on a real machine (two QR-code creations, long-lived connection send/receive, webhook switchover, custom-domain reachability); see the "Live Test Results" section at the end.
 
-## 证据来源与可信度
+## Evidence Sources and Credibility
 
-飞书开放平台的文档站（`open.feishu.cn`、`open.larkoffice.com`）在本环境无法抓取，所以结论主要来自**官方 SDK 的源码**和第三方对接项目的文档：
+The Feishu Open Platform doc sites (`open.feishu.cn`, `open.larkoffice.com`) cannot be scraped from this environment, so the conclusions below come mainly from **the official SDK's source code** and the docs of third-party integration projects:
 
-| 来源 | 版本 | 可信度 |
+| Source | Version | Credibility |
 |---|---|---|
-| `larksuite/node-sdk`（官方）：`scene/registration/*`、`ws-client/*`、`code-gen/projects/application.ts`、`code-gen/projects/im.ts` | 提交 `e34a66f0`（2026-10-12），包版本 1.75.0 | 高。是协议的实际实现，`im.ts` 与 `application.ts` 里的注释是官方文档的摘录 |
-| `openclaw/openclaw` 的 `docs/channels/feishu*`（第三方对接，生产使用） | 提交 `89f8764f`（2026-10-14） | 中高。是别人踩过的坑，但不是官方 |
-| `SmokingMouse/trellis` PR #72（另一个第三方对接） | | 中。佐证扫码创建的流程 |
-| 搜索结果摘要 | | 低，仅作线索 |
+| `larksuite/node-sdk` (official): `scene/registration/*`, `ws-client/*`, `code-gen/projects/application.ts`, `code-gen/projects/im.ts` | commit `e34a66f0` (2026-10-12), package version 1.75.0 | High. It is the actual implementation of the protocol; the comments in `im.ts` and `application.ts` are excerpts of the official docs |
+| `docs/channels/feishu*` from `openclaw/openclaw` (third-party integration, used in production) | commit `89f8764f` (2026-10-14) | Medium-high. Pitfalls someone else has already hit, but not official |
+| `SmokingMouse/trellis` PR #72 (another third-party integration) | | Medium. Corroborates the QR-code creation flow |
+| Search result snippets | | Low; leads only |
 
-没有实机验证。扫码创建需要用户用飞书 App 扫码，涉及在用户的飞书账号下创建应用，需要用户配合（见最后一节）。
+No live verification yet. QR-code creation requires the user to scan with the Feishu app; it involves creating an app under the user's Feishu account and needs the user's cooperation (see the last section).
 
-## 1. 扫码一键创建：确实存在，且是官方能力
+## 1. QR-code one-click creation: it really exists, and it is an official capability
 
-SDK 的 `registerApp`（`scene/registration/index.ts`）基于 OAuth 2.0 设备授权流程（RFC 8628），只有两个 HTTP 调用，**不依赖 Node 运行时，Worker 里用 `fetch` 就能做**：
+The SDK's `registerApp` (`scene/registration/index.ts`) is built on the OAuth 2.0 device authorization flow (RFC 8628) and needs only two HTTP calls — **no Node runtime required, a Worker can do it with `fetch`**:
 
 ```
-POST https://accounts.feishu.cn/oauth/v1/app/registration      (Lark 国际版: accounts.larksuite.com)
+POST https://accounts.feishu.cn/oauth/v1/app/registration      (Lark international: accounts.larksuite.com)
 Content-Type: application/x-www-form-urlencoded
 
 1) action=begin & archetype=PersonalAgent & auth_method=client_secret & request_user_info=open_id
    → { device_code, verification_uri_complete, user_code, interval, expires_in }
 
-2) 每 interval 秒轮询： action=poll & device_code=...
-   → 等待中: { error: "authorization_pending" }     太快: { error: "slow_down" }（间隔加 5 秒）
-   → 成功:   { client_id, client_secret, user_info: { open_id, tenant_brand } }
-   → 失败:   access_denied / expired_token
+2) Poll every interval seconds: action=poll & device_code=...
+   → pending: { error: "authorization_pending" }     too fast: { error: "slow_down" } (interval + 5s)
+   → success: { client_id, client_secret, user_info: { open_id, tenant_brand } }
+   → failure: access_denied / expired_token
 ```
 
-要点：
+Key points:
 
-- `archetype: "PersonalAgent"`：这是为**个人 agent** 设计的应用类型，与我们的场景吻合。
-- 返回的 `user_info.open_id` 是**扫码人**的 open_id，直接可作为 owner 绑定（OpenClaw 的扫码流程就是据此把私聊锁定为本人）。`tenant_brand` 是 `feishu` 或 `lark`；若是 `lark`，要切换到 `accounts.larksuite.com` 继续轮询。
-- 二维码链接 10 分钟内有效、一次性。`expires_in` 默认 600 秒。
-- 链接上可带预填信息：`name`（支持 `{user}` 占位）、`desc`、头像（1–6 个公开可访问的图片 URL）；`createOnly=true` 隐藏「选择已有应用」入口，避免绑定到已有应用；`clientID` 用于更新已有应用的配置。
-- 扫码确认页上预置的**权限、事件、回调**通过 `addons` 参数传（只能带 5 个公开字段：`preset`、`scopes.tenant/user`、`events.items.tenant/user`、`callbacks.items`）。语义是**只增不减**，名称不在平台目录里的会被静默丢弃；整个 `addons` 还依赖平台灰度开关，**未开启时整个参数被忽略，走默认流程**。
-- SDK 注释明确写出：`events.subscription_type`、`request_url`、`security.*`、加密密钥这类**敏感配置不能通过 URL 带**，必须走「更新应用配置」OpenAPI，`encodeAddons` 会拒绝。
+- `archetype: "PersonalAgent"`: an app type designed for **personal agents**, which matches our scenario.
+- The returned `user_info.open_id` is the open_id of **the person who scanned**, usable directly as the owner binding (OpenClaw's scan flow relies on exactly this to lock direct chats to that person). `tenant_brand` is `feishu` or `lark`; if it is `lark`, polling must switch to `accounts.larksuite.com`.
+- The QR link is valid for 10 minutes and is single-use. `expires_in` defaults to 600 seconds.
+- The link can carry prefilled fields: `name` (supports the `{user}` placeholder), `desc`, avatar (1–6 publicly accessible image URLs); `createOnly=true` hides the 「选择已有应用」 ("select an existing app") entry so the flow cannot bind to an existing app; `clientID` is for updating an existing app's config.
+- The **permissions, events, and callbacks** preset on the scan confirmation page are passed via the `addons` parameter (only 5 public fields can be carried: `preset`, `scopes.tenant/user`, `events.items.tenant/user`, `callbacks.items`). The semantics are **add-only** — names not present in the platform catalog are silently dropped. The whole `addons` mechanism also depends on a platform gradual-rollout switch: **when it is off, the entire parameter is ignored and the default flow runs**.
+- The SDK comments state explicitly: **sensitive config** such as `events.subscription_type`, `request_url`, `security.*`, and encryption keys **cannot be carried in the URL**; it must go through the "update app config" OpenAPI — `encodeAddons` will reject it.
 
-已知的坑（OpenClaw 文档）：国内飞书手机 App 有时对二维码无反应，建议回退到手动方式（在开发者后台创建自建应用，手动填 App ID 和 App Secret）。
+Known pitfall (OpenClaw docs): the China-market Feishu mobile app sometimes does not react to the QR code; the recommended fallback is the manual path (create a custom app in the developer console and fill in the App ID and App Secret by hand).
 
-**结论：「部署完成后出二维码，扫码创建 bot」成立，且实现成本很低。** 手动填凭据应当作为兜底路径保留。
+**Conclusion: "show a QR code once deployment finishes, scan it to create the bot" holds, and the implementation cost is very low.** Manually entering credentials should be kept as the fallback path.
 
-## 2. 事件接收：长连接是默认，webhook 是可选
+## 2. Event reception: the long-lived connection is the default, webhook is optional
 
-| 模式 | 要求 | 备注 |
+| Mode | Requirements | Notes |
 |---|---|---|
-| **长连接（WebSocket）** | 应用主动连飞书，**不需要公网地址** | 扫码创建的应用默认走这种（OpenClaw：WebSocket 是默认传输；trellis：创建后「等长连接连上」） |
-| webhook | 需要公网 HTTPS 地址，飞书把事件 POST 过来 | OpenClaw 视为可选；回调带签名，有时间戳 |
+| **Long-lived connection (WebSocket)** | The app dials out to Feishu; **no public address needed** | QR-code-created apps use this by default (OpenClaw: WebSocket is the default transport; trellis: after creation, "wait for the long-lived connection to come up") |
+| webhook | Requires a public HTTPS address for Feishu to POST events to | OpenClaw treats it as optional; callbacks carry a signature and a timestamp |
 
-### 2.1 能否把扫码创建的应用改成 webhook：不确定
+### 2.1 Whether a QR-code-created app can be switched to webhook: uncertain
 
-「更新应用配置」接口（`PATCH /open-apis/application/v7/applications/:app_id/config`）可以设置 `event.subscription_type: "webhook" | "websocket"`、`request_url`、`add_events`、`callback.callback_type`、`event_and_callback_encrypt_strategy`（`encryption_key`、`verification_token`）。但官方注释写明：
+The "update app config" API (`PATCH /open-apis/application/v7/applications/:app_id/config`) can set `event.subscription_type: "webhook" | "websocket"`, `request_url`, `add_events`, `callback.callback_type`, and `event_and_callback_encrypt_strategy` (`encryption_key`, `verification_token`). But the official comments state plainly:
 
-> 仅支持更新开发者后台创建的自建应用，**不包含通过机器人助手等其他渠道创建的自建应用**
+> Only custom apps created in the developer console are supported, **excluding custom apps created through other channels such as the bot assistant**
 
-扫码创建的 `PersonalAgent` 应用算不算「开发者后台创建的」，源码和文档里都没有答案。**必须实测。**
+Whether a QR-code-created `PersonalAgent` app counts as "created in the developer console" is answered nowhere in the source or the docs. **Must be tested live.**
 
-另外：事件订阅服务器地址修改后立即生效，其他配置要「提交发布」并审核通过后才在线上生效。
+Also: the event subscription server address takes effect immediately after modification; other config takes effect in production only after "submit for release" plus review approval.
 
-### 2.2 长连接协议（`ws-client/index.ts`）
+### 2.2 Long-lived connection protocol (`ws-client/index.ts`)
 
-1. `POST https://open.feishu.cn/callback/ws/endpoint`，body `{ AppID, AppSecret }`，请求头 `locale: zh`。返回 `{ code, data: { URL, ClientConfig: { PingInterval, ReconnectCount, ReconnectInterval, ReconnectNonce } } }`。`URL` 里带 `device_id`、`service_id`。
-2. 连接 `URL`（WebSocket）。帧是 **protobuf**（`pbbp2.Frame`，头部键值对；`method`: 0 控制帧 / 1 数据帧）。头部键：`type`（`ping`/`pong`/`event`/`card`）、`message_id`、`sum`、`seq`（大事件分片）、`trace_id`、`biz_rt`、握手状态。
-3. 客户端按 `PingInterval` 发 ping 帧。
-4. 事件帧要**分片合并**（`sum`、`seq`），处理后回一个同结构的响应帧，payload 为 `{ "code": 200 }`，并带上 `biz_rt` 耗时。
-5. 错误码包括 `exceed_conn_limit`（连接数超限）、`auth_failed`、`forbidden`。
-6. 长连接只对**自建应用且飞书（非国际版 Lark 部分场景）**可用，需要在开发者后台选择「使用长连接接收事件/回调」（SDK 日志原文）。多连接时飞书是「集群模式」，一个事件只投递给其中一个连接（来自对飞书长连接机制的常见描述，源码里没有直接证据，**未验证**）。
+1. `POST https://open.feishu.cn/callback/ws/endpoint`, body `{ AppID, AppSecret }`, request header `locale: zh`. Returns `{ code, data: { URL, ClientConfig: { PingInterval, ReconnectCount, ReconnectInterval, ReconnectNonce } } }`. The `URL` carries `device_id` and `service_id`.
+2. Connect to `URL` (WebSocket). Frames are **protobuf** (`pbbp2.Frame`, header key-value pairs; `method`: 0 control frame / 1 data frame). Header keys: `type` (`ping`/`pong`/`event`/`card`), `message_id`, `sum`, `seq` (sharding of large events), `trace_id`, `biz_rt`, handshake status.
+3. The client sends ping frames at the `PingInterval` cadence.
+4. Event frames must be **reassembled from shards** (`sum`, `seq`); after processing, reply with a response frame of the same structure, payload `{ "code": 200 }`, and carry the elapsed time in `biz_rt`.
+5. Error codes include `exceed_conn_limit` (connection count over the limit), `auth_failed`, `forbidden`.
+6. The long-lived connection is available only for **custom apps on Feishu (not in some Lark international scenarios)** and requires selecting 「使用长连接接收事件/回调」 ("use long-lived connection to receive events/callbacks") in the developer console (verbatim from the SDK log). With multiple connections, Feishu runs in "cluster mode" and delivers each event to only one of the connections (from common descriptions of Feishu's long-lived connection mechanism; no direct evidence in the source, **unverified**).
 
-### 2.3 把长连接放进 Durable Object：可行，但有代价
+### 2.3 Putting the long-lived connection inside a Durable Object: feasible, but at a cost
 
-| 问题 | 分析 |
+| Question | Analysis |
 |---|---|
-| DO 能当 WebSocket **客户端**吗 | 能。但文档明确：**出站 WebSocket 不能休眠**，连接期间 DO 一直在内存里。注意方向：心跳 ping 是 **DO 发给飞书**的（间隔由飞书在 `ClientConfig.PingInterval` 下发），DO 的状态是「整月不休眠」，而不是「被反复唤醒」。出站连接收到的消息是否计入请求数，未验证 |
-| 费用 | 常醒的 DO 整月约 331,776 GB-s，低于付费计划每月含的 400,000 GB-s（见 [cloudflare-do-websocket.md](cloudflare-do-websocket.md)）；但这会让「休眠几乎不花钱」的假设失效，且挤占含量 |
-| 崩溃 / 逐出后谁来重连 | DO 没有常驻进程。需要 alarm 心跳，在 DO 被重置后拉起并重连。原型已验证 alarm 可以唤醒被重置的 DO |
-| 协议实现 | 要自己用 TypeScript 实现 protobuf 帧编解码、分片合并、ping、确认帧。`pbbp2` 很小（官方 SDK 的 `pbbp2.d.ts` 约 8.6 KB），可手写；官方 SDK 依赖 Node 的 `ws` 与 axios，不适合直接放进 Worker |
-| 确认时限 | 事件需要在数秒内确认（具体时限未在源码中看到），否则飞书会重发；总管的处理必须异步，收到先确认再处理，并用 `message_id` 去重 |
+| Can a DO act as a WebSocket **client** | Yes. But the docs are explicit: **an outbound WebSocket cannot hibernate** — the DO stays in memory for the whole connection. Note the direction: heartbeat pings go **from the DO to Feishu** (the interval is dictated by Feishu via `ClientConfig.PingInterval`), so the DO's state is "awake all month", not "woken over and over". Whether messages received over the outbound connection count toward request quota is unverified |
+| Cost | An always-awake DO burns roughly 331,776 GB-s per month, below the 400,000 GB-s included monthly with the paid plan (see [cloudflare-do-websocket.md](cloudflare-do-websocket.md)); but this breaks the "hibernation costs almost nothing" assumption and eats into the included allowance |
+| Who reconnects after a crash / eviction | A DO has no resident process. An alarm heartbeat is needed to bring the DO back up and reconnect after a reset. The prototype verified that an alarm can wake a reset DO |
+| Protocol implementation | We would have to implement protobuf frame encode/decode, shard reassembly, ping, and ack frames ourselves in TypeScript. `pbbp2` is tiny (the official SDK's `pbbp2.d.ts` is about 8.6 KB) and can be hand-written; the official SDK depends on Node's `ws` and axios, so it does not drop into a Worker |
+| Ack deadline | Events must be acknowledged within seconds (the exact deadline is not visible in the source), otherwise Feishu redelivers; the steward's processing must be asynchronous — acknowledge first, then process — and deduplicate on `message_id` |
 
-### 2.4 长连接与 webhook 的取舍
+### 2.4 Long-lived connection vs webhook
 
-| | 长连接 | webhook |
+| | Long-lived connection | webhook |
 |---|---|---|
-| DO 能否休眠 | 否，连接期间常醒 | 能，空闲几乎零成本 |
-| 需要可被飞书访问的地址 | 否 | 是（国内大概率要自定义域名） |
-| 要自己实现 | protobuf 帧、分片合并、ping、确认帧、重连、alarm 保活 | 验签、URL 验证握手、数秒内响应、去重 |
-| 故障面 | 连接状态要自己发现和恢复 | 无连接状态，飞书会重发 |
+| Can the DO hibernate | No, awake for as long as the connection lives | Yes, near-zero cost while idle |
+| Needs an address Feishu can reach | No | Yes (in mainland China, almost certainly a custom domain) |
+| Must be implemented by us | protobuf frames, shard reassembly, ping, ack frames, reconnect, alarm keep-alive | signature verification, the URL verification handshake, responding within seconds, dedup |
+| Failure surface | Connection state must be detected and recovered by us | No connection state; Feishu redelivers |
 
-结论：适配器两种都支持，有可用自定义域名且扫码创建的应用能改成 webhook 时优先 webhook，否则退回长连接。前提都是第 6 节的未验证项。OpenClaw 的 webhook 模式有两条值得借鉴的做法：先把事件**持久化再返回 200**；拒绝时间戳与本机时钟相差超过 1 小时的签名回调（飞书签名不带过期，截获的回调可被重放）。
+Conclusion: the adapter supports both; prefer webhook when a usable custom domain exists and the QR-code-created app can be switched to webhook, otherwise fall back to the long-lived connection. Both rest on the unverified items in section 6. Two practices from OpenClaw's webhook mode are worth borrowing: **persist the event before returning 200**; and reject signed callbacks whose timestamp deviates from the local clock by more than 1 hour (Feishu signatures carry no expiry, so an intercepted callback can be replayed).
 
-## 3. 一个与渠道无关、但被这次调研放大的风险：国内网络
+## 3. A channel-independent risk amplified by this research: the mainland China network
 
-我们在本机实测过：`*.workers.dev` 在国内被封（DNS 污染，TLS 按 SNI 重置），必须借助代理才能访问（[协议原型实测](do-protocol-spike.md)）。这对飞书渠道有两层含义：
+We have tested locally: `*.workers.dev` is blocked in mainland China (DNS pollution, TLS reset by SNI) and is reachable only through a proxy ([protocol prototype live test](do-protocol-spike.md)). For the Feishu channel this has two layers of implication:
 
-1. **飞书服务器能否把 webhook 回调推到我们的 Worker 地址**。飞书服务器在国内，访问 `workers.dev` 大概率同样受阻（**未验证**）。所以：webhook 模式大概率需要一个**自定义域名**，长连接则没有这个问题（出站的，DO 从 Cloudflare 边缘连飞书）。
-2. **更直接的问题：用户自己**。你在手机上点开汇报里的「查看详情」链接，以及电脑上的连接器连总管的 WebSocket，都要访问我们的 Worker 地址。国内用户**不加代理就访问不了 `workers.dev`**。
+1. **Whether Feishu's servers can push webhook callbacks to our Worker address.** Feishu's servers are in China; their access to `workers.dev` is most likely blocked the same way (**unverified**). So webhook mode most likely needs a **custom domain**, while the long-lived connection has no such problem (it is outbound — the DO connects to Feishu from the Cloudflare edge).
+2. **The more direct problem: the users themselves.** Tapping the 「查看详情」 ("view details") link in a report card on a phone, or the desktop connector connecting to the steward's WebSocket, both hit our Worker address. Mainland users **cannot reach `workers.dev` without a proxy**.
 
-所以，对中国大陆用户，「一键部署后零配置」不成立：**需要给 Worker 绑定自定义域名**（或者让连接器与网页走用户自己的代理）。这应当写进上手流程，并在部署指引里把它作为中国用户的必经步骤。Cloudflare 自定义域名在国内可达性也并不稳定，是否可用需要实测。
+So for mainland Chinese users, "one-click deploy, zero config" does not hold: **the Worker needs a custom domain bound** (or the connector and the web pages must go through the user's own proxy). This should be written into the onboarding flow and listed in the deployment guide as a mandatory step for Chinese users. Cloudflare custom domains are themselves not reliably reachable from China; whether one works needs a live test.
 
-## 4. 消息发送（`im/v1`）
+## 4. Message sending (`im/v1`)
 
-来自 `code-gen/projects/im.ts` 的官方注释。
+From the official comments in `code-gen/projects/im.ts`.
 
-- **发送消息** `POST /open-apis/im/v1/messages?receive_id_type=open_id`，body `{ receive_id, msg_type, content, uuid? }`。`msg_type` 支持文本、富文本、卡片（`interactive`）、图片、文件、音频、视频等。`uuid` 字段用于请求去重（具体去重窗口在源码注释里没有写，**未验证**）。
-- **回复消息** 支持文本、富文本、卡片等。前提：应用开启**机器人能力**；回复单聊时，用户必须在机器人的**可用范围**内；回复群消息时，机器人要在群里且有发言权限。
-- **更新已发送的卡片** `PATCH /open-apis/im/v1/messages/:message_id`，body `{ content }`。注释说明：更新应用发送的消息卡片用 `patch`；编辑消息（`update`）只支持文本和富文本。
-- **频率**：向**同一用户**发送限 **5 QPS**；向同一群组限群内机器人共享 5 QPS。
-- **大小**：序列化后的消息上限 **30 KB**（OpenClaw 文档：Markdown 卡片与富文本超过会被拆分）；纯文本按 4000 字符分块是常见做法。
-- **流式回复**：通过 Card Kit 的流式 API，机器人在生成时实时更新同一张卡片（OpenClaw 已用）。
-- **下载用户发来的图片**：`image.get` 只能下载**机器人自己上传**的图片；用户发给机器人的图片要用「获取消息中的资源文件」接口（`im/v1/messages/:message_id/resources/:file_key`）。媒体上传下载默认上限 30 MB（OpenClaw 配置）。
-- **访问令牌**：`tenant_access_token`，用 `client_id` / `client_secret` 换取，有有效期（约 2 小时，来自常识，源码摘录里没有写，**未验证**）。
+- **Send message** `POST /open-apis/im/v1/messages?receive_id_type=open_id`, body `{ receive_id, msg_type, content, uuid? }`. `msg_type` supports text, rich text, cards (`interactive`), images, files, audio, video, and more. The `uuid` field is for request deduplication (the exact dedup window is not stated in the source comments, **unverified**).
+- **Reply to message** supports text, rich text, cards, and more. Preconditions: the app has **bot capability** enabled; when replying in a direct chat, the user must be inside the bot's **availability range**; when replying to a group message, the bot must be in the group and have permission to speak.
+- **Update an already-sent card** `PATCH /open-apis/im/v1/messages/:message_id`, body `{ content }`. Per the comments: use `patch` to update a message card sent by the app; editing a message (`update`) supports only text and rich text.
+- **Rate limits**: **5 QPS** cap when sending to **the same user**; for the same group, the bots in the group share 5 QPS.
+- **Size**: the serialized message cap is **30 KB** (OpenClaw docs: Markdown cards and rich text beyond that get split); chunking plain text at 4000 characters is common practice.
+- **Streaming replies**: via Card Kit's streaming API, the bot updates the same card in real time while generating (OpenClaw already uses this).
+- **Downloading images sent by users**: `image.get` can only download images **uploaded by the bot itself**; for images a user sends to the bot, use the "get message resource" API (`im/v1/messages/:message_id/resources/:file_key`). The default media upload/download cap is 30 MB (OpenClaw's config).
+- **Access token**: `tenant_access_token`, obtained by exchanging `client_id` / `client_secret`, with an expiry (about 2 hours; from common knowledge, not written in the source excerpts, **unverified**).
 
-## 5. 对总管设计的影响
+## 5. Impact on the steward's design
 
-1. **上手流程可以做成**：部署完成 → 打开设置页 → 页面展示由 DO 发起的 `begin` 得到的二维码 → 用户用飞书扫码 → DO 的 alarm 轮询得到 `client_id`、`client_secret`、`open_id` → 加密存储、绑定 owner → 开始接收事件。**用户只需要一次扫码。**
-2. **入站默认走长连接**，由 DO 托管；`ChannelAdapter` 需要支持两种入站实现：`LongConnection`（DO 出站连接，alarm 保活）和 `Webhook`（HTTP 回调，自定义域名）。MVP 先做长连接。
-3. **owner 绑定自动完成**：用 `registerApp` 返回的 `open_id`，不需要用户额外输入。
-4. **出站要有限流**：同一用户 5 QPS，通知合并窗口（steward.md §6.4）与此一致；`notify_user` 渲染的卡片不得超过 30 KB。
-5. **卡片按钮**走 `card.action.trigger` 回调。长连接模式下回调也通过同一连接到达（`MessageType.card`），需要确认帧。
-6. **中国用户必须自定义域名**（§3），写进上手文档，并在部署后检查流程里加入「访问性自检」。
+1. **The onboarding flow can be**: deployment finishes → open the settings page → the page shows the QR code obtained from the DO-initiated `begin` call → the user scans with Feishu → the DO's alarm polling obtains `client_id`, `client_secret`, `open_id` → encrypt and store, bind the owner → start receiving events. **The user scans exactly once.**
+2. **Inbound defaults to the long-lived connection**, hosted by the DO; `ChannelAdapter` needs to support two inbound implementations: `LongConnection` (DO outbound connection, alarm keep-alive) and `Webhook` (HTTP callback, custom domain). The MVP does the long-lived connection first.
+3. **Owner binding is done automatically**: use the `open_id` returned by `registerApp`; the user needs to enter nothing extra.
+4. **Outbound must be rate-limited**: 5 QPS to the same user; the notification merge window (steward.md §6.4) matches this; the card rendered by `notify_user` must not exceed 30 KB.
+5. **Card buttons** go through the `card.action.trigger` callback. In long-lived-connection mode the callback also arrives over the same connection (`MessageType.card`) and needs an ack frame.
+6. **Chinese users must have a custom domain** (§3); write it into the onboarding docs and add a "reachability self-check" to the post-deployment checks.
 
-## 6. 仍未验证的点
+## 6. Points still unverified
 
-| 项 | 为什么重要 |
+| Item | Why it matters |
 |---|---|
-| 扫码创建的应用能否通过 `PATCH .../config` 改成 webhook | 决定 webhook 模式是否可用 |
-| 扫码创建的应用是否需要「发布 / 审核」才生效，个人账号有没有创建限制（需要开发者权限） | 决定上手流程是否真的「一次扫码」 |
-| `addons` 的灰度开关对用户是否开启；默认预置哪些权限与事件，是否包含 `im.message.receive_v1` 和 `card.action.trigger` | 决定是否需要额外步骤补权限 |
-| 长连接在 Cloudflare DO 里的稳定性（出站 WebSocket、protobuf 帧、重连、alarm 保活） | 决定「DO 托管长连接」可行与否 |
-| 飞书服务器访问 `workers.dev` 与自定义域名的可达性 | 决定 webhook 是否可行 |
-| 事件确认的时限、重发策略、`message_id` 去重窗口 | 影响幂等设计 |
-| 单聊机器人对话的「可用范围」默认值，别人能不能给这个 bot 发消息 | 影响 owner 绑定之外的安全 |
-| 国内飞书 App 对二维码无反应的情形占比 | 决定兜底路径的重要性 |
+| Whether a QR-code-created app can be switched to webhook via `PATCH .../config` | Decides whether webhook mode is available at all |
+| Whether a QR-code-created app needs "publish / review" before it takes effect, and whether personal accounts face creation restrictions (developer permission required) | Decides whether onboarding is truly "one scan" |
+| Whether the `addons` gradual-rollout switch is enabled for the user; which permissions and events are preset by default, and whether they include `im.message.receive_v1` and `card.action.trigger` | Decides whether extra steps are needed to top up permissions |
+| Stability of the long-lived connection inside a Cloudflare DO (outbound WebSocket, protobuf frames, reconnect, alarm keep-alive) | Decides whether a "DO-hosted long-lived connection" is feasible |
+| Reachability of `workers.dev` and of the custom domain from Feishu's servers | Decides whether webhook is viable |
+| The event ack deadline, the redelivery policy, the `message_id` dedup window | Affects idempotency design |
+| The default "availability range" for direct chats with the bot, and whether other people can message this bot | Affects security beyond owner binding |
+| How often the China-market Feishu app fails to react to the QR code | Decides how important the fallback path is |
 
-## 7. 建议的实测
+## 7. Recommended live tests
 
-（以下已于 2026-10-14 完成，见下一节。）
+(Completed on 2026-10-14; see the next section.)
 
-## 8. 实测结果（2026-10-14）
+## 8. Live test results (2026-10-14)
 
-环境：Mac mini（macOS）+ 官方 SDK `@larksuiteoapi/node-sdk@1.75.0`；Cloudflare Worker `shepherd-hook` + 自定义域名 `shepherd-spike.iefnaf.cc`；两次扫码创建（两个不同的飞书账号）。原始脚本：[spikes/feishu](../../spikes/feishu)。
+Environment: Mac mini (macOS) + official SDK `@larksuiteoapi/node-sdk@1.75.0`; Cloudflare Worker `shepherd-hook` + custom domain `shepherd-spike.iefnaf.cc`; two QR-code creations (two different Feishu accounts). Original scripts: [spikes/feishu](../../spikes/feishu).
 
-### 8.1 通过的
+### 8.1 What passed
 
-| 项 | 结果 |
+| Item | Result |
 |---|---|
-| 扫码创建（两个账号各一次） | ✅ 均成功。返回 `client_id`/`client_secret`/扫码人 `open_id`。默认配置**完全一致**：36 个权限（含收发消息、卡片、机器人能力）、9 个事件（含 `im.message.receive_v1`）、websocket 回调（含 `card.action.trigger`）、自动发布版本 1.0.0，无需任何审核或管理员操作 |
-| 二维码有效期 | 实测 `expires_in=3600s`（SDK 文档写 10 分钟，以实测为准） |
-| 扫码补权限（`addons` 更新流程） | ✅ 第二个应用上成功加上 `application:application:patch`（36→37 个），**secret 不轮换**、应用不变。（第一次在另一应用上未生效，原因未定；灰度或确认页操作都有可能） |
-| 长连接全链路 | ✅ 事件到达（`im.message.receive_v1`，从消息 `create_time` 到本地收到约 **500–600 ms**）、回复文本、发送卡片、`PATCH` 更新卡片、按钮回调（`card.action.trigger`）、图片消息、`messageResource.get` 下载用户发的图（30 KB webp，约 850 ms） |
-| 引用回复路由 | ✅ 用户引用回复我们的卡片时，事件的 `parent_id` **正好等于**我们那张卡片的 `message_id`。「回复某条汇报即路由到对应 Thread」的强信号成立 |
-| 自定义域名国内可达性 | ✅ 本机不走代理直连 `https://shepherd-spike.iefnaf.cc/` 200（约 1.2 s）。连接器与详情页走自定义域名**不需要代理** |
+| QR-code creation (once for each of two accounts) | ✅ Both succeeded. Returned `client_id`/`client_secret`/the scanner's `open_id`. The default configs were **exactly identical**: 36 permissions (including message send/receive, cards, bot capability), 9 events (including `im.message.receive_v1`), websocket callback (including `card.action.trigger`), auto-published version 1.0.0 — no review or admin action of any kind |
+| QR code validity | Measured `expires_in=3600s` (the SDK docs say 10 minutes; trust the measurement) |
+| Permission top-up by scan (the `addons` update flow) | ✅ `application:application:patch` was successfully added on the second app (36→37); **the secret is not rotated**, the app unchanged. (A first attempt on another app did not take effect; cause undetermined — gradual rollout or an action on the confirmation page are both possible) |
+| Long-lived connection, full chain | ✅ Events arrived (`im.message.receive_v1`, roughly **500–600 ms** from the message `create_time` to local receipt), text replies, sending cards, `PATCH` card updates, button callbacks (`card.action.trigger`), image messages, and `messageResource.get` downloading a user-sent image (30 KB webp, about 850 ms) |
+| Quote-reply routing | ✅ When a user quote-replies to our card, the event's `parent_id` **is exactly** that card's `message_id`. The strong signal holds: "replying to a given report routes to the corresponding Thread" |
+| Custom-domain reachability from China | ✅ A direct hit on `https://shepherd-spike.iefnaf.cc/` from this machine without a proxy returned 200 (about 1.2 s). The connector and the detail pages via the custom domain **need no proxy** |
 
-### 8.2 webhooks：可用，但切换需要「配置 + 控制台重新发布」两步（核心发现，含一次反复）
+### 8.2 webhooks: usable, but switching takes two steps, "config change + console republish" (key finding, with one reversal)
 
-1. `*.workers.dev` 从国内不可达，**对飞书服务器同样不可达**：PATCH 到 workers.dev 地址报 210042（URL 验证失败 = 飞书的验证请求到不了 Worker）。
-2. 换自定义域名后，**URL 验证通过**（日志看到飞书验证服务器 `123.58.10.238/239`（中国）的 `url_verification` 请求），PATCH 返回 success。
-3. **但仅靠 API 切换不生效**：多次成功 PATCH（含 `add_events`）、停掉长连接客户端、甚至用 API `publish` 发版（版本 1.0.1 上线，`online_version_id` 已切换），事件投递依然走长连接。期间 `callback_info.callback_type` 的显示在 webhook/websocket 间跳动，与真实投递不一致。
-4. **控制台重新发布后生效**：用户在开发者后台重新发布版本，再 PATCH 一次，`callback_type` 稳定显示 webhook，**事件投递真实切换**：
-   - `im.message.receive_v1` 从飞书服务器直达 Worker，消息创建到收到约 **400 ms**；
-   - `card.action.trigger` 按钮回调同样到达，`action.value` 自定义数据原样回传，`context.open_message_id` 指向卡片消息（回调路由强信号），`operator.open_id` 可校验操作者。
-5. `publish` API 注意：不带 `mobile_default_ability`/`pc_default_ability` 报 210042 系的 210304（缺字段）；带全 5 个字段仍报 50516，但版本会创建并上线——**API 发版与控制台发版在服务端效果不等价**，差在哪未查明。
+1. `*.workers.dev` is unreachable from mainland China, **and equally unreachable to Feishu's servers**: PATCHing a workers.dev address returned 210042 (URL verification failed = Feishu's verification request never reached the Worker).
+2. After switching to the custom domain, **URL verification passed** (the logs show the `url_verification` request from Feishu's verification servers `123.58.10.238/239` (China)), and the PATCH returned success.
+3. **But switching via the API alone does not take effect**: after multiple successful PATCHes (including `add_events`), stopping the long-lived-connection client, and even releasing a version via the `publish` API (version 1.0.1 went live, `online_version_id` already switched), event delivery still ran over the long-lived connection. During this period the displayed `callback_info.callback_type` bounced between webhook/websocket, out of sync with actual delivery.
+4. **It took effect after a console republish**: the user republished the version in the developer console, then PATCHed once more; `callback_type` settled on webhook, and **event delivery actually switched**:
+   - `im.message.receive_v1` now reaches the Worker straight from Feishu's servers, roughly **400 ms** from message creation to receipt;
+   - the `card.action.trigger` button callback arrives as well: `action.value` custom data round-trips verbatim, `context.open_message_id` points at the card message (a strong signal for callback routing), and `operator.open_id` can verify the operator.
+5. `publish` API caveat: without `mobile_default_ability`/`pc_default_ability` it returns 210304, of the 210042 family (missing fields); with all 5 fields it still returns 50516, yet the version is created and goes live — **an API release and a console release are not equivalent server-side**; where they differ was not determined.
 
-**结论：webhook 对扫码创建的应用可用**，条件是自定义域名 + 扫码补 `application:application:patch` 权限 + config PATCH + **控制台重新发布**（API 发版不能替代）。长连接作为无需控制台操作的备选。设置流程里「控制台重新发布」是唯一需要用户离开扫码流程的一步；`publish` API 与 PATCH 的正确组合顺序（先发版后 PATCH？）未穷尽，值得后续再试一次，若成立则全自动。
+**Conclusion: webhook is usable for QR-code-created apps**, on the conditions of a custom domain + a scan to add the `application:application:patch` permission + the config PATCH + **a console republish** (an API release cannot substitute for it). The long-lived connection remains the option that needs no console work. In the setup flow, "republish in the console" is the only step that pulls the user away from the scan flow; the correct combination and ordering of the `publish` API and the PATCH (release first, then PATCH?) was not exhausted — worth another try later; if it works, the whole thing is fully automatic.
 
-**对实现的影响**：webhook 模式下 DO 只需一个 HTTP 端点加验签（事件带 `token` 字段可校验，回调有独立 `token`），**不需要在 DO 里手写 protobuf 长连接客户端**，实现量大幅下降，且 DO 可以休眠。MVP 默认改为 webhook，长连接作为「不想去控制台」的降级选项。
+**Impact on the implementation**: in webhook mode the DO needs only one HTTP endpoint plus signature verification (events carry a `token` field that can be checked; callbacks have a separate `token`); **no hand-written protobuf long-lived-connection client inside the DO**, the implementation effort drops sharply, and the DO can hibernate. The MVP default switches to webhook, with the long-lived connection as the downgrade option for "I don't want to touch the console".
 
-### 8.3 其他实测细节
+### 8.3 Other live-test details
 
-- `image.get` 不能下载用户发的图（返回 400），必须用 `im.messageResource.get`——与官方注释一致。
-- 创建应用的默认名会被裁短（预填 "Shepherd Spike ({user})" → 应用名 "Spike"）；多次创建会出现多个同名 bot，产品上要注意引导用户删除旧应用或命名区分。
-- `addons` 编码后的内容确实走 URL 参数（实测链接中可见 gzip+base64 的 `addons=` 段）。
-- wrangler OAuth 授权页会记住上次勾选的权限范围，重新 login 不会自动补全；远程机器上 `wrangler login` 的 localhost 回调到不了远端，需要控制台手动操作或 API Token（本次用「现有权限部署 + 控制台手动绑域名」绕过）。
+- `image.get` cannot download user-sent images (returns 400); `im.messageResource.get` is required — consistent with the official comments.
+- The default app name gets truncated at creation (prefilled "Shepherd Spike ({user})" → app name "Spike"); repeated creations pile up same-named bots, so the product should guide users to delete old apps or tell them apart by name.
+- The encoded `addons` content really does travel in the URL parameter (the gzip+base64 `addons=` segment is visible in the tested link).
+- The wrangler OAuth consent page remembers the permission scopes checked last time; re-login does not auto-complete them. On a remote machine, `wrangler login`'s localhost callback cannot reach the remote end, so manual console operations or an API Token are needed (this round was worked around with "deploy under existing permissions + bind the domain manually in the console").
 
-## 9. 对设计的影响（更新）
+## 9. Impact on the design (updated)
 
-1. **MVP 入站 = webhook**（2026-10-14 实测后修正）：DO 完全休眠、实现只要一个 HTTP 端点加验签；设置流程多一步「控制台重新发布」。长连接降为备选（无需控制台，但 DO 常醒且要在 DO 里实现 protobuf 帧协议）。
-2. 上手流程：扫码创建（默认权限/事件/自动发布）→ 扫码补 `application:application:patch` → config PATCH 切 webhook（URL 验证自动完成）→ 控制台重新发布。待验证 `publish` API 能否替代最后一步。
-3. 自定义域名是国内用户的必选项（连接器、详情页、webhook 全依赖它），部署指引里要有可达性自检。
-4. 引用路由的强信号已验证：文本消息的 `parent_id` 和卡片回调的 `context.open_message_id` 都指向我们的消息 ID。
+1. **MVP inbound = webhook** (revised after the 2026-10-14 live test): the DO hibernates fully, and the implementation is just one HTTP endpoint plus signature verification; the setup flow gains one extra step, "republish in the console". The long-lived connection is demoted to the alternative (no console needed, but the DO stays awake and the protobuf frame protocol must be implemented inside the DO).
+2. Onboarding: scan to create (default permissions/events/auto-publish) → scan to add `application:application:patch` → config PATCH to switch to webhook (URL verification happens automatically) → republish in the console. To be verified: whether the `publish` API can replace the last step.
+3. A custom domain is mandatory for mainland Chinese users (the connector, the detail pages, and webhook all depend on it); the deployment guide must include a reachability self-check.
+4. The strong signal for quote routing is now verified: both a text message's `parent_id` and a card callback's `context.open_message_id` point at our message ID.
 
