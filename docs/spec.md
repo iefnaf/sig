@@ -199,7 +199,7 @@ The core idea: **distinguish "the machine is temporarily away" from "the task fa
 | Connection drops mid-task | The worker is marked "lost contact", not failed. The steward neither retries nor declares failure; it waits, and only mentions it in a report if the loss of contact drags on |
 | The machine comes back | The connector reports tasks still running and tasks already finished, and the steward reconciles. Still running: resumed. Finished: results collected late. Interrupted: **automatically try to resume the original session, and ask the user only if that fails** |
 
-Memory keeps each machine's online habits (usually online vs. usually offline). The MVP only records this; automatic selection when dispatching long tasks comes later.
+Memory keeps each machine's online habits (usually online vs. usually offline); the MVP only records them. When several machines have the repo, the MVP picks one by a deterministic rule (user-named > the Thread's last machine > online > most free slots) and asks when there is no unique winner; see [ADR-0001](adr/0001-mvp-implementation-baseline.md). Habit-based selection for long tasks comes later.
 
 ## 10. Memory
 

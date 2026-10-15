@@ -50,7 +50,7 @@ Authorization: Bearer <device token>
 ### 3.2 Keep-alive and sleep
 
 - The connector sends a WebSocket protocol-level `ping` frame every **25 seconds**; if no `pong` arrives within 60 seconds it treats the link as dead and reconnects. The runtime auto-replies `pong` and **does not wake a sleeping DO** — near-zero cost.
-- There is no periodic application-level heartbeat. The DO judges "is the machine online" purely by whether a connection exists; for half-open connections the DO probes only when needed: after sending a command to a machine it sets an ack deadline (§4.2), and on timeout marks the machine suspect.
+- *(Superseded by [ADR-0001](../adr/0001-mvp-implementation-baseline.md): the e2e spike hit half-dead TCP, so the real implementation uses a bidirectional application-level heartbeat — uplink ping, downlink pong, inter-frame timeout forcing reconnect — and `hello` also re-delivers `failed(timeout)` commands, deduplicated by `cmdId`.)* Original text: there is no periodic application-level heartbeat. The DO judges "is the machine online" purely by whether a connection exists; for half-open connections the DO probes only when needed: after sending a command to a machine it sets an ack deadline (§4.2), and on timeout marks the machine suspect.
 - The DO sleeps after roughly 10 seconds without events. **Sleeping wipes memory**, so all protocol state (unacked commands, timeouts, retries) lives in SQLite and is driven by `this.schedule` (alarms), with no reliance on in-memory Promises or timers.
 - Measured ([spike results](../research/do-protocol-spike.md)): with a protocol-level ping every 5 seconds, the DO sleeps as usual, the connection stays up, and the wake count does not grow; the first message after a sleep costs only about 35–50 ms more. The connector need not do anything to "keep the DO online".
 
@@ -157,7 +157,7 @@ User (Feishu/web)                                  DO                           
    │ "添加机器" ("add machine")                    │                                           │
    │──────────────────────────────────────────────▶│ create pairing{code, 10min}               │
    │◀── command hint ──────────────────────────────│                                           │
-   │  npx shepherd connect <url> <code>                                                        │
+   │  npx @iefnaf/shepherd connect <url> <code>                                                        │
    │ ………… 在目标机器终端粘贴运行 ("paste & run on the target machine") ……………………………………………………………▶│
    │                                               │◀── POST /pair {code, machine}─────────────│
    │                                               │ validate code: exists, unexpired, unused  │
