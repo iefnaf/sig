@@ -1,5 +1,7 @@
-// LocalStore (ADR-0001 decision 13): device credentials + the connEpoch counter, in
-// node:sqlite so connEpoch survives a connector restart (the spike's seqs.json bug, §5.1/§3.4).
+// LocalStore (ADR-0001 decision 13): device credentials, the connEpoch counter, the command
+// dedup log (connector-pi.md §6.3), and the persistent event log with per-worker seq counters —
+// all in node:sqlite so they survive connector restarts (the spike's seqs.json bug: the DO
+// dedups on (workerId, seq), so a restart that renumbers events silently drops them all).
 import { DatabaseSync } from "node:sqlite";
 import { chmodSync, existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
@@ -25,7 +27,30 @@ export class LocalStore {
       token TEXT NOT NULL,
       connEpoch INTEGER NOT NULL DEFAULT 0
     )`);
+    this.db.exec(`CREATE TABLE IF NOT EXISTS command (
+      cmdId TEXT PRIMARY KEY,
+      state TEXT NOT NULL,
+      result TEXT,
+      createdAt INTEGER NOT NULL
+    )`);
+    this.db.exec(`CREATE TABLE IF NOT EXISTS event (
+      workerId TEXT NOT NULL,
+      seq INTEGER NOT NULL,
+      payload TEXT NOT NULL,
+      createdAt INTEGER NOT NULL,
+      PRIMARY KEY (workerId, seq)
+    )`);
+    this.db.exec(`CREATE TABLE IF NOT EXISTS worker_seq (
+      workerId TEXT PRIMARY KEY,
+      nextSeq INTEGER NOT NULL DEFAULT 1,
+      ackedUpTo INTEGER NOT NULL DEFAULT 0
+    )`);
     chmodSync(path, 0o600);
+  }
+
+  // Shared with CommandLog / EventLog, which own their own tables' logic.
+  get database(): DatabaseSync {
+    return this.db;
   }
 
   saveCredentials(credentials: Omit<Credentials, "connEpoch">): void {

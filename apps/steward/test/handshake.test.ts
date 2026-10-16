@@ -127,7 +127,7 @@ describe("single-connection constraint (connEpoch supersede)", () => {
     expect(closedB.code).toBe(4409);
 
     // The original connection is still alive and usable.
-    wsA.send(JSON.stringify({ t: "ping", id: "p1" }));
+    wsA.send(JSON.stringify({ t: "bogus", id: "p1" }));
     const reply = await nextMessage(wsA);
     expect(reply.code).toBe("unsupported");
   });
