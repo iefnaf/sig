@@ -15,7 +15,7 @@ beforeEach(() => {
 
 afterEach(async () => {
   await Promise.allSettled(processes.map((p) => p.close(200).catch(() => p.kill())));
-  rmSync(dir, { recursive: true, force: true });
+  rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
 });
 
 /** Spawns PiProcess against an inline `node -e` script acting as the peer. */

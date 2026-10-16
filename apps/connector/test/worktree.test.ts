@@ -15,7 +15,7 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
-  rmSync(dir, { recursive: true, force: true });
+  rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
 });
 
 describe("WorktreeManager (connector-pi.md §8.2)", () => {

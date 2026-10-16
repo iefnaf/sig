@@ -14,7 +14,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  rmSync(dir, { recursive: true, force: true });
+  rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
 });
 
 /** Creates the layout `npm install -g` would produce: <npmRoot>/@iefnaf/shepherd/bin+package.json. */

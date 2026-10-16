@@ -57,7 +57,7 @@ afterEach(async () => {
   }
   await new Promise((resolve) => setTimeout(resolve, 100));
   store?.close();
-  rmSync(dir, { recursive: true, force: true });
+  rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
 });
 
 function setup(runs: ScenarioStep[][], extraEnv: Record<string, string> = {}): void {
@@ -504,7 +504,14 @@ describe("CommandError surface for the new paths", () => {
     // the launch's last marker check has passed, the finally has not. The stop must settle
     // the worker itself, and the marker must not outlive the launch to trap the next start
     // of the same workerId at `starting`.
-    const scenario = writeScenario(dir, "scenario-n1", [reportRun({ status: "done", summary: "done" })]);
+    // The leading delay keeps the run OPEN when the stop lands: without it the scripted
+    // report/settle (zero-delay steps) races the stop's close() and sometimes wins on a
+    // loaded runner, leaving lastOutcome "reported" instead of "stopped" (same pattern as
+    // the slow scenario above). The delay costs nothing on the passing path — the stop's
+    // kill interrupts it — and only a regression ever waits out the waitFor.
+    const scenario = writeScenario(dir, "scenario-n1", [
+      [{ delayMs: 8000 }, ...reportRun({ status: "done", summary: "done" })],
+    ]);
     const id = "w-n1";
     workerIds.add(id);
     let stopFired = false;

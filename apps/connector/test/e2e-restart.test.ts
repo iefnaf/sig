@@ -54,7 +54,7 @@ afterEach(async () => {
   for (const app of apps) app.stop();
   await mock.close();
   store.close();
-  rmSync(dir, { recursive: true, force: true });
+  rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
 });
 
 function bootApp(scenarioPath: string | null, recovery: ConstructorParameters<typeof ConnectorApp>[0]["recovery"] = {}): Promise<ConnectorApp> {
