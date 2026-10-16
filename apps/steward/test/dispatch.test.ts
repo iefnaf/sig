@@ -223,3 +223,59 @@ describe("the dispatch service (Dispatcher.startWorker)", () => {
     fake.close();
   });
 });
+
+// PR #45 review #6: interventions on a broken worker are refused before the enqueue — the
+// connector rejects them anyway (broken_worker), and refusing here keeps the tool reply from
+// claiming a delivery (「已发送」/「会尽快停下」) that can never happen.
+describe("the dispatch service: interventions on a broken worker are refused up front (PR #45 review #6)", () => {
+  beforeEach(async () => {
+    await resetLedgerState();
+    await mockReset();
+    await configureAndBind("ou_owner");
+  });
+
+  it("send_to_worker refuses instead of promising a prompt delivery", async () => {
+    const fake = await pairFakeConnector("mac-studio", { run: null });
+    await fake.connect();
+    const first = await ownerStub().dispatchForTest({ prompt: "任务", repoRef: "repo-a", newTitle: "任务" });
+    expect(first).toMatchObject({ kind: "dispatched" });
+    const [cmd] = await fake.waitForCmds(1);
+    const workerId = String((cmd!.args as Record<string, unknown>).workerId);
+    // The connector failed the start: the worker lands broken (markStartFailed).
+    fake.send({ t: "cmd_result", re: cmd!.id, ok: false, error: { code: "startup_failed" } });
+    for (;;) {
+      const snap = await ownerStub().debugSnapshot();
+      if (snap.threads[0]?.workers[0]?.state === "broken") break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+
+    const send = await ownerStub().sendForTest({ workerId, text: "追加指令", intent: "auto" });
+    expect(send).toMatchObject({ kind: "refused" });
+    expect((send as { reason: string }).reason).toContain("已损坏");
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(fake.cmds).toHaveLength(1); // nothing was enqueued
+    fake.close();
+  });
+
+  it("interrupt_worker refuses instead of promising a stop", async () => {
+    const fake = await pairFakeConnector("mac-studio", { run: null });
+    await fake.connect();
+    const first = await ownerStub().dispatchForTest({ prompt: "任务", repoRef: "repo-a", newTitle: "任务" });
+    expect(first).toMatchObject({ kind: "dispatched" });
+    const [cmd] = await fake.waitForCmds(1);
+    const workerId = String((cmd!.args as Record<string, unknown>).workerId);
+    fake.send({ t: "cmd_result", re: cmd!.id, ok: false, error: { code: "startup_failed" } });
+    for (;;) {
+      const snap = await ownerStub().debugSnapshot();
+      if (snap.threads[0]?.workers[0]?.state === "broken") break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+
+    const interrupt = await ownerStub().interruptForTest({ workerId });
+    expect(interrupt).toMatchObject({ kind: "refused" });
+    expect((interrupt as { reason: string }).reason).toContain("已损坏");
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(fake.cmds).toHaveLength(1); // nothing was enqueued
+    fake.close();
+  });
+});

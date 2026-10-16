@@ -621,6 +621,48 @@ describe("CommandError surface for the new paths", () => {
     await waitFor(() => startedOf("w-n3-next"), 15_000, "next write task launched");
   }, 45_000);
 
+  it("sends and manual resumes re-acquire the serial slot instead of double-running (issue #16 × #45 merge)", async () => {
+    const run: ScenarioStep[] = [{ delayMs: 300 }, ...reportRun({ status: "done", summary: "done" })];
+    setup([run]);
+    registerRepo("serial");
+    const aId = "w-mg-a";
+    const bId = "w-mg-b";
+    workerIds.add(aId);
+    workerIds.add(bId);
+
+    // A runs and settles; B (dispatched while A ran) takes the slot when it frees.
+    await manager.startWorker("cmd-mg-a", args({ workerId: aId }));
+    await manager.startWorker("cmd-mg-b", args({ workerId: bId, threadId: "mg-b-thread" }));
+    expect(store.getWorker(bId)?.state).toBe("queued");
+    await waitFor(() => settledOf(aId), 15_000, "A settled");
+    await waitFor(() => startedOf(bId), 15_000, "B took the slot");
+    expect(store.getWorker(aId)?.state).toBe("idle");
+
+    // A manual resume while B holds the slot is refused (retriable) — not silently run.
+    await expect(manager.handleCommand("cmd-mg-rs", "resume", { workerId: aId, reason: "manual" })).rejects.toMatchObject({
+      code: "slot_busy",
+    });
+
+    // A send to the idle A parks (same pendingSends queue as lost/recovering sends) — it
+    // must not relaunch A beside B in the repo the owner pinned to one write at a time.
+    let sendResolved = false;
+    const send = manager
+      .handleCommand("cmd-mg-send", "send", { workerId: aId, text: "接着改", intent: "auto" })
+      .then((result) => {
+        sendResolved = true;
+        return result;
+      });
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(sendResolved).toBe(false); // parked, not delivered
+    expect(events.filter((e) => e.workerId === aId && e.type === "started")).toHaveLength(1); // no second run
+
+    // When B settles, the serial pump drains the parked send: A relaunches with it.
+    await waitFor(() => settledOf(bId), 15_000, "B settled");
+    await waitFor(() => events.filter((e) => e.workerId === aId && e.type === "started").length === 2, 15_000, "A relaunched by the parked send");
+    await send;
+    expect(sendResolved).toBe(true);
+  }, 60_000);
+
   it("resume on a queued worker explains the queue instead of resuming nothing", async () => {
     setup([[]]);
     registerRepo("serial");
