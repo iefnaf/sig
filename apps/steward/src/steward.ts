@@ -495,6 +495,16 @@ export class Steward extends Agent<Env> {
         }
         return outcome;
       },
+      sendToWorker: async (input) => {
+        const outcome = await this.dispatcher.sendToWorker(input);
+        if (outcome.kind === "sent") await this.backfillRunThread(outcome.threadId);
+        return outcome;
+      },
+      interruptWorker: async (input) => {
+        const outcome = await this.dispatcher.interruptWorker(input);
+        if (outcome.kind === "interrupted") await this.backfillRunThread(outcome.threadId);
+        return outcome;
+      },
       notifyUser: async (input) => {
         const owner = this.ownerOpenIdSync();
         if (!owner) return;
@@ -594,6 +604,16 @@ export class Steward extends Agent<Env> {
   private async markRunNotified(): Promise<void> {
     const run = await this.currentRunBinding();
     if (run) this.sql`UPDATE sh_run SET notified = 1 WHERE operationId = ${run.operationId}`;
+  }
+
+  /** Issue #9: an intervention resolves the Thread this run's reply belongs to (same
+   *  rationale as a dispatch, review #8) — the tool resolved the worker; the routing
+   *  backfill never passes through model judgment (§3.1). */
+  private async backfillRunThread(threadId: string): Promise<void> {
+    const run = await this.currentRunBinding();
+    if (run && run.routedThreadId === null) {
+      this.sql`UPDATE sh_run SET routedThreadId = ${threadId} WHERE operationId = ${run.operationId} AND routedThreadId IS NULL`;
+    }
   }
 
   private ownerOpenIdSync(): string | null {
@@ -2297,6 +2317,20 @@ export class Steward extends Agent<Env> {
       provenance: "test",
       cmdId: input.cmdId ?? `test:${ulid()}`,
     });
+  }
+
+  /** Test entry into the intervention half of the dispatch service (send/interrupt). */
+  async sendForTest(
+    input: Omit<import("./dispatch.ts").SendToWorkerInput, "provenance" | "cmdId"> & { cmdId?: string },
+  ): Promise<import("./dispatch.ts").SendToWorkerOutcome> {
+    return this.dispatcher.sendToWorker({ ...input, provenance: "test", cmdId: input.cmdId ?? `test:${ulid()}` });
+  }
+
+  /** Test entry into the intervention half of the dispatch service (send/interrupt). */
+  async interruptForTest(
+    input: Omit<import("./dispatch.ts").InterruptWorkerInput, "provenance" | "cmdId"> & { cmdId?: string },
+  ): Promise<import("./dispatch.ts").InterruptWorkerOutcome> {
+    return this.dispatcher.interruptWorker({ ...input, provenance: "test", cmdId: input.cmdId ?? `test:${ulid()}` });
   }
 
   /** Test entry into the proactive-behavior service (issue #20): create + arm a routine. */

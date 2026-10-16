@@ -102,6 +102,41 @@ export type StartWorkerOutcome =
   | { kind: "asked_offline"; threadId: string; machineName: string }
   | { kind: "refused"; reason: string };
 
+/** What the steward's send_to_worker tool asks the service to do (issue #9, §6.1 `send`). */
+export interface SendToWorkerInput {
+  workerId: string;
+  text: string;
+  intent: "now" | "after" | "auto";
+  /** The authorizing run: `user:<msgId>` / `evt:…` (steward.md §7.1). */
+  provenance: string;
+  /** `tool:<taskId>` — the idempotency key for replays (protocol §7.1). */
+  cmdId: string;
+}
+
+export type SendToWorkerOutcome =
+  | {
+      kind: "sent";
+      threadId: string;
+      /** How the connector will deliver it — the §6.2 state table applied to the worker's
+       *  ledger state; `steer` is what makes the reply mention after_current_tools. */
+      delivery: "steer" | "follow_up" | "prompt" | "queued";
+      machineOffline: boolean;
+    }
+  | { kind: "refused"; reason: string };
+
+/** What the steward's interrupt_worker tool asks the service to do (§6.1 `interrupt`). */
+export interface InterruptWorkerInput {
+  workerId: string;
+  /** “停，然后……” — the instruction handed to the worker right after the abort. */
+  then?: string;
+  provenance: string;
+  cmdId: string;
+}
+
+export type InterruptWorkerOutcome =
+  | { kind: "interrupted"; threadId: string; machineOffline: boolean }
+  | { kind: "refused"; reason: string };
+
 export interface DispatcherDeps {
   ledger: Ledger;
   /** Enqueues a connector command (steward.enqueue); `notAfter: null` = wait until online. */
@@ -237,6 +272,97 @@ export class Dispatcher {
         };
       }
     }
+  }
+
+  /**
+   * The steward's `send_to_worker` lands here (issue #9): the deterministic half is the
+   * §6.2 state table applied to the ledger's worker state (which delivery the connector
+   * will pick), the command enqueue with the tool's idempotency key, and the timeline
+   * entry. The tool tells the model what delivery to expect — including the
+   * after_current_tools effect for a running worker.
+   */
+  async sendToWorker(input: SendToWorkerInput): Promise<SendToWorkerOutcome> {
+    if (input.text.trim().length === 0) return { kind: "refused", reason: "text 为空" };
+    const worker = this.ledger.workers.get(input.workerId);
+    if (!worker) {
+      return { kind: "refused", reason: `worker ${input.workerId} 不存在。先 get_thread 拿到最新的 workerId。` };
+    }
+    const machine = this.ledger.machines.get(worker.deviceId);
+    const offline = !(machine?.online ?? false);
+    // PR #45 review #6: the connector rejects a broken worker's sends (broken_worker) —
+    // refuse here, before the enqueue, so the tool reply cannot claim a delivery (「已发送」)
+    // the connector is guaranteed to reject.
+    if (worker.state === "broken") {
+      return {
+        kind: "refused",
+        reason: `worker ${input.workerId} 已损坏（需要人工决定），指令不会被送达。先和用户确认下一步。`,
+      };
+    }
+    const delivery =
+      worker.state === "running" || worker.state === "recovering"
+        ? input.intent === "after"
+          ? "follow_up"
+          : "steer"
+        : worker.state === "starting" || worker.state === "lost"
+          ? "queued"
+          : "prompt"; // idle — broken was refused above
+    // Replay dedup (protocol §7.1): the same tool task re-running after a crash converges on
+    // the existing outbox row instead of writing a second timeline entry.
+    if (this.#deps.commandExists(input.cmdId)) {
+      return { kind: "sent", threadId: worker.threadId, delivery, machineOffline: offline };
+    }
+    const { cmdId } = await this.#deps.enqueueCommand(
+      worker.deviceId,
+      "send",
+      { workerId: worker.workerId, text: input.text, intent: input.intent },
+      { workerId: worker.workerId, cmdId: input.cmdId },
+    );
+    this.ledger.timeline.add(
+      worker.threadId,
+      "intervention",
+      `追加指令（intent=${input.intent}，将按 ${delivery} 送达）：${input.text}`,
+      { workerId: worker.workerId, cmdId, provenance: input.provenance },
+    );
+    return { kind: "sent", threadId: worker.threadId, delivery, machineOffline: offline };
+  }
+
+  /**
+   * The steward's `interrupt_worker` lands here (issue #9): enqueue the `interrupt` command
+   * (§6.1 — clear_queue → abort → optional then) and record it on the Thread's timeline.
+   * The hook in the extension is what gates autonomy (§7.2: user_explicit/user_reply_to
+   * only); this method stays mechanical.
+   */
+  async interruptWorker(input: InterruptWorkerInput): Promise<InterruptWorkerOutcome> {
+    const worker = this.ledger.workers.get(input.workerId);
+    if (!worker) {
+      return { kind: "refused", reason: `worker ${input.workerId} 不存在。先 get_thread 拿到最新的 workerId。` };
+    }
+    const machine = this.ledger.machines.get(worker.deviceId);
+    const offline = !(machine?.online ?? false);
+    // PR #45 review #6: nothing runs on a broken worker — refuse before the enqueue so the
+    // model cannot promise「会尽快停下」for a command the connector will reject.
+    if (worker.state === "broken") {
+      return { kind: "refused", reason: `worker ${input.workerId} 已损坏（需要人工决定），没有运行中的任务可停。` };
+    }
+    if (this.#deps.commandExists(input.cmdId)) {
+      return { kind: "interrupted", threadId: worker.threadId, machineOffline: offline };
+    }
+    const { cmdId } = await this.#deps.enqueueCommand(
+      worker.deviceId,
+      "interrupt",
+      {
+        workerId: worker.workerId,
+        ...(input.then !== undefined ? { then: { text: input.then } } : {}),
+      },
+      { workerId: worker.workerId, cmdId: input.cmdId },
+    );
+    this.ledger.timeline.add(
+      worker.threadId,
+      "intervention",
+      input.then !== undefined ? `中断指令（停后继续）：${input.then}` : "中断指令（停止运行）",
+      { workerId: worker.workerId, cmdId, provenance: input.provenance },
+    );
+    return { kind: "interrupted", threadId: worker.threadId, machineOffline: offline };
   }
 
   /**
