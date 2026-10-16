@@ -28,6 +28,19 @@ describe("parseOwnerText: the M1 fixed phrases", () => {
     expect(parseOwnerText("/status ")).toEqual({ kind: "status" });
   });
 
+  it("parses the add-machine and web-link phrases", () => {
+    expect(parseOwnerText("/加机器")).toEqual({ kind: "add_machine" });
+    expect(parseOwnerText("/添加机器 ")).toEqual({ kind: "add_machine" });
+    expect(parseOwnerText("/add-machine")).toEqual({ kind: "add_machine" });
+    expect(parseOwnerText("/addmachine")).toEqual({ kind: "add_machine" });
+    expect(parseOwnerText("/网页")).toEqual({ kind: "web_link" });
+    expect(parseOwnerText("/web ")).toEqual({ kind: "web_link" });
+    expect(parseOwnerText("/login")).toEqual({ kind: "web_link" });
+    // Trailing content means it is not the fixed phrase — it falls through to dispatch/help.
+    expect(parseOwnerText("/加机器 现在")).toBeNull();
+    expect(parseOwnerText("/网页 login.html")).toBeNull();
+  });
+
   it("rejects everything else: natural language waits for the M2 steward", () => {
     expect(parseOwnerText("帮我把登录 bug 修一下")).toBeNull();
     expect(parseOwnerText("/派发")).toBeNull(); // no repo, no prompt

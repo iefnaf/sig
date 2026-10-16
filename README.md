@@ -37,5 +37,11 @@ The LLM steward arrives with M2; until then the Feishu bot understands fixed com
 |---|---|
 | `/派发 <repo>[@<machine>] <要做的事>` (also `/dispatch`, `/run`) | Creates a Thread and dispatches a write task to a machine that has the repo (unique online winner; ties and offline-only machines come back as a question) |
 | `/状态` (also `/status`) | Lists machines and Threads with their derived state (`running` / `waiting_you` / `idle`) |
+| `/加机器` (also `/添加机器`, `/add-machine`) | Issues a one-time pairing code and replies with `npx @iefnaf/shepherd connect <url> <code>` to run on the new machine |
+| `/网页` (also `/web`, `/login`) | Replies with a one-time login link (15 min, single use) to the companion web |
 
 Quote-replying to a report card continues the same Thread on its last machine — queuing until it comes back online if it dropped — and the next worker starts from the previous worker's branch. Report cards' buttons (e.g. "排队等上线" while a machine is offline) resolve the Thread from the card itself, never from data stuffed into the button.
+
+## The companion web
+
+Report cards carry a **查看详情** button: a one-time signed link (15 min, single use) that logs the owner in and opens the Thread timeline (L2: instructions, dispatches, reports, questions — mobile-friendly, server-rendered, no JS). While logged in (`/网页` for a fresh link), `/app` lists all Threads and `/app/machines` lists paired machines with live online state; the 撤销 button bumps a machine's device epoch and closes its connection (4403), so a stolen token dies instantly (protocol §5.1). The chat-issued `/加机器` command is the only pairing path.

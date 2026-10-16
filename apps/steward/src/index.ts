@@ -2,12 +2,21 @@ import { getAgentByName, routeAgentRequest } from "agents";
 import { parseToken } from "@shepherd/protocol";
 import { bearer } from "./auth.ts";
 import { Steward } from "./steward.ts";
+import { parseSessionCookie, verifyLinkToken } from "./web.ts";
 
 export { Steward };
 
 function json(body: unknown, status = 200): Response {
   return Response.json(body, { status });
 }
+
+function htmlPage(body: string, status = 200): Response {
+  return new Response(body, { status, headers: { "content-type": "text/html; charset=utf-8" } });
+}
+
+// The web's shared "get a fresh link" page (web.ts renders the full variant inside the DO;
+// this stateless twin answers rejected probes without waking it).
+const LINK_HINT = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex"><title>Shepherd</title><style>body{font:15px/1.7 -apple-system,"PingFang SC",sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:0 16px}main{max-width:480px}</style></head><body><main><p>链接无效或已过期。</p><p style="opacity:.75;font-size:13px">在飞书里对总管发 <code>/网页</code>，取一条新的一次性登录链接（15 分钟内有效，只能打开一次）。</p></main></body></html>`;
 
 // Length-independent comparison so the setup gate does not leak the token byte-by-byte.
 function setupTokenMatches(got: string | null, want: string): boolean {
@@ -54,6 +63,26 @@ export default {
     // Feishu event webhook (steward.md §9.1): one of the two unauthenticated entry points
     // (ADR-0001 decision 7) — the DO validates Feishu's verification token itself.
     if (url.pathname === "/channels/feishu/events" && request.method === "POST") {
+      const stub = await getAgentByName(env.Steward, "owner");
+      return stub.fetch(request);
+    }
+
+    // The one-time signed link (spec §7.3 / §12.2): possession of a valid HMAC is the auth,
+    // the same "stateless pre-check, then forward" pattern as the device token — invalid or
+    // expired links are answered here and never wake the Durable Object.
+    if (url.pathname.startsWith("/link/") && request.method === "GET") {
+      const verified = await verifyLinkToken(env.SERVER_KEY, url.pathname.slice("/link/".length));
+      if (!verified) return htmlPage(LINK_HINT, 410);
+      const stub = await getAgentByName(env.Steward, "owner");
+      return stub.fetch(request);
+    }
+
+    // Web app pages: session-cookie gated. A request without a well-formed cookie is rejected
+    // here (no DO wake); a well-formed one is forwarded — session liveness stays in the DO.
+    if ((url.pathname === "/app" || url.pathname.startsWith("/app/")) && (request.method === "GET" || request.method === "POST")) {
+      const cookie = request.headers.get("cookie") ?? "";
+      const raw = cookie.split(/;\s*/).find((part) => part.startsWith("shepherd_session="))?.slice("shepherd_session=".length) ?? null;
+      if (!(await parseSessionCookie(env.SERVER_KEY, raw))) return htmlPage(LINK_HINT.replace("链接无效或已过期。", "这一页需要先登录。"), 401);
       const stub = await getAgentByName(env.Steward, "owner");
       return stub.fetch(request);
     }

@@ -53,6 +53,7 @@ import { failureCard, reportCardFor } from "./report-template.ts";
 import { MIGRATIONS, runMigrations } from "./schema.ts";
 import { openSecret, sealSecret } from "./secretbox.ts";
 import { renderSetupPage, type SetupView } from "./setup-page.ts";
+import { WebApp, linkTargetForThread } from "./web.ts";
 
 interface ConnState {
   deviceId: string;
@@ -192,6 +193,26 @@ export class Steward extends Agent<Env> {
         if (!owner) return;
         await this.enqueueOutbound({ kind: "card", to: owner, card, threadId, urgency: "push" });
       },
+      createPairing: () => this.createPairing(),
+      deployOrigin: () => this.web.origin(),
+      webLinkUrl: (target) => this.web.linkUrl(target),
+    }));
+  }
+
+  // The signed-link web app (issue #22, steward.md §10): login exchange, Thread timeline,
+  // machine management. Same lazy-bind pattern as the ledger.
+  private web_?: WebApp;
+  private get web(): WebApp {
+    return (this.web_ ??= new WebApp({
+      sql: this.sql.bind(this) as unknown as import("./schema.ts").SqlExecutor,
+      secret: this.env.SERVER_KEY,
+      ledger: this.ledger,
+      listDevices: () =>
+        this.sql<{ deviceId: string; name: string | null; revoked: number }>`
+          SELECT deviceId, name, revoked FROM device ORDER BY createdAt, deviceId
+        `.map((d) => ({ deviceId: d.deviceId, name: d.name, revoked: !!d.revoked })),
+      revokeDevice: (deviceId) => void this.revoke(deviceId),
+      audit: (reason, detail) => this.logChannel(reason, detail),
     }));
   }
 
@@ -202,15 +223,27 @@ export class Steward extends Agent<Env> {
   }
 
   // Plain-HTTP surface reached via the Worker's stub.fetch forwards (index.ts): the Feishu
-  // webhook (unauthenticated — the adapter validates Feishu's own token) and the setup page
-  // (the Worker has already checked SETUP_TOKEN before forwarding).
+  // webhook (unauthenticated — the adapter validates Feishu's own token), the setup page
+  // (the Worker has already checked SETUP_TOKEN before forwarding), and the signed-link web
+  // (the Worker has already HMAC-verified the link token / session cookie before forwarding).
   async onRequest(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    // Every request the DO serves reveals the deployment's public origin — the source for the
+    // pairing command's URL and the absolute one-time card links (web.ts owns the value).
+    if (url.protocol === "https:" || url.protocol === "http:") this.web.recordOrigin(url.origin);
     if (url.pathname === "/channels/feishu/events" && request.method === "POST") {
       return this.handleFeishuWebhook(request);
     }
     if (url.pathname === "/setup" && (request.method === "GET" || request.method === "POST")) {
       return this.handleSetup(request);
+    }
+    if (url.pathname.startsWith("/link/") && request.method === "GET") {
+      // index.ts verified the HMAC and expiry before forwarding; single-use is decided here.
+      const secure = url.protocol === "https:" && url.hostname !== "localhost" && url.hostname !== "127.0.0.1";
+      return this.web.openLink(url.pathname.slice("/link/".length), secure);
+    }
+    if ((url.pathname === "/app" || url.pathname.startsWith("/app/")) && (request.method === "GET" || request.method === "POST")) {
+      return this.web.handle(request);
     }
     return new Response("not found", { status: 404 });
   }
@@ -507,7 +540,7 @@ export class Steward extends Agent<Env> {
     for (const intent of this.ledger.notifications.pending()) {
       try {
         if (!cfg?.ownerOpenId) continue; // no owner yet: the intent stays pending, not lost
-        const card = this.renderNotification(intent);
+        const card = await this.renderNotification(intent);
         if (card === null) {
           // Its data is gone (thread archived / worker pruned); drop the intent rather than
           // retry forever.
@@ -523,18 +556,21 @@ export class Steward extends Agent<Env> {
   }
 
   /** Deterministic core templates (steward.md §6.2 source 1): data in, card out, no LLM. */
-  private renderNotification(intent: NotifyRow): unknown | null {
+  private async renderNotification(intent: NotifyRow): Promise<unknown | null> {
     const worker = intent.workerId ? this.ledger.workers.get(intent.workerId) : null;
     const thread = this.ledger.threads.get(intent.threadId);
     if (!worker || !thread) return null;
     const machine = this.ledger.machines.get(worker.deviceId);
     const machineName = machine?.name ?? worker.deviceId;
     const footer = `Thread「${thread.title}」 · ${worker.agent} @ ${machineName} · 引用回复可继续这个 Thread`;
+    // steward.md §6.4: the timeline link is appended by the system — a fresh one-time link
+    // per card, never by the (M2) LLM.
+    const detailsUrl = await this.web.linkUrl(linkTargetForThread(thread.threadId));
 
     if (intent.kind === "done_report" || intent.kind === "attention_report") {
       const report = this.ledger.workers.reportsForWorker(worker.workerId).at(-1);
       if (!report) return null;
-      return reportCardFor(report, worker, machineName, thread.title);
+      return reportCardFor(report, worker, machineName, thread.title, detailsUrl ?? undefined);
     }
 
     // failure_push: either the start never happened or the run ended in a failure class that
@@ -545,14 +581,15 @@ export class Steward extends Agent<Env> {
         `${worker.lastOutcome.slice("start_failed:".length)}。重新 /派发 一次即可。`,
         thread.title,
         footer,
+        detailsUrl ?? undefined,
       );
     }
     const question = this.ledger.questions.openForThread(thread.threadId);
-    return failureCard("运行出错，需要你决定下一步", question?.text ?? "查看 Thread 时间线了解详情。", thread.title, footer);
+    return failureCard("运行出错，需要你决定下一步", question?.text ?? "查看 Thread 时间线了解详情。", thread.title, footer, detailsUrl ?? undefined);
   }
 
-  // Not wired to any HTTP route yet (the setup page / chat command that triggers this is a
-  // later ticket); callable via RPC on the stub. `/pair` below is the only consumer for now.
+  // `/加机器` in chat is the trigger (issue #22); `/pair` is the only HTTP consumer of the
+  // code. QR/setup-page issuance was never built — chat is the canonical path now.
   async createPairing(): Promise<{ code: string }> {
     const code = generatePairingCode();
     this.sql`INSERT INTO pairing (code, expiresAt) VALUES (${code}, ${Date.now() + 10 * 60_000})`;

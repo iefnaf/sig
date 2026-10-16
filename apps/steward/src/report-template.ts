@@ -25,6 +25,8 @@ export interface ReportCardInput {
   needsYou?: string;
   threadTitle: string;
   footer: string;
+  /** One-time signed timeline URL appended by the system (steward.md §6.4), never by the LLM. */
+  detailsUrl?: string;
 }
 
 function clip(text: string, max: number): string {
@@ -42,6 +44,15 @@ export function renderReportCard(input: ReportCardInput): { config: unknown; hea
   if (input.needsYou && input.needsYou.trim().length > 0) {
     elements.push({ tag: "hr" });
     elements.push({ tag: "div", text: { tag: "lark_md", content: `**需要你**：${clip(input.needsYou, MAX_NEEDS_YOU + 6)}` } });
+  }
+  if (input.detailsUrl) {
+    // "查看详情" logs the owner straight into the Thread timeline (spec §7.3; the URL is a
+    // one-time signed link minted per card — the value carries no data, unlike §3.1's rule
+    // for action buttons, because nothing needs resolving on click).
+    elements.push({
+      tag: "action",
+      actions: [{ tag: "button", text: { tag: "plain_text", content: "查看详情" }, type: "default", url: input.detailsUrl }],
+    });
   }
   elements.push({
     tag: "note",
@@ -96,20 +107,21 @@ export function toneOfReport(status: ReportRow["status"]): Tone {
 }
 
 /** Assembles the deterministic done-class card for a processed `report` event. */
-export function reportCardFor(report: ReportRow, worker: WorkerRow, machineName: string, threadTitle: string) {
+export function reportCardFor(report: ReportRow, worker: WorkerRow, machineName: string, threadTitle: string, detailsUrl?: string) {
   return renderReportCard({
     tone: toneOfReport(report.status),
     conclusion: report.summary,
     did: didBullets(report),
     needsYou: needsYouOf(report),
     threadTitle,
+    detailsUrl,
     footer: `Thread「${threadTitle}」 · ${worker.agent} @ ${machineName} · 引用回复可继续这个 Thread`,
   });
 }
 
 /** The deterministic failure card for settled error / start-failure pushes. */
-export function failureCard(conclusion: string, needsYou: string, threadTitle: string, footer: string) {
-  return renderReportCard({ tone: "failure", conclusion, did: [], needsYou, threadTitle, footer });
+export function failureCard(conclusion: string, needsYou: string, threadTitle: string, footer: string, detailsUrl?: string) {
+  return renderReportCard({ tone: "failure", conclusion, did: [], needsYou, threadTitle, footer, detailsUrl });
 }
 
 /** The offline-ask card (spec §9): dispatch found only an offline machine — never decide silently. */
@@ -146,6 +158,8 @@ export const HELP_TEXT = [
   "M1 固定指令（自然语言要等 M2 的总管）：",
   "/派发 <repo>[@<machine>] <要做的事> —— 派一个写任务并汇报",
   "/状态 —— 所有 Thread 与机器",
+  "/加机器 —— 给新电脑发配对命令",
+  "/网页 —— 取一次性登录链接，网页里看时间线、管机器",
 ].join("\n");
 
 export function statusText(threads: Array<{ title: string; state: string; unread: boolean }>, machines: Array<{ name: string; online: boolean }>): string {
