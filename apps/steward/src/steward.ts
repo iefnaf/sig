@@ -1116,6 +1116,8 @@ export class Steward extends Agent<Env> {
   protected workerSweepIntervalS = WORKER_SWEEP_INTERVAL_S;
   /** In-memory dedupe of pending schedule() rows (the SDK fires every row; see armWorkerSweeps). */
   private lastSweepArmAt = 0;
+  /** The cadence of that arm — a leftover LONGER alarm must not suppress a shorter re-arm. */
+  private lastSweepArmIntervalS = 0;
 
   /** Arms the maintenance alarm while any worker is in an active state. Called from every
    * point that can change that (event reduction, hello reconciliation, dispatch enqueue);
@@ -1126,10 +1128,18 @@ export class Steward extends Agent<Env> {
     `[0]!.n;
     if (active === 0) return;
     // schedule() rows each fire once: without this guard every wake that touches a worker
-    // would add another row and the alarm would fan out. A DO reset clears the flag — the
-    // cost is at most one redundant no-op pass.
-    if (Date.now() - this.lastSweepArmAt < this.workerSweepIntervalS * 1000 * 0.9) return;
+    // would add another row and the alarm would fan out. Only skip when the pending arm is
+    // at this cadence or faster — an arm left over from a WIDER cadence (interval shrunk
+    // since, e.g. tests) can be up to that wider interval away and must not block this one.
+    // A DO reset clears the flags — the cost is at most one redundant no-op pass.
+    if (
+      this.lastSweepArmIntervalS <= this.workerSweepIntervalS &&
+      Date.now() - this.lastSweepArmAt < this.workerSweepIntervalS * 1000 * 0.9
+    ) {
+      return;
+    }
     this.lastSweepArmAt = Date.now();
+    this.lastSweepArmIntervalS = this.workerSweepIntervalS;
     void this.schedule(this.workerSweepIntervalS, "sweepWorkers");
   }
 

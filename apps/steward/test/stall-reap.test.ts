@@ -198,9 +198,11 @@ describe("the §8.4 stall alarm (online machine, lastEventAt + 20 min)", () => {
     const { fake, workerId } = await dispatchRunningWorker("等真实闹钟");
     await backdate(workerId, 3);
 
-    // Generous window: #6's wake/run machinery shares the DO's alarm slot, so under suite
-    // load the 1 s maintenance alarm can lag.
-    const deadline = Date.now() + 22_000;
+    // Generous window: #6's wake/run machinery shares the DO's alarm slot, and CI runners
+    // vary several-fold in speed (observed: a run where every RPC → WS cmd hop exceeded 5 s).
+    // The alarm only needs to fire ONCE inside the window; on a fast runner this breaks out
+    // in a couple of seconds.
+    const deadline = Date.now() + 45_000;
     while (Date.now() < deadline) {
       const row = await workerRow(workerId);
       if (row!.thread.timeline.some((e) => e.kind === "stall")) break;
@@ -212,7 +214,7 @@ describe("the §8.4 stall alarm (online machine, lastEventAt + 20 min)", () => {
     expect((await sentCards()).length).toBe(1);
     fake.close();
     void (await mockCalls());
-  }, 45_000);
+  }, 75_000);
 });
 
 describe("the reap sweep (running + offline 10 min, or online-but-silent 45 min → lost)", () => {
