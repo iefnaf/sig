@@ -111,7 +111,14 @@ export interface ChangeReport {
   supersededBy?: string | null;
 }
 
+/** Why commit (and propose) refuse a draft. */
+export type CommitRejectionCode = "invalid" | "trust" | "over_limit" | "capacity";
+
 export interface ProposeResult {
+  /** Set when the draft itself cannot be committed (shape/trust refusal, or a single note
+   *  over the layer cap — no eviction can ever make that fit). Surfaces as a tool error so
+   *  the model learns the refusal at propose time, not at commit (review finding 5). */
+  rejected?: { code: CommitRejectionCode; message: string };
   /** Exact (normalized) match among loaded layers: commit will only bump its useCount. */
   duplicate: NoteRow | null;
   /** Closest active entries — same-meaning ones belong in commit.replaces (§2.4). */
@@ -119,8 +126,6 @@ export interface ProposeResult {
   /** Lowest-scored eviction candidates (pinned excluded), empty when the write fits. */
   needsEviction: NoteRow[];
 }
-
-export type CommitRejectionCode = "invalid" | "trust" | "over_limit" | "capacity";
 
 export type CommitResult =
   | { ok: true; note: NoteRow; changes: ChangeReport[]; /** true when a duplicate absorbed the write */ bumped: boolean }
@@ -361,7 +366,20 @@ export function createNotes(deps: NotesDeps) {
 
   const propose = (draft: NoteDraft): ProposeResult => {
     const check = checkDraft(draft);
-    if (!check.ok) return { duplicate: null, similar: [], needsEviction: [] };
+    if (!check.ok) return { rejected: { code: check.code, message: check.message }, duplicate: null, similar: [], needsEviction: [] };
+    // A single note over the cap can never fit, whatever gets evicted (review finding 5):
+    // refuse up front instead of handing out pointless eviction candidates.
+    if (check.text.length > capFor(draft.layer)) {
+      return {
+        rejected: {
+          code: "over_limit",
+          message: `单条超过${layerLabel(draft.layer)}上限（${check.text.length} > ${capFor(draft.layer)} 字）。请压缩。`,
+        },
+        duplicate: null,
+        similar: [],
+        needsEviction: [],
+      };
+    }
     const at = now();
     const dup = findExact(check.text, draft.layer, check.scopeRepoId);
     if (dup) {
@@ -456,12 +474,14 @@ export function createNotes(deps: NotesDeps) {
       return { ok: true, note, changes, bumped: false };
     });
 
-  const confirm = (noteId: string): { ok: boolean; changes: ChangeReport[] } =>
+  /** `evidence` is the user message that carried the confirmation (verified one layer up);
+   *  it rides the log row so a later promotion's provenance stays traceable. */
+  const confirm = (noteId: string, evidence?: string): { ok: boolean; changes: ChangeReport[] } =>
     tx(() => {
       const note = noteById(noteId);
       if (!note || note.status === "removed" || note.confirmed) return { ok: note !== null, changes: [] };
       sql`UPDATE sh_note SET confirmed = 1, lastUsedAt = ${now()} WHERE noteId = ${noteId}`;
-      return { ok: true, changes: [log("confirmed", note, "owner_confirmed")] };
+      return { ok: true, changes: [log("confirmed", note, evidence ? `confirmed_by:${evidence}` : "owner_confirmed")] };
     });
 
   const pin = (noteId: string, pinned: boolean): { ok: boolean; changes: ChangeReport[] } =>
@@ -485,45 +505,58 @@ export function createNotes(deps: NotesDeps) {
     });
 
   const list = (filter: { layer?: NoteLayer | "all"; scopeRepoId?: string; includeRemoved?: boolean } = {}): NoteRow[] => {
-    // The tagged template interpolates only values, so each shape is spelled out; never text.
-    // No layer filter = the loaded layers (resident + project); "all" includes the archive.
-    const layerRows = (layer: NoteLayer | "all") =>
-      layer === "all"
+    // The tagged template interpolates only values, so every shape is spelled out; never text.
+    // Semantics (review finding 7): a scope filter narrows that layer's repo rows — except
+    // with "all", where resident (global) rows stay in the listing alongside the repo's own.
+    const rows =
+      filter.layer === "archive"
         ? filter.scopeRepoId
           ? sql<Record<string, unknown>>`
-              SELECT * FROM sh_note WHERE scope_repoId = ${filter.scopeRepoId}
+              SELECT * FROM sh_note WHERE layer = 'archive' AND scope_repoId = ${filter.scopeRepoId}
               ORDER BY pinned DESC, createdAt, noteId
             `
           : sql<Record<string, unknown>>`
-              SELECT * FROM sh_note ORDER BY pinned DESC, createdAt, noteId
+              SELECT * FROM sh_note WHERE layer = 'archive' ORDER BY pinned DESC, createdAt, noteId
             `
-        : layer === "project" && filter.scopeRepoId
-          ? sql<Record<string, unknown>>`
-              SELECT * FROM sh_note WHERE layer = 'project' AND scope_repoId = ${filter.scopeRepoId}
-              ORDER BY pinned DESC, createdAt, noteId
-            `
-          : sql<Record<string, unknown>>`
-              SELECT * FROM sh_note WHERE layer = ${layer}
-              ORDER BY pinned DESC, createdAt, noteId
-            `;
-    const rows =
-      filter.layer === undefined
-        ? layerRows("resident").concat(
-            filter.scopeRepoId
+        : filter.layer === "all"
+          ? filter.scopeRepoId
+            ? sql<Record<string, unknown>>`
+                SELECT * FROM sh_note
+                WHERE layer = 'resident' OR (layer != 'resident' AND scope_repoId = ${filter.scopeRepoId})
+                ORDER BY pinned DESC, createdAt, noteId
+              `
+            : sql<Record<string, unknown>>`
+                SELECT * FROM sh_note ORDER BY pinned DESC, createdAt, noteId
+              `
+          : filter.layer === "project" && filter.scopeRepoId
+            ? sql<Record<string, unknown>>`
+                SELECT * FROM sh_note WHERE layer = 'project' AND scope_repoId = ${filter.scopeRepoId}
+                ORDER BY pinned DESC, createdAt, noteId
+              `
+            : filter.layer !== undefined
               ? sql<Record<string, unknown>>`
-                  SELECT * FROM sh_note WHERE layer = 'project' AND scope_repoId = ${filter.scopeRepoId}
+                  SELECT * FROM sh_note WHERE layer = ${filter.layer}
                   ORDER BY pinned DESC, createdAt, noteId
                 `
-              : layerRows("project"),
-          )
-        : layerRows(filter.layer);
+              : filter.scopeRepoId
+                ? sql<Record<string, unknown>>`
+                    SELECT * FROM sh_note
+                    WHERE layer = 'resident' OR (layer = 'project' AND scope_repoId = ${filter.scopeRepoId})
+                    ORDER BY pinned DESC, createdAt, noteId
+                  `
+                : sql<Record<string, unknown>>`
+                    SELECT * FROM sh_note WHERE layer IN ('resident', 'project')
+                    ORDER BY pinned DESC, createdAt, noteId
+                  `;
     return rows.map(viewNote).filter((n) => n.status !== "removed" || filter.includeRemoved === true);
   };
 
   const search = (q: string, opts: { layers?: NoteLayer[] } = {}): NoteRow[] => {
     const needle = q.trim();
     if (needle.length === 0) return [];
-    // Trigram needs ≥3 characters to match anything; shorter needles fall back to LIKE.
+    // Trigram needs ≥3 characters to match anything; shorter needles fall back to LIKE —
+    // with % _ ! escaped (ESCAPE '!') so "100%" cannot match the world (review finding 6).
+    const likeSafe = needle.replace(/[!%_]/g, (m) => `!${m}`);
     const rows =
       needle.length >= 3
         ? sql<Record<string, unknown>>`
@@ -533,7 +566,7 @@ export function createNotes(deps: NotesDeps) {
             ORDER BY n.createdAt DESC, n.noteId
           `
         : sql<Record<string, unknown>>`
-            SELECT * FROM sh_note WHERE text LIKE ${`%${needle}%`} AND status != 'removed'
+            SELECT * FROM sh_note WHERE text LIKE ${`%${likeSafe}%`} ESCAPE '!' AND status != 'removed'
             ORDER BY createdAt DESC, noteId
           `;
     const notes = rows.map(viewNote);
@@ -560,8 +593,24 @@ export function createNotes(deps: NotesDeps) {
     return { resident, project };
   };
 
-  /** The project notes for one fetch of the Threads that involve these repos (get_thread). */
-  const forRepos = (repoIds: string[]): NoteRow[] => context({ repoIds }).project;
+  /** The project notes for one fetch of the Threads that involve these repos (get_thread).
+   *  Deliberately NOT context(): only the project rows are assembled here, so a get_thread
+   *  call cannot reset the resident layer's 90-day decay clock (review finding 2) — resident
+   *  notes count as used only when the layer is genuinely assembled (notes.context) or the
+   *  entry is re-proposed. The always-rendered section likewise does not count as use, or
+   *  resident notes could never age (§2.5 rule 3 would be dead code). */
+  const forRepos = (repoIds: string[]): NoteRow[] => {
+    const at = now();
+    const rows = [...new Set(repoIds ?? [])].flatMap((repoId) =>
+      sql<Record<string, unknown>>`
+        SELECT * FROM sh_note
+        WHERE layer = 'project' AND status = 'active' AND scope_repoId = ${repoId}
+        ORDER BY pinned DESC, createdAt, noteId
+      `.map(viewNote),
+    );
+    for (const note of rows) sql`UPDATE sh_note SET lastUsedAt = ${at} WHERE noteId = ${note.noteId}`;
+    return rows;
+  };
 
   /** The resident layer as a system-prompt section body (§4.1); empty string omits it. */
   const renderResidentSection = (): string => {
@@ -585,13 +634,29 @@ export function createNotes(deps: NotesDeps) {
       SELECT op, noteId, text, reason FROM sh_note_log WHERE reportedAt IS NULL ORDER BY id
     `.map((r) => ({ op: r.op as NoteOp, noteId: r.noteId, text: r.text, reason: r.reason }));
 
-  /** Drains pending ChangeReports into one relay block; marks them reported. Called when
-   *  the next user reply is being built — the block rides on that reply (spec §10.3). */
-  const drainPendingForReply = (): string => {
+  /** Renders the pending relay block WITHOUT marking anything (review finding 4): the
+   *  caller marks via markPendingReported(upTo) only after the reply row is durably
+   *  enqueued — a crash in between then costs at most a duplicate announcement, never a
+   *  silent one (spec §10.3). `upTo` bounds the marking so a change that lands between
+   *  render and mark stays pending and rides the reply after it. */
+  const renderPendingForReply = (): { text: string; upTo: number } => {
+    const rows = sql<{ id: number }>`SELECT id FROM sh_note_log WHERE reportedAt IS NULL ORDER BY id`;
+    if (rows.length === 0) return { text: "", upTo: 0 };
     const pending = pendingChanges();
-    if (pending.length === 0) return "";
-    sql`UPDATE sh_note_log SET reportedAt = ${now()} WHERE reportedAt IS NULL`;
-    return renderChangeReports(pending);
+    return { text: renderChangeReports(pending), upTo: rows[rows.length - 1]!.id };
+  };
+
+  /** Marks pending rows up to and including `upTo` as relayed. */
+  const markPendingReported = (upTo: number): void => {
+    if (upTo <= 0) return;
+    sql`UPDATE sh_note_log SET reportedAt = ${now()} WHERE reportedAt IS NULL AND id <= ${upTo}`;
+  };
+
+  /** Render + mark in one step (tests, and callers that have nothing to lose by marking). */
+  const drainPendingForReply = (): string => {
+    const { text, upTo } = renderPendingForReply();
+    markPendingReported(upTo);
+    return text;
   };
 
   /** Decay (60d project demotion), resident suggestions (90d), and the capacity backstop.
@@ -664,6 +729,8 @@ export function createNotes(deps: NotesDeps) {
     forRepos,
     renderResidentSection,
     pendingChanges,
+    renderPendingForReply,
+    markPendingReported,
     drainPendingForReply,
     maintenance,
   };

@@ -120,7 +120,9 @@ sh_note(noteId, layer, scope_repoId?, kind, text, bytes,
         source, evidence, confirmed, pinned,
         createdAt, lastUsedAt, useCount, status, supersededBy)
 sh_note_fts(text)                     -- FTS5
-sh_note_log(ts, op, noteId, reason)   -- all changes; drives ChangeReport
+sh_note_log(id, ts, op, noteId, text, reason, reportedAt)
+                                       -- all changes (text = snapshot for the relay);
+                                       -- reportedAt marks "already relayed with a reply" (issue #18)
 ```
 
 | Layer | `layer` | Contents | Capacity | How it loads |
@@ -284,7 +286,7 @@ Five groups. Every tool returns compact text plus a few structured fields. The "
 | `find_threads(text, hints?)` | Candidates from §3 | safe |
 | `get_thread(threadId)` | Summary, workers, open questions, project-layer notes, recent timeline | safe |
 | `update_thread(threadId, {title?, goal?, summary?})` | Updates the summary | safe (idempotent overwrite) |
-| `notes_propose(draft)` / `notes_commit(draft, replaces?)` / `notes_pin(id, pinned)` / `notes_remove(id)` | Two-phase writes from §2.4 | propose: safe; commit: safe (idempotency key is the `taskId`) |
+| `notes_propose(draft)` / `notes_commit(draft, replaces?, confirmEvidence?)` / `notes_confirm(id, evidenceRef)` / `notes_pin(id, pinned)` / `notes_remove(id)` / `notes_list` | Two-phase writes from §2.4; confirm/list complete the conversation surface (issue #18). Resident writes require `evidence=user:<msgId>` (auto-attached from the triggering message in user runs); low-trust promotions require a confirmed predecessor or the run's own confirmation message | propose: safe; commit: safe (an exact-text duplicate absorbs the replay) |
 | `notes_search(q)` | Search the archive layer | safe |
 
 **Dispatch and control (via the protocol gateway)**

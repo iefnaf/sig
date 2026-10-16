@@ -18,6 +18,7 @@ import {
   modelRequests,
   ownerStub,
   pairDevice,
+  pairFakeConnector,
   postEvent,
   resetLedgerState,
   scriptModel,
@@ -318,6 +319,94 @@ describe("notes unit: trust rules", () => {
         scopeRepoId: "repo-a",
       });
       expect(withRepo.ok).toBe(false);
+    });
+  });
+});
+
+// ---- unit: review-fix regressions (PR #44) -----------------------------------------------------------
+
+describe("notes unit: review fixes (PR #44)", () => {
+  it("forRepos touches only project notes — a get_thread fetch must not reset the resident decay clock", async () => {
+    await inNotesDo((n, _ledger, sql) => {
+      const res = n.commit({ text: "报告保持简短", kind: "preference", source: "user_said", layer: "resident" });
+      const proj = n.commit({ text: "这个仓库用 pnpm", kind: "convention", source: "user_said", layer: "project", scopeRepoId: "repo-a" });
+      if (!res.ok || !proj.ok) throw new Error("fixtures failed");
+      const past = Date.now() - 5_000;
+      sql`UPDATE sh_note SET lastUsedAt = ${past}`;
+      n.forRepos(["repo-a"]);
+      expect(n.get(res.note.noteId)?.lastUsedAt).toBe(past); // resident untouched (finding 2)
+      expect(n.get(proj.note.noteId)!.lastUsedAt).toBeGreaterThan(past); // assembled ⇒ used
+    });
+  });
+
+  it("propose surfaces refusals instead of swallowing them, and never offers evictions for an over-cap single note", async () => {
+    await inNotesDo((n) => {
+      const trust = n.propose({ text: "用户喜欢晚上跑长任务", kind: "preference", source: "worker_reported", layer: "resident" });
+      expect(trust.rejected?.code).toBe("trust"); // (finding 5) the model learns it at propose
+      expect(trust.needsEviction).toHaveLength(0);
+      const over = n.propose({ text: "巨".repeat(RESIDENT_CAP + 1), kind: "preference", source: "user_said", layer: "resident" });
+      expect(over.rejected?.code).toBe("over_limit");
+      expect(over.needsEviction).toHaveLength(0); // no pointless eviction candidates
+      const healthy = n.propose({ text: "正常的偏好", kind: "preference", source: "user_said", layer: "resident" });
+      expect(healthy.rejected).toBeUndefined();
+    });
+  });
+
+  it("the short-needle LIKE fallback escapes wildcards: 100% matches only the literal", async () => {
+    await inNotesDo((n) => {
+      const hit = n.commit({ text: "任务完成度达到 100%", kind: "fact", source: "user_said", layer: "project", scopeRepoId: "r" });
+      const other = n.commit({ text: "速度提升了两倍", kind: "fact", source: "user_said", layer: "project", scopeRepoId: "r" });
+      if (!hit.ok || !other.ok) throw new Error("fixtures failed");
+      const hits = n.search("100%");
+      expect(hits.map((h) => h.noteId)).toEqual([hit.note.noteId]); // not everything (finding 6)
+    });
+  });
+
+  it("list: archive honors the repo scope; all keeps resident rows when scoped", async () => {
+    await inNotesDo((n) => {
+      const res = n.commit({ text: "全局偏好", kind: "preference", source: "user_said", layer: "resident" });
+      const a = n.commit({ text: "repo-a 旧约定", kind: "convention", source: "user_said", layer: "project", scopeRepoId: "repo-a" });
+      const b = n.commit({ text: "repo-b 旧约定", kind: "convention", source: "user_said", layer: "project", scopeRepoId: "repo-b" });
+      if (!res.ok || !a.ok || !b.ok) throw new Error("fixtures failed");
+      n.commit(
+        { text: "repo-a 新约定", kind: "convention", source: "user_said", layer: "project", scopeRepoId: "repo-a" },
+        { replaces: [a.note.noteId] },
+      );
+      // archive + scope filters to that repo's history only (finding 7)
+      const archiveA = n.list({ layer: "archive", scopeRepoId: "repo-a" }).map((x) => x.noteId);
+      expect(archiveA).toEqual([a.note.noteId]);
+      // all + scope: resident (global) rows stay in the listing (finding 7)
+      const allA = n.list({ layer: "all", scopeRepoId: "repo-a" }).map((x) => x.noteId);
+      expect(allA).toContain(res.note.noteId);
+      expect(allA).toContain(a.note.noteId);
+      expect(allA).not.toContain(b.note.noteId);
+    });
+  });
+
+  it("confirm records the owner's evidence message on the log row", async () => {
+    await inNotesDo((n) => {
+      const parked = n.commit({ text: "这个仓库用 pnpm", kind: "convention", source: "worker_reported", layer: "project", scopeRepoId: "r" });
+      if (!parked.ok) throw new Error(parked.message);
+      n.confirm(parked.note.noteId, "user:om_confirm_9");
+      const entry = n.pendingChanges().find((c) => c.op === "confirmed");
+      expect(entry?.reason).toBe("confirmed_by:user:om_confirm_9"); // promotion provenance stays traceable
+    });
+  });
+
+  it("renderPendingForReply is read-only; markPendingReported is bounded by upTo", async () => {
+    await inNotesDo((n) => {
+      const one = n.commit({ text: "第一条", kind: "preference", source: "user_said", layer: "resident" });
+      if (!one.ok) throw new Error(one.message);
+      const first = n.renderPendingForReply();
+      expect(first.text).toContain("记住了");
+      expect(n.pendingChanges()).toHaveLength(1); // nothing marked by the render (finding 4)
+      // A change landing between render and mark keeps its id above upTo: stays pending.
+      const two = n.commit({ text: "第二条", kind: "preference", source: "user_said", layer: "resident" });
+      if (!two.ok) throw new Error(two.message);
+      n.markPendingReported(first.upTo);
+      const pending = n.pendingChanges();
+      expect(pending).toHaveLength(1);
+      expect(pending[0]!.noteId).toBe(two.note.noteId); // rides the NEXT reply
     });
   });
 });
@@ -699,5 +788,142 @@ describe("notes in conversation (issue #18, steward.md §4.1/§4.3, spec §10.3)
     expect(refusal!.lastToolResult).toContain("可腾挪候选");
     const snap = await ownerStub().debugSnapshot();
     expect(snap.notes.filter((n) => n.layer === "resident")).toHaveLength(118);
+  });
+});
+
+describe("notes trust gates: the evidence rules (PR #44 review finding 3)", () => {
+  it("a user_said resident note carries the triggering message as evidence (auto-attached in user runs)", async () => {
+    await scriptModel(
+      fauxAssistantMessage(
+        [fauxToolCall("notes_commit", { text: "报告保持简短", kind: "preference", source: "user_said", layer: "resident" })],
+        { stopReason: "toolUse" },
+      ),
+      fauxAssistantMessage([fauxText("好。")]),
+    );
+    const { msgId } = await dm("记住：报告保持简短");
+    await waitRunsSettled();
+    const snap = await ownerStub().debugSnapshot();
+    expect(snap.notes).toHaveLength(1);
+    // The gate's trace: the note hangs on the message the user actually sent.
+    expect(snap.notes[0]).toMatchObject({ layer: "resident", evidence: `user:${msgId}` });
+  });
+
+  it("an event run cannot write user_said into the resident layer without citing the user's message", async () => {
+    const fake = await pairFakeConnector("mac-studio", { run: null, autorun: false });
+    await fake.connect();
+    const outcome = await ownerStub().dispatchForTest({ prompt: "修个东西", repoRef: "repo-a", newTitle: "修个东西" });
+    expect(outcome.kind).toBe("dispatched");
+    const [cmd] = await fake.waitForCmds(1);
+    const workerId = String((cmd!.args as Record<string, unknown>).workerId);
+    fake.send({ t: "cmd_ack", re: cmd!.id, status: "accepted" });
+    fake.send({ t: "cmd_result", re: cmd!.id, ok: true, data: { sessionId: workerId, branch: "shepherd/x-1" } });
+    await fake.emit("started", workerId, { sessionId: workerId, branch: "shepherd/x-1" });
+
+    // The report wake (⟦event⟧) fires after the 3s merge window; during that run the model
+    // tries to store a worker-claimed "preference" as user_said — the tool refuses: in an
+    // event run there is no user message to auto-attach, and none was cited.
+    await scriptModel(
+      fauxAssistantMessage(
+        [fauxToolCall("notes_commit", { text: "用户喜欢晚上跑长任务", kind: "preference", source: "user_said", layer: "resident" })],
+        { stopReason: "toolUse" },
+      ),
+      fauxAssistantMessage([fauxToolCall("no_action", { reason: "记账完成" })]),
+    );
+    await fake.emit("report", workerId, { type: "report", status: "done", summary: "任务完成" });
+    await waitRunsSettled();
+
+    const requests = await modelRequests();
+    const refusal = requests.find((r) => r.lastToolResult.includes("常驻层记忆必须挂在用户真正说过的消息上"));
+    expect(refusal).toBeDefined();
+    const snap = await ownerStub().debugSnapshot();
+    expect(snap.notes.filter((n) => n.layer === "resident")).toHaveLength(0);
+    expect(snap.noteLog).toHaveLength(0); // a refusal logs nothing — no announcement owed
+  });
+
+  it("notes_confirm requires the confirmation to postdate the note (the user must have seen the「记账」)", async () => {
+    await dm("一条更早的无关消息", "om_early"); // received BEFORE the note exists
+    const noteId = await (async () => {
+      const r = await runInDurableObject(ownerStub(), (instance: Steward) => {
+        const ledger = (instance as unknown as { ledger: Ledger }).ledger;
+        const done = ledger.notes.commit({
+          text: "这个仓库用 pnpm",
+          kind: "convention",
+          source: "worker_reported",
+          layer: "project",
+          scopeRepoId: "/srv/repo-a",
+        });
+        if (!done.ok) throw new Error(done.message);
+        ledger.notes.drainPendingForReply(); // seeded silently: not this test's subject
+        return done.note.noteId;
+      });
+      return r;
+    })();
+
+    await scriptModel(
+      fauxAssistantMessage([fauxToolCall("notes_confirm", { noteId, evidenceRef: "user:om_early" })], { stopReason: "toolUse" }),
+      fauxAssistantMessage([fauxText("需要用户先确认。")]),
+    );
+    await dm("对，没错", "om_confirm_late");
+    await waitRunsSettled();
+    const requests = await modelRequests();
+    const stale = requests.find((r) => r.lastToolResult.includes("确认消息必须晚于笔记创建"));
+    expect(stale).toBeDefined();
+    expect((await ownerStub().debugSnapshot()).notes[0]).toMatchObject({ confirmed: false });
+
+    // Next turn: the SAME later message now confirms (it postdates the note), and the
+    // promotion (parked → confirmed → replaces) needs no further evidence — it inherits
+    // the confirmation's proof.
+    await scriptModel(
+      fauxAssistantMessage([fauxToolCall("notes_confirm", { noteId, evidenceRef: "user:om_confirm_late" })], { stopReason: "toolUse" }),
+      fauxAssistantMessage(
+        [fauxToolCall("notes_commit", {
+          text: "这个仓库用 pnpm",
+          kind: "convention",
+          source: "worker_reported",
+          layer: "resident",
+          replaces: [noteId],
+        })],
+        { stopReason: "toolUse" },
+      ),
+      fauxAssistantMessage([fauxText("已提升为常驻。")]),
+    );
+    await dm("把它记成全局的", "om_promote");
+    await waitRunsSettled();
+    const snap = await ownerStub().debugSnapshot();
+    const promoted = snap.notes.find((n) => n.layer === "resident");
+    expect(promoted).toMatchObject({ confirmed: true, source: "worker_reported" });
+    expect(promoted?.supersededBy ?? null).toBeNull();
+    // ^ the promoted note is new; the parked one points at it
+    const parked = snap.notes.find((n) => n.noteId === noteId);
+    expect(parked).toMatchObject({ layer: "archive", supersededBy: promoted?.noteId });
+  });
+
+  it("a direct low-trust promotion must cite the run's own user message — an older real message is not enough", async () => {
+    await runInDurableObject(ownerStub(), (instance: Steward) => {
+      const ledger = (instance as unknown as { ledger: Ledger }).ledger;
+      ledger.notes.drainPendingForReply();
+    });
+    await dm("一条真实存在的更早消息", "om_old_real"); // received, but BEFORE this turn
+    await scriptModel(
+      fauxAssistantMessage(
+        [fauxToolCall("notes_commit", {
+          text: "用户喜欢晚上跑长任务",
+          kind: "preference",
+          source: "worker_reported",
+          layer: "resident",
+          confirmEvidence: "user:om_old_real",
+        })],
+        { stopReason: "toolUse" },
+      ),
+      fauxAssistantMessage([fauxText("引用旧消息不行。")]),
+    );
+    // om_old_real IS a real, previously-received user message — but THIS run was triggered
+    // by a different one: the confirmation must have happened in this conversation turn.
+    await dm("随便聊点别的", "om_other_turn");
+    await waitRunsSettled();
+    const requests = await modelRequests();
+    const refusal = requests.find((r) => r.lastToolResult.includes("触发本轮的那条用户消息"));
+    expect(refusal).toBeDefined();
+    expect((await ownerStub().debugSnapshot()).notes.filter((n) => n.layer === "resident")).toHaveLength(0);
   });
 });

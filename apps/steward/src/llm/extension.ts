@@ -36,6 +36,9 @@ export interface StewardExtensionContext {
   /** Verify a model-claimed provenance reference (§7.2): `user:<msgId>` must be a message
    *  this deployment actually received. Routine/followup/watch ids land with #20. */
   checkProvenanceRef(ref: string): Promise<boolean>;
+  /** When that message was received (ms), or null for unknown refs — lets the notes tools
+   *  bind a confirmation to the note it confirms (received AFTER the note existed). */
+  messageReceivedAt(ref: string): Promise<number | null>;
   /** notify_user / ask_user land in the outbound queue; only these reach the user.
    *  `dedupeId` (from the tool taskId) makes replayed calls converge on one message. */
   notifyUser(input: {
@@ -328,6 +331,7 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
       const draft = draftOf(args);
       if (typeof draft === "string") return err(draft);
       const result = ctx.ledger.notes.propose(draft);
+      if (result.rejected) return err(`refused: ${result.rejected.message}`);
       return ok(
         JSON.stringify({
           duplicate: result.duplicate && { noteId: result.duplicate.noteId, text: result.duplicate.text },
@@ -341,12 +345,12 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
   const notesCommit = defineTool({
     name: "notes_commit",
     description:
-      "写入记忆的第二步（唯一写入路径）。replaces：被取代/被腾挪的旧条目 id（旧条目进档案，可追溯）。常驻层只收用户亲口说的偏好；worker_reported / inferred 来源要进常驻层必须已获用户确认且带 confirmEvidence=user:<消息id>；connector 来源只能进项目层。写入会记入下一条回复的「记账」，无需在正文里复述。",
+      "写入记忆的第二步（唯一写入路径）。replaces：被取代/被腾挪的旧条目 id（旧条目进档案，可追溯）。常驻层的门是硬性的：evidence 必须指向用户真正说过的那条消息（user:<om_…>；用户消息触发的轮次里可省略，系统会用当轮消息）；worker_reported / inferred 要进常驻层必须先在项目层经 notes_confirm 确认（replaces 指向它），或当轮就是用户的确认消息（confirmEvidence=user:<om_…>）；connector 来源只能进项目层。写入会记入下一条回复的「记账」，无需在正文里复述。",
     parameters: Type.Intersect([
       noteDraftSchema,
       Type.Object({
         replaces: Type.Optional(Type.Array(Type.String(), { description: "notes_propose 给出的旧条目 id（同义取代或腾挪）" })),
-        confirmEvidence: Type.Optional(Type.String({ description: "低信任来源提升常驻层时的用户确认消息：user:<om_…>" })),
+        confirmEvidence: Type.Optional(Type.String({ description: "用户确认消息：user:<om_…>（直接提升低信任来源时必填，须是当轮用户消息）" })),
       }),
     ]),
     // §4.3: commit is replay-safe — an exact-text duplicate absorbs the replay (bump only).
@@ -354,14 +358,48 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
     execute: async (args) => {
       const draft = draftOf(args);
       if (typeof draft === "string") return err(draft);
-      // The anti-poisoning check the module cannot do (§2.3 + §7.2's pattern): a low-trust
-      // promotion needs the owner's own words — a message this deployment really received.
-      if (args.layer === "resident" && LOW_TRUST_SOURCES.includes(draft.source)) {
-        if (!args.confirmEvidence || !(await ctx.checkProvenanceRef(args.confirmEvidence))) {
-          return err("refused: 低信任来源进常驻层需要 confirmEvidence=user:<消息id>（用户确认过的那条消息，必须是真实收到的）。否则先写项目层，用 notes_confirm 走确认。");
+      // The anti-poisoning checks the module cannot do (§2.3 + §7.2's pattern). A resident
+      // write always rests on the owner's own words; a low-trust promotion additionally
+      // rests on a confirmation that is bound to something: either a project note this
+      // deployment already marked confirmed (notes_confirm verified its evidence), or the
+      // user message that triggered THIS run (event runs have neither and must park first).
+      if (args.layer === "resident" && draft.source === "user_said") {
+        const run = await ctx.currentRun();
+        const claimed = args.evidence ?? (run?.kind === "user" ? run.provenance : undefined);
+        if (!claimed || !(await ctx.checkProvenanceRef(claimed))) {
+          return err(
+            "refused: 常驻层记忆必须挂在用户真正说过的消息上（evidence=user:<om_…>）。用户消息触发的轮次可省略 evidence；系统输入的轮次必须指明用户原话所在的消息。",
+          );
         }
-        draft.confirmed = true;
-        draft.evidence = draft.evidence ?? args.confirmEvidence;
+        draft.evidence = claimed;
+      }
+      if (args.layer === "resident" && LOW_TRUST_SOURCES.includes(draft.source)) {
+        // A confirmed LOW-TRUST predecessor is the parked-then-promoted path: notes_confirm
+        // already bound the owner's message to it (temporally), so the promotion inherits
+        // that proof. A confirmed user_said/connector note proves nothing about this claim.
+        const replacesActive = (args.replaces ?? [])
+          .map((id) => ctx.ledger.notes.get(id))
+          .filter(
+            (n): n is NonNullable<typeof n> =>
+              n !== null && n.status === "active" && n.confirmed && LOW_TRUST_SOURCES.includes(n.source),
+          );
+        if (replacesActive.length > 0) {
+          // Parked → confirmed (notes_confirm bound the owner's message to it) → promoted.
+          draft.confirmed = true;
+        } else {
+          const run = await ctx.currentRun();
+          if (!args.confirmEvidence || !(await ctx.checkProvenanceRef(args.confirmEvidence))) {
+            return err("refused: 低信任来源进常驻层需要先在项目层记录并经 notes_confirm 确认（replaces 指向它），或给出 confirmEvidence=user:<消息id>。");
+          }
+          if (run && run.kind !== "user") {
+            return err("refused: 事件触发的轮次不能直接提升低信任记忆：先写项目层，等用户确认（notes_confirm）后再提升。");
+          }
+          if (run && args.confirmEvidence !== run.provenance) {
+            return err("refused: confirmEvidence 必须是触发本轮的那条用户消息（确认必须发生在对话里，不能引用旧消息）。");
+          }
+          draft.confirmed = true;
+          draft.evidence = draft.evidence ?? args.confirmEvidence;
+        }
       }
       const result = ctx.ledger.notes.commit(draft, { replaces: args.replaces });
       if (!result.ok) {
@@ -383,7 +421,7 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
   const notesConfirm = defineTool({
     name: "notes_confirm",
     description:
-      "用户确认了某条待确认记忆（worker 汇报/推断来源）。evidenceRef 必须是用户说确认的那条消息（user:<om_…>，须真实存在）。确认后方可提升常驻层（notes_commit + replaces）。",
+      "用户确认了某条待确认记忆（worker 汇报/推断来源）。evidenceRef 必须是用户说确认的那条消息（user:<om_…>），且必须晚于笔记创建（「记账」先告知、用户再确认——引用更早的消息不算确认）。确认后方可提升常驻层（notes_commit + replaces）。",
     parameters: Type.Object({
       noteId: Type.String(),
       evidenceRef: Type.String({ description: "用户确认消息：user:<om_…>" }),
@@ -394,10 +432,17 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
       if (!note) return err(`笔记 ${args.noteId} 不存在。`);
       if (note.status === "removed") return err(`笔记 ${args.noteId} 已被删除。`);
       if (note.confirmed) return ok("已是确认状态。");
-      if (!(await ctx.checkProvenanceRef(args.evidenceRef))) {
+      const receivedAt = await ctx.messageReceivedAt(args.evidenceRef);
+      if (receivedAt === null) {
         return err("refused: evidenceRef 必须是本部署真实收到的用户消息（user:<om_…>）。");
       }
-      ctx.ledger.notes.confirm(args.noteId);
+      // The announcement rides the first reply AFTER the note exists, so a genuine
+      // confirmation always postdates createdAt — anything earlier is a citation, not a
+      // confirmation (review finding 3b).
+      if (receivedAt <= note.createdAt) {
+        return err("refused: 确认消息必须晚于笔记创建（用户先看到「记账」才能确认）。");
+      }
+      ctx.ledger.notes.confirm(args.noteId, args.evidenceRef);
       return ok("已确认。现在可以用 notes_commit（replaces 指向它）提升到常驻层。");
     },
   });
@@ -558,4 +603,4 @@ const ROLE_PROMPT = `你是 Shepherd 的总管（steward）：替用户调度他
 6. 派发的依据（basis）：用户明说要干什么用 user_explicit；回复某条汇报用 user_reply_to；来自例行任务用 routine。凭空的推断禁止派发，改用 ask_user。
 7. notify_user 的三段有硬性长度限制（结论 ≤80 字；做了什么 ≤4 条、每条 ≤100 字；需要你 ≤120 字），超长会被拒绝——压缩重写，不要截断。
 8. 永远不要替用户宣布「这件事完成了」；完成与否由汇报与事实说话。
-9. 记忆（notes_* 工具）：值得记的是「不知道它就会派错/多问/说错」的事——用户偏好与项目约定，不是闲聊内容。写入分两步：先 notes_propose 看查重/相似/腾挪候选，再 notes_commit（replaces 带上被取代或被腾挪的旧条目 id）。信任规则是硬性的：worker_reported / inferred 来源先写项目层（待确认），用户确认后（notes_confirm，evidenceRef=用户消息id）才能提升常驻层；直接提升要在 notes_commit 里带 confirmEvidence；connector 来源永远只进项目层。每次写入系统会自动在下一条回复后附「记账」，正文不必复述。用户要看/置顶/删除记忆时用 notes_list / notes_pin / notes_remove。`;
+9. 记忆（notes_* 工具）：值得记的是「不知道它就会派错/多问/说错」的事——用户偏好与项目约定，不是闲聊内容。写入分两步：先 notes_propose 看查重/相似/腾挪候选，再 notes_commit（replaces 带上被取代或被腾挪的旧条目 id）。信任规则是硬性的：常驻层永远要有 evidence=用户真正说过的消息 id（用户消息触发的轮次可省略，系统自动挂当轮消息；事件触发的轮次必须指明）；worker_reported / inferred 来源先写项目层（待确认），用户在对话里确认后（notes_confirm，evidenceRef=确认那条消息）才能提升常驻层；connector 来源永远只进项目层。每次写入系统会自动在下一条回复后附「记账」，正文不必复述。用户要看/置顶/删除记忆时用 notes_list / notes_pin / notes_remove。`;

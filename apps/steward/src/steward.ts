@@ -402,6 +402,18 @@ export class Steward extends Agent<Env> {
         if (msgId.length === 0) return false;
         return this.sql`SELECT 1 AS one FROM sh_inbound WHERE channel = 'feishu' AND msgId = ${msgId}`.length > 0;
       },
+      messageReceivedAt: async (ref) => {
+        // Notes' temporal binding (PR #44 review finding 3b): when the owner's message
+        // arrived, so a confirmation can be required to postdate the note it confirms.
+        if (!ref.startsWith("user:")) return null;
+        const msgId = ref.slice("user:".length);
+        if (msgId.length === 0) return null;
+        return (
+          this.sql<{ receivedAt: number }>`
+            SELECT receivedAt FROM sh_inbound WHERE channel = 'feishu' AND msgId = ${msgId}
+          `[0]?.receivedAt ?? null
+        );
+      },
       startWorker: async (input) => {
         const outcome = await this.dispatcher.startWorker(input);
         // Review #8: a dispatch in this run picks/creates the Thread the conversation is now
@@ -2026,60 +2038,56 @@ export class Steward extends Agent<Env> {
       const hasText = Boolean(result.text && result.text.trim().length > 0);
       // spec §10.3 (issue #18): every memory ChangeReport rides on the next reply —
       // deterministic, so "remembered: …" reaches the user even if the model never says it.
-      // Drained lazily: only when a message really goes out (a silent settle — e.g. an empty
-      // run that already notified — must not consume the pending reports). The durable
-      // outbound row carries the text, so a retried send cannot lose or duplicate the block.
-      let relayText: string | null = null;
-      const withRelay = (text: string): string => {
-        if (relayText === null) relayText = this.ledger.notes.drainPendingForReply();
-        return relayText === "" ? text : `${text}\n${relayText}`;
-      };
+      // Ordering (review finding 4): the relay is RENDERED here but marked reported only
+      // after the reply row is durably enqueued — a crash in the remaining window costs at
+      // most a duplicate announcement (the outbound queue owns delivery retries), never a
+      // silent one. `upTo` bounds the marking: a change landing between render and mark
+      // stays pending and rides the reply after it.
+      const relay = this.ledger.notes.renderPendingForReply();
+      const withRelay = (text: string): string => (relay.text === "" ? text : `${text}\n${relay.text}`);
       // Review #9: a `done` run with no final text is legitimate when the model already
       // produced user-facing output (ask_user terminates the turn right after its push;
       // notify_user cards went out mid-run). Only a silent empty answer is treated as a
       // failure the user must hear about.
       const alreadyNotified = Boolean(run.notified);
+      const reply = async (text: string): Promise<void> => {
+        // §6.2 source 3: the final text of a user-triggered run IS the reply. The outbound
+        // id is keyed to the run (review #6): concurrent polls and interrupted settle windows
+        // converge on one message. The enqueue's insert is synchronous inside the call, so
+        // once it returns the announcement cannot be lost; only then is the relay marked.
+        try {
+          const { id } = await this.enqueueOutbound({
+            id: `reply:${run.operationId}`,
+            kind: "text",
+            to: owner!,
+            text,
+            threadId: run.routedThreadId,
+            urgency: "push",
+          });
+          this.ledger.notes.markPendingReported(relay.upTo);
+          this.ledger.runs.settle(run.operationId, result, id);
+        } catch (err) {
+          // Nothing durable went out: the run stays open and the next poll retries, with the
+          // relay still pending — the announcement is never silently consumed.
+          this.logChannel("reply_enqueue_failed", `${run.operationId} ${errorText(err)}`);
+        }
+      };
       if (owner && result.status === "done" && hasText) {
-        // §6.2 source 3: the final text of a user-triggered run IS the reply. Carrying the
-        // routed thread keeps quote-reply chains on the same Thread (§3.1) — either the
-        // quote-route resolved at submit time or the run's own dispatch backfilled it.
-        // The outbound id is keyed to the run (review #6): concurrent polls and interrupted
-        // settle windows converge on one message.
-        void this.enqueueOutbound({
-          id: `reply:${run.operationId}`,
-          kind: "text",
-          to: owner,
-          text: withRelay(result.text!),
-          threadId: run.routedThreadId,
-          urgency: "push",
-        }).then(({ id }) => this.ledger.runs.settle(run.operationId, result, id));
+        void reply(withRelay(result.text!));
         return;
       }
       if (owner && result.status !== "done") {
         // No template exists for user replies; a one-line notice beats silence (the budget
         // cap and its degradation behavior are #28's to refine).
-        void this.enqueueOutbound({
-          id: `reply:${run.operationId}`,
-          kind: "text",
-          to: owner,
-          text: withRelay("⚠️ 总管这轮没有跑成（模型调用失败或被中断），这条消息我没能处理；稍后再试或重发一次。"),
-          threadId: run.routedThreadId,
-          urgency: "push",
-        }).then(({ id }) => this.ledger.runs.settle(run.operationId, result, id));
+        void reply(withRelay("⚠️ 总管这轮没有跑成（模型调用失败或被中断），这条消息我没能处理；稍后再试或重发一次。"));
         return;
       }
       if (owner && result.status === "done" && !hasText && !alreadyNotified) {
         // Review #9: done, empty, and nothing reached the user — say so instead of silence.
-        void this.enqueueOutbound({
-          id: `reply:${run.operationId}`,
-          kind: "text",
-          to: owner,
-          text: withRelay("⚠️ 总管这轮没有给出回复（可能只调用了内部工具）；需要的话再说一次。"),
-          threadId: run.routedThreadId,
-          urgency: "push",
-        }).then(({ id }) => this.ledger.runs.settle(run.operationId, result, id));
+        void reply(withRelay("⚠️ 总管这轮没有给出回复（可能只调用了内部工具）；需要的话再说一次。"));
         return;
       }
+
     }
     // Event/routine/follow-up runs, and user runs that already reached the user: the text is
     // kept for audit and nothing more is sent (§6.2).
@@ -2092,24 +2100,6 @@ export class Steward extends Agent<Env> {
    * time and harness.submit deduplicates by it, so replays and crash-restarts never produce a
    * second steward input.
    */
-  /**
-   * The notes lifecycle pass (issue #18, steward.md §2.5): 60-day project demotions, 90-day
-   * resident demotion *suggestions* (never automatic — resident entries have broad impact),
-   * and the capacity backstop. Deterministic; its ChangeReports land in sh_note_log and
-   * reach the user with the next reply (spec §10.3) — no wake, no push of their own.
-   */
-  async notesMaintenance(_payload?: unknown, schedule?: { id: string }): Promise<void> {
-    try {
-      this.ledger.notes.maintenance(Date.now());
-    } catch (err) {
-      this.logChannel("notes_maintenance_failed", errorText(err));
-    }
-    // Rearm daily (review #1's pattern: cancel the running job's schedule first, else the
-    // idempotent insert dedups onto a job the driver deletes when this handler returns).
-    if (schedule !== undefined) await this.cancelSchedule(schedule.id).catch(() => {});
-    await this.schedule(NOTES_MAINTENANCE_DAY_S, "notesMaintenance", undefined, { idempotent: true });
-  }
-
   async drainWakes(_payload?: unknown, schedule?: { id: string }): Promise<void> {
     let submitted = false;
     try {
@@ -2144,6 +2134,24 @@ export class Steward extends Agent<Env> {
       this.drainWakeScheduleId = scheduled?.id;
     }
     if (submitted) void this.pollRuns();
+  }
+
+  /**
+   * The notes lifecycle pass (issue #18, steward.md §2.5): 60-day project demotions, 90-day
+   * resident demotion *suggestions* (never automatic — resident entries have broad impact),
+   * and the capacity backstop. Deterministic; its ChangeReports land in sh_note_log and
+   * reach the user with the next reply (spec §10.3) — no wake, no push of their own.
+   */
+  async notesMaintenance(_payload?: unknown, schedule?: { id: string }): Promise<void> {
+    try {
+      this.ledger.notes.maintenance(Date.now());
+    } catch (err) {
+      this.logChannel("notes_maintenance_failed", errorText(err));
+    }
+    // Rearm daily (review #1's pattern: cancel the running job's schedule first, else the
+    // idempotent insert dedups onto a job the driver deletes when this handler returns).
+    if (schedule !== undefined) await this.cancelSchedule(schedule.id).catch(() => {});
+    await this.schedule(NOTES_MAINTENANCE_DAY_S, "notesMaintenance", undefined, { idempotent: true });
   }
 
   // Card button callbacks (issue #5): the Thread is resolved from the card's providerMsgId —
