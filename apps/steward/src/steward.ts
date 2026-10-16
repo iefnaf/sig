@@ -184,6 +184,9 @@ export type PairResult =
 export class Steward extends Agent<Env> {
   onStart(): void {
     runMigrations(this.sql.bind(this), MIGRATIONS);
+    // A DO restart clears the in-memory arm-dedupe while storage alarms keep their own
+    // clock: re-arm maintenance so a restart never strands active workers unwatched.
+    this.armWorkerSweeps();
   }
 
   // The signing/sealing key set (primary = SERVER_KEY, plus SERVER_KEY_PREVIOUS during a
@@ -216,6 +219,15 @@ export class Steward extends Agent<Env> {
         this.sql`UPDATE outbox SET state = 'expired' WHERE cmdId = ${cmdId} AND state = 'queued'`;
         return this.sql<{ changes: number }>`SELECT changes() AS changes`[0]!.changes > 0;
       },
+      // A start_worker that has not left the outbox pipeline yet (issue #13 review finding 3):
+      // the run is alive even when its worker row was reaped away.
+      hasDeliverableStart: (threadId) =>
+        this.sql<{ one: number }>`
+          SELECT 1 AS one FROM outbox o JOIN sh_worker w ON w.workerId = o.workerId
+          WHERE w.threadId = ${threadId} AND o.kind = 'start_worker'
+            AND o.state IN ('queued', 'sent') AND o.workerId IS NOT NULL
+          LIMIT 1
+        `.length > 0,
       sendText: async (text, threadId) => {
         const owner = this.ownerOpenIdSync();
         if (!owner) return;
@@ -567,6 +579,9 @@ export class Steward extends Agent<Env> {
     try {
       const { applied } = this.ledger.applyPendingEvents();
       if (applied > 0) {
+        // Events catching up can release a parked hello-snapshot verdict for a reaped
+        // worker (issue #13 review finding 2) — resolve before anything reads the state.
+        this.ledger.workers.resolveReapPending();
         // Any applied event can start a run (started/resumed) or end one (settled/lost) —
         // the maintenance alarm follows suit (issue #13).
         this.armWorkerSweeps();
@@ -868,28 +883,75 @@ export class Steward extends Agent<Env> {
 
   /**
    * One maintenance pass: the §8.4 stall alarm (online machine + silence past the threshold →
-   * one template notice per stall) and the reap sweep (offline 10 min or online-silent 45 min
-   * → lost). Offline workers skip the stall notice on purpose — they are the reap sweep's
-   * territory, and "lost contact" is not news worth interrupting the user for (spec §9).
+   * one template notice per stall) and the reap sweep (issue #13). Reap rules:
+   * - `running`/`recovering`: machine offline for a real 10 minutes (measured from the
+   *   offline transition, so a connection blip never reaps — review finding 4), or
+   *   online-but-silent 45 min (the connector forgot the worker).
+   * - `starting`: NEVER by silence clocks alone (review finding 3) — a start_worker that can
+   *   still be delivered means the worker is queued, not lost, and reaping it would open the
+   *   duplicate-dispatch door. The command's own lifecycle decides; only once it is terminal
+   *   does the sweep close the worker out.
+   * Offline workers skip the stall notice on purpose — they are the reap sweep's territory,
+   * and "lost contact" is not news worth interrupting the user for (spec §9).
    */
   async sweepWorkers(): Promise<{ stalled: number; reaped: number }> {
     let stalled = 0;
     let reaped = 0;
     const now = Date.now();
-    // Query with the shorter threshold and classify per worker in one pass.
-    for (const worker of this.ledger.workers.silentSince(Math.min(this.reapOfflineMs, this.stallAlarmMs))) {
-      const silentMs = now - (worker.lastEventAt ?? worker.createdAt);
-      if (silentMs >= this.reapSilentMs || (!worker.machineOnline && silentMs >= this.reapOfflineMs)) {
-        if (this.ledger.workers.reapWorker(worker.workerId, worker.machineOnline)) reaped += 1;
-        continue;
+    try {
+      // Query with the shorter threshold and classify per worker in one pass.
+      for (const worker of this.ledger.workers.silentSince(Math.min(this.reapOfflineMs, this.stallAlarmMs))) {
+        const silentMs = now - (worker.lastEventAt ?? worker.createdAt);
+        if (worker.state === "starting") {
+          const cmd = worker.cmdId ? this.commandState(worker.cmdId) : null;
+          if (cmd && (cmd.state === "failed" || cmd.state === "expired")) {
+            const settled =
+              cmd.state === "expired"
+                ? // The user withdrew it: close quietly, no push (they already know).
+                  this.ledger.workers.settleWithdrawnStart(worker.workerId)
+                : // Failed undelivered (queue timeout, ack exhaustion): the owner clicked
+                  // "排队等上线" and must hear that it never happened.
+                  this.ledger.workers.markStartFailed(
+                    worker.workerId,
+                    worker.cmdId!,
+                    cmd.failReason === "idle" ? "排队超时（机器长时间未上线）" : `命令失败（${cmd.failReason ?? cmd.state}）`,
+                  );
+            if (settled) reaped += 1;
+          } else if (cmd?.state === "done" && silentMs >= this.reapSilentMs) {
+            // Delivered and acknowledged, yet nothing ever started and no events arrived:
+            // the wedge backstop, only at the online-but-silent horizon.
+            if (this.ledger.workers.reapWorker(worker.workerId, worker.machineOnline)) reaped += 1;
+          }
+          continue;
+        }
+        if (!worker.machineOnline) {
+          if (now - worker.machineLastSeen >= this.reapOfflineMs) {
+            if (this.ledger.workers.reapWorker(worker.workerId, false)) reaped += 1;
+          }
+          continue; // recently dropped, or not yet due: wait out the offline clock
+        }
+        if (silentMs >= this.reapSilentMs) {
+          if (this.ledger.workers.reapWorker(worker.workerId, true)) reaped += 1;
+          continue;
+        }
+        if (silentMs >= this.stallAlarmMs) {
+          if (this.ledger.workers.notifyStall(worker.workerId, silentMs)) stalled += 1;
+        }
       }
-      if (worker.machineOnline && silentMs >= this.stallAlarmMs) {
-        if (this.ledger.workers.notifyStall(worker.workerId, silentMs)) stalled += 1;
-      }
+      // A settled queue-timeout queues a failure push (markStartFailed); drain for reaps too.
+      if (stalled > 0 || reaped > 0) void this.drainNotifications();
+    } finally {
+      // Re-arm even when a pass throws mid-way: a ledger error must not kill the alarm chain.
+      this.armWorkerSweeps();
     }
-    if (stalled > 0) void this.drainNotifications();
-    this.armWorkerSweeps();
     return { stalled, reaped };
+  }
+
+  /** The outbox row's state/failReason for a worker's start_worker command, if it exists. */
+  private commandState(cmdId: string): { state: string; failReason: string | null } | null {
+    return this.sql<{ state: string; failReason: string | null }>`
+      SELECT state, failReason FROM outbox WHERE cmdId = ${cmdId}
+    `[0] ?? null;
   }
 
   // =================================================================================================

@@ -166,6 +166,7 @@ const KIND_LABELS: Record<string, string> = {
   lost: "失联",
   resumed: "恢复",
   note: "备注",
+  stall: "长时间静默",
 };
 
 function relTime(ts: number, now: number): string {

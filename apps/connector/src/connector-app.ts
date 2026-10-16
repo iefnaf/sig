@@ -51,7 +51,12 @@ export class ConnectorApp {
       stateDir: options.stateDir,
       adapter: options.adapter,
       recovery: options.recovery,
-      watchdog: options.watchdog,
+      // Detection failures must surface in the daemon log, never as an unhandled rejection
+      // (Node's default would crash the connector over its own watchdog).
+      watchdog: {
+        ...options.watchdog,
+        onError: (err) => this.log?.("watchdog_error", { error: err instanceof Error ? err.message : String(err) }),
+      },
       emit: (workerId, fields) => {
         this.log?.("worker_event", { workerId, type: fields.type });
         this.client.emit(workerId, fields);

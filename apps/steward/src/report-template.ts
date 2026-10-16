@@ -138,7 +138,7 @@ export function stallCard(
     tone: "attention",
     conclusion: `⏸ ${threadTitle}：${minutes} 分钟没有任何动静`,
     did: [],
-    needsYou: `${machineName} 上的 ${worker.agent} 无输出已 ${minutes} 分钟。可能是超长的工具调用，也可能卡住了；连接器会自动重启一次，仍无动静会被回收为失联。`,
+    needsYou: `${machineName} 上的 ${worker.agent} 无输出已 ${minutes} 分钟。可能是超长的工具调用，也可能卡住了；若确实卡住，连接器会尝试自动重启，持续无动静会被回收为失联。`,
     threadTitle,
     footer,
     detailsUrl,

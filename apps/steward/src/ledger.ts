@@ -121,9 +121,11 @@ export interface NotifyRow {
   workerId: string | null;
 }
 
-/** A worker in an active state, plus whether its machine currently has a live connection. */
+/** A worker in an active state, plus its machine's connection state (issue #13 review: the
+ * reap sweep needs WHEN the machine went offline, not just that it is offline now). */
 export interface SilentWorker extends WorkerRow {
   machineOnline: boolean;
+  machineLastSeen: number;
 }
 
 // ---- web read model (steward.md §10: pages are served from the memory module's views) -------------
@@ -359,6 +361,8 @@ export function createLedger(deps: LedgerDeps) {
         VALUES (${input.workerId}, ${input.threadId}, ${input.deviceId}, ${input.repoId ?? null},
                 ${input.agent}, ${input.mode}, 'starting', ${input.cmdId ?? null}, ${ts}, ${ts})
       `;
+      // A fresh run of this id: any deferred reap-reconcile verdict is void.
+      sql`DELETE FROM sh_reap_pending WHERE workerId = ${input.workerId}`;
       return workers.get(input.workerId)!;
     },
     get(workerId: string): WorkerRow | null {
@@ -399,8 +403,8 @@ export function createLedger(deps: LedgerDeps) {
      * ledger matches the snapshot, later hellos take no branch.
      */
     reconcileFromSnapshot(deviceId: string, snapshots: HelloMessage["workers"]): void {
-      const rows = sql<{ workerId: string; threadId: string; state: string }>`
-        SELECT workerId, threadId, state FROM sh_worker WHERE deviceId = ${deviceId}
+      const rows = sql<{ workerId: string; threadId: string; state: string; lastOutcome: string | null }>`
+        SELECT workerId, threadId, state, lastOutcome FROM sh_worker WHERE deviceId = ${deviceId}
       `;
       for (const worker of rows) {
         const snap = snapshots.find((s) => s.workerId === worker.workerId);
@@ -408,7 +412,19 @@ export function createLedger(deps: LedgerDeps) {
         const processed =
           sql<{ processedUpTo: number }>`SELECT processedUpTo FROM worker_ack WHERE workerId = ${worker.workerId}`[0]
             ?.processedUpTo ?? 0;
-        if (snap.lastSeq > processed) continue; // the event stream is still telling the story
+        if (snap.lastSeq > processed) {
+          // The event stream is still telling the story — but if this worker was reaped by
+          // the DO while its machine was offline, park the snapshot's verdict: once the
+          // stream catches up (resolveReapPending), the verdict applies without waiting for
+          // another hello that may never come (issue #13 review finding 2).
+          if (worker.state === "lost" && worker.lastOutcome === "reaped") {
+            sql`
+              INSERT OR REPLACE INTO sh_reap_pending (workerId, threadId, snapState, lastSeq, createdAt)
+              VALUES (${worker.workerId}, ${worker.threadId}, ${snap.state}, ${snap.lastSeq}, ${now()})
+            `;
+          }
+          continue;
+        }
         const ledgerActive = (ACTIVE_WORKER_STATES as readonly string[]).includes(worker.state);
         const snapActive = (ACTIVE_WORKER_STATES as readonly string[]).includes(snap.state);
         if (ledgerActive && !snapActive) {
@@ -471,12 +487,13 @@ export function createLedger(deps: LedgerDeps) {
     silentSince(silentMs: number): SilentWorker[] {
       const cutoff = now() - silentMs;
       return sql<Record<string, unknown>>`
-        SELECT w.*, CASE WHEN m.online = 1 THEN 1 ELSE 0 END AS machineOnline
+        SELECT w.*, CASE WHEN m.online = 1 THEN 1 ELSE 0 END AS machineOnline,
+               COALESCE(m.lastSeen, 0) AS machineLastSeen
         FROM sh_worker w LEFT JOIN sh_machine m ON m.deviceId = w.deviceId
         WHERE w.state IN ('starting', 'running', 'recovering')
           AND COALESCE(w.lastEventAt, w.createdAt) <= ${cutoff}
         ORDER BY w.workerId
-      `.map((r) => ({ ...viewWorker(r), machineOnline: r.machineOnline === 1 }));
+      `.map((r) => ({ ...viewWorker(r), machineOnline: r.machineOnline === 1, machineLastSeen: Number(r.machineLastSeen ?? 0) }));
     },
 
     /**
@@ -519,6 +536,66 @@ export function createLedger(deps: LedgerDeps) {
         recomputeThreadState(worker.threadId);
         return true;
       });
+    },
+
+    /**
+     * Applies deferred hello-workers verdicts whose event stream has caught up (see
+     * reconcileFromSnapshot's gated branch). A `lost`+`reaped` worker whose parked snapshot
+     * is active resumes; one whose snapshot says the run ended accepts that verdict. Ordered
+     * by seq only — never by connector timestamps, which may skew. Idempotent.
+     */
+    resolveReapPending(): number {
+      let resolved = 0;
+      for (const pending of sql<{ workerId: string; threadId: string; snapState: string; lastSeq: number }>`
+        SELECT workerId, threadId, snapState, lastSeq FROM sh_reap_pending
+      `) {
+        const processed =
+          sql<{ processedUpTo: number }>`SELECT processedUpTo FROM worker_ack WHERE workerId = ${pending.workerId}`[0]
+            ?.processedUpTo ?? 0;
+        if (pending.lastSeq > processed) continue; // still gated
+        const worker = workers.get(pending.workerId);
+        sql`DELETE FROM sh_reap_pending WHERE workerId = ${pending.workerId}`;
+        resolved += 1;
+        if (!worker || worker.state !== "lost" || worker.lastOutcome !== "reaped") continue; // the story moved on
+        const snapActive = (ACTIVE_WORKER_STATES as readonly string[]).includes(pending.snapState);
+        if (snapActive) {
+          sql`
+            UPDATE sh_worker SET state = 'running', lastOutcome = NULL, updatedAt = ${now()}
+            WHERE workerId = ${pending.workerId}
+          `;
+          timeline.add(pending.threadId, "resumed", "已恢复运行（回收后按连接器快照对账）", {
+            workerId: pending.workerId,
+            reconciled: true,
+          });
+        } else {
+          // The connector says the run ended while it was unreachable: take its word for it.
+          sql`
+            UPDATE sh_worker SET state = ${pending.snapState}, updatedAt = ${now()}
+            WHERE workerId = ${pending.workerId}
+          `;
+          timeline.add(pending.threadId, "note", `对账：连接器报告运行已结束（${pending.snapState}）`, {
+            workerId: pending.workerId,
+            reconciled: true,
+          });
+        }
+        recomputeThreadState(pending.threadId);
+      }
+      return resolved;
+    },
+
+    /**
+     * A start_worker that will never be delivered (user-cancelled `expired`, or failed) ends
+     * its still-`starting` worker quietly — timeline only, no push: the user already knows
+     * (they cancelled, or the failure push comes from markStartFailed). Opens the Thread for
+     * a fresh dispatch instead of wedging it behind a worker that will never run.
+     */
+    settleWithdrawnStart(workerId: string): boolean {
+      const worker = workers.get(workerId);
+      if (!worker || worker.state !== "starting") return false;
+      sql`UPDATE sh_worker SET state = 'idle', lastOutcome = 'cancelled', updatedAt = ${now()} WHERE workerId = ${workerId}`;
+      timeline.add(worker.threadId, "note", "派发命令已撤回，worker 未启动", { workerId, withdrawn: true });
+      recomputeThreadState(worker.threadId);
+      return true;
     },
   };
 
@@ -738,10 +815,20 @@ export function createLedger(deps: LedgerDeps) {
       return;
     }
 
+    // Issue #13 review finding 2: a worker reaped by the DO that produces an event is alive.
+    // If a hello-snapshot verdict is parked for this worker (its stream was behind at
+    // reconnect), that verdict — not this event, which may predate the reap — decides once
+    // the stream catches up (workers.resolveReapPending).
+    const resurrectable =
+      worker.state === "lost" &&
+      worker.lastOutcome === "reaped" &&
+      sql`SELECT 1 AS one FROM sh_reap_pending WHERE workerId = ${workerId}`.length === 0;
+
     switch (type) {
       case "started": {
         sql`
           UPDATE sh_worker SET state = 'running', sessionId = ${str(event.sessionId)}, branch = ${str(event.branch)},
+                              lastOutcome = CASE WHEN lastOutcome = 'reaped' THEN NULL ELSE lastOutcome END,
                               lastEventAt = ${ts}, updatedAt = ${now()}
           WHERE workerId = ${workerId}
         `;
@@ -752,17 +839,32 @@ export function createLedger(deps: LedgerDeps) {
         break;
       }
       case "progress": {
-        // Coarse progress only updates the worker; it never reaches the timeline (§5.3).
-        sql`
-          UPDATE sh_worker SET lastEventAt = ${ts},
-                              lastProgress = ${JSON.stringify({ phase: event.phase, tool: event.tool ?? null, target: event.target ?? null, turn: event.turn ?? null })},
-                              updatedAt = ${now()}
-          WHERE workerId = ${workerId}
-        `;
+        // Coarse progress only updates the worker; it never reaches the timeline (§5.3) —
+        // except when it proves a reaped worker is alive (issue #13 review finding 2).
+        const lastProgress = JSON.stringify({ phase: event.phase, tool: event.tool ?? null, target: event.target ?? null, turn: event.turn ?? null });
+        if (resurrectable) {
+          sql`
+            UPDATE sh_worker SET state = 'running', lastOutcome = NULL, lastEventAt = ${ts},
+                                lastProgress = ${lastProgress}, updatedAt = ${now()}
+            WHERE workerId = ${workerId}
+          `;
+          timeline.add(worker.threadId, "resumed", "重新收到事件，恢复运行（回收后自动纠正）", { workerId, seq, resurrected: true });
+          recomputeThreadState(worker.threadId);
+        } else {
+          sql`
+            UPDATE sh_worker SET lastEventAt = ${ts}, lastProgress = ${lastProgress}, updatedAt = ${now()}
+            WHERE workerId = ${workerId}
+          `;
+        }
         sql`UPDATE worker_ack SET processedUpTo = ${seq} WHERE workerId = ${workerId}`;
-        return; // no state change, no recompute needed
+        return; // no further state change
       }
       case "report": {
+        if (resurrectable) {
+          // A report from a worker the DO reaped: it is alive (issue #13 review finding 2).
+          sql`UPDATE sh_worker SET state = 'running', lastOutcome = NULL, updatedAt = ${now()} WHERE workerId = ${workerId}`;
+          timeline.add(worker.threadId, "resumed", "重新收到事件，恢复运行（回收后自动纠正）", { workerId, seq, resurrected: true });
+        }
         const status = (event.status === "blocked" || event.status === "needs_decision" ? event.status : "done") as ReportRow["status"];
         sql`
           INSERT OR IGNORE INTO sh_report (workerId, seq, threadId, status, summary, changes, decisions, leftovers, tests, question, next, git, receivedAt)
@@ -830,9 +932,12 @@ export function createLedger(deps: LedgerDeps) {
       }
       case "lost":
       case "resumed": {
-        // lost: not failed — the steward waits (spec §9). resumed: back to running.
+        // lost: not failed — the steward waits (spec §9). resumed: back to running (and a
+        // resumed worker is by definition no longer reaped).
         sql`
-          UPDATE sh_worker SET state = ${type === "lost" ? "lost" : "running"}, lastEventAt = ${ts}, updatedAt = ${now()}
+          UPDATE sh_worker SET state = ${type === "lost" ? "lost" : "running"},
+                              lastOutcome = CASE WHEN lastOutcome = 'reaped' THEN NULL ELSE lastOutcome END,
+                              lastEventAt = ${ts}, updatedAt = ${now()}
           WHERE workerId = ${workerId}
         `;
         timeline.add(worker.threadId, type, lostResumedText(type, event), { workerId, seq });

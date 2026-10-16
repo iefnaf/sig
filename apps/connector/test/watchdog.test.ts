@@ -1,15 +1,26 @@
 // Stall watchdog (issue #13, ADR-0001): silent + cold-CPU workers get one in-place respawn
 // with a continuation note, a second strike settles error:stall, and quiet-but-hot builds are
-// never stalls. Unit tests drive StallWatchdog with scripted CPU samples; manager tests run
-// fake-pi processes that genuinely go silent (a real sleeping node process really is cold, so
-// even the real `ps` sampler would agree — but the tests inject samples for determinism).
+// never stalls. CPU is measured as the delta of cumulative CPU time over the worker's WHOLE
+// process tree (pi idles while its tool children work), so "hot" means the tree accumulated
+// CPU during the sample window. Unit tests drive StallWatchdog with scripted tree samples;
+// manager tests run fake-pi processes that genuinely go silent, and one test exercises the
+// REAL sampler against a CPU-bound tool child — the shape the original %cpu-of-pi sampler
+// got wrong (PR #41 review finding 1).
+import { execFileSync } from "node:child_process";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { WorkerManager, type StartWorkerArgs } from "../src/worker-manager.ts";
 import { LocalStore } from "../src/store.ts";
 import { EventLog } from "../src/events.ts";
-import { StallWatchdog, stallContinueNote, type WatchdogCandidate } from "../src/watchdog.ts";
+import {
+  StallWatchdog,
+  parseCpuTimeMs,
+  parseProcStatCpuMs,
+  stallContinueNote,
+  type TreeCpuSample,
+  type WatchdogCandidate,
+} from "../src/watchdog.ts";
 import { fakePiAdapter, makeGitRepo, reportRun, tmpDir, waitFor, writeScenario, type ScenarioStep } from "./helpers.ts";
 
 // A run that answers the prompt RPC (that response is stdout!) and then goes silent: the
@@ -32,8 +43,8 @@ let eventLog: EventLog;
 let events: EmittedEvent[];
 let manager: WorkerManager;
 const workerIds = new Set<string>();
-let cpuScript: Array<number | undefined> = [];
-let cpuCalls = 0;
+let treeScript: Array<TreeCpuSample | undefined> = [];
+let errors: unknown[] = [];
 
 beforeEach(async () => {
   dir = tmpDir("shepherd-watchdog-test");
@@ -42,8 +53,8 @@ beforeEach(async () => {
   store = new LocalStore(join(stateDir, "connector.sqlite"));
   eventLog = new EventLog(store.database);
   events = [];
-  cpuScript = [];
-  cpuCalls = 0;
+  treeScript = [];
+  errors = [];
 });
 
 afterEach(async () => {
@@ -55,15 +66,24 @@ afterEach(async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-/** A deterministic CPU sampler consuming the script (last value repeats). */
-function scriptedCpu(pid: number): Promise<number | undefined> {
-  cpuCalls += 1;
-  const value = cpuScript.length > 1 ? cpuScript.shift() : cpuScript[0];
-  return Promise.resolve(value);
+/** A deterministic tree sampler consuming the script (last value repeats). */
+function scriptedTree(pid: number): Promise<TreeCpuSample | undefined> {
+  const value = treeScript.length > 1 ? treeScript.shift() : treeScript[0];
+  return Promise.resolve(value === undefined ? undefined : { ...value, members: value.members.map((m) => m.replace("PID", String(pid))) });
 }
 
-/** Manager + fake-pi with the watchdog shrunk to test scale and CPU scripted. */
-function setup(runs: ScenarioStep[][], opts: { sharedRuns?: boolean } = {}): void {
+/** A permanently cold tree: identical members, zero accumulated CPU between samples. */
+const coldTree = (): TreeCpuSample => ({ totalCpuMs: 0, members: ["PID@t0"] });
+
+/** A permanently hot tree: every sample adds 10 s of cumulative CPU (utilization ≫ threshold). */
+function hotTreeSampler() {
+  let calls = 0;
+  return (pid: number): Promise<TreeCpuSample | undefined> =>
+    Promise.resolve({ totalCpuMs: calls++ * 10_000, members: [`${pid}@t0`] });
+}
+
+/** Manager + fake-pi with the watchdog shrunk to test scale and the tree sampler scripted. */
+function setup(runs: ScenarioStep[][], opts: { sharedRuns?: boolean; sample?: (pid: number) => Promise<TreeCpuSample | undefined> } = {}): void {
   const scenario = writeScenario(dir, "scenario", runs);
   const runsFile = join(dir, "runs-shared.txt");
   if (opts.sharedRuns) writeFileSync(runsFile, "0");
@@ -75,7 +95,13 @@ function setup(runs: ScenarioStep[][], opts: { sharedRuns?: boolean } = {}): voi
       const stored = eventLog.append(workerId, fields);
       events.push(JSON.parse(stored.payload) as EmittedEvent);
     },
-    watchdog: { stallMs: 400, tickMs: 80, cpuSampleGapMs: 10, sampleCpu: scriptedCpu },
+    watchdog: {
+      stallMs: 400,
+      tickMs: 80,
+      cpuSampleGapMs: 10,
+      sampleTreeCpu: opts.sample ?? scriptedTree,
+      onError: (err) => errors.push(err),
+    },
   });
 }
 
@@ -96,6 +122,27 @@ const stallNotices = () => events.filter((e) => e.type === "progress" && e.tool 
 const resumedEvents = () => events.filter((e) => e.type === "resumed");
 const settledEvent = () => events.find((e) => e.type === "settled");
 
+// ---- cputime parsing (macOS ps / procps / Linux /proc) --------------------------------------------
+
+describe("cputime parsing", () => {
+  it("parses the formats ps actually prints", () => {
+    expect(parseCpuTimeMs("0:04.26")).toBe(4260); // macOS: MM:SS.cc
+    expect(parseCpuTimeMs("37:24")).toBe(2_244_000); // procps under an hour: MM:SS
+    expect(parseCpuTimeMs("1:02:03")).toBe(3_723_000); // procps: HH:MM:SS
+    expect(parseCpuTimeMs("2-01:00:00")).toBe(176_400_000); // days prefix
+    expect(parseCpuTimeMs("0.94")).toBe(940); // sub-minute seconds
+    expect(parseCpuTimeMs("garbage")).toBeUndefined();
+    expect(parseCpuTimeMs("1:2:3:4")).toBeUndefined();
+  });
+
+  it("parses /proc/<pid>/stat cumulative CPU (utime+stime)", () => {
+    // comm with spaces and parens is why parsing starts after the last ')'.
+    const stat = "1234 (a b(c)) S 1 1234 1234 0 -1 4194624 200 0 30 10 500 700 0 0 20 0 1 0";
+    expect(parseProcStatCpuMs(stat, 100)).toBe(12_000); // (500+700) ticks at 100 Hz
+    expect(parseProcStatCpuMs("no closing paren")).toBeUndefined();
+  });
+});
+
 // ---- StallWatchdog in isolation -------------------------------------------------------------------
 
 describe("StallWatchdog (detection and strike policy)", () => {
@@ -104,7 +151,7 @@ describe("StallWatchdog (detection and strike policy)", () => {
     const strikes: Array<{ workerId: string; strike: 1 | 2; why: string }> = [];
     let candidates = initial;
     const watchdog = new StallWatchdog(
-      { stallMs: 1000, cpuSampleGapMs: 0, sampleCpu: scriptedCpu, now: () => now },
+      { stallMs: 1000, cpuSampleGapMs: 0, sampleTreeCpu: scriptedTree, now: () => now },
       {
         candidates: () => candidates,
         onStrike: async (workerId, strike, why) => {
@@ -125,15 +172,15 @@ describe("StallWatchdog (detection and strike policy)", () => {
     };
   }
 
-  it("silent + two cold samples → strike 1, then strike 2 on the next stall", async () => {
-    cpuScript = [1, 1];
+  it("silent + two cold tree samples → strike 1, then strike 2 on the next stall", async () => {
+    treeScript = [coldTree()];
     const h = harness();
     h.advance(1001); // past the threshold
     expect(await h.watchdog.tick()).toBe(1);
     expect(h.strikes).toEqual([expect.objectContaining({ workerId: "w-1", strike: 1 })]);
-    // Silence counts from lastOutputAt (0) against now (11_001): 11 s, both samples cold.
+    // Silence counts from lastOutputAt (0) against now (11_001): 11 s, zero tree CPU.
     expect(h.strikes[0]!.why).toContain("no stdout for 11s");
-    expect(h.strikes[0]!.why).toContain("1.0%/1.0%");
+    expect(h.strikes[0]!.why).toContain("+0ms");
 
     // The respawned process is silent again: fresh pid, fresh lastOutputAt, then the clock
     // runs out a second time.
@@ -143,8 +190,8 @@ describe("StallWatchdog (detection and strike policy)", () => {
     expect(h.strikes[1]).toMatchObject({ strike: 2 });
   });
 
-  it("quiet-but-hot (either sample ≥ threshold) is not a stall, and the next check waits another window", async () => {
-    cpuScript = [80, 1];
+  it("quiet-but-hot (the tree accumulated CPU) is not a stall, and the next check waits another window", async () => {
+    treeScript = [{ totalCpuMs: 0, members: ["PID@t0"] }, { totalCpuMs: 5_000, members: ["PID@t0"] }];
     const h = harness();
     h.advance(1001);
     expect(await h.watchdog.tick()).toBe(0);
@@ -152,31 +199,86 @@ describe("StallWatchdog (detection and strike policy)", () => {
 
     // The hot check pushed the consideration window: still nothing one threshold later…
     h.advance(1000);
-    cpuScript = [80];
+    treeScript = [{ totalCpuMs: 20_000, members: ["PID@t0"] }];
     expect(await h.watchdog.tick()).toBe(0);
-    // …but after a full window past the hot check with cold samples, it strikes.
+    // …but after a full window past the hot check with a cold tree, it strikes.
     h.advance(1);
-    cpuScript = [0.5, 0.5];
+    treeScript = [coldTree()];
     expect(await h.watchdog.tick()).toBe(1);
     expect(h.strikes[0]!.strike).toBe(1);
   });
 
-  it("an unreadable CPU sample never declares a stall", async () => {
-    cpuScript = [undefined, undefined];
+  it("an unreadable tree sample never declares a stall", async () => {
+    treeScript = [undefined];
     const h = harness();
     h.advance(1001);
     expect(await h.watchdog.tick()).toBe(0);
   });
 
+  it("tree membership changing between the samples (a churning build) never declares a stall", async () => {
+    treeScript = [
+      { totalCpuMs: 0, members: ["PID@t0"] },
+      { totalCpuMs: 0, members: ["PID@t0", "99@t1"] }, // a tool child spawned during the gap
+    ];
+    const h = harness();
+    h.advance(1001);
+    expect(await h.watchdog.tick()).toBe(0);
+    expect(h.strikes).toHaveLength(0);
+  });
+
   it("recent stdout output means no stall", async () => {
-    cpuScript = [0, 0];
+    treeScript = [coldTree()];
     const h = harness([{ workerId: "w-1", pid: 11, lastOutputAt: 9_500 }]);
     h.advance(400); // silent only 500ms < 1000ms
     expect(await h.watchdog.tick()).toBe(0);
   });
 
+  it("a worker that speaks (or is replaced) during the sample window is not struck", async () => {
+    // Freshness re-check (PR #41 review): output arriving between the two samples must
+    // cancel the strike. The second sampler call simulates that mid-window output.
+    let candidates: WatchdogCandidate[] = [{ workerId: "w-1", pid: 11, lastOutputAt: 0 }];
+    let calls = 0;
+    let now = 10_000;
+    const spokeMidWindow = (pid: number): Promise<TreeCpuSample | undefined> => {
+      calls += 1;
+      if (calls === 2) candidates = [{ workerId: "w-1", pid, lastOutputAt: now }];
+      return Promise.resolve({ totalCpuMs: 0, members: [`${pid}@t0`] });
+    };
+    const watchdog = new StallWatchdog(
+      { stallMs: 1000, cpuSampleGapMs: 0, sampleTreeCpu: spokeMidWindow, now: () => now },
+      {
+        candidates: () => candidates,
+        onStrike: async () => {
+          throw new Error("must not strike");
+        },
+      },
+    );
+    now += 1001; // past the threshold when the check starts
+    expect(await watchdog.tick()).toBe(0);
+    expect(calls).toBe(2); // both samples really were taken
+
+    // Same shape, but the process was REPLACED mid-window (different pid): also no strike.
+    candidates = [{ workerId: "w-1", pid: 11, lastOutputAt: 0 }];
+    calls = 0;
+    const replacedMidWindow = (pid: number): Promise<TreeCpuSample | undefined> => {
+      calls += 1;
+      if (calls === 2) candidates = [{ workerId: "w-1", pid: 99, lastOutputAt: 0 }];
+      return Promise.resolve({ totalCpuMs: 0, members: [`${pid}@t0`] });
+    };
+    const watchdog2 = new StallWatchdog(
+      { stallMs: 1000, cpuSampleGapMs: 0, sampleTreeCpu: replacedMidWindow, now: () => now },
+      {
+        candidates: () => candidates,
+        onStrike: async () => {
+          throw new Error("must not strike");
+        },
+      },
+    );
+    expect(await watchdog2.tick()).toBe(0);
+  });
+
   it("forget() resets the strike count — a fresh run starts at strike 1 again", async () => {
-    cpuScript = [0, 0];
+    treeScript = [coldTree()];
     const h = harness();
     h.advance(1001);
     await h.watchdog.tick();
@@ -186,6 +288,50 @@ describe("StallWatchdog (detection and strike policy)", () => {
     await h.watchdog.tick();
     expect(h.strikes[1]!.strike).toBe(1);
   });
+
+  it("a failed strike handler does not consume the strike, and the error is reported, not thrown", async () => {
+    treeScript = [coldTree()];
+    const errors: unknown[] = [];
+    let calls = 0;
+    const watchdog = new StallWatchdog(
+      { stallMs: 1000, cpuSampleGapMs: 0, sampleTreeCpu: scriptedTree, now: () => 10_000 + 1001, onError: (err) => errors.push(err) },
+      {
+        candidates: () => [{ workerId: "w-1", pid: 11, lastOutputAt: 0 }],
+        onStrike: async () => {
+          calls += 1;
+          if (calls === 1) throw new Error("emit failed");
+        },
+      },
+    );
+    expect(await watchdog.tick()).toBe(0);
+    expect(errors).toHaveLength(1);
+    // The strike was not counted: the retry strikes 1 again (its respawn), not 2.
+    expect(await watchdog.tick()).toBe(1);
+    expect(calls).toBe(2);
+  });
+
+  it("stop() cancels an in-flight check", async () => {
+    let releaseSamples!: (sample: TreeCpuSample | undefined) => void;
+    const gated = () =>
+      new Promise<TreeCpuSample | undefined>((resolve) => {
+        releaseSamples = resolve;
+      });
+    let struck = false;
+    const watchdog = new StallWatchdog(
+      { stallMs: 1000, cpuSampleGapMs: 0, sampleTreeCpu: () => gated(), now: () => 10_000 + 1001 },
+      {
+        candidates: () => [{ workerId: "w-1", pid: 11, lastOutputAt: 0 }],
+        onStrike: async () => {
+          struck = true;
+        },
+      },
+    );
+    const ticking = watchdog.tick();
+    watchdog.stop(); // stopped while the first sample is still pending
+    releaseSamples({ totalCpuMs: 0, members: ["11@t0"] });
+    expect(await ticking).toBe(0);
+    expect(struck).toBe(false);
+  });
 });
 
 // ---- WorkerManager over fake-pi -------------------------------------------------------------------
@@ -194,7 +340,7 @@ describe("worker stalls through the manager (fake-pi)", () => {
   it("double stall: one respawn with a continuation note, then settles error:stall", async () => {
     setup([stallRun(), stallRun()], { sharedRuns: true });
     store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
-    cpuScript = [0, 0];
+    treeScript = [coldTree()];
     const result = await manager.startWorker("cmd-stall", args());
     expect(result.sessionId).toBe("w-stall-1");
 
@@ -236,10 +382,10 @@ describe("worker stalls through the manager (fake-pi)", () => {
         const stored = eventLog.append(workerId, fields);
         events.push(JSON.parse(stored.payload) as EmittedEvent);
       },
-      watchdog: { stallMs: 400, tickMs: 80, cpuSampleGapMs: 10, sampleCpu: scriptedCpu },
+      watchdog: { stallMs: 400, tickMs: 80, cpuSampleGapMs: 10, sampleTreeCpu: scriptedTree },
     });
     store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
-    cpuScript = [0, 0];
+    treeScript = [coldTree()];
 
     const result = await manager.startWorker("cmd-stall", args());
     await waitFor(() => settledEvent(), 15_000, "settled after respawn");
@@ -258,18 +404,17 @@ describe("worker stalls through the manager (fake-pi)", () => {
     expect(String(prompts[1]!.text)).toContain("stalled");
   }, 30_000);
 
-  it("quiet-but-hot is not a stall: a silent, CPU-busy process is left alone", async () => {
-    setup([stallRun(1_500)]);
+  it("quiet-but-hot is not a stall: a silent process whose tree burns CPU is left alone", async () => {
+    setup([stallRun(1_500)], { sample: hotTreeSampler() });
     store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
-    cpuScript = [90];
 
     await manager.startWorker("cmd-hot", args());
-    // Plenty of ticks pass the silence threshold while the sampler says "busy".
+    // Plenty of ticks pass the silence threshold while the tree keeps accumulating CPU.
     await new Promise((resolve) => setTimeout(resolve, 1_200));
-    expect(cpuCalls).toBeGreaterThan(1);
     expect(stallNotices()).toHaveLength(0);
     expect(resumedEvents()).toHaveLength(0);
     expect(store.getWorker("w-stall-1")!.state).toBe("running");
+    expect(errors).toEqual([]);
   }, 15_000);
 
   it("ongoing output keeps the watchdog quiet even with cold CPU samples", async () => {
@@ -291,7 +436,7 @@ describe("worker stalls through the manager (fake-pi)", () => {
     ];
     setup([chatter]);
     store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
-    cpuScript = [0, 0];
+    treeScript = [coldTree()];
 
     await manager.startWorker("cmd-chatty", args());
     await waitFor(() => settledEvent(), 15_000, "settled without watchdog interference");
@@ -301,9 +446,52 @@ describe("worker stalls through the manager (fake-pi)", () => {
   }, 30_000);
 });
 
+// ---- The REAL sampler vs a CPU-bound tool child (PR #41 review finding 1) -------------------------
+
+describe("the production sampler under a busy tool child (fake-pi, real ps)", () => {
+  // The bug this pins: pi itself idles at ~2% CPU while its tool child burns 80%+. Measuring
+  // only the parent declared a stall and killed a healthy build. The tree sampler must see
+  // the child. Marker-matched cleanup only — never a broad pkill.
+  afterEach(() => {
+    try {
+      execFileSync("pkill", ["-f", "shepherd-wd-busy"]);
+    } catch {
+      // none left
+    }
+  });
+
+  it("a silent parent with a CPU-bound child is hot, never a stall", async () => {
+    const busy = `node -e "/*shepherd-wd-busy*/ const e=Date.now()+9000; while(Date.now()<e){Math.sqrt(Math.random())}"`;
+    const scenario = writeScenario(dir, "scenario", [[{ shell: busy }], [{ delayMs: 60_000 }]]);
+    const runsFile = join(dir, "runs-shared.txt");
+    writeFileSync(runsFile, "0");
+    manager = new WorkerManager({
+      store,
+      stateDir,
+      adapter: fakePiAdapter(stateDir, scenario, { FAKE_PI_RUNS_FILE: runsFile }),
+      emit: (workerId, fields) => {
+        const stored = eventLog.append(workerId, fields);
+        events.push(JSON.parse(stored.payload) as EmittedEvent);
+      },
+      // NO sampler injection: the production listDescendants + ps/proc path runs for real.
+      watchdog: { stallMs: 500, tickMs: 100, cpuSampleGapMs: 300 },
+    });
+    store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+
+    await manager.startWorker("cmd-busy-child", args());
+    // The child spins for ~9 s; the watchdog becomes eligible at 500 ms of silence. Watch
+    // well past that: no detection, no respawn, the worker stays running.
+    await new Promise((resolve) => setTimeout(resolve, 7_500));
+    expect(stallNotices()).toHaveLength(0);
+    expect(resumedEvents()).toHaveLength(0);
+    expect(store.getWorker("w-stall-1")!.state).toBe("running");
+    expect(errors).toEqual([]);
+  }, 40_000);
+});
+
 describe("stallContinueNote", () => {
   it("states the reason and instructs continuation, not a redo", () => {
-    const note = stallContinueNote("no stdout for 480s with CPU 0.3%/0.4%");
+    const note = stallContinueNote("no stdout for 480s with tree CPU +0ms over 2500ms (0.0%)");
     expect(note).toContain("no stdout for 480s");
     expect(note).toContain("continue");
     expect(note).toContain("Do not redo completed work");

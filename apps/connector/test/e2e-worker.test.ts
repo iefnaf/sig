@@ -139,7 +139,8 @@ describe("start_worker over the real transport (issue #3 + #30)", () => {
         stallMs: 400,
         tickMs: 80,
         cpuSampleGapMs: 10,
-        sampleCpu: (pid) => Promise.resolve(Number.isFinite(pid) ? 0.2 : 0.2),
+        // A permanently cold, stable tree: identical members, zero accumulated CPU.
+        sampleTreeCpu: () => Promise.resolve({ totalCpuMs: 0, members: ["w-e2e-stall@t0"] }),
       },
     });
     await app.start();

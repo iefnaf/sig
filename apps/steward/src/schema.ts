@@ -307,4 +307,21 @@ export const MIGRATIONS: readonly Migration[] = [
       )`;
     },
   },
+  {
+    // Issue #13 review: when hello.workers reconciliation is gated behind undelivered events
+    // (snap.lastSeq > processedUpTo), the DO remembers the pending verdict for a reaped
+    // worker and applies it once the event stream catches up — otherwise a worker reaped
+    // while its machine was offline stays `lost` forever even though it is alive (the events
+    // that would prove it are exactly the ones that blocked the reconcile).
+    id: "009_reap_reconcile",
+    up: (sql) => {
+      sql`CREATE TABLE IF NOT EXISTS sh_reap_pending (
+        workerId TEXT PRIMARY KEY,
+        threadId TEXT NOT NULL,
+        snapState TEXT NOT NULL,
+        lastSeq INTEGER NOT NULL,
+        createdAt INTEGER NOT NULL
+      )`;
+    },
+  },
 ];
