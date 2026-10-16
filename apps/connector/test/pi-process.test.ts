@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
-import { rmSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { PiProcess, RpcError } from "../src/pi-process.ts";
 import { tmpDir } from "./helpers.ts";
@@ -146,5 +147,32 @@ describe("PiProcess (rpc.md framing + spike-conclusions §2)", () => {
     `);
     await proc.rpc({ type: "get_state" }, 2000);
     expect(proc.getStderrTail().length).toBeLessThanOrEqual(64 * 1024 + 100);
+  });
+
+  it("writes a redacted, capped stderr file per worker (§12: tails under ~/.shepherd/logs)", async () => {
+    const stderrFile = join(dir, "pi-w-test.log");
+    const proc = new PiProcess({
+      command: [
+        process.execPath,
+        "-e",
+        `for (let i = 0; i < 60; i++) process.stderr.write("sk-abcdefghijklmnopqrst noise " + i + " " + "x".repeat(60) + "\\n");`,
+      ],
+      args: [],
+      cwd: dir,
+      onEvent: () => {},
+      onExit: () => {},
+      stderrFile,
+      stderrFileMaxBytes: 2048,
+    });
+    proc.spawn();
+    await proc.waitExit();
+
+    // Every line carried the key, so any window the cap kept is fully redacted — the
+    // assertion cannot depend on which chunk boundaries the platform happens to deliver.
+    const content = readFileSync(stderrFile, "utf8");
+    expect(content).not.toContain("sk-abcdefghijklmnopqrst");
+    expect(content).toContain("[redacted]");
+    expect(content.length).toBeLessThan(8192); // bounded (worst case: one big final append)
+    expect(content).toContain("noise 59");
   });
 });

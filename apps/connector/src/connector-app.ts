@@ -17,6 +17,11 @@ export interface ConnectorAppOptions {
   WebSocketImpl?: ClientOptions["WebSocketImpl"];
   /** Overrides the agent adapter (tests inject fake-pi). */
   adapter?: import("./agent.ts").AgentAdapter;
+  /** Coarse lifecycle logging (daemon): event names and ids only, never session content. */
+  log?: (event: string, fields?: Record<string, unknown>) => void;
+  /** Connection lifecycle hooks, forwarded to the client (the daemon logs these). */
+  onWelcome?: ClientOptions["onWelcome"];
+  onClose?: ClientOptions["onClose"];
 }
 
 /** §12: clamp(floor(0.5 × total memory MB / 250 MB), 1, 8), configurable later. */
@@ -36,15 +41,20 @@ export class ConnectorApp {
       store: options.store,
       stateDir: options.stateDir,
       adapter: options.adapter,
-      emit: (workerId, fields) => this.client.emit(workerId, fields),
+      emit: (workerId, fields) => {
+        options.log?.("worker_event", { workerId, type: fields.type });
+        this.client.emit(workerId, fields);
+      },
     });
 
     this.client = new ConnectorClient({
       store: options.store,
       machineName: options.machineName,
       WebSocketImpl: options.WebSocketImpl,
-      handleCommand: (cmd: CmdMessage) => this.runCommand(cmd),
+      handleCommand: (cmd: CmdMessage) => this.runCommand(cmd, options.log),
       snapshot: () => this.snapshot(),
+      onWelcome: options.onWelcome,
+      onClose: options.onClose,
       workersSnapshot: () =>
         this.store.listWorkers().map((w) => ({
           workerId: w.workerId,
@@ -65,16 +75,28 @@ export class ConnectorApp {
     this.client.stop();
   }
 
-  private async runCommand(cmd: CmdMessage): Promise<CommandResult> {
+  private async runCommand(
+    cmd: CmdMessage,
+    log?: (event: string, fields?: Record<string, unknown>) => void,
+  ): Promise<CommandResult> {
+    log?.("command_received", { cmdId: cmd.id, kind: cmd.kind });
     try {
       const data = await this.manager.handleCommand(cmd.id, cmd.kind, cmd.args ?? {});
+      log?.("command_settled", { cmdId: cmd.id, kind: cmd.kind, ok: true });
       return { ok: true, data };
     } catch (err) {
       if (err instanceof CommandError) {
+        log?.("command_settled", {
+          cmdId: cmd.id,
+          kind: cmd.kind,
+          ok: false,
+          code: err.code,
+        });
         return { ok: false, error: { code: err.code, message: err.message, retriable: err.retriable } };
       }
       const code = (err as { code?: string }).code ?? "internal";
       const message = err instanceof Error ? err.message : String(err);
+      log?.("command_settled", { cmdId: cmd.id, kind: cmd.kind, ok: false, code });
       return { ok: false, error: { code, message, retriable: false } };
     }
   }

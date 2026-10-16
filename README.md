@@ -46,6 +46,27 @@ Machines that never reconnect during the window must re-pair after it closes.
 
 Mainland-China users must bind a custom domain to the Worker: `*.workers.dev` is unreachable there, which breaks the web app, the connector, and Feishu's webhook delivery alike (see the [Feishu research](docs/research/feishu-channel.md) §3 and §8.2).
 
+## Installing the connector
+
+On a machine you want Shepherd to run agents from (macOS or Linux, Node ≥ 22.18):
+
+```sh
+npx @iefnaf/shepherd connect <steward-url> <pairing-code>
+```
+
+This pairs the machine (redeeming the pairing code from the steward's `/pair` endpoint), installs the connector as a background service — a launchd agent (`dev.shepherd.connector`) on macOS, a systemd user unit on Linux — and starts it now and at login. `connect --foreground` runs it attached to the terminal instead (containers, dev boxes). Then:
+
+```sh
+shepherd add-repo ~/code/my-repo   # allow start_worker in this repository (§8.1)
+shepherd status                    # service, pairing, workers, installed assets
+shepherd logs                      # tail ~/.shepherd/logs/connector.log
+shepherd stop | start | restart    # control the service
+shepherd upgrade                   # npm-install the latest package and restart the service
+shepherd uninstall                 # remove the service (keeps ~/.shepherd data)
+```
+
+State lives under `~/.shepherd/` (set `SHEPHERD_HOME` to move it): credentials in `connector.sqlite` (0600), pi sessions and the versioned extension/prompt files, worker worktrees, and logs that contain no keys or session content. The service unit runs the same `shepherd daemon` the package ships, so `upgrade` is just an npm reinstall plus a service restart.
+
 ## Talking to it (M1)
 
 The LLM steward arrives with M2; until then the Feishu bot understands fixed command phrases only, and everything else — machine choice, branch relay, the three-part done-report card — is deterministic:

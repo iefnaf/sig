@@ -20,3 +20,16 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm -r typecheck
       - run: pnpm -r test
+      # Issue #26: the connector must ship as a self-contained `@iefnaf/shepherd` tarball —
+      # bundled dist, bin wrapper, zero runtime dependencies (workspace deps stay in dev).
+      # Fail the build if the layout regresses.
+      - name: connector tarball layout
+        run: |
+          cd apps/connector
+          npm pack --dry-run 2>&1 | tee /tmp/pack.log
+          for f in dist/cli.js dist/ext/shepherd-pi.ts bin/shepherd.js; do
+            grep -q " $f$" /tmp/pack.log || { echo "tarball is missing $f"; exit 1; }
+          done
+          node -e "const p=require('./package.json'); \
+            if (p.dependencies && Object.keys(p.dependencies).length > 0) { \
+              console.error('runtime dependencies leaked into the manifest'); process.exit(1); }"
