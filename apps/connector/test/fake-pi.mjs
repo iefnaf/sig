@@ -9,6 +9,8 @@
 //   FAKE_PI_LOG          path to append delivered prompts as JSON lines (assertions)
 //   FAKE_PI_ENV_LOG       path to append one JSON snapshot of the child env at startup
 //                       (issue #27: the connector must not pass its credentials through)
+//   FAKE_PI_ARGV_LOG      path to append the child argv at startup (issue #16: --tools
+//                       read-only whitelist and --approve/--no-approve assertions)
 //   FAKE_PI_SESSIONS_DIR directory for session JSONL files (default /tmp/fake-sessions);
 //                       `session` steps append real entries so the connector's §9.1
 //                       session-tail reconciliation has true pi-shaped files to read
@@ -38,6 +40,9 @@ const scenario = JSON.parse(readFileSync(scriptPath, "utf8"));
 
 if (process.env.FAKE_PI_ENV_LOG) {
   appendFileSync(process.env.FAKE_PI_ENV_LOG, JSON.stringify(process.env) + "\n");
+}
+if (process.env.FAKE_PI_ARGV_LOG) {
+  appendFileSync(process.env.FAKE_PI_ARGV_LOG, JSON.stringify(process.argv) + "\n");
 }
 
 // Pull --session-id <id> from argv so get_state echoes what the connector expects.

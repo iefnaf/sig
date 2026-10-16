@@ -1,0 +1,436 @@
+// Issue #16 (spec §11, connector-pi.md §8.2/§8.3/§13): read-only tasks run in the repo's own
+// checkout with a restricted tool set; per repo the owner picks worktree (default) / serial /
+// main checkout via the local CLI; approveProject is a connector-local setting that a command
+// must never set; cleanup_worktree refuses dirty or unpushed worktrees unless forced, and
+// nothing is ever auto-deleted.
+import { existsSync, readFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { installAssets } from "../src/install.ts";
+import { PiAdapter } from "../src/pi-adapter.ts";
+import { LocalStore, WORKSPACE_MODES } from "../src/store.ts";
+import { CommandError, WorkerManager, type StartWorkerArgs } from "../src/worker-manager.ts";
+import { EventLog } from "../src/events.ts";
+import {
+  fakePiAdapter,
+  makeGitRepo,
+  reportRun,
+  tmpDir,
+  waitFor,
+  writeScenario,
+  type ScenarioStep,
+} from "./helpers.ts";
+import { git } from "./helpers.ts";
+
+interface EmittedEvent {
+  workerId: string;
+  seq: number;
+  type: string;
+  [key: string]: unknown;
+}
+
+let dir: string;
+let stateDir: string;
+let repo: string;
+let store: LocalStore;
+let eventLog: EventLog;
+let events: EmittedEvent[];
+let manager: WorkerManager;
+const workerIds = new Set<string>();
+
+beforeEach(async () => {
+  dir = tmpDir("shepherd-workspace-test");
+  stateDir = join(dir, "state");
+  repo = await makeGitRepo(dir);
+  store = new LocalStore(join(stateDir, "connector.sqlite"));
+  eventLog = new EventLog(store.database);
+  events = [];
+});
+
+afterEach(async () => {
+  for (const workerId of workerIds) {
+    await manager?.stopProcess(workerId).catch(() => undefined);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  store?.close();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+function setup(runs: ScenarioStep[][], extraEnv: Record<string, string> = {}): void {
+  const scenario = writeScenario(dir, "scenario", runs);
+  manager = new WorkerManager({
+    store,
+    stateDir,
+    adapter: fakePiAdapter(stateDir, scenario, extraEnv),
+    emit: (workerId, fields) => {
+      const stored = eventLog.append(workerId, fields);
+      events.push(JSON.parse(stored.payload) as EmittedEvent);
+    },
+  });
+}
+
+function registerRepo(workspace?: "worktree" | "serial" | "main", approved = false): void {
+  store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+  if (workspace !== undefined || approved) {
+    store.setRepoConfig(repo, { ...(workspace !== undefined ? { workspace } : {}), approved });
+  }
+}
+
+function args(overrides: Partial<StartWorkerArgs> = {}): StartWorkerArgs {
+  const merged: StartWorkerArgs = {
+    workerId: "w-ws-test-1",
+    threadId: "the-thread",
+    repoId: repo,
+    mode: "write",
+    prompt: "Do the thing",
+    ...overrides,
+  };
+  workerIds.add(merged.workerId);
+  return merged;
+}
+
+const settledOf = (workerId: string) => events.find((e) => e.type === "settled" && e.workerId === workerId);
+const startedOf = (workerId: string) => events.find((e) => e.type === "started" && e.workerId === workerId);
+
+describe("buildArgs: the §4.2 command line", () => {
+  // Built lazily inside each test: the shared `dir` fixture exists only after beforeEach.
+  const base = { workerId: "w-x", threadId: "t", cwd: "/repo", prompt: "p", commandId: "c" };
+
+  it("readonly runs with the §8.3 tool whitelist; write runs unrestricted", () => {
+    const adapter = new PiAdapter({ stateDir });
+    const assets = installAssets(join(dir, "assets"));
+    const readonlyArgs = adapter.buildArgs({ ...base, mode: "readonly" }, assets);
+    const writeArgs = adapter.buildArgs({ ...base, mode: "write" }, assets);
+    expect(readonlyArgs).toContain("--tools");
+    expect(readonlyArgs[readonlyArgs.indexOf("--tools") + 1]).toBe("read,grep,find,ls,report");
+    expect(writeArgs).not.toContain("--tools");
+  });
+
+  it("--no-approve by default; --approve only via the repo's local approveProject flag (§13)", () => {
+    const adapter = new PiAdapter({ stateDir });
+    const assets = installAssets(join(dir, "assets"));
+    expect(adapter.buildArgs({ ...base, mode: "write" }, assets)).toContain("--no-approve");
+    expect(adapter.buildArgs({ ...base, mode: "readonly" }, assets)).not.toContain("--approve");
+    const approved = adapter.buildArgs({ ...base, mode: "write", approveProject: true }, assets);
+    expect(approved).toContain("--approve");
+    expect(approved).not.toContain("--no-approve");
+  });
+});
+
+describe("read-only tasks (spec §11, connector-pi.md §8.3)", () => {
+  it("run in the repository's own checkout — no worktree — with the restricted tools", async () => {
+    const argvLog = join(dir, "argv.jsonl");
+    setup([reportRun({ status: "done", summary: "read everything" })], { FAKE_PI_ARGV_LOG: argvLog });
+    registerRepo();
+
+    const result = await manager.startWorker("cmd-ro-1", args({ mode: "readonly" }));
+    await waitFor(() => settledOf("w-ws-test-1"), 15_000, "settled event");
+
+    expect(result.cwd).toBe(repo); // §8.3: the original directory, never a worktree
+    expect(result.worktree).toBeUndefined();
+    expect(result.branch).toBeUndefined();
+    expect(store.getWorker("w-ws-test-1")).toMatchObject({ mode: "readonly", worktree: null, branch: null });
+
+    // The real spawn carried the §8.3 whitelist (research #16: no write/exec tools).
+    const argv = JSON.parse(readFileSync(argvLog, "utf8")) as string[];
+    expect(argv).toContain("--tools");
+    expect(argv[argv.indexOf("--tools") + 1]).toBe("read,grep,find,ls,report");
+    // No worktree directory was created under the connector's state.
+    expect(existsSync(join(stateDir, "worktrees"))).toBe(false);
+  }, 30_000);
+});
+
+describe("per-repo workspace modes (spec §11, connector-pi.md §8.2)", () => {
+  it("defaults to worktree: every write task gets its own worktree", async () => {
+    setup([reportRun({ status: "done", summary: "done" })]);
+    registerRepo(); // no explicit config
+
+    const result = await manager.startWorker("cmd-wt-1", args());
+    await waitFor(() => settledOf("w-ws-test-1"), 15_000, "settled event");
+    expect(result.worktree).toMatch(/worktrees\/repo-a-[0-9a-f]{8}\/the-thread-1$/);
+    expect(store.getRepo(repo)).toMatchObject({ workspace: "worktree", approved: false });
+  }, 30_000);
+
+  it("main mode: write tasks run directly in the checkout, base is ignored", async () => {
+    setup([reportRun({ status: "done", summary: "done" })]);
+    registerRepo("main");
+    await git(repo, ["branch", "some-other-base"]);
+
+    const result = await manager.startWorker("cmd-main-1", args({ base: "some-other-base" }));
+    await waitFor(() => settledOf("w-ws-test-1"), 15_000, "settled event");
+
+    expect(result.cwd).toBe(repo);
+    expect(result.worktree).toBeUndefined();
+    expect(result.branch).toBeUndefined();
+    // The checkout stayed where the owner left it — the connector never switches branches there.
+    expect((await git(repo, ["rev-parse", "--abbrev-ref", "HEAD"])).trim()).toBe("main");
+    expect(existsSync(join(stateDir, "worktrees"))).toBe(false);
+  }, 30_000);
+
+  it("serial mode: a second write worker queues and starts when the first settles", async () => {
+    const slowFirst: ScenarioStep[] = [
+      { delayMs: 1500 },
+      ...reportRun({ status: "done", summary: "first done" }, { shellBefore: "echo one > one.txt" }),
+    ];
+    setup([slowFirst]);
+    registerRepo("serial");
+
+    const first = await manager.startWorker("cmd-ser-1", args({ workerId: "w-ser-1" }));
+    expect(first.queued).toBeUndefined();
+    expect(store.getWorker("w-ser-1")?.state).toBe("running");
+
+    // The second write task for the same repo queues (§8.2): FIFO, one at a time.
+    const second = await manager.startWorker("cmd-ser-2", args({ workerId: "w-ser-2", threadId: "second-thread" }));
+    expect(second).toMatchObject({ queued: true, cwd: repo });
+    expect(second.worktree).toBeUndefined();
+    expect(store.getWorker("w-ser-2")).toMatchObject({ state: "queued", mode: "write" });
+    const queuedEvent = events.find((e) => e.type === "queued" && e.workerId === "w-ser-2");
+    expect(queuedEvent).toMatchObject({ behind: "w-ser-1" });
+    // Nothing started behind the steward's back: no started event, no worktree yet.
+    expect(startedOf("w-ser-2")).toBeUndefined();
+
+    await waitFor(() => startedOf("w-ser-2"), 25_000, "queued worker started after the first settled");
+    expect(startedOf("w-ser-2")).toMatchObject({ branch: "shepherd/second-thread-1" });
+    await waitFor(() => settledOf("w-ser-2"), 15_000, "second worker settled");
+
+    // The queue row is gone once launched.
+    expect(store.getQueuedStart("w-ser-2")).toBeNull();
+    // Serial ≠ shared directory: each write task still got its own worktree branch, and the
+    // shells ran there — the repo's own checkout was never touched.
+    expect(existsSync(join(repo, "one.txt"))).toBe(false);
+  }, 45_000);
+
+  it("serial mode: readonly tasks neither queue nor get blocked by the write worker", async () => {
+    setup([
+      [
+        { emit: { type: "agent_start" } },
+        { emit: { type: "turn_start" } },
+        { delayMs: 300 },
+        { emit: { type: "agent_settled", aborted: false } },
+      ],
+      reportRun({ status: "done", summary: "read-only answer" }),
+    ]);
+    registerRepo("serial");
+
+    await manager.startWorker("cmd-ser-slow", args({ workerId: "w-ser-slow" }));
+    const ro = await manager.startWorker("cmd-ser-ro", args({ workerId: "w-ser-ro", mode: "readonly" }));
+    expect(ro.queued).toBeUndefined(); // §8.3: read-only tasks are not isolated → never queued
+    expect(store.getWorker("w-ser-ro")?.state).toBe("running");
+    await waitFor(() => settledOf("w-ser-ro"), 15_000, "readonly settled alongside the write worker");
+    await waitFor(() => settledOf("w-ser-slow"), 15_000, "write worker settled");
+  }, 30_000);
+
+  it("a connector restart re-arms the queue from the persisted start", async () => {
+    const suffix = Math.random().toString(36).slice(2, 8);
+    const runnerId = `w-rst-run-${suffix}`;
+    const queuedId = `w-rst-q-${suffix}`;
+    workerIds.add(runnerId);
+    workerIds.add(queuedId);
+    // The runner's run stays in flight (long delay) so the second write task really queues.
+    setup([[{ delayMs: 10_000 }, ...reportRun({ status: "done", summary: "never reached before the crash" })]]);
+    registerRepo("serial");
+    await manager.startWorker("cmd-rst-1", args({ workerId: runnerId }));
+    await manager.startWorker("cmd-rst-2", args({ workerId: queuedId, threadId: "queued-thread" }));
+    expect(store.getWorker(queuedId)?.state).toBe("queued");
+    manager.simulateCrash(); // runner in flight, queued start persisted
+
+    // Second boot over the same state: the runner's session never reached disk → it breaks
+    // (startup_interrupted), which frees the serial slot; the pump then launches the queued
+    // worker from the persisted queue row — its command result was already sent with
+    // queued:true, so losing it would have stranded the Thread at `starting` forever.
+    const scenario = writeScenario(dir, "scenario-boot2", [reportRun({ status: "done", summary: "queued after restart" })]);
+    const manager2 = new WorkerManager({
+      store,
+      stateDir,
+      adapter: fakePiAdapter(stateDir, scenario),
+      emit: (workerId, fields) => {
+        const stored = eventLog.append(workerId, fields);
+        events.push(JSON.parse(stored.payload) as EmittedEvent);
+      },
+    });
+    manager = manager2;
+    await manager2.reconcileStartup();
+    await waitFor(() => startedOf(queuedId), 25_000, "queued worker started after restart");
+    expect(store.getQueuedStart(queuedId)).toBeNull();
+    await waitFor(() => settledOf(queuedId), 15_000, "restarted queue drained");
+  }, 60_000);
+});
+
+describe("approveProject is local-only (connector-pi.md §13)", () => {
+  it("rejects a start_worker command that carries it, no matter the value", async () => {
+    setup([[]]);
+    registerRepo();
+    for (const key of ["approveProject", "approve"]) {
+      await expect(
+        manager.handleCommand(`cmd-bad-${key}`, "start_worker", {
+          ...args({ workerId: `w-bad-${key}` }),
+          [key]: true,
+        }),
+      ).rejects.toMatchObject({ code: "local_only_setting" });
+    }
+    expect(events.length).toBe(0); // rejected at the entrance: nothing ran
+  });
+
+  it("a repo approved via the local CLI runs pi with --approve", async () => {
+    const argvLog = join(dir, "argv.jsonl");
+    setup([reportRun({ status: "done", summary: "done" })], { FAKE_PI_ARGV_LOG: argvLog });
+    registerRepo("worktree", true);
+
+    await manager.startWorker("cmd-ap-1", args());
+    await waitFor(() => settledOf("w-ws-test-1"), 15_000, "settled event");
+    const spawns = readFileSync(argvLog, "utf8").trim().split("\n");
+    expect(spawns.length).toBe(1); // one spawn only — no hidden second process
+    const flags = JSON.parse(spawns[0]!) as string[];
+    expect(flags).toContain("--approve");
+    expect(flags).not.toContain("--no-approve");
+  }, 30_000);
+});
+
+describe("cleanup_worktree (connector-pi.md §6.1/§8.2)", () => {
+  async function finishedWorker(dirty: boolean, pushed = false): Promise<string> {
+    setup([
+      reportRun(
+        { status: "done", summary: "done" },
+        // Uncommitted change (no commit): the dirty branch of the §8.2 refusal.
+        { shellBefore: dirty ? "echo dirt > dirty.txt" : "" },
+      ),
+    ]);
+    registerRepo();
+    const workerId = `w-clean-${Math.random().toString(36).slice(2, 8)}`;
+    workerIds.add(workerId);
+    const result = await manager.startWorker(`cmd-${workerId}`, args({ workerId }));
+    await waitFor(() => settledOf(workerId), 15_000, "settled event");
+    if (pushed) {
+      // Put HEAD inside a remote-tracking ref (shared object store) so it counts as pushed.
+      const head = (await git(result.worktree!, ["rev-parse", "HEAD"])).trim();
+      await git(repo, ["update-ref", `refs/remotes/origin/mirror-${workerId}`, head]);
+    }
+    return workerId;
+  }
+
+  it("refuses a dirty worktree; force removes it", async () => {
+    const workerId = await finishedWorker(true);
+    const worktree = store.getWorker(workerId)!.worktree!;
+    await expect(manager.cleanupWorktree(workerId, false)).rejects.toMatchObject({ code: "worktree_dirty" });
+    expect(existsSync(worktree)).toBe(true); // refused means untouched
+
+    const removed = await manager.cleanupWorktree(workerId, true);
+    expect(removed.removed).toBe(worktree);
+    expect(existsSync(worktree)).toBe(false);
+    expect(store.getWorker(workerId)).toMatchObject({ worktree: null, branch: null });
+  }, 30_000);
+
+  it("removes a clean, pushed worktree without force", async () => {
+    const workerId = await finishedWorker(false, true);
+    const worktree = store.getWorker(workerId)!.worktree!;
+    await expect(manager.cleanupWorktree(workerId, false)).resolves.toMatchObject({ removed: worktree });
+    expect(existsSync(worktree)).toBe(false);
+  }, 30_000);
+
+  it("refuses while the worker still runs, and has nothing to do for worktree-less workers", async () => {
+    setup([reportRun({ status: "done", summary: "done" })]);
+    registerRepo();
+    const runningId = "w-still-running";
+    workerIds.add(runningId);
+    await manager.startWorker("cmd-run", args({ workerId: runningId }));
+    const worktree = store.getWorker(runningId)!.worktree!;
+    await expect(manager.cleanupWorktree(runningId, true)).rejects.toMatchObject({ code: "worker_running" });
+    expect(existsSync(worktree)).toBe(true); // even force never deletes under a live run
+
+    await expect(manager.cleanupWorktree("w-never-heard-of", false)).rejects.toMatchObject({ code: "not_found" });
+  }, 30_000);
+
+  it("readonly and main-checkout workers answer no_worktree", async () => {
+    setup([reportRun({ status: "done", summary: "done" })]);
+    registerRepo("main");
+    const workerId = "w-main-run";
+    workerIds.add(workerId);
+    await manager.startWorker("cmd-main", args({ workerId }));
+    await waitFor(() => settledOf(workerId), 15_000, "settled event");
+    await expect(manager.cleanupWorktree(workerId, true)).rejects.toMatchObject({ code: "no_worktree" });
+  }, 30_000);
+});
+
+describe("LocalStore per-repo config and the queue tables (issue #16)", () => {
+  it("persists workspace/approved per repo, defaulting to worktree/unapproved", () => {
+    store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+    expect(store.getRepo(repo)).toMatchObject({ workspace: "worktree", approved: false });
+    expect(store.setRepoConfig(repo, { workspace: "serial", approved: true })).toBe(true);
+    expect(store.getRepo(repo)).toMatchObject({ workspace: "serial", approved: true });
+    // Re-registering (add-repo again) never resets local settings.
+    store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+    expect(store.getRepo(repo)).toMatchObject({ workspace: "serial", approved: true });
+    expect(store.setRepoConfig("/no/such/repo", { workspace: "main" })).toBe(false);
+    expect(WORKSPACE_MODES).toEqual(["worktree", "serial", "main"]);
+  });
+
+  it("round-trips queued starts and clears worktree columns", async () => {
+    store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+    store.upsertWorker({ workerId: "w-q", threadId: "t", repoId: repo, mode: "write", state: "queued" });
+    store.saveQueuedStart("w-q", "cmd-q", { prompt: "task", mode: "write" });
+    expect(store.getQueuedStart("w-q")).toMatchObject({ commandId: "cmd-q" });
+    store.deleteQueuedStart("w-q");
+    expect(store.getQueuedStart("w-q")).toBeNull();
+
+    store.upsertWorker({ workerId: "w-w", threadId: "t", repoId: repo, mode: "write", state: "idle", worktree: "/tmp/w", branch: "shepherd/t-1", base: "main" });
+    store.clearWorkerWorktree("w-w");
+    expect(store.getWorker("w-w")).toMatchObject({ worktree: null, branch: null, base: null });
+  });
+
+  it("listWorkers returns creation order (the serial queue's FIFO)", async () => {
+    store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+    for (const id of ["w-z-late-created-first", "w-a"]) {
+      // createdAt comes from Date.now(); force ordering with a tiny sleep.
+      store.upsertWorker({ workerId: id, threadId: "t", repoId: repo, mode: "write", state: "queued" });
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    const order = store.listWorkers().map((w) => w.workerId);
+    expect(order.indexOf("w-z-late-created-first")).toBeLessThan(order.indexOf("w-a"));
+  });
+});
+
+describe("CommandError surface for the new paths", () => {
+  it("stop_process on a queued write worker drops it from the queue instead of no-op'ing", async () => {
+    const slow: ScenarioStep[] = [{ delayMs: 8000 }, ...reportRun({ status: "done", summary: "slow" })];
+    setup([slow]);
+    registerRepo("serial");
+    await manager.startWorker("cmd-sq-1", args({ workerId: "w-sq-runner" }));
+    await manager.startWorker("cmd-sq-2", args({ workerId: "w-sq-victim", threadId: "victim-thread" }));
+    expect(store.getWorker("w-sq-victim")?.state).toBe("queued");
+
+    await manager.stopProcess("w-sq-victim");
+    expect(store.getWorker("w-sq-victim")).toMatchObject({ state: "idle", lastOutcome: "stopped_while_queued" });
+    expect(store.getQueuedStart("w-sq-victim")).toBeNull();
+    expect(events.some((e) => e.type === "settled" && e.workerId === "w-sq-victim" && e.outcome === "aborted")).toBe(true);
+
+    // When the runner settles, the stopped worker stays stopped — nothing starts behind the
+    // user's back.
+    await manager.stopProcess("w-sq-runner"); // end the slow runner without waiting it out
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(startedOf("w-sq-victim")).toBeUndefined();
+  }, 30_000);
+
+  it("resume on a queued worker explains the queue instead of resuming nothing", async () => {
+    setup([[]]);
+    registerRepo("serial");
+    await manager.startWorker("cmd-hold", args({ workerId: "w-hold" }));
+    await manager.startWorker("cmd-q", args({ workerId: "w-q-resume", threadId: "q-thread" }));
+    await expect(manager.handleCommand("cmd-rs", "resume", { workerId: "w-q-resume", reason: "manual" })).rejects.toMatchObject(
+      { code: "not_started" },
+    );
+  }, 30_000);
+
+  it("cleanup_worktree is reachable through handleCommand with force in args", async () => {
+    setup([reportRun({ status: "done", summary: "done" })]);
+    registerRepo();
+    const workerId = "w-cmd-clean";
+    workerIds.add(workerId);
+    const result = await manager.startWorker("cmd-cc", args({ workerId }));
+    await waitFor(() => settledOf(workerId), 15_000, "settled event");
+    // dirty: the report committed nothing, but the branch is unpushed → refused without force
+    await expect(manager.handleCommand("cmd-cw1", "cleanup_worktree", { workerId })).rejects.toBeInstanceOf(CommandError);
+    await expect(manager.handleCommand("cmd-cw2", "cleanup_worktree", { workerId, force: true })).resolves.toMatchObject({
+      removed: result.worktree,
+    });
+  }, 30_000);
+});

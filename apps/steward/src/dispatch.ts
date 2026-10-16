@@ -88,6 +88,10 @@ export interface StartWorkerInput {
   newTitle?: string;
   goal?: string;
   machineHint?: string;
+  /** §11 (issue #16): research/Q&A/review tasks run readonly in the repo's own checkout;
+   * anything that may change code needs a workspace. The steward decides at dispatch; the
+   * default — also when unsure — is write. */
+  mode?: "write" | "readonly";
   /** The authorizing run: `user:<msgId>` / `evt:…` / `routine:…` (steward.md §7.1). */
   provenance: string;
   /** `tool:<taskId>` — the idempotency key for replays (protocol §7.1). */
@@ -223,7 +227,7 @@ export class Dispatcher {
           this.ledger.timeline.add(thread.threadId, "user_instruction", input.prompt, { provenance: input.provenance });
           created = true;
         }
-        await this.dispatchTo(thread, choice.deviceId, repoId, input.prompt, choice.queued, input.provenance, input.cmdId);
+        await this.dispatchTo(thread, choice.deviceId, repoId, input.prompt, choice.queued, input.provenance, input.cmdId, input.mode);
         return {
           kind: "dispatched",
           workerId: this.ledger.workers.latestOnThread(thread.threadId)!.workerId,
@@ -323,7 +327,7 @@ export class Dispatcher {
   private hasLiveWorker(threadId: string): boolean {
     return this.ledger.workers
       .listByThread(threadId)
-      .some((w) => w.state === "starting" || w.state === "running" || w.state === "recovering");
+      .some((w) => w.state === "queued" || w.state === "starting" || w.state === "running" || w.state === "recovering");
   }
 
   /**
@@ -339,6 +343,7 @@ export class Dispatcher {
     queued: boolean,
     provenance: string,
     cmdId?: string,
+    mode: "write" | "readonly" = "write",
   ): Promise<void> {
     // Review (other findings): a replayed call carrying a cmdId that already exists must not
     // register a second worker row (the outbox dedupes the command, but the ghost `starting`
@@ -349,7 +354,7 @@ export class Dispatcher {
     const previous = this.ledger.workers.latestOnThread(thread.threadId);
     const base = previous?.branch ?? undefined;
     this.ledger.questions.closeOpen(thread.threadId, "用户重新派发");
-    this.ledger.workers.register({ workerId, threadId: thread.threadId, deviceId, repoId, agent: AGENT, mode: "write" });
+    this.ledger.workers.register({ workerId, threadId: thread.threadId, deviceId, repoId, agent: AGENT, mode });
     this.ledger.threads.setLastMachine(thread.threadId, deviceId);
     this.ledger.recomputeThreadState(thread.threadId);
     const machineName = this.ledger.machines.get(deviceId)?.name ?? deviceId;
@@ -360,9 +365,9 @@ export class Dispatcher {
         workerId,
         threadId: thread.threadId,
         repoId,
-        mode: "write",
+        mode,
         prompt,
-        ...(base ? { base } : {}),
+        ...(mode === "write" && base ? { base } : {}),
       },
       // Offline queueing is exactly `notAfter: null` (protocol §4.2): no expiry, delivered at
       // the next hello; the idle sweep still fails it after ~30 min of the machine not returning.

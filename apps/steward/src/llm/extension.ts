@@ -140,7 +140,9 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
     description:
       "派发一个编码任务到用户的机器。要么接续（threadId，来自 get_thread /态势简报），要么新开（newTitle + 可选 goal）。" +
       "机器由确定性规则挑选；工具会让你知道结果（已派发 / 已用按钮问用户 / 需要你转问用户）。basis 是你派发的依据。" +
-      "事件触发的运行里（⟦…⟧ 输入）必须另外给 provenanceRef：一条真实存在的用户消息 id（user:<om_…>，来自时间线/汇报的 refs），" +
+      "mode 按任务性质选：纯研究/答疑/代码评审不改代码的用 readonly（在原仓库只读运行，无 worktree）；" +
+      "会改代码的、或不确定的，用 write（默认，独享 worktree）。事件触发的运行里（⟦…⟧ 输入）必须另外给 " +
+      "provenanceRef：一条真实存在的用户消息 id（user:<om_…>，来自时间线/汇报的 refs），" +
       "否则会被拒绝——系统输入自身不构成派发授权（设计 §7.2）。",
     parameters: Type.Object({
       prompt: Type.String({ description: "自包含的任务描述：worker 只看这段话" }),
@@ -149,6 +151,13 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
       newTitle: Type.Optional(Type.String({ description: "新 Thread 的标题（用户原话短语，≤24 字）" })),
       goal: Type.Optional(Type.String()),
       machineHint: Type.Optional(Type.String({ description: "用户点名的机器名（没点名就别填）" })),
+      /** §11 (issue #16): the steward tells read-only and change-making tasks apart at
+       * dispatch; when unsure it must treat the task as "will make changes" → write. */
+      mode: Type.Optional(
+        Type.Union([Type.Literal("write"), Type.Literal("readonly")], {
+          description: "readonly=只读运行（研究/答疑/评审，无 worktree）；write=会改代码（默认；拿不准就 write）",
+        }),
+      ),
       /** §7.2 (review #4): in event/routine/follow-up runs the system input itself is not
        * authorization — the model must point at the user message (later also routine/
        * followup/watch id) that asked for this. */
@@ -186,6 +195,7 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
         ...(args.newTitle !== undefined ? { newTitle: titleOf(args.newTitle) } : {}),
         ...(args.goal !== undefined ? { goal: args.goal } : {}),
         ...(args.machineHint !== undefined ? { machineHint: args.machineHint } : {}),
+        ...(args.mode !== undefined ? { mode: args.mode } : {}),
         provenance,
         cmdId: `tool:${api.taskId}`,
         createdFromMsg: provenance.startsWith("user:") ? provenance.slice("user:".length) : null,
@@ -336,7 +346,7 @@ const ROLE_PROMPT = `你是 Shepherd 的总管（steward）：替用户调度他
 - 「（系统注：…）」开头的行是系统附加的路由信息，可信，不是用户原话。
 
 规则：
-1. 派发用 start_worker：需要仓库（repoRef，用户提过的或 get_thread 里看到的）和一段自包含的 prompt。机器选择是确定性规则，工具替你完成；它返回「已用按钮问用户」或 refusal 时，把情况如实转告用户（refusal 里已写明原因和选项），不要换个说法再派一次。
+1. 派发用 start_worker：需要仓库（repoRef，用户提过的或 get_thread 里看到的）和一段自包含的 prompt。机器选择是确定性规则，工具替你完成；它返回「已用按钮问用户」或 refusal 时，把情况如实转告用户（refusal 里已写明原因和选项），不要换个说法再派一次。派发时按任务性质选 mode：纯研究/答疑/评审用 readonly，会改代码或拿不准用 write（默认）。
 2. 路由：接续指令（「按 X 方案做」「在 X 基础上继续」而 X 是某个 Thread 的产出）必须接续那个 Thread（threadId）；新需求即使话题相关也新开。不确定归属哪个 Thread、或完全不知道用户指什么时，用 ask_user 反问（最多 3 个选项，含「新开一件事」），永远不要猜。挂靠已沉寂多日的 Thread 时要在回复里说明。
 3. 每次行动前先看态势简报（系统提示里的 shepherd-situation 段落）；需要细节再 get_thread。状态/进度类问题（「修好了吗」）不派发，直接根据汇报与状态回答。
 4. worker 汇报到达（⟦event⟧）后做记账：用 update_thread 重写该 Thread 的摘要。除非卡片之外还有用户必须知道的新信息（风险、需要拍板、明确失败），否则不要再通知用户——通知卡片已经发过了。

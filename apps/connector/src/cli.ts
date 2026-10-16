@@ -11,6 +11,10 @@
 //   upgrade [--version V]  npm-install @iefnaf/shepherd (default @latest) and restart the
 //                          service; the fresh daemon rewrites the versioned pi assets
 //   add-repo <path>        register a repository so start_worker may run in it (§8.1)
+//   repo-config <path> [--workspace worktree|serial|main] [--approve|--no-approve]
+//                          per-repo local settings (§8.2/§13): how write tasks get a
+//                          directory, and whether pi runs with --approve there. Never
+//                          settable by a remote command — only here, on the machine
 //   daemon                 internal: the background service's entry point
 import { existsSync, readdirSync } from "node:fs";
 import { hostname, homedir } from "node:os";
@@ -23,7 +27,7 @@ import { installAssets } from "./install.ts";
 import { tailFile } from "./logger.ts";
 import { connect } from "./pairing.ts";
 import { getServiceInstaller, SHEPHERD_LABEL, type ServiceInstaller, type ServiceSpec } from "./service.ts";
-import { LocalStore } from "./store.ts";
+import { isWorkspaceMode, LocalStore, WORKSPACE_MODES } from "./store.ts";
 import { defaultBranch, repoTopLevel } from "./worktree.ts";
 import { runUpgrade } from "./upgrade.ts";
 import { VERSION } from "./version.ts";
@@ -52,6 +56,8 @@ usage:
   shepherd uninstall                              remove the service (keeps ~/.shepherd data)
   shepherd upgrade [--version <version>]          replace the package and restart the service
   shepherd add-repo <path>                        register a repository for start_worker
+  shepherd repo-config <path> [options]           per-repo local settings (workspace mode,
+                                                  project trust); never settable remotely
   shepherd daemon                                 internal: run the connector daemon
 
 environment:
@@ -128,6 +134,8 @@ async function main(argv: string[]): Promise<void> {
       return upgradeCommand(rest);
     case "add-repo":
       return addRepo(rest[0]);
+    case "repo-config":
+      return repoConfig(rest);
     case "daemon":
       return daemonCommand();
     default:
@@ -230,6 +238,12 @@ async function statusCommand(): Promise<void> {
         ? "none"
         : [...byState.entries()].map(([state, count]) => `${count} ${state}`).join(", ");
     console.log(`workers:  ${summary}`);
+    const repos = store.listRepos();
+    const repoLine =
+      repos.length === 0
+        ? "none (shepherd add-repo <path>)"
+        : repos.map((r) => `${r.name}[${r.workspace}${r.approved ? ", approved" : ""}]`).join(", ");
+    console.log(`repos:    ${repoLine}`);
   } finally {
     store.close();
   }
@@ -349,6 +363,53 @@ async function addRepo(path: string | undefined): Promise<void> {
   try {
     store.addRepo({ repoId: topLevel, name, path: topLevel, defaultBranch: branch, remote });
     console.log(`registered ${name} (${topLevel})${branch ? ` default branch: ${branch}` : ""}`);
+    console.log("next: shepherd repo-config <path> to pick the workspace mode or approve the project");
+  } finally {
+    store.close();
+  }
+}
+
+// --- repo-config -----------------------------------------------------------------------------
+
+/** `shepherd repo-config <path> [--workspace worktree|serial|main] [--approve|--no-approve]`
+ * (§8.2/§13, issue #16): the per-repo settings that live only in the connector's local
+ * store. A command from the steward carrying them is rejected; this is the only writer.
+ * With no flags it just prints the current configuration. */
+async function repoConfig(argv: string[]): Promise<void> {
+  const [path] = argv.filter((a) => !a.startsWith("--"));
+  if (!path) usage();
+  const { value: workspace } = takeFlag(argv, "--workspace");
+  const approve = argv.includes("--approve") ? true : argv.includes("--no-approve") ? false : undefined;
+  if (workspace !== undefined && !isWorkspaceMode(workspace)) {
+    fail(`unknown workspace mode '${workspace}' (expected one of: ${WORKSPACE_MODES.join(" | ")})`);
+  }
+  if (argv.includes("--approve") && argv.includes("--no-approve")) {
+    fail("--approve and --no-approve are mutually exclusive");
+  }
+  if (workspace === undefined && approve === undefined) {
+    // Read-only invocation: show the current settings.
+    const topLevel = await repoTopLevel(path);
+    const store = new LocalStore(join(stateDir(), "connector.sqlite"));
+    try {
+      const repo = store.getRepo(topLevel);
+      if (!repo) fail(`${topLevel} is not registered; run 'shepherd add-repo ${path}' first`);
+      console.log(`${repo.name} (${repo.repoId})`);
+      console.log(`workspace: ${repo.workspace}`);
+      console.log(`approved:  ${repo.approved ? "yes (pi runs with --approve)" : "no (pi runs with --no-approve)"}`);
+    } finally {
+      store.close();
+    }
+    return;
+  }
+
+  const topLevel = await repoTopLevel(path);
+  const store = new LocalStore(join(stateDir(), "connector.sqlite"));
+  try {
+    if (!store.setRepoConfig(topLevel, { ...(workspace !== undefined ? { workspace } : {}), ...(approve !== undefined ? { approved: approve } : {}) })) {
+      fail(`${topLevel} is not registered; run 'shepherd add-repo ${path}' first`);
+    }
+    const repo = store.getRepo(topLevel)!;
+    console.log(`${repo.name}: workspace=${repo.workspace}, approved=${repo.approved ? "yes" : "no"}`);
   } finally {
     store.close();
   }

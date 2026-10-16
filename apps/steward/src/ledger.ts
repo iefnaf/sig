@@ -30,7 +30,7 @@ export interface LedgerDeps {
 
 export type ThreadState = "running" | "waiting_you" | "idle";
 /** Worker states that keep a Thread `running` (steward.md §5.2); lost/broken do not count. */
-export const ACTIVE_WORKER_STATES = ["starting", "running", "recovering"] as const;
+export const ACTIVE_WORKER_STATES = ["queued", "starting", "running", "recovering"] as const;
 
 export interface ThreadRow {
   threadId: string;
@@ -819,6 +819,21 @@ export function createLedger(deps: LedgerDeps) {
     }
 
     switch (type) {
+      case "queued": {
+        // §8.2 serial repos (issue #16): the connector parked this write worker behind the
+        // repo's current one; `started` follows when the slot frees. Not a failure — the
+        // Thread stays running-shaped.
+        sql`
+          UPDATE sh_worker SET state = 'queued', lastEventAt = ${ts}, updatedAt = ${now()}
+          WHERE workerId = ${workerId}
+        `;
+        timeline.add(worker.threadId, "note", "排队中：等同一仓库的前一个写任务结束（serial 模式）", {
+          workerId,
+          seq,
+          behind: event.behind ?? null,
+        });
+        break;
+      }
       case "started": {
         sql`
           UPDATE sh_worker SET state = 'running', sessionId = ${str(event.sessionId)}, branch = ${str(event.branch)},
@@ -980,7 +995,7 @@ export function createLedger(deps: LedgerDeps) {
     sql`
       UPDATE sh_thread SET state = CASE
         WHEN EXISTS (
-          SELECT 1 FROM sh_worker w WHERE w.threadId = sh_thread.threadId AND w.state IN ('starting', 'running', 'recovering')
+          SELECT 1 FROM sh_worker w WHERE w.threadId = sh_thread.threadId AND w.state IN ('queued', 'starting', 'running', 'recovering')
         ) THEN 'running'
         WHEN EXISTS (
           SELECT 1 FROM sh_question q WHERE q.threadId = sh_thread.threadId AND q.status = 'open'

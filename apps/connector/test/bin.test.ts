@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { makeGitRepo } from "./helpers.ts";
 import { VERSION } from "../src/version.ts";
 
 const exec = promisify(execFile);
@@ -88,5 +89,36 @@ describe("bin/shepherd.js (skipped when dist has not been built)", () => {
     await run(["status"]);
     expect(existsSync(stateDir)).toBe(true); // status created nothing...
     expect(existsSync(join(stateDir, "connector.sqlite"))).toBe(false); // ...it only reports
+  });
+
+  it("repo-config sets and shows the per-repo local settings (§8.2/§13, issue #16)", async () => {
+    const repo = await makeGitRepo(home);
+
+    // Not registered yet: refuse with the hint, never auto-register via a config call.
+    const unregistered = await run(["repo-config", repo, "--workspace", "serial"]);
+    expect(unregistered.code).toBe(1);
+    expect(unregistered.stderr).toContain("not registered");
+
+    expect((await run(["add-repo", repo])).code).toBe(0);
+
+    // Invalid mode is rejected with the valid vocabulary.
+    const bad = await run(["repo-config", repo, "--workspace", "sometimes"]);
+    expect(bad.code).toBe(1);
+    expect(bad.stderr).toContain("worktree | serial | main");
+
+    const set = await run(["repo-config", repo, "--workspace", "serial", "--approve"]);
+    expect(set.code).toBe(0);
+    expect(set.stdout).toContain("workspace=serial");
+    expect(set.stdout).toContain("approved=yes");
+
+    // No flags: print the current configuration.
+    const show = await run(["repo-config", repo]);
+    expect(show.code).toBe(0);
+    expect(show.stdout).toContain("workspace: serial");
+    expect(show.stdout).toContain("--approve");
+
+    // And status surfaces the per-repo settings.
+    const status = await run(["status"]);
+    expect(status.stdout).toContain("repo-a[serial, approved]");
   });
 });

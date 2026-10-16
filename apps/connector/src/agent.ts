@@ -34,6 +34,9 @@ export interface StartSpec {
   prompt: string;
   /** Correlates the run window with the steward command (ADR-0001 marker). */
   commandId: string;
+  /** approveProject (§13): the repo's local trust flag — pi runs with --approve. Never
+   * taken from the command; set by the WorkerManager from the LocalStore's repo row. */
+  approveProject?: boolean;
   images?: { data: string; mimeType: string }[];
   model?: string;
 }

@@ -12,7 +12,7 @@ import { acquireLock, markLocksHeldByDeadProcess, releaseLock, removeStaleLocks 
 import { RESUME_PROMPT, PiAdapter } from "./pi-adapter.ts";
 import { ProgressThrottle } from "./progress.ts";
 import { inspectSessionTail, type SessionTail } from "./session-tail.ts";
-import type { LocalStore, WorkerRow } from "./store.ts";
+import type { LocalStore, RegisteredRepo, WorkerRow } from "./store.ts";
 import { WorktreeManager } from "./worktree.ts";
 import { join } from "node:path";
 
@@ -44,6 +44,9 @@ export interface StartWorkerResult {
   branch?: string;
   cwd: string;
   worktree?: string;
+  /** §8.2 serial mode: the write worker waits for the repo's current write worker instead of
+   * starting now. The `started` event follows when the slot frees. */
+  queued?: boolean;
 }
 
 /** Knobs and seams for the §9 recovery paths (tests shrink timers and inject process I/O). */
@@ -85,6 +88,15 @@ const WORKER_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]*[a-zA-Z0-9]$/;
  * `lost` workers additionally get their pending resume re-scheduled at startup. */
 const IN_FLIGHT_STATES = new Set(["starting", "running", "recovering"]);
 
+/** §8.2 serial mode: states in which a write worker holds the repo's single write slot —
+ * in-flight, awaiting an automatic resume (`lost`), or itself queued ahead of another. */
+const SERIAL_SLOT_STATES = new Set(["starting", "running", "recovering", "lost", "queued"]);
+
+/** §8.2/§13 (issue #16): settings that live in the connector's LocalStore and are set only
+ * by the machine's owner via the CLI. A command carrying one is rejected outright — the
+ * last line of defense against a compromised steward (connector-do-protocol §6.2). */
+const LOCAL_ONLY_ARGS = ["approveProject", "approve", "workspace", "workspaceMode"];
+
 export class WorkerManager {
   private readonly store: LocalStore;
   private readonly stateDir: string;
@@ -106,6 +118,8 @@ export class WorkerManager {
   private readonly inspectTailFn: (sessionFile: string | null | undefined) => SessionTail;
   private snapshotTimer?: NodeJS.Timeout;
   private readonly resumeTimers = new Map<string, NodeJS.Timeout>();
+  /** Repos with a queued-write launch in flight (guards pump re-entry). */
+  private readonly pumpingRepos = new Set<string>();
   /** Set by simulateCrash: a crashed instance processes nothing further. */
   private crashed = false;
 
@@ -145,6 +159,7 @@ export class WorkerManager {
   ): Promise<unknown> {
     switch (kind) {
       case "start_worker":
+        rejectLocalOnlyArgs(args);
         return this.startWorker(commandId, parseStartWorkerArgs(args));
       case "stop_process": {
         const workerId = commandWorkerId(args, envelopeWorkerId, kind);
@@ -157,6 +172,10 @@ export class WorkerManager {
         const count = this.store.recordResume(workerId, this.resumeWindowMs);
         await this.resumeWorker(workerId, reason, count);
         return { resumed: true, count };
+      }
+      case "cleanup_worktree": {
+        const workerId = commandWorkerId(args, envelopeWorkerId, kind);
+        return this.cleanupWorktree(workerId, args.force === true);
       }
       default:
         throw new CommandError("unsupported_command", `command kind '${kind}' is not implemented yet`);
@@ -186,18 +205,53 @@ export class WorkerManager {
       throw new CommandError("not_registered_repo", `repo '${args.repoId}' is not registered on this machine`);
     }
 
+    // --- §8.2 serial mode: only one write worker at a time in the repo. A second write task
+    // is queued (FIFO) and starts when the current one settles; the command result says so,
+    // and the `started` event follows when the slot frees. Readonly tasks are never isolated
+    // (§8.3) and never queue.
+    if (args.mode === "write" && repo.workspace === "serial") {
+      const holder = this.writeSlotHolder(args.repoId, args.workerId);
+      if (holder) {
+        this.store.upsertWorker({
+          workerId: args.workerId,
+          threadId: args.threadId,
+          repoId: args.repoId,
+          mode: "write",
+          state: "queued",
+          branch: null,
+          worktree: null,
+          base: args.base ?? null,
+        });
+        // The args persist so a connector restart re-arms the queue (the command result
+        // with queued:true already went out; losing the start would strand the Thread).
+        this.store.saveQueuedStart(args.workerId, commandId, args);
+        await this.emitEvent(args.workerId, "queued", { behind: holder });
+        return { queued: true, sessionId: "", cwd: repo.path };
+      }
+    }
+
+    return this.launchWorker(commandId, args, repo);
+  }
+
+  /** Everything after validation: lock, workspace resolution (§8.2), the `starting` row,
+   * adapter start, and the `started` event. Both the direct path and the serial pump land
+   * here; launch failures surface as CommandError (the direct path forwards them to
+   * cmd_result, the pump breaks the worker instead). */
+  private async launchWorker(commandId: string, args: StartWorkerArgs, repo: RegisteredRepo): Promise<StartWorkerResult> {
     // --- One process per session (§4.3): lock file, `lock_held` when alive, stale removed.
     const lock = acquireLock(this.stateDir, args.workerId);
     if (!lock.ok) {
       throw new CommandError("lock_held", `worker ${args.workerId} is locked by pid ${lock.pid}`, true);
     }
 
-    // --- Write tasks get a dedicated worktree (§8.2).
+    // --- §8.2 workspace resolution. Write + worktree/serial → a dedicated worktree; write +
+    // main, and every readonly run (§8.3) → the repository's own checkout, no worktree.
+    const useWorktree = args.mode === "write" && repo.workspace !== "main";
     let cwd = repo.path;
     let branch: string | undefined;
     let base: string | undefined;
     let worktree: string | undefined;
-    if (args.mode === "write") {
+    if (useWorktree) {
       try {
         const created = await this.worktrees.create({ repoPath: repo.path, threadId: args.threadId, base: args.base });
         cwd = created.path;
@@ -210,6 +264,8 @@ export class WorkerManager {
         throw new CommandError("worktree_failed", `could not create worktree: ${message}`);
       }
     }
+    // `main` mode ignores `base`: the checkout is whatever the owner left it at — the
+    // connector never checks branches out in the user's own working directory.
 
     this.store.upsertWorker({
       workerId: args.workerId,
@@ -230,6 +286,8 @@ export class WorkerManager {
       mode: args.mode,
       prompt: args.prompt,
       commandId,
+      // §13: approveProject comes from the repo's local config, never from the command.
+      approveProject: repo.approved === true ? true : undefined,
       images: args.images,
       model: args.model,
     };
@@ -272,11 +330,135 @@ export class WorkerManager {
     }
   }
 
-  /** stop_process (§6.1): reclaim the process, keep the session on disk. */
+  /** stop_process (§6.1): reclaim the process, keep the session on disk. On a queued write
+   * worker (§8.2) there is no process yet — the pending start is dropped instead, so the
+   * queue does not launch a task the user tried to stop. */
   async stopProcess(workerId: string): Promise<void> {
+    const worker = this.store.getWorker(workerId);
+    if (worker?.state === "queued") {
+      this.store.deleteQueuedStart(workerId);
+      this.store.setWorkerState(workerId, "idle", "stopped_while_queued");
+      await this.emitEvent(workerId, "settled", { outcome: "aborted" });
+      return;
+    }
     await this.adapter.stopProcess(workerId); // process_exit handler releases the lock
     // §9.3: a stop that had to escalate to SIGKILL may have orphaned tool children.
     await this.cleanupOrphans(workerId);
+  }
+
+  // --- Serial write queue (connector-pi.md §8.2) --------------------------------------------
+
+  /** The write worker holding the repo's serial slot, if any (creation order; `lost` still
+   * holds the slot while an automatic resume may bring it back). `exclude` keeps a worker
+   * from blocking itself. */
+  private writeSlotHolder(repoId: string, excludeWorkerId?: string): string | undefined {
+    const holders = this.store
+      .listWorkers()
+      .filter(
+        (w) =>
+          w.repoId === repoId &&
+          w.mode === "write" &&
+          w.workerId !== excludeWorkerId &&
+          SERIAL_SLOT_STATES.has(w.state),
+      );
+    // Name the live runner, not another queued worker, when one exists.
+    return holders.find((w) => w.state !== "queued")?.workerId ?? holders[0]?.workerId;
+  }
+
+  /** Starts the next queued write worker of every repo whose slot freed up. Triggered by
+   * settle/break transitions, reconciliation, and queue-loss cleanup — never by a timer. */
+  private pumpQueuedWorkers(): void {
+    if (this.crashed) return;
+    const repos = new Set(
+      this.store.listWorkers().filter((w) => w.state === "queued" && !this.pumpingRepos.has(w.repoId)).map((w) => w.repoId),
+    );
+    for (const repoId of repos) {
+      this.pumpOnce(repoId);
+    }
+  }
+
+  /** A repo's oldest queued write worker launches when no write worker is in flight. The
+   * `pumpingRepos` guard makes re-entrant pumps (settle during a launch) a no-op. */
+  private pumpOnce(repoId: string): void {
+    if (this.crashed || this.pumpingRepos.has(repoId)) return;
+    const workers = this.store.listWorkers().filter((w) => w.repoId === repoId);
+    const inFlight = workers.some((w) => w.mode === "write" && IN_FLIGHT_STATES.has(w.state));
+    const lost = workers.some((w) => w.mode === "write" && w.state === "lost"); // resume may still bring it back
+    const next = workers.find((w) => w.state === "queued"); // creation order (FIFO)
+    if (!next || inFlight || lost) return;
+    const queued = this.store.getQueuedStart(next.workerId);
+    if (!queued) {
+      // The persisted start args vanished (e.g. a queue row from before this feature's
+      // schema): break honestly instead of stranding the Thread at `queued` forever.
+      void this.breakWorker(
+        next.workerId,
+        "unknown",
+        "Queued start was lost in a connector restart; re-dispatch the task.",
+        "queue_lost",
+      );
+      return;
+    }
+    this.pumpingRepos.add(repoId);
+    void this.launchQueued(next, queued).finally(() => {
+      this.pumpingRepos.delete(repoId);
+      // The launch may itself unblock another queued worker (e.g. it broke immediately).
+      this.pumpQueuedWorkers();
+    });
+  }
+
+  private async launchQueued(worker: WorkerRow, queued: { commandId: string; args: unknown }): Promise<void> {
+    if (this.crashed) return;
+    this.store.deleteQueuedStart(worker.workerId);
+    if (typeof queued.args !== "object" || queued.args === null) {
+      await this.breakWorker(worker.workerId, "unknown", "Queued start args were unreadable; re-dispatch the task.", "queue_lost");
+      return;
+    }
+    const args = parseStartWorkerArgs(queued.args as Record<string, unknown>);
+    const repo = this.store.getRepo(worker.repoId);
+    if (!repo) {
+      await this.breakWorker(worker.workerId, "unknown", `repo '${worker.repoId}' is no longer registered`, "startup_failed");
+      return;
+    }
+    try {
+      // The command result already went out with queued:true; the `started` event (emitted
+      // by launchWorker) is what tells the steward the run is now live.
+      await this.launchWorker(queued.commandId, args, repo);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      await this.breakWorker(worker.workerId, "unknown", `Queued start failed: ${message}`, "startup_failed");
+    }
+  }
+
+  // --- cleanup_worktree (connector-pi.md §6.1/§8.2) -----------------------------------------
+
+  /** Explicit-only worktree removal: refuses dirty or unpushed worktrees unless `force`, and
+   * refuses outright while the worker may still use it (in flight, queued, or awaiting a
+   * resume). Nothing in the connector ever deletes a worktree on its own (§8.2). */
+  async cleanupWorktree(workerId: string, force: boolean): Promise<{ removed: string }> {
+    const worker = this.store.getWorker(workerId);
+    if (!worker) throw new CommandError("not_found", `worker ${workerId} is unknown on this machine`);
+    if (!worker.worktree) {
+      throw new CommandError(
+        "no_worktree",
+        `worker ${workerId} ran without a worktree (readonly task or main-checkout repo)`,
+      );
+    }
+    if (SERIAL_SLOT_STATES.has(worker.state)) {
+      throw new CommandError(
+        "worker_running",
+        `worker ${workerId} is ${worker.state}; stop it and let it settle before cleaning up its worktree`,
+      );
+    }
+    const repo = this.store.getRepo(worker.repoId);
+    if (!repo) throw new CommandError("not_registered_repo", `repo '${worker.repoId}' is not registered on this machine`);
+    try {
+      await this.worktrees.cleanup(repo.path, worker.worktree, { force });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new CommandError("worktree_dirty", message);
+    }
+    this.store.clearWorkerWorktree(workerId);
+    return { removed: worker.worktree };
   }
 
   // --- Startup reconciliation (connector-pi.md §9.1) ----------------------------------------
@@ -309,6 +491,8 @@ export class WorkerManager {
         console.error(`[shepherd] session-tail reconciliation failed for ${worker.workerId}:`, err);
       }
     }
+    // Queued write workers whose runner settled or broke over the restart can start now.
+    this.pumpQueuedWorkers();
   }
 
   private async reconcileWorkerTail(worker: WorkerRow): Promise<void> {
@@ -323,6 +507,7 @@ export class WorkerManager {
       await this.emitEvent(worker.workerId, "report", { ...tail.report, ...(git ? { git } : {}) });
       await this.emitEvent(worker.workerId, "settled", { outcome: "reported" });
       this.store.setWorkerState(worker.workerId, "idle", "reported");
+      this.pumpQueuedWorkers(); // §8.2: the serial slot freed
       return;
     }
     if (tail.kind === "not_started") {
@@ -403,6 +588,11 @@ export class WorkerManager {
   private async resumeWorker(workerId: string, reason: string, count: number): Promise<void> {
     const worker = this.store.getWorker(workerId);
     if (!worker) throw new CommandError("not_found", `worker ${workerId} is unknown on this machine`);
+    if (worker.state === "queued") {
+      // §8.2: a queued write worker has no session yet — there is nothing to resume. It
+      // starts on its own when the repo's serial slot frees.
+      throw new CommandError("not_started", `worker ${workerId} is queued behind another write task; it starts when that one settles`);
+    }
     if (this.adapter.isRunning?.(workerId)) {
       await this.adapter.resume(workerId, reason);
       this.store.setWorkerState(workerId, "running");
@@ -421,6 +611,8 @@ export class WorkerManager {
       mode: worker.mode === "readonly" ? "readonly" : "write",
       prompt: RESUME_PROMPT,
       commandId: `resume-${count}-${this.now()}`,
+      // §13: the repo's local trust applies to resumes exactly like first starts.
+      approveProject: repo?.approved === true ? true : undefined,
     };
     this.active.set(workerId, {
       repoId: worker.repoId,
@@ -457,6 +649,8 @@ export class WorkerManager {
   private async breakWorker(workerId: string, errorClass: ErrorClass, detail: string, lastOutcome: string): Promise<void> {
     this.store.setWorkerState(workerId, "broken", lastOutcome);
     await this.emitEvent(workerId, "settled", { outcome: "error", errorClass, lastText: detail });
+    // §8.2: a broken write worker frees the repo's serial slot for the next queued one.
+    this.pumpQueuedWorkers();
   }
 
   // --- Orphan cleanup (§9.3) ----------------------------------------------------------------
@@ -568,6 +762,10 @@ export class WorkerManager {
         if (event.outcome === "error" && event.errorClass === "transient") {
           // §5.2/§9.2: one automatic resume for transient-class errors (backoff + budget apply).
           this.scheduleAutoResume(event.workerId, "error:transient");
+        } else {
+          // §8.2: a settled write worker frees the repo's serial slot. (A transient error's
+          // resume keeps the slot — the run is still in flight from the queue's viewpoint.)
+          this.pumpQueuedWorkers();
         }
         return;
       }
@@ -605,6 +803,20 @@ function commandWorkerId(args: Record<string, unknown>, envelopeWorkerId: string
   const workerId = typeof args.workerId === "string" && args.workerId.length > 0 ? args.workerId : envelopeWorkerId;
   if (!workerId) throw new CommandError("bad_request", `${kind} requires a workerId`);
   return workerId;
+}
+
+/** §8.2/§13 (issue #16): local-only settings arriving inside a command are rejected before
+ * anything runs — even a fully authenticated steward must not flip approveProject or the
+ * workspace mode from afar; the owner sets them with `shepherd repo-config` on the machine. */
+function rejectLocalOnlyArgs(args: Record<string, unknown>): void {
+  for (const key of LOCAL_ONLY_ARGS) {
+    if (key in args) {
+      throw new CommandError(
+        "local_only_setting",
+        `'${key}' is a connector-local setting; set it on the machine with 'shepherd repo-config' (§13)`,
+      );
+    }
+  }
 }
 
 function parseStartWorkerArgs(args: Record<string, unknown>): StartWorkerArgs {
