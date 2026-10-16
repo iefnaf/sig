@@ -139,5 +139,9 @@ export default defineConfig({
   // One workerd instance backs every file here, and the Durable Object's SQLite plus the
   // node-side Feishu mock are shared mutable state that per-test storage isolation does not
   // cover — so files must run one at a time for exact-count assertions to stay meaningful.
+  // Wall time instead comes from parallel *processes*: scripts/test-groups.mjs (the `test`
+  // script) runs balanced file groups concurrently, each loading this config — and therefore
+  // its own workerd + mock state — in a separate vitest process. Keep fileParallelism false:
+  // within one process the shared state above still requires serial files.
   test: { fileParallelism: false },
 });
