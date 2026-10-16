@@ -599,7 +599,7 @@ Legend: ✓ verified in the protocol spike; ◦ seen only in docs or type declar
 | The `beforeRequest` hook replaces only the single request and persists nothing | ✓ (issue #6: verified by test — see §4.1) |
 | A tool result's `control.terminate` ends the turn | ✓ (issue #6: ask_user / no_action terminate) |
 | `input` with a custom `entry` (distinguishing user vs event) | ? `pi-durable@1.1.0` types disallow it, the repo README allows it; `PiHarness.submit` does not expose it. The MVP uses content markers (§4.2) |
-| DO SQLite supports FTS5 and JSON functions | ◦ (official docs); trigger-sync behavior unverified |
+| DO SQLite supports FTS5 and JSON functions | ✓ (issue #18: external-content FTS5 with the `trigram` tokenizer verified by test in workerd — insert/update/delete triggers stay in sync, CJK substring `MATCH` works; the default unicode61 tokenizer would have collapsed Chinese sentences into single tokens) |
 | `ctx.storage.transactionSync` | ◦ (DO storage API) |
 | `this.schedule(cron, ...)` idempotent | ◦ (Agents SDK docs) |
 | Feishu: QR-code creation (`registerApp` device flow) | ◦ official SDK source; no live scan performed |

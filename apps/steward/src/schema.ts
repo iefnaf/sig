@@ -400,4 +400,68 @@ export const MIGRATIONS: readonly Migration[] = [
       });
     },
   },
+  {
+    // Notes: the layered memory (issue #18, steward.md §2.3-§2.5, spec §10). resident =
+    // always-loaded preferences/conventions (2,400-char hard cap); project = per-repo
+    // conventions (1,500 per repo); archive = superseded/demoted/evicted entries — never
+    // deleted, fetched on demand. Writes are two-phase (notes_propose → notes_commit with
+    // `replaces`); every change lands in sh_note_log and is relayed to the user with the
+    // next reply (spec §10.3: silent memory is unacceptable).
+    id: "010_notes",
+    up: (sql) => {
+      // status: 'active' = current knowledge (any layer — an evicted/demoted entry stays
+      // valid content in the archive); 'superseded' = replaced by a newer note; 'removed' =
+      // deleted at the user's word (kept as a tombstone; the layer always reads 'archive').
+      // `bytes` is the normalized text's character count — the unit of both layer caps.
+      sql`CREATE TABLE IF NOT EXISTS sh_note (
+        noteId TEXT PRIMARY KEY,
+        layer TEXT NOT NULL,
+        scope_repoId TEXT,
+        kind TEXT NOT NULL,
+        text TEXT NOT NULL,
+        bytes INTEGER NOT NULL,
+        source TEXT NOT NULL,
+        evidence TEXT,
+        confirmed INTEGER NOT NULL DEFAULT 0,
+        pinned INTEGER NOT NULL DEFAULT 0,
+        createdAt INTEGER NOT NULL,
+        lastUsedAt INTEGER,
+        useCount INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'active',
+        supersededBy TEXT
+      )`;
+      sql`CREATE INDEX IF NOT EXISTS sh_note_placement ON sh_note (layer, scope_repoId, status)`;
+      // FTS5 trigram (verified against workerd for issue #18, incl. CJK substring matching
+      // and trigger sync): substring search that works for Chinese text, where the default
+      // unicode61 tokenizer would collapse whole sentences into single tokens. External
+      // content table: the index can never drift from sh_note because only the triggers
+      // below ever write it.
+      sql`CREATE VIRTUAL TABLE IF NOT EXISTS sh_note_fts USING fts5(text, content = 'sh_note', content_rowid = 'rowid', tokenize = 'trigram')`;
+      sql`CREATE TRIGGER IF NOT EXISTS sh_note_fts_ai AFTER INSERT ON sh_note BEGIN
+            INSERT INTO sh_note_fts (rowid, text) VALUES (new.rowid, new.text);
+          END`;
+      sql`CREATE TRIGGER IF NOT EXISTS sh_note_fts_ad AFTER DELETE ON sh_note BEGIN
+            INSERT INTO sh_note_fts (sh_note_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
+          END`;
+      sql`CREATE TRIGGER IF NOT EXISTS sh_note_fts_au AFTER UPDATE OF text ON sh_note BEGIN
+            INSERT INTO sh_note_fts (sh_note_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
+            INSERT INTO sh_note_fts (rowid, text) VALUES (new.rowid, new.text);
+          END`;
+      // Every change (noted/superseded/evicted/demoted/suggest_demote/pinned/unpinned/
+      // removed/confirmed) with a text snapshot, so the relay renders even after the note
+      // itself changes. `reportedAt` = already relayed to the user; the next user reply
+      // drains pending rows (steward.md §2.1: the module reports, the steward relays).
+      sql`CREATE TABLE IF NOT EXISTS sh_note_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        op TEXT NOT NULL,
+        noteId TEXT NOT NULL,
+        text TEXT NOT NULL,
+        reason TEXT,
+        reportedAt INTEGER
+      )`;
+      sql`CREATE INDEX IF NOT EXISTS sh_note_log_pending ON sh_note_log (reportedAt, id)`;
+      sql`CREATE INDEX IF NOT EXISTS sh_note_log_note ON sh_note_log (noteId, op, ts)`;
+    },
+  },
 ];

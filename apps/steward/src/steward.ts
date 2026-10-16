@@ -141,6 +141,9 @@ const OWNER_BOUND_REPLY = "✅ 已绑定，设置完成。此后直接在这里�
 // steward.md §6.3: while any sh_run is open, an alarm-driven task polls every 2 seconds; on
 // settlement a user run's final text becomes the reply, everything else is discarded.
 const RUN_POLL_S = 2;
+// steward.md §2.5 (issue #18): notes maintenance (decay, demotion suggestions, capacity
+// backstop) runs once a day via alarm; its ChangeReports relay with the next user reply.
+const NOTES_MAINTENANCE_DAY_S = 86_400;
 // Sent when the first event lands on the webhook after the QR switch: only a delivered event
 // proves the transport actually moved (research §8.2 — the API's callback_type report stays
 // out of sync with real delivery until the console republish lands).
@@ -215,6 +218,10 @@ export type PairResult =
 export class Steward extends Agent<Env> {
   onStart(): void {
     runMigrations(this.sql.bind(this), MIGRATIONS);
+    // Notes maintenance is daily and idempotent (steward.md §2.5): arming at boot covers a
+    // fresh deployment; the handler re-arms itself with the review-#1 cancel-then-schedule
+    // pattern so the chain never dies with an evicted isolate.
+    void this.schedule(NOTES_MAINTENANCE_DAY_S, "notesMaintenance", undefined, { idempotent: true });
     // Wakes queued by past reducers (crash between queue and submit, §11) drain now.
     void this.drainWakes();
     void this.pollRuns();
@@ -2017,6 +2024,16 @@ export class Steward extends Agent<Env> {
     if (run.kind === "user") {
       const owner = this.ownerOpenIdSync();
       const hasText = Boolean(result.text && result.text.trim().length > 0);
+      // spec §10.3 (issue #18): every memory ChangeReport rides on the next reply —
+      // deterministic, so "remembered: …" reaches the user even if the model never says it.
+      // Drained lazily: only when a message really goes out (a silent settle — e.g. an empty
+      // run that already notified — must not consume the pending reports). The durable
+      // outbound row carries the text, so a retried send cannot lose or duplicate the block.
+      let relayText: string | null = null;
+      const withRelay = (text: string): string => {
+        if (relayText === null) relayText = this.ledger.notes.drainPendingForReply();
+        return relayText === "" ? text : `${text}\n${relayText}`;
+      };
       // Review #9: a `done` run with no final text is legitimate when the model already
       // produced user-facing output (ask_user terminates the turn right after its push;
       // notify_user cards went out mid-run). Only a silent empty answer is treated as a
@@ -2032,7 +2049,7 @@ export class Steward extends Agent<Env> {
           id: `reply:${run.operationId}`,
           kind: "text",
           to: owner,
-          text: result.text!,
+          text: withRelay(result.text!),
           threadId: run.routedThreadId,
           urgency: "push",
         }).then(({ id }) => this.ledger.runs.settle(run.operationId, result, id));
@@ -2045,7 +2062,7 @@ export class Steward extends Agent<Env> {
           id: `reply:${run.operationId}`,
           kind: "text",
           to: owner,
-          text: "⚠️ 总管这轮没有跑成（模型调用失败或被中断），这条消息我没能处理；稍后再试或重发一次。",
+          text: withRelay("⚠️ 总管这轮没有跑成（模型调用失败或被中断），这条消息我没能处理；稍后再试或重发一次。"),
           threadId: run.routedThreadId,
           urgency: "push",
         }).then(({ id }) => this.ledger.runs.settle(run.operationId, result, id));
@@ -2057,7 +2074,7 @@ export class Steward extends Agent<Env> {
           id: `reply:${run.operationId}`,
           kind: "text",
           to: owner,
-          text: "⚠️ 总管这轮没有给出回复（可能只调用了内部工具）；需要的话再说一次。",
+          text: withRelay("⚠️ 总管这轮没有给出回复（可能只调用了内部工具）；需要的话再说一次。"),
           threadId: run.routedThreadId,
           urgency: "push",
         }).then(({ id }) => this.ledger.runs.settle(run.operationId, result, id));
@@ -2075,6 +2092,24 @@ export class Steward extends Agent<Env> {
    * time and harness.submit deduplicates by it, so replays and crash-restarts never produce a
    * second steward input.
    */
+  /**
+   * The notes lifecycle pass (issue #18, steward.md §2.5): 60-day project demotions, 90-day
+   * resident demotion *suggestions* (never automatic — resident entries have broad impact),
+   * and the capacity backstop. Deterministic; its ChangeReports land in sh_note_log and
+   * reach the user with the next reply (spec §10.3) — no wake, no push of their own.
+   */
+  async notesMaintenance(_payload?: unknown, schedule?: { id: string }): Promise<void> {
+    try {
+      this.ledger.notes.maintenance(Date.now());
+    } catch (err) {
+      this.logChannel("notes_maintenance_failed", errorText(err));
+    }
+    // Rearm daily (review #1's pattern: cancel the running job's schedule first, else the
+    // idempotent insert dedups onto a job the driver deletes when this handler returns).
+    if (schedule !== undefined) await this.cancelSchedule(schedule.id).catch(() => {});
+    await this.schedule(NOTES_MAINTENANCE_DAY_S, "notesMaintenance", undefined, { idempotent: true });
+  }
+
   async drainWakes(_payload?: unknown, schedule?: { id: string }): Promise<void> {
     let submitted = false;
     try {
