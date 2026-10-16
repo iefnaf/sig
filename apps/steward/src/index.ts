@@ -26,6 +26,12 @@ function setupTokenMatches(got: string | null, want: string): boolean {
   return diff === 0;
 }
 
+// The raw signing secrets for web verification: primary first, SERVER_KEY_PREVIOUS during a
+// rotation window (issue #27). Minting always uses [0].
+function webVerifyKeys(env: { SERVER_KEY: string; SERVER_KEY_PREVIOUS?: string }): string[] {
+  return [env.SERVER_KEY, env.SERVER_KEY_PREVIOUS].filter((k): k is string => typeof k === "string" && k.length > 0);
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -81,9 +87,11 @@ export default {
 
     // The one-time signed link (spec §7.3 / §12.2): possession of a valid HMAC is the auth,
     // the same "stateless pre-check, then forward" pattern as the device token — invalid or
-    // expired links are answered here and never wake the Durable Object.
+    // expired links are answered here and never wake the Durable Object. The key set includes
+    // SERVER_KEY_PREVIOUS during a rotation window (issue #27) so links minted just before a
+    // rotation still open until the window closes.
     if (url.pathname.startsWith("/link/") && request.method === "GET") {
-      const verified = await verifyLinkToken(env.SERVER_KEY, url.pathname.slice("/link/".length));
+      const verified = await verifyLinkToken(webVerifyKeys(env), url.pathname.slice("/link/".length));
       if (!verified) return htmlPage(LINK_HINT, 410);
       const stub = await getAgentByName(env.Steward, "owner");
       return stub.fetch(request);
@@ -94,7 +102,7 @@ export default {
     if ((url.pathname === "/app" || url.pathname.startsWith("/app/")) && (request.method === "GET" || request.method === "POST")) {
       const cookie = request.headers.get("cookie") ?? "";
       const raw = cookie.split(/;\s*/).find((part) => part.startsWith("shepherd_session="))?.slice("shepherd_session=".length) ?? null;
-      if (!(await parseSessionCookie(env.SERVER_KEY, raw))) return htmlPage(LINK_HINT.replace("链接无效或已过期。", "这一页需要先登录。"), 401);
+      if (!(await parseSessionCookie(webVerifyKeys(env), raw))) return htmlPage(LINK_HINT.replace("链接无效或已过期。", "这一页需要先登录。"), 401);
       const stub = await getAgentByName(env.Steward, "owner");
       return stub.fetch(request);
     }

@@ -55,24 +55,31 @@ describe("link tokens: HMAC, expiry, tampering (pure functions)", () => {
 
   it("round-trips a minted token", async () => {
     const { token } = await mintLinkToken(SECRET, "t/t_123");
-    const verified = await verifyLinkToken(SECRET, token);
+    const verified = await verifyLinkToken([SECRET], token);
     expect(verified).toMatchObject({ target: "t/t_123" });
   });
 
   it("rejects tokens signed with a different key, tampered targets, and garbage", async () => {
     const { token } = await mintLinkToken("another-key", "home");
-    expect(await verifyLinkToken(SECRET, token)).toBeNull();
+    expect(await verifyLinkToken([SECRET], token)).toBeNull();
     const ok = await mintLinkToken(SECRET, "home");
     const tampered = ok.token.replace("wl1.home.", "wl1.t/t_evil.");
-    expect(await verifyLinkToken(SECRET, tampered)).toBeNull();
-    expect(await verifyLinkToken(SECRET, "wl1.home.9999999999999.abcdef.0123")).toBeNull();
-    expect(await verifyLinkToken(SECRET, null)).toBeNull();
+    expect(await verifyLinkToken([SECRET], tampered)).toBeNull();
+    expect(await verifyLinkToken([SECRET], "wl1.home.9999999999999.abcdef.0123")).toBeNull();
+    expect(await verifyLinkToken([SECRET], null)).toBeNull();
   });
 
   it("rejects an expired token even though the mac is intact", async () => {
     const past = Date.now() - LINK_TTL_MS - 1;
     const { token } = await mintLinkToken(SECRET, "home", past);
-    expect(await verifyLinkToken(SECRET, token)).toBeNull();
+    expect(await verifyLinkToken([SECRET], token)).toBeNull();
+  });
+
+  it("old-key links verify against the rotation-window key set", async () => {
+    const previous = "the-previous-server-key";
+    const { token } = await mintLinkToken(previous, "home");
+    expect(await verifyLinkToken(["the-new-server-key"], token)).toBeNull(); // alone: dead
+    expect(await verifyLinkToken(["the-new-server-key", previous], token)).toMatchObject({ target: "home" });
   });
 });
 
@@ -134,16 +141,20 @@ describe("/网页 → one-time link → session cookie → /app", () => {
   it("a well-formed but unknown session sid is rejected by the DO", async () => {
     const fakeSid = "ab".repeat(32);
     const cookie = `shepherd_session=${await sessionCookieValue("test-server-key-not-a-secret", fakeSid)}`;
-    expect(await parseSessionCookie("test-server-key-not-a-secret", cookie.split("=")[1]!)).toBe(fakeSid);
+    expect(await parseSessionCookie(["test-server-key-not-a-secret"], cookie.split("=")[1]!)).toBe(fakeSid);
     const res = await SELF.fetch("https://example.com/app", { headers: { cookie } });
     expect(res.status).toBe(401);
   });
 
-  it("SERVER_KEY rotation invalidates unopened links and existing cookies", async () => {
+  it("the SERVER_KEY_PREVIOUS window keeps old-key links and cookies alive; dropping it kills them (issue #27)", async () => {
+    const previous = "the-previous-server-key";
     const { cookie, linkUrl } = await loginViaChat();
-    // The key is a test binding; rotation is simulated by verifying against another key.
-    const rotated = "rotated-server-key";
-    expect(await verifyLinkToken(rotated, linkUrl.slice("https://example.com/link/".length))).toBeNull();
-    expect(await parseSessionCookie(rotated, cookie.split("=")[1]!)).toBeNull();
+    const token = linkUrl.slice("https://example.com/link/".length);
+    // During the window (both keys in the set) a pre-rotation credential still verifies;
+    // the new key alone, or after the operator drops SERVER_KEY_PREVIOUS, it is dead.
+    expect(await verifyLinkToken(["test-server-key-not-a-secret", previous], token)).not.toBeNull();
+    expect(await parseSessionCookie(["test-server-key-not-a-secret", previous], cookie.split("=")[1]!)).not.toBeNull();
+    expect(await verifyLinkToken([previous], token)).toBeNull();
+    expect(await parseSessionCookie([previous], cookie.split("=")[1]!)).toBeNull();
   });
 });

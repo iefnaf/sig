@@ -85,8 +85,12 @@ export interface VerifiedLink {
   expiresAt: number;
 }
 
-/** Stateless check: HMAC intact and not past expiry. Single-use is a DB fact, not checked here. */
-export async function verifyLinkToken(secret: string, token: string | null): Promise<VerifiedLink | null> {
+/**
+ * Stateless check: HMAC intact (against any key in the set — the SERVER_KEY_PREVIOUS window
+ * of issue #27 keeps unopened links working through a rotation) and not past expiry.
+ * Single-use is a DB fact, not checked here.
+ */
+export async function verifyLinkToken(secrets: readonly string[], token: string | null): Promise<VerifiedLink | null> {
   if (!token) return null;
   const parts = token.split(".");
   if (parts.length !== 5 || parts[0] !== "wl1" || !/^[0-9a-f]{64}$/.test(parts[4]!)) return null;
@@ -94,8 +98,11 @@ export async function verifyLinkToken(secret: string, token: string | null): Pro
   if (!/^[\w/-]+$/.test(target) || !/^\d+$/.test(expiresRaw) || !/^[0-9a-f]{32}$/.test(nonce)) return null;
   const expiresAt = Number(expiresRaw);
   if (!Number.isFinite(expiresAt) || expiresAt < Date.now()) return null;
-  if (!(await macOk(secret, `${prefix}.${target}.${expiresRaw}.${nonce}`, macHex))) return null;
-  return { target, nonce, expiresAt };
+  const payload = `${prefix}.${target}.${expiresRaw}.${nonce}`;
+  for (const secret of secrets) {
+    if (await macOk(secret, payload, macHex)) return { target, nonce, expiresAt };
+  }
+  return null;
 }
 
 // ---- session cookie -----------------------------------------------------------------------------
@@ -105,12 +112,14 @@ export async function sessionCookieValue(secret: string, sid: string): Promise<s
 }
 
 /** The Worker's stateless pre-check: returns the sid when the cookie is well-formed. */
-export async function parseSessionCookie(secret: string, value: string | null): Promise<string | null> {
+export async function parseSessionCookie(secrets: readonly string[], value: string | null): Promise<string | null> {
   if (!value) return null;
   const parts = value.split(".");
   if (parts.length !== 3 || parts[0] !== "ws1" || !/^[0-9a-f]{64}$/.test(parts[2]!)) return null;
-  if (!(await macOk(secret, `ws1.${parts[1]}`, parts[2]!))) return null;
-  return parts[1]!;
+  for (const secret of secrets) {
+    if (await macOk(secret, `ws1.${parts[1]}`, parts[2]!)) return parts[1]!;
+  }
+  return null;
 }
 
 // ---- views (rendered shapes — the data comes from ledger.views, steward.md §10) -----------------
@@ -129,7 +138,9 @@ export interface DeviceView {
 
 export interface WebDeps {
   sql: SqlExecutor;
-  secret: string;
+  /** The key set: [0] is the primary (everything new is minted with it); the rest keep
+   * verifying during a SERVER_KEY rotation window (issue #27, auth.ts). */
+  secrets: readonly string[];
   ledger: Ledger;
   /** Protocol-layer `device` rows (steward.ts owns that table): deviceId, name, epoch, revoked. */
   listDevices(): Array<{ deviceId: string; name: string | null; revoked: boolean }>;
@@ -276,7 +287,7 @@ export class WebApp {
   async linkUrl(target: string): Promise<string | null> {
     const origin = this.origin();
     if (!origin) return null;
-    const { token, expiresAt } = await mintLinkToken(this.#deps.secret, target, this.#now());
+    const { token, expiresAt } = await mintLinkToken(this.#deps.secrets[0]!, target, this.#now());
     this.#sql`
       INSERT INTO sh_web_link (tokenHash, target, expiresAt, createdAt)
       VALUES (${await sha256Hex(token)}, ${target}, ${expiresAt}, ${this.#now()})
@@ -311,7 +322,7 @@ export class WebApp {
     `;
     this.#purgeExpiredWebRows(now);
     const cookie = [
-      `${SESSION_COOKIE}=${await sessionCookieValue(this.#deps.secret, sid)}`,
+      `${SESSION_COOKIE}=${await sessionCookieValue(this.#deps.secrets[0]!, sid)}`,
       "Path=/",
       "HttpOnly",
       "SameSite=Lax",
@@ -329,7 +340,7 @@ export class WebApp {
   async #sessionFromRequest(request: Request): Promise<SessionRow | null> {
     const cookie = request.headers.get("cookie") ?? "";
     const raw = cookie.split(/;\s*/).find((part) => part.startsWith(`${SESSION_COOKIE}=`))?.slice(SESSION_COOKIE.length + 1) ?? null;
-    const sid = await parseSessionCookie(this.#deps.secret, raw);
+    const sid = await parseSessionCookie(this.#deps.secrets, raw);
     if (!sid) return null;
     const row = this.#sql<{ csrf: string }>`
       SELECT csrf FROM sh_web_session WHERE sid = ${sid} AND expiresAt > ${this.#now()}

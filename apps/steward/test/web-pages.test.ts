@@ -4,9 +4,9 @@
 // epoch and closes the live connector connection with 4403 (protocol §5.1); /加机器 in chat
 // issues the pairing code and answers with the npx connect command, redeemable exactly once.
 import { CloseCode } from "@shepherd/protocol";
-import { SELF } from "cloudflare:test";
+import { SELF, runInDurableObject } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
-import type { ShOutboundRow } from "../src/steward.ts";
+import type { ShOutboundRow, Steward } from "../src/steward.ts";
 import {
   FakeConnector,
   configureAndBind,
@@ -25,6 +25,13 @@ beforeEach(async () => {
   await resetLedgerState();
   await mockReset();
   await configureAndBind("ou_owner");
+  // The /加机器 test redeems a real code through POST /pair; the brute-force lockout's
+  // GLOBAL failure bucket (issue #27) survives resetLedgerState and other test files
+  // deliberately fill it — clear it so this file's redemption cannot be rate-limited.
+  await runInDurableObject(ownerStub(), (instance: Steward) => {
+    const sql = (instance as unknown as { sql: (s: TemplateStringsArray) => void }).sql.bind(instance);
+    sql`DELETE FROM pair_fail`;
+  });
 });
 
 async function ownerDm(text: string): Promise<void> {

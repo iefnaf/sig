@@ -228,7 +228,7 @@ export class Steward extends Agent<Env> {
   private get web(): WebApp {
     return (this.web_ ??= new WebApp({
       sql: this.sql.bind(this) as unknown as import("./schema.ts").SqlExecutor,
-      secret: this.env.SERVER_KEY,
+      secrets: [this.env.SERVER_KEY, this.env.SERVER_KEY_PREVIOUS].filter((k): k is string => typeof k === "string" && k.length > 0),
       ledger: this.ledger,
       listDevices: () =>
         this.sql<{ deviceId: string; name: string | null; revoked: number }>`
