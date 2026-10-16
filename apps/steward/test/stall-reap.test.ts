@@ -39,31 +39,16 @@ async function dispatchRunningWorker(prompt: string): Promise<{ fake: FakeConnec
   });
   await fake.connect();
   const outcome = await ownerStub().dispatchForTest({ prompt, repoRef: "repo-a", newTitle: prompt });
-  console.log("ZZ dispatch outcome:", JSON.stringify(outcome));
-  if (outcome.kind !== "dispatched") throw new Error(`ZZ not dispatched: ${JSON.stringify(outcome)}`);
-  // ZZ diagnostics: dump outbox + machine state while waiting for the cmd.
-  const zzDeadline = Date.now() + 12_000;
-  let zzCmd: Record<string, unknown> | undefined;
-  for (;;) {
-    if (fake.cmds.length > 0) {
-      zzCmd = fake.cmds[0];
-      break;
-    }
-    if (Date.now() > zzDeadline) break;
-    await new Promise((resolve) => setTimeout(resolve, 2_000));
-    const zz = await runInDurableObject(ownerStub(), (instance: Steward, state: DurableObjectState) => {
-      const outbox = state.storage.sql.exec("SELECT cmdId, state, failReason, workerId FROM outbox").toArray();
-      const machines = state.storage.sql.exec("SELECT name, online FROM sh_machine").toArray();
-      const conns = (instance as unknown as { getConnections?: (t: string) => unknown[] }).getConnections?.("dev:*") ?? [];
-      return { outbox, machines, connCount: conns.length };
-    });
-    console.log("ZZ waiting:", JSON.stringify(zz), "cmds:", fake.cmds.length);
-  }
-  if (!zzCmd) throw new Error(`ZZ cmd never arrived; see ZZ logs above`);
-  const [cmd] = [zzCmd];
+  expect(outcome.kind).toBe("dispatched");
+  const [cmd] = await fake.waitForCmds(1, 15_000); // CI runners can lag the RPC → WS hop by seconds
   const workerId = String((cmd!.args as Record<string, unknown>).workerId);
   const threadId = String((cmd!.args as Record<string, unknown>).threadId);
   await fake.emit("started", workerId, { sessionId: workerId, cwd: "/srv/repo-a", branch: `shepherd/${threadId}-1` });
+  // emit resolves on the WS send, not on the DO's apply. Every caller backdates lastEventAt
+  // next; on a slow runner the started-apply can still land AFTER the backdate and overwrite
+  // it (lastEventAt = now), so the stall alarm sees a fresh worker and never fires. The row
+  // reaching "running" is the proof the apply has happened.
+  await waitForWorkerState(workerId, "running");
   return { fake, workerId, threadId };
 }
 
@@ -114,8 +99,15 @@ async function workerRow(workerId: string) {
   return null;
 }
 
-async function sentCards() {
-  return (await ownerStub().outboundRows(30)).filter((r) => r.kind === "card" && r.status === "sent");
+async function sentCards(minCount = 1, timeoutMs = 8_000) {
+  // Poll like e2e-loop's sentCards: the outbound queue's sender can lag the assertion by
+  // seconds on CI, and a one-shot read reports a healthy send as missing.
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const rows = (await ownerStub().outboundRows(30)).filter((r) => r.kind === "card" && r.status === "sent");
+    if (rows.length >= minCount || Date.now() > deadline) return rows; // caller asserts on timeout
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
 }
 
 /** fake.emit resolves when the frame is sent, not when the DO has applied it — poll the row. */
@@ -235,7 +227,7 @@ describe("the reap sweep (running + offline 10 min, or online-but-silent 45 min 
     expect(row!.thread.state).toBe("idle"); // the Thread no longer pretends to be running
     expect(row!.thread.timeline.some((e) => e.kind === "lost" && e.text.includes("机器离线"))).toBe(true);
     await waitWhileOutboundPending();
-    expect((await sentCards()).length).toBe(0); // lost is not news worth a push (spec §9)
+    expect((await sentCards(0)).length).toBe(0); // lost is not news worth a push (spec §9); queue drained above
 
     // The machine returns with the worker actually running: hello reconciliation flips it
     // back to running — the sweep never wedges a live worker in `lost`.
