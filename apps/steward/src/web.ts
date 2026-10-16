@@ -653,11 +653,14 @@ function rawProcessScript(workerId: string): string {
         if (m.done) {
           // The connector says whether the page was budget-cut (truncated) — never guess from
           // byte counts: the budget is UTF-8 while string lengths are UTF-16, so CJK cuts
-          // would read as "everything loaded" and strand the tail.
+          // would read as "everything loaded" and strand the tail. An empty terminating page
+          // means "nothing more" — distinct from a session that never had any content.
           if (m.truncated) {
             endStream(cursor ? "已达单次加载上限（2 MB）；可以继续加载后面的内容。" : "已达单次加载上限（2 MB）。", true);
           } else if (total === 0) {
             endStream("还没有任何对话内容。", false);
+          } else if (m.entries.length === 0) {
+            endStream("没有更多内容了。", false);
           } else {
             endStream("已加载全部内容。", false);
           }

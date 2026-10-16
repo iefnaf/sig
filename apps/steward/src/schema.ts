@@ -315,7 +315,8 @@ export const MIGRATIONS: readonly Migration[] = [
     up: (sql) => {
       // state lives in SQLite because the DO may sleep between chunks (§6.6). `cursor` is the
       // last entry id forwarded — an id, not content — so a DO-side cap cut can still tell
-      // the browser where it stopped and how to continue.
+      // the browser where it stopped and how to continue. (Created here on fresh databases;
+      // 010's ALTER adds it on ones that ran the pre-review 009.)
       sql`CREATE TABLE IF NOT EXISTS history_relay (
         reqId TEXT PRIMARY KEY,
         webConnId TEXT NOT NULL,
@@ -329,6 +330,20 @@ export const MIGRATIONS: readonly Migration[] = [
       )`;
       sql`CREATE INDEX IF NOT EXISTS history_relay_conn ON history_relay (webConnId)`;
       sql`CREATE INDEX IF NOT EXISTS history_relay_device ON history_relay (deviceId)`;
+    },
+  },
+  {
+    // Issue #23 review: 009 originally shipped without `cursor` (head 1efaaf3) and was then
+    // edited in place — but runMigrations skips by applied id, so any dev/preview DO that
+    // already ran the old 009 would never see the new column and the relay's SELECT would
+    // throw. This is the repo's spike-bug-2 pattern: the column is added by ALTER, and the
+    // duplicate-column error on fresh databases (where 009's CREATE TABLE already made it)
+    // is tolerated by ignoringDuplicateColumn.
+    id: "010_history_relay_cursor",
+    up: (sql) => {
+      ignoringDuplicateColumn(() => {
+        sql`ALTER TABLE history_relay ADD COLUMN cursor TEXT`;
+      });
     },
   },
 ];
