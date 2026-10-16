@@ -140,55 +140,64 @@ describe("review #4: event-triggered runs need a verifiable provenanceRef to dis
   }, 30_000);
 });
 
-describe("review #5: the brief spends its budget questions-first and states omissions", () => {
-  const thread = (id: string, state: string, unread = false) => ({
-    threadId: id,
-    title: `标题${id}`,
-    goal: null,
-    summary: null,
-    summaryAt: null,
-    state,
-    unread,
-    lastMachine: null,
-    lastActivityAt: 0,
-    archived: false,
-    createdFromMsg: null,
-    createdAt: 0,
+describe("review #5 (round 2): budget invariants — no omission is ever silent", () => {
+  const thread = (id: string, state: string, title = `标题${id}`) => ({
+    threadId: id, title, goal: null, summary: null, summaryAt: null, state, unread: false,
+    lastMachine: null, lastActivityAt: 0, archived: false, createdFromMsg: null, createdAt: 0,
   }) as ReturnType<Ledger["threads"]["get"]>;
 
-  function stubLedger(threads: Array<{ id: string; state: string; unread?: boolean }>, questions: Array<{ threadId: string; text: string }>) {
+  function stubLedger(
+    threads: Array<{ id: string; state: string; title?: string }>,
+    questions: Record<string, string>,
+    machineCount = 1,
+  ) {
     return {
-      machines: { list: () => [], runningCount: () => 0 },
-      threads: { list: () => threads.map((t) => thread(t.id, t.state, t.unread)) },
-      questions: { openForThread: (id: string) => (questions.find((q) => q.threadId === id) ?? null) as never },
+      machines: {
+        list: () => Array.from({ length: machineCount }, (_, i) => ({ deviceId: `d${i}`, name: `machine-with-a-very-long-name-${i}`, online: i % 2 === 0, maxWorkers: 4 })),
+        runningCount: () => 0,
+      },
+      threads: { list: () => threads.map((t) => thread(t.id, t.state, t.title ?? `标题${t.id}`)) },
+      questions: { openForThread: (id: string) => (questions[id] !== undefined ? ({ text: questions[id] } as never) : null) },
     } as unknown as Ledger;
   }
 
-  it("keeps open questions visible when idle threads blow the budget", () => {
-    const threads = Array.from({ length: 10 }, (_, i) => ({ id: `t_${i}`, state: "idle" }));
-    const brief = buildSituationBrief(stubLedger(threads, [{ threadId: "t_0", text: "要不要删库？" }]));
-    expect(brief.length).toBeLessThanOrEqual(1200);
-    expect(brief).toContain("未决问题");
-    expect(brief).toContain("要不要删库？");
+  it("A: the offline machine label carries no stray backtick", () => {
+    const brief = buildSituationBrief(stubLedger([], {}));
+    expect(brief).not.toContain("`");
   });
 
-  it("orders waiting_you first and hides no state silently", () => {
-    const brief = buildSituationBrief(
-      stubLedger(
-        [
-          { id: "t_idle", state: "idle" },
-          { id: "t_wait", state: "waiting_you" },
-          { id: "t_run", state: "running" },
-        ],
-        [{ threadId: "t_wait", text: "等你拍板" }],
-      ),
-    );
-    const waitPos = brief.indexOf("t_wait");
-    const runPos = brief.indexOf("t_run");
-    const idlePos = brief.indexOf("t_idle");
-    expect(waitPos).toBeGreaterThan(-1);
-    expect(waitPos).toBeLessThan(runPos);
-    expect(runPos).toBeLessThan(idlePos);
+  it("B.3: three uncapped 320-char questions still make it in (clipped), budget held", () => {
+    const longQ = "要不要删库？".padEnd(320, "话");
+    const threads = [
+      ...Array.from({ length: 9 }, (_, i) => ({ id: `t_${String(i + 1).padStart(2, "0")}`, state: "idle" })),
+      { id: "t_10", state: "waiting_you" },
+      { id: "t_11", state: "waiting_you" },
+      { id: "t_12", state: "waiting_you" },
+    ];
+    const brief = buildSituationBrief(stubLedger(threads, { t_10: longQ, t_11: longQ, t_12: longQ }));
+    expect(brief.length).toBeLessThanOrEqual(1200);
+    expect(brief).toContain("未决问题");
+    for (const id of ["t_10", "t_11", "t_12"]) expect(brief).toContain(id);
+    expect(brief).toContain("要不要删库");
+  });
+
+  it("B.1: a partial drop is counted — kept + counted === total", () => {
+    const q = "问".repeat(120);
+    const threads = Array.from({ length: 12 }, (_, i) => ({ id: `t_${String(i + 1).padStart(2, "0")}`, state: "waiting_you", title: "标".repeat(30) }));
+    const questions = Object.fromEntries(Array.from({ length: 6 }, (_, i) => [`t_${String(i + 1).padStart(2, "0")}`, q]));
+    const brief = buildSituationBrief(stubLedger(threads, questions));
+    expect(brief.length).toBeLessThanOrEqual(1200);
+    const kept = (brief.match(/：问{50}/g) ?? []).length;
+    const counted = Number(/另有 (\d+) 个未决问题未列出/.exec(brief)?.[1] ?? 0);
+    expect(kept).toBeGreaterThan(0); // partial: some kept…
+    expect(kept + counted).toBe(6); // …and the dropped rest counted, never silent
+  });
+
+  it("B.2: the last-resort fallback still states the omitted questions within budget", () => {
+    const threads = [{ id: "t_01", state: "waiting_you" }];
+    const brief = buildSituationBrief(stubLedger(threads, { t_01: "要不要删库？" }, 80));
+    expect(brief.length).toBeLessThanOrEqual(1200);
+    expect(brief).toContain("另有 1 个未决问题未列出");
   });
 });
 
