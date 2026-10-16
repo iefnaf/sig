@@ -27,6 +27,11 @@ import {
   EventsGapMessageSchema,
   EventsMessageSchema,
   HelloMessageSchema,
+  HISTORY_MAX_BYTES,
+  HISTORY_RELAY_TTL_MS,
+  HistoryAckMessageSchema,
+  HistoryChunkMessageSchema,
+  HistoryOpenMessageSchema,
   PingMessageSchema,
   PROTOCOL_VERSION,
   generatePairingCode,
@@ -36,6 +41,8 @@ import {
   type CmdMessage,
   type ErrorMessage,
   type EventsAckMessage,
+  type HistoryReqMessage,
+  type MachineOfflineMessage,
   type PongMessage,
   type ResyncMessage,
   type ServerKey,
@@ -74,9 +81,11 @@ import { MIGRATIONS, runMigrations } from "./schema.ts";
 import { openSecret, sealSecret } from "./secretbox.ts";
 import { renderSetupPage, type SetupView } from "./setup-page.ts";
 import { escapeMarkers } from "./wake-text.ts";
-import { WebApp, linkTargetForThread } from "./web.ts";
+import { WebApp, linkTargetForThread, parseSessionCookie } from "./web.ts";
 
 interface ConnState {
+  /** Set on browser connections (the L3 stream consumers); connector connections carry deviceId. */
+  role?: "web";
   deviceId: string;
   epoch: number;
   /** Key that authenticated the connection (issue #27): ≠ primary ⇒ welcome rekeys. */
@@ -111,6 +120,10 @@ const IDLE_SWEEP_INTERVAL_S = 60;
 // New commands default to a 10-minute expiry (protocol §4.2); callers that want "wait for it
 // to come online" pass `notAfter: null` explicitly.
 const DEFAULT_NOTAFTER_MS = 10 * 60_000;
+
+// History relay (protocol §6.6, issue #23): a relay row older than this is dropped; the
+// browser's stream JS treats silence past its own deadline as the end. Shrunk in tests.
+const HISTORY_RELAY_TTL_DEFAULT_MS = HISTORY_RELAY_TTL_MS;
 
 // ---- Channel: Feishu webhook inbound + outbound queue (steward.md §6.1, §9; spike bugs 1, 3) ----
 // A claim is the double-send guard (bug 1): the conditional UPDATE hands a row to exactly one
@@ -177,6 +190,11 @@ export interface ShOutboundRow {
 }
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** UTF-8 size of a serialized relay message — the byte meter is numbers only, never content. */
+function jsonByteLength(value: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(value)).length;
+}
 
 function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -304,6 +322,8 @@ export class Steward extends Agent<Env> {
   // Tests shrink the /pair lockout (see feishuSendTimeoutMs for the same pattern).
   protected pairLockMs = PAIR_LOCK_MS;
 
+  // Tests shrink the history relay TTL to exercise the alarm-driven sweep quickly.
+  protected historyRelayTtlMs = HISTORY_RELAY_TTL_DEFAULT_MS;
 
   // The memory module (steward.md §2): all sh_* ledger SQL lives behind this handle. Bound
   // lazily because `sql`/`ctx` only mean something once the DO is live.
@@ -356,6 +376,7 @@ export class Steward extends Agent<Env> {
           SELECT deviceId, name, revoked FROM device ORDER BY createdAt, deviceId
         `.map((d) => ({ deviceId: d.deviceId, name: d.name, revoked: !!d.revoked })),
       revokeDevice: (deviceId) => void this.revoke(deviceId),
+      machineConnected: (deviceId) => this.connFor(deviceId) !== undefined,
       audit: (reason, detail) => this.logChannel(reason, detail),
     }));
   }
@@ -534,6 +555,9 @@ export class Steward extends Agent<Env> {
   }
 
   async getConnectionTags(_connection: Connection, ctx: ConnectionContext): Promise<string[]> {
+    // §5.3: the role query param routes/tags the connection; legitimacy is decided by the
+    // credential — device token for connectors (onConnect), session cookie for browsers.
+    if (new URL(ctx.request.url).searchParams.get("role") === "web") return ["web"];
     const parsed = await parseToken(await this.serverKeys(), bearer(ctx.request));
     return parsed ? [`dev:${parsed.deviceId}`] : [];
   }
@@ -543,6 +567,24 @@ export class Steward extends Agent<Env> {
   }
 
   async onConnect(connection: Connection, ctx: ConnectionContext): Promise<void> {
+    // Browser connections (§5.3 `web` role): authenticated by the session cookie the Worker
+    // layer already HMAC-verified (index.ts onBeforeConnect); liveness stays a DB fact here.
+    if (new URL(ctx.request.url).searchParams.get("role") === "web") {
+      const raw = (ctx.request.headers.get("cookie") ?? "")
+        .split(/;\s*/)
+        .find((part) => part.startsWith("shepherd_session="))
+        ?.slice("shepherd_session=".length) ?? null;
+      const sid = await parseSessionCookie(
+        [this.env.SERVER_KEY, this.env.SERVER_KEY_PREVIOUS].filter((k): k is string => typeof k === "string" && k.length > 0),
+        raw,
+      );
+      if (!sid || !this.web.sessionAlive(sid)) {
+        connection.close(CloseCode.UNAUTHORIZED, "unauthorized");
+        return;
+      }
+      connection.setState({ role: "web", deviceId: "", epoch: 0, keyId: "" } satisfies ConnState);
+      return;
+    }
     const parsed = await parseToken(await this.serverKeys(), bearer(ctx.request));
     if (!parsed) {
       connection.close(CloseCode.UNAUTHORIZED, "unauthorized");
@@ -567,11 +609,28 @@ export class Steward extends Agent<Env> {
 
   onClose(connection: Connection): void {
     const state = connection.state as unknown as ConnState | null;
-    if (!state?.deviceId) return;
+    if (!state) return;
+    if (state.role === "web") {
+      // §6.6 termination: the browser closing its connection ends every stream it opened.
+      this.sql`DELETE FROM history_relay WHERE webConnId = ${connection.id}`;
+      return;
+    }
+    if (!state.deviceId) return;
     // A superseded old connection closes after its replacement is live: only the last
     // connection for the device takes the machine offline.
     const remaining = [...this.getConnections<ConnState>(`dev:${state.deviceId}`)].filter((c) => c.id !== connection.id);
-    if (remaining.length === 0) this.ledger.machines.setOnline(state.deviceId, false);
+    if (remaining.length > 0) return; // superseded, not offline — its relays die with the
+    // connector-side reset; the browser's silence watchdog ends the view.
+    // The machine really went offline: every relay through it dies with the connection, and
+    // each browser hears why (§6.6 machine_offline) instead of waiting out its own timeout.
+    const orphaned = this.sql<{ reqId: string; webConnId: string }>`
+      SELECT reqId, webConnId FROM history_relay WHERE deviceId = ${state.deviceId}
+    `;
+    for (const relay of orphaned) {
+      this.sql`DELETE FROM history_relay WHERE reqId = ${relay.reqId}`;
+      this.getConnection(relay.webConnId)?.send(JSON.stringify({ t: "machine_offline", re: relay.reqId } satisfies MachineOfflineMessage));
+    }
+    this.ledger.machines.setOnline(state.deviceId, false);
   }
 
   async onMessage(connection: Connection, raw: WSMessage): Promise<void> {
@@ -583,7 +642,34 @@ export class Steward extends Agent<Env> {
       this.sendError(connection, "bad_request", "invalid JSON");
       return;
     }
+    // §5.3 role fence: browsers only stream history; connectors do everything else. A
+    // cross-role message is answered with forbidden and never reaches a handler.
+    const state = connection.state as unknown as ConnState | null;
     const t = (message as { t?: unknown }).t;
+    if (state?.role === "web") {
+      switch (t) {
+        case "history_open":
+          this.handleHistoryOpen(connection, message);
+          return;
+        case "history_ack":
+          this.handleHistoryAck(connection, message);
+          return;
+        default:
+          this.sendError(connection, "forbidden", `message type ${JSON.stringify(t)} is not allowed on a web connection`);
+          return;
+      }
+    }
+    if (t === "history_open" || t === "history_ack") {
+      // §5.3: browser-type messages on a connector connection.
+      const id = (message as { id?: unknown }).id;
+      this.sendError(
+        connection,
+        "forbidden",
+        `message type ${JSON.stringify(t)} is not allowed on a connector connection`,
+        typeof id === "string" ? id : undefined,
+      );
+      return;
+    }
     switch (t) {
       case "hello":
         this.handleHello(connection, message);
@@ -606,6 +692,14 @@ export class Steward extends Agent<Env> {
         // the DO just accepts the report instead of answering "unsupported".
         EventsGapMessageSchema.safeParse(message);
         return;
+      case "history_chunk":
+        this.handleHistoryChunk(connection, message);
+        return;
+      case "error":
+        // A connector reply to something the DO itself sent. The only DO-originated requests
+        // are history pulls (§6.6): relay a failure to the waiting browser and end its stream.
+        this.relayHistoryError(connection, message);
+        return;
       default:
         break;
     }
@@ -619,6 +713,126 @@ export class Steward extends Agent<Env> {
     const parsed = PingMessageSchema.safeParse(raw);
     if (!parsed.success) return;
     connection.send(JSON.stringify({ t: "pong", re: parsed.data.id } satisfies PongMessage));
+  }
+
+  // ---- History relay (protocol §6.6, issue #23) ---------------------------------------------------
+  // The DO is a pure pipe: ids and byte meters in SQLite, content only ever in memory
+  // between the two sockets. Nothing here logs or persists entry text.
+
+  /** browser → DO: resolve the worker, refuse offline machines, then ask the connector. */
+  private handleHistoryOpen(connection: Connection, raw: unknown): void {
+    const parsed = HistoryOpenMessageSchema.safeParse(raw);
+    if (!parsed.success) {
+      this.sendError(connection, "bad_request", "invalid history_open");
+      return;
+    }
+    const open = parsed.data;
+    const worker = this.ledger.workers.get(open.workerId);
+    if (!worker) {
+      this.sendError(connection, "not_found", `worker ${open.workerId} is unknown`, open.id);
+      return;
+    }
+    const deviceConn = this.connFor(worker.deviceId);
+    if (!deviceConn) {
+      // §6.6: offline is answered directly — the transcript lives on that machine only.
+      connection.send(JSON.stringify({ t: "machine_offline", re: open.id } satisfies MachineOfflineMessage));
+      return;
+    }
+    const reqId = ulid();
+    const maxBytes = Math.min(open.maxBytes ?? HISTORY_MAX_BYTES, HISTORY_MAX_BYTES);
+    const now = Date.now();
+    // One live stream per browser connection — a re-open supersedes the previous one.
+    this.sql`DELETE FROM history_relay WHERE webConnId = ${connection.id}`;
+    this.sql`
+      INSERT INTO history_relay (reqId, webConnId, workerId, deviceId, maxBytes, sentBytes, expiresAt, createdAt)
+      VALUES (${reqId}, ${connection.id}, ${open.workerId}, ${worker.deviceId}, ${maxBytes}, 0, ${now + this.historyRelayTtlMs}, ${now})
+    `;
+    void this.schedule(Math.max(1, Math.ceil(this.historyRelayTtlMs / 1000)), "sweepHistoryRelays");
+    const req: HistoryReqMessage = {
+      t: "history_req",
+      id: reqId,
+      workerId: open.workerId,
+      maxBytes,
+      ...(open.since ? { since: open.since } : {}),
+    };
+    deviceConn.send(JSON.stringify(req));
+  }
+
+  /** browser → DO → connector: the ack that slides the connector's window (§6.6 step 4). */
+  private handleHistoryAck(connection: Connection, raw: unknown): void {
+    const parsed = HistoryAckMessageSchema.safeParse(raw);
+    if (!parsed.success) return;
+    const relay = this.sql<{ webConnId: string; deviceId: string }>`
+      SELECT webConnId, deviceId FROM history_relay WHERE reqId = ${parsed.data.re}
+    `[0];
+    // Unknown reqId (stream already finished) or another connection's stream: drop.
+    if (!relay || relay.webConnId !== connection.id) return;
+    this.connFor(relay.deviceId)?.send(JSON.stringify(parsed.data));
+  }
+
+  /** connector → DO → browser: forward one chunk, meter the bytes, end finished streams. */
+  private handleHistoryChunk(connection: Connection, raw: unknown): void {
+    const parsed = HistoryChunkMessageSchema.safeParse(raw);
+    if (!parsed.success) return;
+    const chunk = parsed.data;
+    const relay = this.sql<{ webConnId: string; deviceId: string; maxBytes: number; sentBytes: number; cursor: string | null; expiresAt: number }>`
+      SELECT webConnId, deviceId, maxBytes, sentBytes, cursor, expiresAt FROM history_relay WHERE reqId = ${chunk.re}
+    `[0];
+    if (!relay) return; // swept/timed out/done: nothing is waiting for this chunk
+    // The relay belongs to one machine: only its connection's chunks travel on. reqIds are
+    // unguessable ULIDs, so this is defense in depth against a confused connector, not auth.
+    if ((connection.state as unknown as ConnState | null)?.deviceId !== relay.deviceId) return;
+    if (relay.expiresAt <= Date.now()) {
+      this.sql`DELETE FROM history_relay WHERE reqId = ${chunk.re}`;
+      return;
+    }
+    const webConn = this.getConnection(relay.webConnId);
+    if (!webConn) {
+      this.sql`DELETE FROM history_relay WHERE reqId = ${chunk.re}`;
+      return;
+    }
+    const bytes = jsonByteLength(raw);
+    if (relay.sentBytes + bytes > relay.maxBytes) {
+      // Defense in depth (the connector budgets maxBytes first): cut the stream here rather
+      // than forward past the cap, and tell the browser it ended — continuing from the last
+      // FORWARDED cursor, never the dropped chunk's (the browser never saw its entries).
+      webConn.send(
+        JSON.stringify({ t: "history_chunk", re: chunk.re, n: chunk.n, entries: [], cursor: relay.cursor, done: true, truncated: true }),
+      );
+      this.sql`DELETE FROM history_relay WHERE reqId = ${chunk.re}`;
+      return;
+    }
+    webConn.send(JSON.stringify(chunk));
+    if (chunk.done) {
+      this.sql`DELETE FROM history_relay WHERE reqId = ${chunk.re}`;
+    } else {
+      this.sql`
+        UPDATE history_relay SET sentBytes = ${relay.sentBytes + bytes}, cursor = ${chunk.cursor ?? null}
+        WHERE reqId = ${chunk.re}
+      `;
+    }
+  }
+
+  /** A connector `error` replying to a history_req: forward the reason, end the stream. */
+  private relayHistoryError(connection: Connection, raw: unknown): void {
+    const re = (raw as { re?: unknown }).re;
+    if (typeof re !== "string") return;
+    const relay = this.sql<{ webConnId: string; deviceId: string }>`
+      SELECT webConnId, deviceId FROM history_relay WHERE reqId = ${re}
+    `[0];
+    if (!relay) return; // not a history reply; nothing else to do with connector errors today
+    if ((connection.state as unknown as ConnState | null)?.deviceId !== relay.deviceId) return;
+    this.sql`DELETE FROM history_relay WHERE reqId = ${re}`;
+    this.getConnection(relay.webConnId)?.send(JSON.stringify(raw));
+  }
+
+  /** Alarm-driven §6.6 termination: relays older than the TTL disappear, browser or not. */
+  async sweepHistoryRelays(): Promise<void> {
+    this.sql`DELETE FROM history_relay WHERE expiresAt <= ${Date.now()}`;
+    const next = this.sql<{ m: number | null }>`SELECT MIN(expiresAt) AS m FROM history_relay`[0]?.m;
+    if (typeof next === "number") {
+      void this.schedule(Math.max(1, Math.ceil((next - Date.now()) / 1000)), "sweepHistoryRelays");
+    }
   }
 
   private async handleHello(connection: Connection, raw: unknown): Promise<void> {

@@ -6,3 +6,4 @@ export * from "./messages.ts";
 export * from "./commands.ts";
 export * from "./events.ts";
 export * from "./heartbeat.ts";
+export * from "./history.ts";

@@ -111,7 +111,34 @@ export default {
       // Stateless pre-check: a bad token never wakes the Durable Object. The key set includes
       // SERVER_KEY_PREVIOUS during a rotation window (issue #27) so existing device tokens
       // keep passing the pre-check until the operator closes the window.
+      //
+      // role=web (protocol §5.3, issue #23): browser sockets for the L3 raw-process stream.
+      // Browsers cannot set Authorization headers, so the session cookie is the credential —
+      // MAC-verified here (liveness stays in the DO); every other role needs a device token.
+      // SameSite=Lax already keeps cross-site handshakes cookieless in modern browsers; the
+      // Origin check is the belt-and-suspenders for older ones (a non-browser client can
+      // forge Origin anyway — it isn't the authenticator, the cookie is).
       onBeforeConnect: async (req) => {
+        const role = new URL(req.url).searchParams.get("role");
+        if (role === "web") {
+          const origin = req.headers.get("origin");
+          if (origin) {
+            let sameHost = false;
+            try {
+              sameHost = new URL(origin).host === new URL(req.url).host;
+            } catch {
+              sameHost = false;
+            }
+            if (!sameHost) return new Response("unauthorized", { status: 401 });
+          }
+          const cookie = req.headers.get("cookie") ?? "";
+          const raw = cookie
+            .split(/;\s*/)
+            .find((part) => part.startsWith("shepherd_session="))
+            ?.slice("shepherd_session=".length) ?? null;
+          if (!(await parseSessionCookie(webVerifyKeys(env), raw))) return new Response("unauthorized", { status: 401 });
+          return;
+        }
         const parsed = await parseToken(await resolveServerKeys(env), bearer(req));
         if (!parsed) return new Response("unauthorized", { status: 401 });
       },
