@@ -5,6 +5,11 @@
 //
 // Channel layer (issue #4, steward.md §6.1 / §9): the SETUP_TOKEN-guarded setup page, manual
 // Feishu credentials, the webhook inbound path, and the alarm-driven outbound queue.
+//
+// Ledger core (issue #5, steward.md §2/§5/§6): machines/repositories from hello, online state
+// from connections, the deterministic event reducer (one transaction, derived Thread state),
+// core-template done reports with no LLM, and fixed-phrase dispatch. Every sh_ledger table is
+// reached through the memory module (ledger.ts); this class only wires it to the transports.
 import { Agent, type Connection, type ConnectionContext, type WSMessage } from "agents";
 import {
   CloseCode,
@@ -32,12 +37,23 @@ import {
   FeishuAdapter,
   SEND_TIMEOUT_MS,
   TOKEN_REFRESH_MARGIN_MS,
+  apiBaseFor,
+  type ApplicationConfigPatch,
   type FeishuCredentials,
 } from "./channel/feishu.ts";
-import { RetriableChannelError, type InboundEvent } from "./channel/types.ts";
+import {
+  APP_CONFIG_PATCH_SCOPE,
+  SLOW_DOWN_EXTRA_S,
+  beginDeviceFlow,
+  pollDeviceFlow as pollDeviceFlowOnce,
+} from "./channel/registration.ts";
+import { RetriableChannelError, type Brand, type InboundEvent } from "./channel/types.ts";
+import { Dispatcher } from "./dispatch.ts";
+import { createLedger, type Ledger, type LedgerSql, type NotifyRow } from "./ledger.ts";
+import { failureCard, reportCardFor } from "./report-template.ts";
 import { MIGRATIONS, runMigrations } from "./schema.ts";
 import { openSecret, sealSecret } from "./secretbox.ts";
-import { renderSetupPage } from "./setup-page.ts";
+import { renderSetupPage, type SetupView } from "./setup-page.ts";
 
 interface ConnState {
   deviceId: string;
@@ -88,6 +104,29 @@ const OUTBOUND_BACKOFF_CAP_MS = 15 * 60_000;
 const OUTBOUND_MAX_ATTEMPTS = 8;
 const OUTBOUND_BATCH = 20;
 const OWNER_BOUND_REPLY = "✅ 已绑定，设置完成。此后直接在这里与 Shepherd 对话即可；设置页面已永久关闭。";
+// Sent when the first event lands on the webhook after the QR switch: only a delivered event
+// proves the transport actually moved (research §8.2 — the API's callback_type report stays
+// out of sync with real delivery until the console republish lands).
+const QR_SETUP_DONE_REPLY = "✅ 事件已切换为 webhook 投递，设置全部完成。此后直接在这里与 Shepherd 对话即可；设置页面已永久关闭。";
+// The events/callbacks the config PATCH subscribes explicitly (additive; the QR template
+// already has them — restating keeps the switch robust when it does not).
+const WEBHOOK_EVENTS = ["im.message.receive_v1"];
+const WEBHOOK_CALLBACKS = ["card.action.trigger"];
+
+export interface ShQrSetupRow {
+  id: number;
+  phase: string;
+  flow: string;
+  deviceCode: string;
+  brand: string;
+  intervalS: number;
+  expiresAt: number;
+  qrUrl: string;
+  userCode: string | null;
+  origin: string | null;
+  lastError: string | null;
+  updatedAt: number;
+}
 
 // /pair brute-force lockout (protocol doc §5.2, issue #27): 5 failures lock the bucket —
 // per source IP and globally — for 15 minutes.
@@ -145,6 +184,46 @@ export class Steward extends Agent<Env> {
   // Tests shrink the /pair lockout (see feishuSendTimeoutMs for the same pattern).
   protected pairLockMs = PAIR_LOCK_MS;
 
+  // The memory module (steward.md §2): all sh_* ledger SQL lives behind this handle. Bound
+  // lazily because `sql`/`ctx` only mean something once the DO is live.
+  private ledger_?: Ledger;
+  private get ledger(): Ledger {
+    return (this.ledger_ ??= createLedger({
+      sql: this.sql.bind(this) as unknown as LedgerSql,
+      tx: (fn) => this.ctx.storage.transactionSync(fn),
+    }));
+  }
+
+  private dispatcher_?: Dispatcher;
+  private get dispatcher(): Dispatcher {
+    return (this.dispatcher_ ??= new Dispatcher({
+      ledger: this.ledger,
+      enqueueCommand: (deviceId, kind, args, opts) => this.enqueue(deviceId, kind, args, opts),
+      // Withdraw only what never left the DO (still `queued`); a sent command may already be
+      // persisted connector-side, and at-most-once beats a maybe-duplicate cancel (§4.2).
+      cancelQueuedCommand: (cmdId) => {
+        this.sql`UPDATE outbox SET state = 'expired' WHERE cmdId = ${cmdId} AND state = 'queued'`;
+        return this.sql<{ changes: number }>`SELECT changes() AS changes`[0]!.changes > 0;
+      },
+      sendText: async (text, threadId) => {
+        const owner = this.ownerOpenIdSync();
+        if (!owner) return;
+        await this.enqueueOutbound({ kind: "text", to: owner, text, threadId: threadId ?? null, urgency: "push" });
+      },
+      sendCard: async (card, threadId) => {
+        const owner = this.ownerOpenIdSync();
+        if (!owner) return;
+        await this.enqueueOutbound({ kind: "card", to: owner, card, threadId, urgency: "push" });
+      },
+    }));
+  }
+
+  private ownerOpenIdSync(): string | null {
+    return this.sql<{ ownerOpenId: string | null }>`
+      SELECT ownerOpenId FROM sh_channel WHERE channel = 'feishu'
+    `[0]?.ownerOpenId ?? null;
+  }
+
   // Plain-HTTP surface reached via the Worker's stub.fetch forwards (index.ts): the Feishu
   // webhook (unauthenticated — the adapter validates Feishu's own token) and the setup page
   // (the Worker has already checked SETUP_TOKEN before forwarding).
@@ -178,8 +257,8 @@ export class Steward extends Agent<Env> {
       connection.close(CloseCode.UNAUTHORIZED, "unauthorized");
       return;
     }
-    const row = this.sql<{ epoch: number; revoked: number }>`
-      SELECT epoch, revoked FROM device WHERE deviceId = ${parsed.deviceId}
+    const row = this.sql<{ name: string | null; epoch: number; revoked: number }>`
+      SELECT name, epoch, revoked FROM device WHERE deviceId = ${parsed.deviceId}
     `[0];
     if (!row) {
       connection.close(CloseCode.UNAUTHORIZED, "unknown device");
@@ -190,6 +269,18 @@ export class Steward extends Agent<Env> {
       return;
     }
     connection.setState({ deviceId: parsed.deviceId, epoch: parsed.epoch, keyId: parsed.keyId } satisfies ConnState);
+    // Machine online state derives from live connections (issue #5): this and onClose are the
+    // only writers. hello fills in the machine's real name and facts moments later.
+    this.ledger.machines.setOnline(parsed.deviceId, true, row.name ?? undefined);
+  }
+
+  onClose(connection: Connection): void {
+    const state = connection.state as unknown as ConnState | null;
+    if (!state?.deviceId) return;
+    // A superseded old connection closes after its replacement is live: only the last
+    // connection for the device takes the machine offline.
+    const remaining = [...this.getConnections<ConnState>(`dev:${state.deviceId}`)].filter((c) => c.id !== connection.id);
+    if (remaining.length === 0) this.ledger.machines.setOnline(state.deviceId, false);
   }
 
   async onMessage(connection: Connection, raw: WSMessage): Promise<void> {
@@ -265,6 +356,9 @@ export class Steward extends Agent<Env> {
       other.close(CloseCode.SUPERSEDED, "superseded by a newer connection");
     }
     connection.setState({ deviceId: auth.deviceId, epoch: auth.epoch, keyId: auth.keyId, connEpoch: hello.connEpoch } satisfies ConnState);
+    // hello is the machine/repo snapshot's source of truth (protocol §6.1, steward.md §2.2):
+    // name, agents, limits, and the full repo list — removals included — land in the ledger.
+    this.ledger.machines.upsertFromHello(hello);
     const acks = Object.fromEntries(
       this.sql<{ workerId: string; upTo: number }>`SELECT workerId, upTo FROM worker_ack`.map((row) => [row.workerId, row.upTo]),
     );
@@ -299,6 +393,9 @@ export class Steward extends Agent<Env> {
       }
     }
     this.redeliverOutbox(auth.deviceId);
+    // A reconnect is also the natural catch-up point for events persisted but not yet reduced
+    // (crash between the events_ack and the reducer, protocol §4.3): drain, then notify.
+    this.applyLedgerEvents();
   }
 
   // protocol §4.2 + ADR-0001 (spike bug 10): hello redelivers queued, sent, AND
@@ -335,6 +432,7 @@ export class Steward extends Agent<Env> {
         UPDATE outbox SET state = 'failed', failReason = 'rejected', result = ${JSON.stringify({ code: ack.code ?? null })}
         WHERE cmdId = ${ack.re}
       `;
+      this.noteCommandFailure(ack.re, `连接器拒绝（${ack.code ?? "未知原因"}）`);
     } else if (ack.status === "ambiguous") {
       // protocol §4.2: a crash during `sending`, undecidable — no automatic re-send.
       this.sql`UPDATE outbox SET state = 'ambiguous' WHERE cmdId = ${ack.re}`;
@@ -349,6 +447,26 @@ export class Steward extends Agent<Env> {
       UPDATE outbox SET state = ${result.ok ? "done" : "failed"}, result = ${JSON.stringify(result.ok ? result.data ?? null : result.error ?? null)}
       WHERE cmdId = ${result.re}
     `;
+    if (!result.ok) {
+      const error = (result.error ?? {}) as { code?: unknown; message?: unknown };
+      const reason = [typeof error.code === "string" ? error.code : null, typeof error.message === "string" ? error.message : null]
+        .filter((part): part is string => part !== null)
+        .join("：") || "未知原因";
+      this.noteCommandFailure(result.re, reason);
+    }
+  }
+
+  // A start_worker the connector could not run: the worker lands `broken`, the failure reaches
+  // the timeline + the user deterministically (there is no LLM to relay it in M1). Idempotent
+  // on the cmdId — cmd_result redeliveries re-run this handler.
+  private noteCommandFailure(cmdId: string, reason: string): void {
+    const row = this.sql<{ workerId: string | null; kind: string }>`
+      SELECT workerId, kind FROM outbox WHERE cmdId = ${cmdId}
+    `[0];
+    if (!row || row.kind !== "start_worker" || !row.workerId) return;
+    if (this.ledger.workers.markStartFailed(row.workerId, cmdId, reason)) {
+      void this.drainNotifications();
+    }
   }
 
   private handleEvents(connection: Connection, raw: unknown): void {
@@ -389,6 +507,78 @@ export class Steward extends Agent<Env> {
         connection.send(JSON.stringify({ t: "resync", workerId, from: upTo + 1 } satisfies ResyncMessage));
       }
     }
+    // Persisted and acked above; now reduce into the ledger (protocol §4.3 keeps the two
+    // decoupled — a crash here leaves the rows pending for the next wake's catch-up).
+    this.applyLedgerEvents();
+  }
+
+  /** Reduces everything pending, then turns notification intents into outbound cards (§5.1). */
+  private applyLedgerEvents(): void {
+    try {
+      const { applied } = this.ledger.applyPendingEvents();
+      if (applied > 0) void this.drainNotifications();
+    } catch (err) {
+      this.logChannel("ledger_apply_failed", errorText(err));
+    }
+  }
+
+  // Single-flight drain, same pattern as deliverOutbound: concurrent wake sources (events,
+  // hello, cmd failures) chain instead of racing, so an intent is enqueued exactly once.
+  private notifyChain: Promise<void> = Promise.resolve();
+
+  drainNotifications(): Promise<void> {
+    const run = this.notifyChain.then(() => this.drainNotifyPass());
+    this.notifyChain = run.catch(() => {});
+    return run;
+  }
+
+  private async drainNotifyPass(): Promise<void> {
+    const cfg = await this.loadFeishuConfig();
+    for (const intent of this.ledger.notifications.pending()) {
+      try {
+        if (!cfg?.ownerOpenId) continue; // no owner yet: the intent stays pending, not lost
+        const card = this.renderNotification(intent);
+        if (card === null) {
+          // Its data is gone (thread archived / worker pruned); drop the intent rather than
+          // retry forever.
+          this.ledger.notifications.markSent(intent.id);
+          continue;
+        }
+        await this.enqueueOutbound({ kind: "card", to: cfg.ownerOpenId, threadId: intent.threadId, card, urgency: "push" });
+        this.ledger.notifications.markSent(intent.id);
+      } catch (err) {
+        this.logChannel("notify_drain_failed", `${intent.id} ${errorText(err)}`);
+      }
+    }
+  }
+
+  /** Deterministic core templates (steward.md §6.2 source 1): data in, card out, no LLM. */
+  private renderNotification(intent: NotifyRow): unknown | null {
+    const worker = intent.workerId ? this.ledger.workers.get(intent.workerId) : null;
+    const thread = this.ledger.threads.get(intent.threadId);
+    if (!worker || !thread) return null;
+    const machine = this.ledger.machines.get(worker.deviceId);
+    const machineName = machine?.name ?? worker.deviceId;
+    const footer = `Thread「${thread.title}」 · ${worker.agent} @ ${machineName} · 引用回复可继续这个 Thread`;
+
+    if (intent.kind === "done_report" || intent.kind === "attention_report") {
+      const report = this.ledger.workers.reportsForWorker(worker.workerId).at(-1);
+      if (!report) return null;
+      return reportCardFor(report, worker, machineName, thread.title);
+    }
+
+    // failure_push: either the start never happened or the run ended in a failure class that
+    // needs a human (steward.md §5.3); the matching open question carries the specifics.
+    if (worker.lastOutcome?.startsWith("start_failed:")) {
+      return failureCard(
+        `派发失败：任务没有开始`,
+        `${worker.lastOutcome.slice("start_failed:".length)}。重新 /派发 一次即可。`,
+        thread.title,
+        footer,
+      );
+    }
+    const question = this.ledger.questions.openForThread(thread.threadId);
+    return failureCard("运行出错，需要你决定下一步", question?.text ?? "查看 Thread 时间线了解详情。", thread.title, footer);
   }
 
   // Not wired to any HTTP route yet (the setup page / chat command that triggers this is a
@@ -592,9 +782,25 @@ export class Steward extends Agent<Env> {
   // row itself, this keeps the *wire* quiet too.
   private deliveryChain: Promise<void> = Promise.resolve();
 
-  private async loadFeishuConfig(): Promise<(FeishuCredentials & { ownerOpenId: string | null }) | null> {
-    const row = this.sql<{ appId: string; appSecretEnc: string; verificationTokenEnc: string; ownerOpenId: string | null }>`
-      SELECT appId, appSecretEnc, verificationTokenEnc, ownerOpenId FROM sh_channel WHERE channel = 'feishu'
+  private async loadFeishuConfig(): Promise<
+    (FeishuCredentials & {
+      ownerOpenId: string | null;
+      brand: Brand;
+      source: "manual" | "qr";
+      webhookStatus: string | null;
+    }) | null
+  > {
+    const row = this.sql<{
+      appId: string;
+      appSecretEnc: string;
+      verificationTokenEnc: string;
+      ownerOpenId: string | null;
+      brand: string | null;
+      source: string | null;
+      webhookStatus: string | null;
+    }>`
+      SELECT appId, appSecretEnc, verificationTokenEnc, ownerOpenId, brand, source, webhookStatus
+      FROM sh_channel WHERE channel = 'feishu'
     `[0];
     if (!row) return null;
     const keys = await this.serverKeys();
@@ -615,10 +821,27 @@ export class Steward extends Agent<Env> {
         WHERE channel = 'feishu'
       `;
     }
-    return { appId: row.appId, appSecret: appSecret.text, verificationToken: verificationToken.text, ownerOpenId: row.ownerOpenId };
+    return {
+      appId: row.appId,
+      appSecret: appSecret.text,
+      verificationToken: verificationToken.text,
+      ownerOpenId: row.ownerOpenId,
+      brand: row.brand === "lark" ? "lark" : "feishu",
+      source: row.source === "qr" ? "qr" : "manual",
+      webhookStatus: row.webhookStatus,
+    };
   }
 
-  protected newFeishuAdapter(credentials: FeishuCredentials): FeishuAdapter {
+  // FEISHU_API exists only in tests (a service binding that mocks Feishu); production calls
+  // the real endpoints via global fetch. Covers both the open API and the accounts device flow.
+  private feishuFetcher(): typeof fetch {
+    return this.env.FEISHU_API ? (this.env.FEISHU_API.fetch.bind(this.env.FEISHU_API) as typeof fetch) : fetch;
+  }
+
+  protected newFeishuAdapter(
+    credentials: FeishuCredentials & { brand?: Brand },
+    opts: { looseHandshake?: boolean } = {},
+  ): FeishuAdapter {
     return new FeishuAdapter({
       credentials,
       tokenStore: {
@@ -646,10 +869,10 @@ export class Steward extends Agent<Env> {
           );
         },
       },
-      // FEISHU_API exists only in tests (a service binding that mocks Feishu); production
-      // calls the real endpoint via global fetch.
-      fetcher: this.env.FEISHU_API ? (this.env.FEISHU_API.fetch.bind(this.env.FEISHU_API) as typeof fetch) : undefined,
+      fetcher: this.feishuFetcher(),
       sendTimeoutMs: this.feishuSendTimeoutMs,
+      apiBase: apiBaseFor(credentials.brand ?? "feishu"),
+      looseHandshake: opts.looseHandshake,
     });
   }
 
@@ -670,32 +893,85 @@ export class Steward extends Agent<Env> {
     }
   }
 
+  // ADR-0001 decision 8: the setup page closes permanently once onboarding is complete. For
+  // the manual flow that is the owner's first DM (issue #4); for the QR flow the owner is
+  // bound at scan time, so completeness additionally requires verified webhook delivery —
+  // until then the page must keep guiding the switch (issue #24, research §8.2).
+  private setupClosed(cfg: Awaited<ReturnType<Steward["loadFeishuConfig"]>>): boolean {
+    if (!cfg?.ownerOpenId) return false;
+    return cfg.source !== "qr" || cfg.webhookStatus === "verified";
+  }
+
+  private qrRow(): ShQrSetupRow | null {
+    return (this.sql`SELECT * FROM sh_qr_setup WHERE id = 1`[0] as ShQrSetupRow | undefined) ?? null;
+  }
+
+  async qrSetupState(): Promise<ShQrSetupRow | null> {
+    return this.qrRow();
+  }
+
   private async handleSetup(request: Request): Promise<Response> {
     const cfg = await this.loadFeishuConfig();
-    // ADR-0001 decision 8: once the owner is bound the setup page is closed permanently.
-    if (cfg?.ownerOpenId) return new Response("not found", { status: 404 });
+    if (cfg && this.setupClosed(cfg)) return new Response("not found", { status: 404 });
     const url = new URL(request.url);
-    const webhookUrl = `${url.origin}/channels/feishu/events`;
-    const page = (opts: { state: "form" | "awaiting_owner"; error?: string; appIdValue?: string }) =>
-      new Response(renderSetupPage({ ...opts, actionUrl: `${url.pathname}${url.search}`, webhookUrl }), {
+    const origin = url.origin;
+    // The page's origin is the deployment's public address: the PATCH's request_url and the
+    // prefilled bot name derive from it. Refreshed on every hit so a domain added mid-setup
+    // is picked up without restarting the flow.
+    if (this.qrRow()) {
+      this.sql`UPDATE sh_qr_setup SET origin = ${origin}, updatedAt = ${Date.now()} WHERE id = 1`;
+    }
+
+    const respond = async (formError?: string, appIdValue?: string) => {
+      const fresh = await this.loadFeishuConfig();
+      return new Response(renderSetupPage({ view: this.setupView(fresh, formError, appIdValue), actionUrl: `${url.pathname}${url.search}`, webhookUrl: `${origin}/channels/feishu/events`, host: url.hostname }), {
         headers: { "content-type": "text/html; charset=utf-8" },
       });
+    };
 
-    if (request.method === "GET") {
-      return page({ state: cfg ? "awaiting_owner" : "form" });
-    }
+    if (request.method === "GET") return respond();
 
     let form: FormData;
     try {
       form = await request.formData();
     } catch {
-      return page({ state: "form", error: "表单解析失败，请重试。" });
+      return respond("表单解析失败，请重试。");
     }
+    const action = String(form.get("action") ?? "manual");
+
+    if (action === "start_qr" || action === "restart_qr") {
+      if (cfg) return respond("已存在应用凭据，无法重新发起扫码创建；如需换应用请提交手动凭据。");
+      try {
+        await this.beginQrFlow("create", origin);
+      } catch (err) {
+        return respond(`发起扫码创建失败：${errorText(err)}`);
+      }
+      return respond();
+    }
+
+    if (action === "start_scope_scan") {
+      if (!cfg || cfg.source !== "qr") return respond("尚未通过扫码创建机器人，无法发起第二步。");
+      try {
+        await this.beginQrFlow("addons", origin);
+      } catch (err) {
+        return respond(`发起第二步扫码失败：${errorText(err)}`);
+      }
+      return respond();
+    }
+
+    if (action === "patch_webhook") {
+      const res = await this.patchWebhookConfig();
+      if (!res.ok) return respond(`切换 webhook 失败：${res.error}`);
+      return respond();
+    }
+
+    // Manual credential submission (issue #4) — the permanent fallback (issue #24). Cancels
+    // any active QR flow; a different appId resets the owner binding (open_id is app-scoped).
     const appId = String(form.get("appId") ?? "").trim();
     const appSecret = String(form.get("appSecret") ?? "").trim();
     const verificationToken = String(form.get("verificationToken") ?? "").trim();
     if (!appId || !appSecret || !verificationToken) {
-      return page({ state: "form", error: "三个字段都必填。", appIdValue: appId });
+      return respond("三个字段都必填。", appId);
     }
 
     // Validate live: a tenant_access_token must actually be obtainable with these credentials
@@ -704,7 +980,7 @@ export class Steward extends Agent<Env> {
     try {
       await this.newFeishuAdapter({ appId, appSecret, verificationToken }).getTenantAccessToken();
     } catch (err) {
-      return page({ state: "form", error: `凭据校验失败：${errorText(err)}`, appIdValue: appId });
+      return respond(`凭据校验失败：${errorText(err)}`, appId);
     }
 
     const [primary] = await this.serverKeys();
@@ -712,20 +988,279 @@ export class Steward extends Agent<Env> {
       sealSecret(primary!, appSecret),
       sealSecret(primary!, verificationToken),
     ]);
-    this.sql`
-      INSERT INTO sh_channel (channel, appId, appSecretEnc, verificationTokenEnc, ownerOpenId, configuredAt, boundAt)
-      VALUES ('feishu', ${appId}, ${appSecretEnc}, ${verificationTokenEnc}, NULL, ${Date.now()}, NULL)
-      ON CONFLICT (channel) DO UPDATE SET
-        appId = excluded.appId, appSecretEnc = excluded.appSecretEnc,
-        verificationTokenEnc = excluded.verificationTokenEnc, configuredAt = excluded.configuredAt
-    `;
-    return page({ state: "awaiting_owner" });
+    const existing = this.sql<{ appId: string | null }>`SELECT appId FROM sh_channel WHERE channel = 'feishu'`[0];
+    const sameApp = existing?.appId === appId;
+    if (sameApp) {
+      this.sql`
+        INSERT INTO sh_channel (channel, appId, appSecretEnc, verificationTokenEnc, ownerOpenId, configuredAt, boundAt, source, brand)
+        VALUES ('feishu', ${appId}, ${appSecretEnc}, ${verificationTokenEnc}, NULL, ${Date.now()}, NULL, 'manual', 'feishu')
+        ON CONFLICT (channel) DO UPDATE SET
+          appId = excluded.appId, appSecretEnc = excluded.appSecretEnc,
+          verificationTokenEnc = excluded.verificationTokenEnc, configuredAt = excluded.configuredAt, source = 'manual'
+      `;
+    } else {
+      this.sql`
+        INSERT INTO sh_channel (channel, appId, appSecretEnc, verificationTokenEnc, ownerOpenId, configuredAt, boundAt, source, brand)
+        VALUES ('feishu', ${appId}, ${appSecretEnc}, ${verificationTokenEnc}, NULL, ${Date.now()}, NULL, 'manual', 'feishu')
+        ON CONFLICT (channel) DO UPDATE SET
+          appId = excluded.appId, appSecretEnc = excluded.appSecretEnc,
+          verificationTokenEnc = excluded.verificationTokenEnc, configuredAt = excluded.configuredAt, source = 'manual',
+          ownerOpenId = NULL, boundAt = NULL, brand = 'feishu',
+          webhookStatus = NULL, webhookPatchedAt = NULL, webhookVerifiedAt = NULL
+      `;
+      // The cached token belongs to the previous app; never reuse it.
+      this.sql`DELETE FROM sh_channel_token WHERE channel = 'feishu'`;
+    }
+    this.sql`DELETE FROM sh_qr_setup`;
+    this.logChannel("manual_credentials_saved", appId);
+    return respond();
   }
 
-  async setupState(): Promise<{ state: "unconfigured" | "awaiting_owner" | "bound"; appId: string | null; ownerOpenId: string | null }> {
+  private setupView(
+    cfg: Awaited<ReturnType<Steward["loadFeishuConfig"]>>,
+    formError?: string,
+    appIdValue?: string,
+  ): SetupView {
+    const qr = this.qrRow();
+    const base = { appId: cfg?.appId, brand: cfg?.brand, formError, appIdValue };
+    if (!cfg) {
+      if (!qr) return { phase: "start", ...base };
+      if (qr.phase === "awaiting_scan") return { phase: "scan1", qrUrl: qr.qrUrl, userCode: qr.userCode ?? "", expiresAt: qr.expiresAt, phaseError: qr.lastError ?? undefined, ...base };
+      // No credentials + any other phase means the create scan failed terminally.
+      return { phase: "failed", phaseError: qr.lastError ?? "扫码创建未完成。", ...base };
+    }
+    if (cfg.source === "manual") {
+      return { phase: "awaiting_owner", ...base };
+    }
+    // QR source: closed is handled before rendering; the remaining phases guide the switch.
+    if (qr?.phase === "awaiting_scope_scan") {
+      return { phase: "scan2", qrUrl: qr.qrUrl, userCode: qr.userCode ?? "", expiresAt: qr.expiresAt, phaseError: qr.lastError ?? undefined, ...base };
+    }
+    if (qr?.phase === "scope_added") {
+      return { phase: "scope_added", phaseError: qr.lastError ?? undefined, ...base };
+    }
+    if (qr?.phase === "webhook_patched" || cfg.webhookStatus === "patched") {
+      return { phase: "patched", phaseError: qr?.lastError ?? undefined, ...base };
+    }
+    return { phase: "created", phaseError: qr?.lastError ?? undefined, ...base };
+  }
+
+  async setupState(): Promise<{
+    state: "unconfigured" | "awaiting_owner" | "awaiting_webhook" | "bound";
+    appId: string | null;
+    ownerOpenId: string | null;
+    source: "manual" | "qr" | null;
+    brand: Brand | null;
+    webhookStatus: string | null;
+  }> {
     const cfg = await this.loadFeishuConfig();
-    if (!cfg) return { state: "unconfigured", appId: null, ownerOpenId: null };
-    return { state: cfg.ownerOpenId ? "bound" : "awaiting_owner", appId: cfg.appId, ownerOpenId: cfg.ownerOpenId };
+    if (!cfg) return { state: "unconfigured", appId: null, ownerOpenId: null, source: null, brand: null, webhookStatus: null };
+    const state = this.setupClosed(cfg) ? "bound" : cfg.source === "qr" ? "awaiting_webhook" : "awaiting_owner";
+    return { state, appId: cfg.appId, ownerOpenId: cfg.ownerOpenId, source: cfg.source, brand: cfg.brand, webhookStatus: cfg.webhookStatus };
+  }
+
+  // ---- QR onboarding state machine (issue #24, steward.md §9.0, research §1/§8.1–§8.2) ----
+
+  /**
+   * Starts (or restarts — links are single-use) a device-flow scan. `create` prefills a
+   * deployment-distinguishing name and locks the flow to a fresh app; `addons` targets the
+   * created app (`clientID`) and carries the `application:application:patch` scope top-up.
+   */
+  private async beginQrFlow(kind: "create" | "addons", origin: string): Promise<void> {
+    const host = new URL(origin).hostname;
+    // The name leads with the deployment label: app names get truncated (research §8.3 — a
+    // prefilled "Shepherd Spike ({user})" landed as "Spike"), and the label is what tells
+    // same-named bots apart across deployments.
+    const hostLabel = (host.split(".")[0] ?? host).slice(0, 16);
+    let clientId: string | undefined;
+    let brand: Brand = "feishu";
+    if (kind === "addons") {
+      const cfg = await this.loadFeishuConfig();
+      if (!cfg) throw new Error("应用凭据缺失");
+      clientId = cfg.appId;
+      brand = cfg.brand; // a lark-created app scans its second code on the lark domain too
+    }
+    const res = await beginDeviceFlow({
+      fetcher: this.feishuFetcher(),
+      brand,
+      preset: kind === "create" ? { name: `${hostLabel}·Shepherd`, desc: `Shepherd 部署：${origin}` } : undefined,
+      createOnly: kind === "create",
+      clientId,
+      addons: kind === "addons" ? { scopes: { tenant: [APP_CONFIG_PATCH_SCOPE] } } : undefined,
+    });
+    const phase = kind === "create" ? "awaiting_scan" : "awaiting_scope_scan";
+    this.sql`
+      INSERT INTO sh_qr_setup (id, phase, flow, deviceCode, brand, intervalS, expiresAt, qrUrl, userCode, origin, lastError, updatedAt)
+      VALUES (1, ${phase}, ${kind}, ${res.deviceCode}, ${brand}, ${res.intervalS}, ${res.expiresAt}, ${res.qrUrl}, ${res.userCode}, ${origin}, NULL, ${Date.now()})
+      ON CONFLICT (id) DO UPDATE SET
+        phase = excluded.phase, flow = excluded.flow, deviceCode = excluded.deviceCode, brand = excluded.brand,
+        intervalS = excluded.intervalS, expiresAt = excluded.expiresAt, qrUrl = excluded.qrUrl,
+        userCode = excluded.userCode, origin = excluded.origin, lastError = NULL, updatedAt = excluded.updatedAt
+    `;
+    void this.schedule(Math.max(1, res.intervalS), "pollDeviceFlow");
+  }
+
+  private armQrPoll(intervalS: number): void {
+    void this.schedule(Math.max(1, intervalS), "pollDeviceFlow");
+  }
+
+  private qrFail(message: string): void {
+    // A create-flow failure leaves nothing configured (restart offered); an addons-flow
+    // failure keeps the created app and offers the scan-2 retry.
+    const row = this.qrRow();
+    const phase = row?.flow === "create" ? "failed" : "created";
+    this.sql`UPDATE sh_qr_setup SET phase = ${phase}, lastError = ${message}, updatedAt = ${Date.now()} WHERE id = 1`;
+    this.logChannel("qr_error", message);
+  }
+
+  /**
+   * Alarm-driven device-flow poll (the DO hibernates between polls). Respects the returned
+   * `interval` (backing off +5s on `slow_down`, RFC 8628) and switches to the Lark accounts
+   * domain the moment a poll reveals `tenant_brand: lark` (research §1). Stale polls (a flow
+   * was restarted, or the phase moved on) no-op via the deviceCode+phase re-checks.
+   */
+  async pollDeviceFlow(): Promise<void> {
+    for (let hop = 0; hop < 3; hop++) {
+      const row = this.qrRow();
+      if (!row || (row.phase !== "awaiting_scan" && row.phase !== "awaiting_scope_scan")) return;
+      if (row.expiresAt <= Date.now()) {
+        this.qrFail("二维码已过期（expired_token），请重新生成。");
+        return;
+      }
+      let outcome: Awaited<ReturnType<typeof pollDeviceFlowOnce>>;
+      try {
+        outcome = await pollDeviceFlowOnce({ fetcher: this.feishuFetcher(), deviceCode: row.deviceCode, brand: row.brand === "lark" ? "lark" : "feishu" });
+      } catch (err) {
+        // Transient network error: keep polling at the current interval (OpenClaw parity).
+        this.logChannel("qr_poll_error", errorText(err));
+        this.armQrPoll(row.intervalS);
+        return;
+      }
+      // Lark switch (SDK parity): the moment any poll reveals tenant_brand=lark — even one
+      // that also carries success or slow_down — persist the brand and immediately re-poll
+      // on the lark domain; only the re-polled response is processed. `hop` bounds the loop.
+      if (outcome.brand === "lark" && row.brand !== "lark") {
+        this.sql`UPDATE sh_qr_setup SET brand = 'lark', updatedAt = ${Date.now()} WHERE id = 1 AND deviceCode = ${row.deviceCode}`;
+        continue;
+      }
+      switch (outcome.status) {
+        case "pending":
+          this.armQrPoll(row.intervalS);
+          return;
+        case "slow_down":
+          this.sql`UPDATE sh_qr_setup SET intervalS = intervalS + ${SLOW_DOWN_EXTRA_S} WHERE id = 1 AND deviceCode = ${row.deviceCode}`;
+          this.armQrPoll(row.intervalS + SLOW_DOWN_EXTRA_S);
+          return;
+        case "denied":
+          this.qrFail("扫码被拒绝（access_denied），请重新生成二维码再试。");
+          return;
+        case "expired":
+          this.qrFail("二维码已过期（expired_token），请重新生成。");
+          return;
+        case "failed":
+          this.qrFail(`扫码流程失败：${outcome.message}`);
+          return;
+        case "success":
+          await this.onQrSuccess(row, outcome);
+          return;
+      }
+    }
+  }
+
+  private async onQrSuccess(
+    row: ShQrSetupRow,
+    outcome: Extract<Awaited<ReturnType<typeof pollDeviceFlowOnce>>, { status: "success" }>,
+  ): Promise<void> {
+    if (row.flow === "create") {
+      if (!outcome.appSecret) {
+        this.qrFail("创建成功但飞书未返回 App Secret；请改用下方手动凭据完成配置。");
+        return;
+      }
+      // The verification token is ours from the start: generated now, sealed, and PATCHed
+      // into the app's encrypt strategy during the switch (a QR-created app's console token
+      // is unknowable via API — research §1: sensitive config goes through the config PATCH).
+      const verificationToken = crypto.randomUUID().replace(/-/g, "");
+      const [primary] = await this.serverKeys();
+      const [appSecretEnc, verificationTokenEnc] = await Promise.all([
+        sealSecret(primary!, outcome.appSecret),
+        sealSecret(primary!, verificationToken),
+      ]);
+      if (!this.qrFlowStillLive(row, "awaiting_scan")) return;
+      this.sql`
+        INSERT INTO sh_channel (channel, appId, appSecretEnc, verificationTokenEnc, ownerOpenId, configuredAt, boundAt, source, brand)
+        VALUES ('feishu', ${outcome.appId}, ${appSecretEnc}, ${verificationTokenEnc}, ${outcome.openId ?? null}, ${Date.now()}, ${outcome.openId ? Date.now() : null}, 'qr', ${outcome.brand ?? "feishu"})
+        ON CONFLICT (channel) DO UPDATE SET
+          appId = excluded.appId, appSecretEnc = excluded.appSecretEnc,
+          verificationTokenEnc = excluded.verificationTokenEnc, configuredAt = excluded.configuredAt,
+          ownerOpenId = excluded.ownerOpenId, boundAt = excluded.boundAt, source = 'qr', brand = excluded.brand
+      `;
+      // The cached token (if any) belongs to a previous app; never reuse it.
+      this.sql`DELETE FROM sh_channel_token WHERE channel = 'feishu'`;
+      this.logChannel("qr_created", `${outcome.appId} brand=${outcome.brand} owner=${outcome.openId ?? "?"}`);
+      // Park on `created` before chaining scan #2, so a failed begin lands in the right state.
+      this.sql`UPDATE sh_qr_setup SET phase = 'created', updatedAt = ${Date.now()} WHERE id = 1`;
+      // Chain scan #2: the scope top-up (research §8.1 — the addons update flow).
+      try {
+        await this.beginQrFlow("addons", row.origin ?? "https://example.com");
+      } catch (err) {
+        const message = `第二步扫码发起失败：${errorText(err)}`;
+        this.sql`UPDATE sh_qr_setup SET lastError = ${message}, updatedAt = ${Date.now()} WHERE id = 1`;
+        this.logChannel("qr_error", message);
+      }
+      return;
+    }
+
+    // Addons flow: the secret is normally NOT rotated (research §8.1); store a rotation only
+    // if Feishu actually returned a different one for the same app.
+    const cfg = await this.loadFeishuConfig();
+    if (cfg && outcome.appId === cfg.appId && outcome.appSecret && outcome.appSecret !== cfg.appSecret) {
+      const [primary] = await this.serverKeys();
+      const appSecretEnc = await sealSecret(primary!, outcome.appSecret);
+      this.sql`UPDATE sh_channel SET appSecretEnc = ${appSecretEnc} WHERE channel = 'feishu'`;
+      this.sql`DELETE FROM sh_channel_token WHERE channel = 'feishu'`;
+      this.logChannel("qr_secret_rotated", outcome.appId);
+    }
+    if (!this.qrFlowStillLive(row, "awaiting_scope_scan")) return;
+    this.sql`UPDATE sh_qr_setup SET phase = 'scope_added', lastError = NULL, updatedAt = ${Date.now()} WHERE id = 1`;
+    this.logChannel("qr_scope_added", `${outcome.appId} (+${APP_CONFIG_PATCH_SCOPE})`);
+    // Auto-attempt the switch; a failure parks the flow on scope_added with the error shown.
+    await this.patchWebhookConfig();
+  }
+
+  /** True when the row still describes the same in-flight flow (guards stale concurrent polls). */
+  private qrFlowStillLive(row: ShQrSetupRow, phase: string): boolean {
+    const fresh = this.qrRow();
+    return fresh !== null && fresh.deviceCode === row.deviceCode && fresh.flow === row.flow && fresh.phase === phase;
+  }
+
+  /**
+   * The config PATCH (research §2.1/§8.2): events + callbacks to the webhook URL, encrypt
+   * strategy pinned to our stored verification token. Accepting the PATCH does NOT mean
+   * delivery switched — that takes the console republish and is proven by event arrival.
+   */
+  private async patchWebhookConfig(): Promise<{ ok: true } | { ok: false; error: string }> {
+    const cfg = await this.loadFeishuConfig();
+    if (!cfg || !cfg.verificationToken) return { ok: false, error: "尚未配置应用凭据。" };
+    const origin = this.qrRow()?.origin;
+    if (!origin) return { ok: false, error: "缺少部署地址，请先打开一次设置页面。" };
+    const webhookUrl = `${origin}/channels/feishu/events`;
+    const body: ApplicationConfigPatch = {
+      event: { subscription_type: "webhook", request_url: webhookUrl, add_events: WEBHOOK_EVENTS },
+      callback: { callback_type: "webhook", add_callbacks: WEBHOOK_CALLBACKS },
+      event_and_callback_encrypt_strategy: { verification_token: cfg.verificationToken },
+    };
+    try {
+      await this.newFeishuAdapter(cfg).applicationConfigPatch(cfg.appId, body);
+    } catch (err) {
+      const error = errorText(err);
+      this.sql`UPDATE sh_qr_setup SET lastError = ${`切换失败：${error}`}, updatedAt = ${Date.now()} WHERE id = 1`;
+      this.logChannel("webhook_patch_failed", error);
+      return { ok: false, error };
+    }
+    this.sql`UPDATE sh_channel SET webhookStatus = 'patched', webhookPatchedAt = ${Date.now()} WHERE channel = 'feishu'`;
+    this.sql`UPDATE sh_qr_setup SET phase = 'webhook_patched', lastError = NULL, updatedAt = ${Date.now()} WHERE id = 1`;
+    this.logChannel("webhook_patched", webhookUrl);
+    return { ok: true };
   }
 
   // ---- Model credentials (spec §12.2 "model keys stored encrypted", issue #27) ---------------
@@ -756,7 +1291,9 @@ export class Steward extends Agent<Env> {
   private async handleFeishuWebhook(request: Request): Promise<Response> {
     const cfg = await this.loadFeishuConfig();
     if (!cfg) return new Response("not found", { status: 404 });
-    const parsed = await this.newFeishuAdapter(cfg).verifyAndParse(request);
+    // Loose handshake inside the QR-switch window (see FeishuAdapterOptions.looseHandshake):
+    // the PATCH's URL check may be signed with the app's previous console token.
+    const parsed = await this.newFeishuAdapter(cfg, { looseHandshake: cfg.source === "qr" && cfg.webhookStatus !== "verified" }).verifyAndParse(request);
     if (parsed instanceof Response) return parsed;
 
     // Persist before 200 (steward.md §9.1): the dedup insert below is the durable record, and
@@ -770,8 +1307,26 @@ export class Steward extends Agent<Env> {
       VALUES ('feishu', ${parsed.msgId}, ${parsed.eventId}, ${parsed.eventType}, ${Date.now()})
     `;
 
+    // Delivery verification (issue #24): a QR-created app keeps delivering over its websocket
+    // transport until the console republish lands, no matter what the config PATCH reported —
+    // so the first event that actually reaches this endpoint is the only real proof the
+    // switch happened (research §8.2). Sync check-then-set: atomic within the DO.
+    if (cfg.source === "qr" && cfg.webhookStatus !== "verified") {
+      const prior = this.sql<{ ws: string | null }>`SELECT webhookStatus AS ws FROM sh_channel WHERE channel = 'feishu'`[0]!.ws;
+      if (prior !== "verified") {
+        this.sql`UPDATE sh_channel SET webhookStatus = 'verified', webhookVerifiedAt = ${Date.now()} WHERE channel = 'feishu'`;
+        this.sql`UPDATE sh_qr_setup SET phase = 'done', updatedAt = ${Date.now()} WHERE id = 1`;
+        this.logChannel("webhook_verified", `${parsed.eventType} ${parsed.eventId}`);
+        if (cfg.ownerOpenId) {
+          await this.enqueueOutbound({ kind: "text", to: cfg.ownerOpenId, text: QR_SETUP_DONE_REPLY, urgency: "push" });
+        }
+      }
+    }
+
     if (parsed.kind === "message") {
       await this.dispatchInboundMessage(parsed, cfg.ownerOpenId);
+    } else if (parsed.kind === "card_action") {
+      await this.dispatchCardAction(parsed, cfg.ownerOpenId);
     } else {
       this.logChannel("event_ignored_other", `${parsed.eventType} ${parsed.eventId}`);
     }
@@ -802,9 +1357,24 @@ export class Steward extends Agent<Env> {
       this.logChannel("ignored_message_type", `${ev.messageType} ${ev.msgId}`);
       return;
     }
-    // The DM is durably recorded (sh_inbound) and logged; handing it to the steward
-    // conversation (harness.submit, sh_run) is the M2 ticket — nothing here decides routing yet.
+    // The owner's text: fixed-phrase dispatch and quote-reply routing (issue #5). Natural
+    // language understanding is the M2 steward's job; here everything is deterministic.
     this.logChannel("owner_message", `${ev.msgId} parent=${ev.parentId ?? "-"} ${ev.text ?? ""}`.slice(0, 500));
+    await this.dispatcher.handleOwnerText({ text: ev.text ?? "", parentId: ev.parentId, msgId: ev.msgId });
+  }
+
+  // Card button callbacks (issue #5): the Thread is resolved from the card's providerMsgId —
+  // never from data stuffed into the button (steward.md §3.1, spike bug list).
+  private async dispatchCardAction(ev: InboundEvent, ownerOpenId: string | null): Promise<void> {
+    if (ownerOpenId === null || !ev.operatorId || !ev.cardMsgId) {
+      this.logChannel("ignored_card_no_owner", `${ev.eventId}`);
+      return;
+    }
+    if (ev.operatorId !== ownerOpenId) {
+      this.logChannel("ignored_card_not_owner", `${ev.operatorId} ${ev.eventId}`);
+      return;
+    }
+    await this.dispatcher.handleCardAction({ operatorId: ev.operatorId, action: ev.action ?? "", cardMsgId: ev.cardMsgId });
   }
 
   private logChannel(reason: string, detail: string): void {
@@ -822,6 +1392,8 @@ export class Steward extends Agent<Env> {
   }
 
   // ---- Outbound queue (steward.md §6.1) ----------------------------------------------------------
+  // Row writes go through the memory module (ledger.outbound owns the sh_outbound table);
+  // what stays here is delivery mechanics only: claims, pacing, backoff, the adapter call.
 
   async enqueueOutbound(input: {
     kind: "text" | "card";
@@ -831,22 +1403,22 @@ export class Steward extends Agent<Env> {
     threadId?: string | null;
     urgency?: "push" | "quiet";
   }): Promise<{ id: string }> {
-    const id = ulid(); // stable across retries; doubles as the provider-side uuid
-    this.sql`
-      INSERT INTO sh_outbound (id, channel, kind, receiveId, threadId, payload, urgency, status, attempts, nextAttemptAt, createdAt)
-      VALUES (${id}, 'feishu', ${input.kind}, ${input.to}, ${input.threadId ?? null},
-              ${JSON.stringify({ text: input.text, card: input.card })}, ${input.urgency ?? "quiet"}, 'queued', 0, ${Date.now()}, ${Date.now()})
-    `;
+    const id = this.ledger.outbound.enqueue(input);
     void this.deliverOutbound();
     return { id };
   }
 
   async outboundRow(id: string): Promise<ShOutboundRow | null> {
-    return (this.sql`SELECT * FROM sh_outbound WHERE id = ${id}`[0] as ShOutboundRow | undefined) ?? null;
+    return (this.ledger.outbound.row(id) as unknown as ShOutboundRow | undefined) ?? null;
   }
 
   async outboundRows(limit = 10): Promise<ShOutboundRow[]> {
-    return this.sql`SELECT * FROM sh_outbound ORDER BY createdAt, id LIMIT ${limit}` as ShOutboundRow[];
+    return this.ledger.outbound.rows(limit) as unknown as ShOutboundRow[];
+  }
+
+  /** Read-only ledger view for tests: threads, workers, reports, questions, timeline. */
+  async debugSnapshot(): Promise<ReturnType<Steward["ledger"]["debug"]["snapshot"]>> {
+    return this.ledger.debug.snapshot();
   }
 
   // Scheduled callback (also fired inline after each enqueue): claims due rows, sends them
@@ -860,31 +1432,22 @@ export class Steward extends Agent<Env> {
 
   private async deliverOutboundPass(): Promise<void> {
     // Reclaim rows whose delivery pass died mid-send (claim expired): back to queued.
-    this.sql`UPDATE sh_outbound SET status = 'queued' WHERE status = 'sending' AND claimExpiresAt <= ${Date.now()}`;
-    const due = this.sql<{ id: string }>`
-      SELECT id FROM sh_outbound WHERE status = 'queued' AND nextAttemptAt <= ${Date.now()}
-      ORDER BY createdAt, id LIMIT ${OUTBOUND_BATCH}
-    `;
-    for (const row of due) await this.deliverOneOutbound(row.id);
+    this.ledger.outbound.reclaimExpiredClaims(Date.now());
+    for (const id of this.ledger.outbound.dueIds(Date.now(), OUTBOUND_BATCH)) {
+      await this.deliverOneOutbound(id);
+    }
     this.rearmDeliveryAlarm();
   }
 
   private async deliverOneOutbound(id: string): Promise<void> {
-    const claim = crypto.randomUUID();
-    // The claim (spike bug 1): one conditional, synchronous UPDATE — only a queued row (or one
-    // whose claim has expired) can be taken, so two concurrent passes never both send it.
-    this.sql`
-      UPDATE sh_outbound SET status = 'sending', claimToken = ${claim}, claimExpiresAt = ${Date.now() + OUTBOUND_CLAIM_MS}
-      WHERE id = ${id} AND (status = 'queued' OR (status = 'sending' AND claimExpiresAt <= ${Date.now()}))
-    `;
-    const row = this.sql<{ kind: string; receiveId: string; channel: string; attempts: number; payload: string; threadId: string | null }>`
-      SELECT kind, receiveId, channel, attempts, payload, threadId FROM sh_outbound WHERE id = ${id} AND claimToken = ${claim}
-    `[0];
+    // The claim (spike bug 1): only a queued row (or one whose claim has expired) can be
+    // taken, so two concurrent passes never both send it.
+    const row = this.ledger.outbound.claimForDelivery(id, Date.now(), OUTBOUND_CLAIM_MS);
     if (!row) return; // another pass owns this row
 
     const cfg = await this.loadFeishuConfig();
-    if (!cfg || !this.stillOwnsClaim(id, claim)) {
-      this.settleOutboundFailure(id, claim, row.attempts + 1, "channel_not_configured", true);
+    if (!cfg) {
+      this.ledger.outbound.settleFailure(id, row.claim, row.attempts + 1, "channel_not_configured", null, Date.now());
       return;
     }
 
@@ -906,44 +1469,27 @@ export class Steward extends Agent<Env> {
         threadId: row.threadId,
       });
       this.touchPace(row.channel, row.receiveId);
-      if (!this.stillOwnsClaim(id, claim)) return; // a reclaim took over mid-send; its send settles
-      this.sql`
-        UPDATE sh_outbound SET status = 'sent', providerMsgId = ${providerMsgId}, sentAt = ${Date.now()},
-                               attempts = attempts + 1, claimToken = NULL, claimExpiresAt = NULL, lastError = NULL
-        WHERE id = ${id}
-      `;
+      this.ledger.outbound.settleSent(id, row.claim, providerMsgId, Date.now());
     } catch (err) {
       // The attempt hit the wire (or timed out at 10s — spike bug 3), so it counts against
       // the receiver's rate budget either way.
       this.touchPace(row.channel, row.receiveId);
-      if (!this.stillOwnsClaim(id, claim)) return;
+      if (!this.ledger.outbound.stillOwns(id, row.claim)) return; // a reclaim took over mid-send; its send settles
       const attempts = row.attempts + 1;
       const retriable = err instanceof RetriableChannelError;
-      this.settleOutboundFailure(id, claim, attempts, errorText(err), !retriable || attempts >= OUTBOUND_MAX_ATTEMPTS);
+      const permanent = !retriable || attempts >= OUTBOUND_MAX_ATTEMPTS;
+      const delay = permanent
+        ? null
+        : Math.min(OUTBOUND_BACKOFF_BASE_MS * 2 ** Math.max(0, attempts - 1), OUTBOUND_BACKOFF_CAP_MS);
+      this.ledger.outbound.settleFailure(
+        id,
+        row.claim,
+        attempts,
+        errorText(err),
+        permanent ? null : Date.now() + (delay ?? 0),
+        Date.now(),
+      );
     }
-  }
-
-  private settleOutboundFailure(id: string, claim: string, attempts: number, error: string, permanent: boolean): void {
-    if (!this.stillOwnsClaim(id, claim)) return;
-    if (permanent) {
-      this.sql`
-        UPDATE sh_outbound SET status = 'failed', attempts = ${attempts}, lastError = ${error},
-                               claimToken = NULL, claimExpiresAt = NULL
-        WHERE id = ${id}
-      `;
-      return;
-    }
-    const delay = Math.min(OUTBOUND_BACKOFF_BASE_MS * 2 ** Math.max(0, attempts - 1), OUTBOUND_BACKOFF_CAP_MS);
-    this.sql`
-      UPDATE sh_outbound SET status = 'queued', attempts = ${attempts}, nextAttemptAt = ${Date.now() + delay},
-                             lastError = ${error}, claimToken = NULL, claimExpiresAt = NULL
-      WHERE id = ${id}
-    `;
-  }
-
-  private stillOwnsClaim(id: string, claim: string): boolean {
-    const row = this.sql<{ claimToken: string | null }>`SELECT claimToken FROM sh_outbound WHERE id = ${id}`[0];
-    return row?.claimToken === claim;
   }
 
   private touchPace(channel: string, receiveId: string): void {
@@ -954,15 +1500,8 @@ export class Steward extends Agent<Env> {
   }
 
   private rearmDeliveryAlarm(): void {
-    const nextDue = this.sql<{ at: number | null }>`
-      SELECT MIN(nextAttemptAt) AS at FROM sh_outbound WHERE status = 'queued'
-    `[0]?.at ?? null;
-    const nextReclaim = this.sql<{ at: number | null }>`
-      SELECT MIN(claimExpiresAt) AS at FROM sh_outbound WHERE status = 'sending'
-    `[0]?.at ?? null;
-    const candidates = [nextDue, nextReclaim].filter((v): v is number => v !== null);
-    if (candidates.length === 0) return;
-    const at = Math.min(...candidates);
+    const at = this.ledger.outbound.nextWake(Date.now());
+    if (at === null) return;
     void this.schedule(Math.max(1, Math.ceil((at - Date.now()) / 1000)), "deliverOutbound");
   }
 }

@@ -103,11 +103,46 @@ describe("FeishuAdapter.verifyAndParse", () => {
     const parsed = await a.verifyAndParse(
       eventRequest({
         schema: "2.0",
-        header: { event_id: "evt_card_2", event_type: "card.action.trigger", create_time: String(Date.now()), token: TEST_VERIFY_TOKEN, app_id: TEST_APP_ID },
+        header: { event_id: "evt_other_2", event_type: "contact.user.updated_v3", create_time: String(Date.now()), token: TEST_VERIFY_TOKEN, app_id: TEST_APP_ID },
         event: {},
       }),
     );
-    expect(parsed).toMatchObject({ kind: "other", msgId: "evt_card_2", eventType: "card.action.trigger" });
+    expect(parsed).toMatchObject({ kind: "other", msgId: "evt_other_2", eventType: "contact.user.updated_v3" });
+  });
+
+  it("card.action.trigger becomes kind=card_action with operator, action value, and card message id", async () => {
+    const a = adapter(new MemoryTokenStore(), fetch);
+    const parsed = await a.verifyAndParse(
+      eventRequest({
+        schema: "2.0",
+        header: { event_id: "evt_card_ok", event_type: "card.action.trigger", create_time: String(Date.now()), token: TEST_VERIFY_TOKEN, app_id: TEST_APP_ID },
+        event: {
+          operator: { open_id: "ou_owner" },
+          action: { value: { action: "wait_online" } },
+          context: { open_message_id: "om_card_1" },
+        },
+      }),
+    );
+    expect(parsed).toMatchObject({
+      kind: "card_action",
+      msgId: "evt_card_ok",
+      operatorId: "ou_owner",
+      action: "wait_online",
+      cardMsgId: "om_card_1",
+    });
+  });
+
+  it("a card.action.trigger without operator or card context is a 400", async () => {
+    const a = adapter(new MemoryTokenStore(), fetch);
+    const parsed = await a.verifyAndParse(
+      eventRequest({
+        schema: "2.0",
+        header: { event_id: "evt_card_bad2", event_type: "card.action.trigger", create_time: String(Date.now()), token: TEST_VERIFY_TOKEN, app_id: TEST_APP_ID },
+        event: { operator: { open_id: "ou_owner" } },
+      }),
+    );
+    expect(parsed).toBeInstanceOf(Response);
+    expect((parsed as Response).status).toBe(400);
   });
 });
 
