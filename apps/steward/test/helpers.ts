@@ -1,9 +1,170 @@
-import { SELF, env } from "cloudflare:test";
+import { SELF, env, runInDurableObject } from "cloudflare:test";
+import { expect } from "vitest";
 import type { Steward } from "../src/steward.ts";
 
 export function ownerStub() {
   const id = env.Steward.idFromName("owner");
   return env.Steward.get(id) as unknown as DurableObjectStub<Steward> & Steward;
+}
+
+// DO SQLite is NOT rolled back between tests in this setup (state visibly carries over), so
+// every channel test starts by clearing the sh_* tables the same way the outbox tests reach
+// in with raw SQL.
+export async function resetChannelState(): Promise<void> {
+  // Any RPC first: it flows through the SDK lifecycle, which runs onStart() → migrations.
+  // Hitting runInDurableObject on a cold DO would find no sh_* tables yet.
+  await ownerStub().setupState();
+  await runInDurableObject(ownerStub(), (instance: Steward) => {
+    // `.bind` matters: the SDK's sql tagged template reads `this.ctx`, so it must be invoked
+    // through the instance (the outbox tests use method-call form for the same reason).
+    const sql = (
+      instance as unknown as { sql: (strings: TemplateStringsArray, ...values: unknown[]) => unknown }
+    ).sql.bind(instance);
+    sql`DELETE FROM sh_channel`;
+    sql`DELETE FROM sh_inbound`;
+    sql`DELETE FROM sh_outbound`;
+    sql`DELETE FROM sh_channel_log`;
+    sql`DELETE FROM sh_channel_token`;
+    sql`DELETE FROM sh_channel_pace`;
+  });
+}
+
+// ---- Feishu mock (service binding FEISHU_API, wired in vitest.config.ts) ----
+
+export interface MockReply {
+  status?: number;
+  body?: unknown;
+  delayMs?: number;
+}
+
+export interface RecordedCall {
+  method: string;
+  path: string;
+  body: string | null;
+  at: number;
+}
+
+const MOCK = "https://feishu.invalid";
+
+// vitest.config.ts always binds FEISHU_API; the optionality only exists for production.
+function feishuMock(): Fetcher {
+  if (!env.FEISHU_API) throw new Error("FEISHU_API service binding missing — check vitest.config.ts");
+  return env.FEISHU_API;
+}
+
+export async function mockReset(): Promise<void> {
+  await feishuMock().fetch(`${MOCK}/__control/reset`, { method: "POST" });
+}
+
+export async function mockQueue(...replies: MockReply[]): Promise<void> {
+  await feishuMock().fetch(`${MOCK}/__control/queue`, { method: "POST", body: JSON.stringify(replies) });
+}
+
+export async function mockCalls(): Promise<RecordedCall[]> {
+  const res = await feishuMock().fetch(`${MOCK}/__control/calls`, { method: "POST" });
+  return res.json();
+}
+
+export function sendCalls(calls: RecordedCall[]): RecordedCall[] {
+  return calls.filter((c) => c.method === "POST" && c.path.startsWith("/open-apis/im/v1/messages"));
+}
+
+export function tokenCalls(calls: RecordedCall[]): RecordedCall[] {
+  return calls.filter((c) => c.path.startsWith("/open-apis/auth/v3/tenant_access_token"));
+}
+
+// The credentials every helper below uses; the webhook's verification token must match
+// `messageEvent({ token })` and `urlVerification({ token })`.
+export const TEST_APP_ID = "cli_test_app";
+export const TEST_APP_SECRET = "sec_test_secret";
+export const TEST_VERIFY_TOKEN = "verify-token";
+export const SETUP_URL = "https://example.com/setup?token=test-setup-token-not-a-secret";
+
+export async function submitSetupCredentials(
+  appId = TEST_APP_ID,
+  appSecret = TEST_APP_SECRET,
+  verificationToken = TEST_VERIFY_TOKEN,
+): Promise<Response> {
+  const body = new URLSearchParams({ appId, appSecret, verificationToken });
+  return SELF.fetch(SETUP_URL, {
+    method: "POST",
+    body,
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+  });
+}
+
+/** Submits credentials and binds `ou_owner` with a first DM; the confirmation send settles. */
+export async function configureAndBind(senderId = "ou_owner"): Promise<void> {
+  await submitSetupCredentials();
+  const res = await postEvent(messageEvent({ msgId: `om_bind_${senderId}`, senderId, text: "hi" }));
+  expect(res.status).toBe(200);
+  await waitWhileOutboundPending();
+}
+
+export interface MessageEventOptions {
+  msgId?: string;
+  senderId?: string;
+  chatType?: "p2p" | "group";
+  text?: string;
+  parentId?: string;
+  messageType?: string;
+  createTime?: number;
+  token?: string;
+  appId?: string;
+}
+
+export function messageEvent(opts: MessageEventOptions = {}) {
+  const now = Date.now();
+  return {
+    schema: "2.0",
+    header: {
+      event_id: `evt_${opts.msgId ?? "om_default"}`,
+      event_type: "im.message.receive_v1",
+      create_time: String(opts.createTime ?? now),
+      token: opts.token ?? TEST_VERIFY_TOKEN,
+      app_id: opts.appId ?? TEST_APP_ID,
+    },
+    event: {
+      message: {
+        message_id: opts.msgId ?? "om_default",
+        root_id: "",
+        parent_id: opts.parentId ?? "",
+        create_time: String(opts.createTime ?? now),
+        chat_id: "oc_default",
+        chat_type: opts.chatType ?? "p2p",
+        message_type: opts.messageType ?? "text",
+        content: JSON.stringify({ text: opts.text ?? "hello" }),
+      },
+      sender: {
+        sender_id: { open_id: opts.senderId ?? "ou_owner" },
+        sender_type: "user",
+        tenant_key: "tenant",
+      },
+    },
+  };
+}
+
+export function postEvent(body: unknown): Promise<Response> {
+  return SELF.fetch("https://example.com/channels/feishu/events", {
+    method: "POST",
+    body: JSON.stringify(body),
+    headers: { "content-type": "application/json" },
+  });
+}
+
+export function urlVerification(token = TEST_VERIFY_TOKEN): Promise<Response> {
+  return postEvent({ type: "url_verification", challenge: "ch-123", token });
+}
+
+/** Polls until no sh_outbound row is queued/sending (the void-fired delivery settled). */
+export async function waitWhileOutboundPending(timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const pending = await ownerStub().outboundRows(20);
+    if (pending.every((row) => row.status === "sent" || row.status === "failed")) return;
+    if (Date.now() > deadline) throw new Error(`outbound rows still pending: ${JSON.stringify(pending.map((r) => [r.id, r.status]))}`);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
 }
 
 export async function pairDevice(name: string): Promise<{ deviceId: string; token: string }> {

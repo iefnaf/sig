@@ -9,6 +9,14 @@ function json(body: unknown, status = 200): Response {
   return Response.json(body, { status });
 }
 
+// Length-independent comparison so the setup gate does not leak the token byte-by-byte.
+function setupTokenMatches(got: string | null, want: string): boolean {
+  if (!got || got.length !== want.length) return false;
+  let diff = 0;
+  for (let i = 0; i < want.length; i++) diff |= got.charCodeAt(i) ^ want.charCodeAt(i);
+  return diff === 0;
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -30,6 +38,24 @@ export default {
       const wsScheme = url.protocol === "https:" ? "wss:" : "ws:";
       const wsUrl = `${wsScheme}//${url.host}/agents/steward/owner`;
       return json({ ...result, wsUrl });
+    }
+
+    // The setup page opens only with SETUP_TOKEN (ADR-0001 decision 8) and 404s otherwise —
+    // including once the owner is bound, which the DO decides permanently. The token check is
+    // stateless so probes never wake the Durable Object.
+    if (url.pathname === "/setup" && (request.method === "GET" || request.method === "POST")) {
+      if (!env.SETUP_TOKEN || !setupTokenMatches(url.searchParams.get("token"), env.SETUP_TOKEN)) {
+        return new Response("not found", { status: 404 });
+      }
+      const stub = await getAgentByName(env.Steward, "owner");
+      return stub.fetch(request);
+    }
+
+    // Feishu event webhook (steward.md §9.1): one of the two unauthenticated entry points
+    // (ADR-0001 decision 7) — the DO validates Feishu's verification token itself.
+    if (url.pathname === "/channels/feishu/events" && request.method === "POST") {
+      const stub = await getAgentByName(env.Steward, "owner");
+      return stub.fetch(request);
     }
 
     const routed = await routeAgentRequest(request, env, {
