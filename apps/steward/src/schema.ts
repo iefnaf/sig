@@ -170,7 +170,8 @@ export const MIGRATIONS: readonly Migration[] = [
       sql`CREATE TABLE IF NOT EXISTS sh_thread_repo (
         threadId TEXT NOT NULL, repoId TEXT NOT NULL, PRIMARY KEY (threadId, repoId)
       )`;
-      // One row per worker session (steward.md §2.2; parentWorker/relay arrives with M2).
+      // One row per worker session (steward.md §2.2; parentWorker — the relay relationship
+      // — and contextPercent arrive with migration 013 / issue #8).
       sql`CREATE TABLE IF NOT EXISTS sh_worker (
         workerId TEXT PRIMARY KEY, threadId TEXT NOT NULL, deviceId TEXT NOT NULL, repoId TEXT,
         agent TEXT NOT NULL, mode TEXT NOT NULL,
@@ -658,6 +659,28 @@ export const MIGRATIONS: readonly Migration[] = [
       )`;
       sql`CREATE INDEX IF NOT EXISTS sh_note_log_pending ON sh_note_log (reportedAt, id)`;
       sql`CREATE INDEX IF NOT EXISTS sh_note_log_note ON sh_note_log (noteId, op, ts)`;
+    },
+  },
+  {
+    // Relay: handoff briefs and continuing on the previous branch (issue #8, spec §5.3,
+    // steward.md §2.6). The worker rows learn their relay parent and the last-reported
+    // context usage; summary updates become versioned (last 5 kept; every 10th update is
+    // prompted as a from-scratch rewrite — steward.md §2.6's anti-drift rule). Existing
+    // threads keep their current summary: it enters history as version 1 on the next
+    // update, so the cumulative counter never reads zero on a thread with a past.
+    id: "013_relay_handoff",
+    up: (sql) => {
+      ignoringDuplicateColumn(() => {
+        sql`ALTER TABLE sh_worker ADD COLUMN parentWorker TEXT`;
+        sql`ALTER TABLE sh_worker ADD COLUMN contextPercent INTEGER`;
+      });
+      sql`CREATE TABLE IF NOT EXISTS sh_thread_summary (
+        threadId TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        summary TEXT NOT NULL,
+        at INTEGER NOT NULL,
+        PRIMARY KEY (threadId, version)
+      )`;
     },
   },
 ];

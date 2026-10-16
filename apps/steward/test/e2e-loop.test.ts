@@ -156,40 +156,48 @@ describe("the happy loop: natural language → tool dispatch → done card → e
     const bookkept = await snapshot();
     expect(bookkept.threads[0]!.summary).toContain("session 过期刷新");
 
-    // --- quote-reply to the card routes to the SAME Thread and relays the branch (§5.3) ----
+    // --- quote-reply to the card routes to the SAME Thread and resumes the session (§5.3) -
     await fake.emit("settled", workerId, { type: "settled", outcome: "reported" });
     await snapshotWhere((s) => s.threads[0]?.workers[0]?.state === "idle", "first run settled");
     await scriptModel(
       fauxAssistantMessage([fauxToolCall("start_worker", { prompt: "再补几个单元测试", repoRef: "repo-a", threadId, basis: "user_reply_to" })], { stopReason: "toolUse" }),
-      fauxAssistantMessage([fauxText("已把「补单测」接到了之前的登录 bug 上。")]),
+      fauxAssistantMessage([fauxText("已把「补单测」接到了之前的登录 bug 上（续用原会话）。")]),
     );
     const res2 = await ownerDm("再补几个单元测试", card1!.providerMsgId!);
     expect(res2.status).toBe(200);
-    const sameThread = await snapshotWhere((s) => s.threads[0]?.workers.length === 2, "second worker on the same thread");
-    expect(sameThread.threads).toHaveLength(1); // no new Thread — signal 1 routed it
-    expect(sameThread.threads[0]!.unread).toBe(false); // the reply counts as read (§6.5)
+    const resumed = await snapshotWhere(
+      (s) => s.threads[0]?.workers[0]?.state === "starting" && s.threads[0]?.workers.length === 1,
+      "resume pending on the same session",
+    );
+    expect(resumed.threads).toHaveLength(1); // no new Thread — signal 1 routed it
+    expect(resumed.threads[0]!.workers).toHaveLength(1); // same session, no second worker (issue #8)
+    expect(resumed.threads[0]!.unread).toBe(false); // the reply counts as read (§6.5)
     const [, cmd2] = await fake.waitForCmds(2);
-    expect((cmd2!.args as Record<string, unknown>).threadId).toBe(threadId);
-    expect((cmd2!.args as Record<string, unknown>).base).toBe("shepherd/login-1"); // relay base
+    expect(cmd2!.kind).toBe("send"); // resume: the task enters the existing session
+    expect(cmd2!.args).toMatchObject({ workerId, text: "再补几个单元测试" });
+    expect(cmd2!.args).not.toHaveProperty("base"); // nothing relayed — the session has its context
 
     // The model saw the quote-routing note with the resolved thread id (§3.1 signal 1).
     const quoteRequest = (await modelRequests()).filter((r) => r.userText.includes("再补几个单元测试")).at(-1);
     expect(quoteRequest!.userText).toContain("（系统注：");
     expect(quoteRequest!.userText).toContain(threadId);
 
-    // Second leg runs and reports; its card comes back on the same Thread.
-    const worker2 = String((cmd2!.args as Record<string, unknown>).workerId);
+    // The resumed run reports on the same worker; its card comes back on the same Thread.
     fake.send({ t: "cmd_ack", re: cmd2!.id, status: "accepted" });
-    fake.send({ t: "cmd_result", re: cmd2!.id, ok: true, data: { sessionId: worker2, branch: "shepherd/login-2" } });
-    await fake.emit("started", worker2, { sessionId: worker2, branch: "shepherd/login-2" });
-    await fake.emit("report", worker2, {
+    fake.send({ t: "cmd_result", re: cmd2!.id, ok: true, data: { delivery: "prompt" } });
+    await fake.emit("started", workerId, { sessionId: workerId }); // no branch → must not clobber
+    await fake.emit("report", workerId, {
       type: "report",
       status: "done",
       summary: "单元测试补齐",
       changes: ["session.test.ts 新增 3 例"],
-      git: { branch: "shepherd/login-2", base: "main", ahead: 1, dirty: 0, filesChanged: 1, insertions: 3, deletions: 0, pushed: false },
+      git: { branch: "shepherd/login-1", base: "main", ahead: 2, dirty: 0, filesChanged: 2, insertions: 8, deletions: 0, pushed: false },
     });
-    await snapshotWhere((s) => s.threads[0]?.workers.length === 2 && s.threads[0]?.workers[1]?.state === "running", "second run reported");
+    const after = await snapshotWhere(
+      (s) => s.threads[0]?.workers[0]?.state === "running" && s.threads[0]?.workers[0]?.lastOutcome === "reported:done",
+      "resumed run reported",
+    );
+    expect(after.threads[0]!.workers[0]!.branch).toBe("shepherd/login-1"); // branch survived the branchless started
     await waitWhileOutboundPending();
     const cards = await sentCards(2);
     expect(cards).toHaveLength(2);
@@ -229,8 +237,11 @@ describe("offline machines (spike bug 4): a Thread remembers its machine and que
     );
     const res = await ownerDm("接着做第二段", card1!.providerMsgId!);
     expect(res.status).toBe(200);
-    const queuedSnap = await snapshotWhere((s) => s.threads[0]?.workers.length === 2, "second worker registered");
-    expect(queuedSnap.threads[0]!.state).toBe("running"); // starting while queued
+    const queuedSnap = await snapshotWhere(
+      (s) => s.threads[0]?.workers[0]?.state === "starting" && s.threads[0]?.workers.length === 1,
+      "resume pending while offline",
+    );
+    expect(queuedSnap.threads[0]!.state).toBe("running"); // resume-pending while queued (issue #8)
     await waitRunsSettled();
     await waitWhileOutboundPending();
     const texts = await sentTexts();
@@ -238,12 +249,19 @@ describe("offline machines (spike bug 4): a Thread remembers its machine and que
     await new Promise((resolve) => setTimeout(resolve, 300));
     expect(fake.cmds).toHaveLength(1); // nothing was delivered to a dead socket
 
-    // --- the machine comes back: hello redelivers the queued command, the run completes -----
+    // --- the machine comes back: hello redelivers the queued resume, the run completes ------
     await fake.connect();
     const [, cmd2] = await fake.waitForCmds(2);
     expect(cmd2).toBeDefined();
+    expect(cmd2!.kind).toBe("send"); // the queued continuation was the resume send
     expect(cmd2!.notAfter).toBeNull(); // "wait until online" (protocol §4.2)
-    await snapshotWhere((s) => s.threads[0]?.workers[1]?.state === "idle", "second leg done after reconnect");
+    const workerId = queuedSnap.threads[0]!.workers[0]!.workerId;
+    fake.send({ t: "cmd_ack", re: cmd2!.id, status: "accepted" });
+    fake.send({ t: "cmd_result", re: cmd2!.id, ok: true, data: { delivery: "prompt", relaunched: true } });
+    await fake.emit("started", workerId, { sessionId: workerId, branch: "shepherd/leg-1" });
+    await fake.emit("report", workerId, { type: "report", status: "done", summary: "第二段接力完成" });
+    await fake.emit("settled", workerId, { type: "settled", outcome: "reported" });
+    await snapshotWhere((s) => s.threads[0]?.workers[0]?.state === "idle", "second leg done after reconnect");
     await waitRunsSettled();
     await waitWhileOutboundPending();
     expect((await sentCards()).length).toBe(2);

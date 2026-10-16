@@ -16,8 +16,22 @@ import { inspectSessionTail, type SessionTail } from "./session-tail.ts";
 import { readSessionHistory } from "./session-history.ts";
 import type { HistoryPage } from "@shepherd/protocol";
 import type { LocalStore, RegisteredRepo, WorkerRow } from "./store.ts";
-import { WorktreeManager } from "./worktree.ts";
+import { WorktreeManager, createReadonlyWorktree } from "./worktree.ts";
 import { join } from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const execGit = promisify(execFile);
+
+/** Resolves a commit-ish (e.g. the previous relay leg's branch) to a full commit sha.
+ *  Throws when the ref does not exist locally — a cross-machine relay without a fetched
+ *  branch must fail loudly, not silently start from the default branch. */
+async function resolveCommitish(cwd: string, commitish: string): Promise<string> {
+  const { stdout } = await execGit("git", ["rev-parse", "--verify", `${commitish}^{commit}`], { cwd, timeout: 30_000 });
+  const sha = stdout.trim();
+  if (!sha) throw new Error(`cannot resolve '${commitish}'`);
+  return sha;
+}
 
 export class CommandError extends Error {
   constructor(
@@ -90,6 +104,8 @@ export interface StartWorkerResult {
   branch?: string;
   cwd: string;
   worktree?: string;
+  /** Readonly relay legs (issue #8): the commit the detached-HEAD worktree sits on. */
+  base?: string;
   /** §8.2 serial mode: the write worker waits for the repo's current write worker instead of
    * starting now. The `started` event follows when the slot frees. */
   queued?: boolean;
@@ -351,18 +367,37 @@ export class WorkerManager {
     let worktree: string | undefined;
     let branch: string | undefined;
     let base: string | undefined;
+    let readonlyWorktree = false;
     try {
       // --- §8.2 workspace resolution. Write + worktree/serial → a dedicated worktree; write +
-      // main, and every readonly run (§8.3) → the repository's own checkout, no worktree.
-      const useWorktree = args.mode === "write" && repo.workspace !== "main";
+      // main, and readonly runs without a relay base (§8.3) → the repository's own checkout.
+      // Readonly + base → a DETACHED-HEAD worktree at that base (issue #8): a review leg
+      // continues from the write leg's branch without checking anything out in the owner's
+      // working directory.
+      const useWorktree = (args.mode === "write" && repo.workspace !== "main") || (args.mode === "readonly" && !!args.base);
       let cwd = repo.path;
       if (useWorktree) {
         try {
-          const created = await this.worktrees.create({ repoPath: repo.path, threadId: args.threadId, base: args.base });
-          cwd = created.path;
-          branch = created.branch;
-          base = created.base;
-          worktree = created.path;
+          if (args.mode === "readonly") {
+            // The base is the previous leg's branch — resolve it to a commit first so the
+            // detached HEAD pins the exact tip even if the branch moves while this runs.
+            const resolved = await resolveCommitish(repo.path, args.base!);
+            const ro = await createReadonlyWorktree(repo.path, {
+              worktreesRoot: join(this.stateDir, "worktrees"),
+              base: resolved,
+              threadId: args.threadId,
+            });
+            cwd = ro.path;
+            worktree = ro.path;
+            base = ro.base;
+            readonlyWorktree = true;
+          } else {
+            const created = await this.worktrees.create({ repoPath: repo.path, threadId: args.threadId, base: args.base });
+            cwd = created.path;
+            branch = created.branch;
+            base = created.base;
+            worktree = created.path;
+          }
           if (this.stopRequested.has(args.workerId)) throw new CommandError("aborted", "worker was stopped during startup");
         } catch (err) {
           if (err instanceof CommandError) throw err;
@@ -411,6 +446,7 @@ export class WorkerManager {
         branch,
         cwd,
         worktree,
+        ...(readonlyWorktree ? { base } : {}),
       };
       this.stopRequested.delete(args.workerId);
       this.store.upsertWorker({
@@ -431,6 +467,7 @@ export class WorkerManager {
         sessionId: handle.sessionId,
         cwd,
         branch,
+        ...(readonlyWorktree ? { base } : {}),
       });
       return result;
     } catch (err) {

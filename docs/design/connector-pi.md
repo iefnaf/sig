@@ -387,9 +387,9 @@ The `history` command backs "view raw history" in the web UI:
 
 1. **Startup self-check**: how to confirm the `report` tool is actually loaded (whether `get_state` exposes the tool list, or verify after the first run). Current plan: treat a missing `report` as `unreported` and raise a warning in the startup log.
 2. *(Resolved by [ADR-0001](../adr/0001-mvp-implementation-baseline.md): the extension writes `commandId` into a `custom` entry.)* **Adjudicating `ambiguous` commands** relies on "the last user message's text is identical", which misjudges repeated instructions (the user sending the same text twice in a row); a more reliable marker is needed, e.g. having the extension write `commandId` into a `custom` entry.
-3. **Whether the report fields suffice for a handoff brief**: whether `decisions`, `leftovers`, and `next` are enough — revisit after the steward-side brief generation is built.
+3. **Whether the report fields suffice for a handoff brief**: whether `decisions`, `leftovers`, and `next` are enough — revisit after the steward-side brief generation is built. *Partially resolved (issue #8): the brief assembles from decisions/leftovers/git pointers and renders them usefully; `next` is not used (the steward's task at hand supersedes it). Revisit with real relay traffic.*
 4. **External-use detection** (§10) relies on `ps` argument matching; it must be validated on both macOS and Linux.
-5. **Context-usage threshold**: how high before suggesting a new session — needs real-world data.
+5. **Context-usage threshold**: how high before suggesting a new session — needs real-world data. *(Issue #8 picked 80% of the reported `contextUsage` as the deterministic resume-vs-new-session threshold — `HIGH_CONTEXT_USAGE` in `handoff.ts`; revisit with data.)*
 6. *(Resolved by [ADR-0001](../adr/0001-mvp-implementation-baseline.md): `node:sqlite`; npm package `@iefnaf/shepherd` with launchd/systemd.)* **Local store selection and the connector's packaging/distribution** (one-command `npx` run, background service registration).
 7. **Cross-model `report` reliability**, and how models behave when they do not follow the "last action" rule.
 8. **Claude Code adaptation**: the first real test of this contract when a second agent plugs in; the focus is how gaps in `steer` and structured reporting degrade.

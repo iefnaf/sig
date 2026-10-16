@@ -42,6 +42,9 @@ export interface EventWakeInput {
   settled?: { outcome: string; errorClass: string | null; text: string };
   /** Whether the deterministic core already pushed a card to the user for this event. */
   notified: boolean;
+  /** §2.6 (issue #8): the next summary update lands on the every-10th boundary — the wake
+   *  asks for a from-scratch rewrite instead of an edit. */
+  summaryRewriteDue?: boolean;
 }
 
 /**
@@ -65,7 +68,13 @@ export function eventWakeText(input: EventWakeInput): string {
     if (r.leftovers?.length) lines.push(`  遗留：${r.leftovers.join("；")}`);
     if (r.question) lines.push(`  问题：${r.question}`);
     lines.push(`已发送给用户的通知：${input.notified ? "是（核心模板卡片）" : "否"}`);
-    lines.push("请做记账：用 update_thread 更新摘要。除非有用户必须知道的新信息，不要再通知用户；无事可做用 no_action 结束。");
+    lines.push(
+      "请做记账：用 update_thread 更新摘要。" +
+        (input.summaryRewriteDue
+          ? "⚠️ 这次的摘要更新落在整十版：必须【从头重写】（按 get_thread 的时间线与汇报重建，不要在旧摘要上缝补）。"
+          : "") +
+        "除非有用户必须知道的新信息，不要再通知用户；无事可做用 no_action 结束。",
+    );
     return lines.join("\n");
   }
 

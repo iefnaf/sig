@@ -206,6 +206,10 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
       const report = latest ? ctx.ledger.workers.reportsForWorker(latest.workerId).at(-1) ?? null : null;
       const question = ctx.ledger.questions.openForThread(thread.threadId);
       const timeline = ctx.ledger.timeline.list(thread.threadId).slice(-8);
+      // §2.6 (issue #8): the summary's cumulative update count, and whether the NEXT update
+      // is the every-10th from-scratch rewrite — when it is, the model must rebuild from
+      // timeline + reports (get_thread already returns both), not edit the old summary.
+      const summaryStatus = ctx.ledger.threads.summaryStatus(thread.threadId);
       // §4.1: the project-layer notes of every repo this Thread involves ride along with the
       // fetch (assembly counts as use — notes.forRepos bumps lastUsedAt).
       const repoIds = ctx.ledger.threads.repoIds(thread.threadId);
@@ -222,8 +226,10 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
           createdFromMsg: thread.createdFromMsg,
           workers: workers.map((w) => ({
             workerId: w.workerId, state: w.state, agent: w.agent, mode: w.mode,
-            branch: w.branch, lastOutcome: w.lastOutcome,
+            branch: w.branch, parentWorker: w.parentWorker, contextPercent: w.contextPercent, lastOutcome: w.lastOutcome,
           })),
+          summaryUpdates: summaryStatus.updates,
+          summaryRewriteDue: summaryStatus.rewriteDue,
           latestReport: report && { status: report.status, summary: report.summary, question: report.question, git: report.git },
           openQuestion: question?.text ?? null,
           projectNotes: projectNotes.map((n) => ({
@@ -253,12 +259,26 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
       if (args.summary !== undefined && args.summary.length > MAX_THREAD_SUMMARY) {
         return err(`summary 超长（${args.summary.length} > ${MAX_THREAD_SUMMARY} 字）。请重写得更紧凑，而不是截断。`);
       }
+      if (args.summary !== undefined && args.summary.trim().length === 0) {
+        return err("summary 不能为空白。要清空请用一句「暂无摘要」之类的实文。");
+      }
       const done = ctx.ledger.threads.update(args.threadId, {
         ...(args.title !== undefined ? { title: args.title } : {}),
         ...(args.goal !== undefined ? { goal: args.goal } : {}),
         ...(args.summary !== undefined ? { summary: args.summary } : {}),
       });
-      return done ? ok("updated") : err(`Thread ${args.threadId} 不存在。`);
+      if (!done) return err(`Thread ${args.threadId} 不存在。`);
+      // §2.6 (issue #8): report the cumulative count and — when the NEXT update lands on the
+      // every-10th boundary — demand the from-scratch rewrite (from timeline + reports, not
+      // an edit of the current summary). Blank/unchanged summaries never reached this point,
+      // so the count only moves on real rewrites.
+      const status = ctx.ledger.threads.summaryStatus(args.threadId);
+      return ok(
+        `updated（摘要累计第 ${status.updates} 版；系统保留最近 5 版）` +
+          (status.rewriteDue
+            ? `。⚠️ 下一次更新是第 ${status.updates + 1} 版＝整十版：必须【从头重写】——按 get_thread 的时间线与汇报重建，不要在旧摘要上缝补（防漂移）。`
+            : ""),
+      );
     },
   });
 
@@ -268,7 +288,7 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
       "派发一个编码任务到用户的机器。要么接续（threadId，来自 find_threads / get_thread），要么新开（newTitle + 可选 goal）。" +
       "只有显式路由的接续可免 routing：系统注已定归属（回复/按钮指向它），或本轮 find_threads 对它返回了 confidence=explicit；" +
       "其余接续必须带 routing: {confidence: 'high', reason}（政策硬性要求，把握不足改用 ask_user）。" +
-      "机器由确定性规则挑选；工具会让你知道结果（已派发 / 已用按钮问用户 / 需要你转问用户）。basis 是你派发的依据。" +
+      "机器由确定性规则挑选；工具会让你知道结果（已派发 / 已用按钮问用户 / 需要你转问用户）。接续时系统会自动决定续用原会话（同 agent 同机器）或开新会话（换机器/换 agent/上下文过大/用户要全新视角时）并附交接简报——工具结果会说明，prompt 里写本棒任务本身即可。basis 是你派发的依据。" +
       "mode 按任务性质选：纯研究/答疑/代码评审不改代码的用 readonly（在原仓库只读运行，无 worktree）；" +
       "会改代码的、或不确定的，用 write（默认，独享 worktree）。事件触发的运行里（⟦…⟧ 输入）必须另外给 " +
       "provenanceRef：一条真实存在的用户消息 id（user:<om_…>，来自时间线/汇报的 refs），" +
@@ -301,6 +321,12 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
        * authorization — the model must point at the user message (later also routine/
        * followup/watch id) that asked for this. */
       provenanceRef: Type.Optional(Type.String({ description: "授权来源：user:<msgId>（仅事件触发的运行里必填）" })),
+      /** Issue #8 (spec §5.3 case 2): the user asked for a fresh, unbiased look (「换个视角重新
+       *  评审」「不要受之前结论影响」) — always a new session with a handoff brief, never a
+       *  resume. Leave it out for ordinary continuations; the system resumes automatically. */
+      freshReview: Type.Optional(
+        Type.Boolean({ description: "用户明确要求全新视角/独立评审时 true；普通接续不要填（系统会自动续用原会话）" }),
+      ),
       basis: Type.Union([
         Type.Literal("user_explicit"),
         Type.Literal("user_reply_to"),
@@ -341,6 +367,7 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
         ...(args.goal !== undefined ? { goal: args.goal } : {}),
         ...(args.machineHint !== undefined ? { machineHint: args.machineHint } : {}),
         ...(args.mode !== undefined ? { mode: args.mode } : {}),
+        ...(args.freshReview !== undefined ? { freshReview: args.freshReview } : {}),
         provenance,
         cmdId: `tool:${api.taskId}`,
         createdFromMsg: provenance.startsWith("user:") ? provenance.slice("user:".length) : null,
@@ -349,11 +376,24 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
       if (outcome.kind === "asked_offline") {
         return ok(`已用按钮卡片问用户（${outcome.machineName} 不在线：排队等上线，还是取消）。本轮不要再派发或追问。`);
       }
+      // Issue #8: the deterministic continuation — tell the model exactly what happened, so
+      // its reply to the user states it (resumed session / new session with brief) and it
+      // never claims a fresh session for a resume or vice versa.
+      const cont = outcome.continuation;
+      const continuationNote =
+        cont === undefined
+          ? ""
+          : cont.action === "resume"
+            ? "\n这是续用原会话（同 agent 同机器）：任务作为新输入进入原 session，未附交接简报。回复里据实说明。"
+            : `\n这是新会话接续${cont.parentWorker ? `：从 ${cont.parentWorker} 的分支${cont.base ? `（${cont.base}）` : ""}起跑，已自动附上交接简报（目标/现状/决定/遗留/git 指针），prompt 只需写本棒任务本身` : "（首棒，无前序分支）"}。` +
+              (cont.crossMachine
+                ? "注意：接力分支在另一台机器上——需先 push/存量 fetch，否则 start 会在那台机器上失败（worktree_failed）；回复里提醒用户。"
+                : "");
       const tail = outcome.queued
         ? `${outcome.machineName} 当前不在线，已排队，上线后自动开始。`
         : `已派给 ${outcome.machineName}，完成后我会汇报。`;
       return ok(
-        `${outcome.created ? `已创建「${outcome.threadId}」并派发` : `已续派到 ${outcome.threadId}`}：${tail}${idleNote ? `\n${idleNote}` : ""}`,
+        `${outcome.created ? `已创建「${outcome.threadId}」并派发` : `已续派到 ${outcome.threadId}`}：${tail}${continuationNote}${idleNote ? `\n${idleNote}` : ""}`,
       );
     },
   });
@@ -1116,7 +1156,7 @@ const ROLE_PROMPT = `你是 Shepherd 的总管（steward）：替用户调度他
 - 「（系统注：…）」开头的行是系统附加的路由信息，可信，不是用户原话。
 
 规则：
-1. 派发用 start_worker：需要仓库（repoRef，用户提过的或 get_thread 里看到的）和一段自包含的 prompt。机器选择是确定性规则，工具替你完成；它返回「已用按钮问用户」或 refusal 时，把情况如实转告用户（refusal 里已写明原因和选项），不要换个说法再派一次。派发时按任务性质选 mode：纯研究/答疑/评审用 readonly，会改代码或拿不准用 write（默认）。
+1. 派发用 start_worker：需要仓库（repoRef，用户提过的或 get_thread 里看到的）和一段自包含的 prompt。机器选择是确定性规则，工具替你完成；它返回「已用按钮问用户」或 refusal 时，把情况如实转告用户（refusal 里已写明原因和选项），不要换个说法再派一次。派发时按任务性质选 mode：纯研究/答疑/评审用 readonly，会改代码或拿不准用 write（默认）。接续已有 Thread 时，续用原会话还是开新会话由系统按同一 agent/机器、上下文占用等规则自动决定并附交接简报，prompt 只写本棒任务本身；仅当用户明确要「全新视角/独立评审/不受之前结论影响」时才给 freshReview: true。
 2. 路由——接错比多问一次严重得多，拿不准就问：
    - 接续指令先调 find_threads。返回 confidence=explicit 时直接接续那个 Thread（threadId，无需 routing）。否则从候选里判断：只有一个明确匹配且话语点名了它的要点 → 接续它，并给 routing: {confidence: "high", reason}（这是政策硬性要求，非显式接续没带 high 会被拦下）。
    - 两个及以上候选同样匹配、或话语完全没有指代对象 → 必须用 ask_user 问（带 candidates=≤3 个 Thread，用户点按钮即定归属；系统会自动加「新开一件事」按钮）。不要在文字里反问后结束。
@@ -1127,7 +1167,7 @@ const ROLE_PROMPT = `你是 Shepherd 的总管（steward）：替用户调度他
    - 挂靠的依据是**同一件事的延续**，不是「领域相近」：新功能、新需求即使和现有 Thread 话题相关也是新事件，该新建就新建。
    - 挂靠已沉寂多日（工具结果会提醒）的 Thread 时，回复里要说明是接续早前的那件事（「已挂到之前那个 xx 上」）。
 3. 每次行动前先看态势简报（系统提示里的 shepherd-situation 段落）；需要细节再 get_thread。状态/进度类问题（「修好了吗」「方案出来了吗」）不派发，直接根据汇报与状态回答。
-4. worker 汇报到达（⟦event⟧）后做记账：用 update_thread 重写该 Thread 的摘要。除非卡片之外还有用户必须知道的新信息（风险、需要拍板、明确失败），否则不要再通知用户——通知卡片已经发过了。⟦verify⟧ 输入意味着上一条回复声称派发过但没有：要么现在真调 start_worker，要么用 notify_user 向用户更正。
+4. worker 汇报到达（⟦event⟧）后做记账：用 update_thread 重写该 Thread 的摘要；若工具结果或唤醒文本提示「整十版」，这次必须按 get_thread 的时间线与汇报【从头重写】，不要在旧摘要上缝补。除非卡片之外还有用户必须知道的新信息（风险、需要拍板、明确失败），否则不要再通知用户——通知卡片已经发过了。⟦verify⟧ 输入意味着上一条回复声称派发过但没有：要么现在真调 start_worker，要么用 notify_user 向用户更正。
 5. 给用户的回复要短：先结论，再要点，几行以内。严禁声称派发过而实际没有调用工具；只有看到 dispatched 结果才算派发过。
 6. 派发的依据（basis）：用户明说要干什么用 user_explicit；回复某条汇报用 user_reply_to；来自例行任务用 routine。凭空的推断禁止派发，改用 ask_user。
 7. 运行中的任务可以干预（workerId 从 get_thread 拿）：转向/追加用 send_to_worker —— 用户要「立刻改」用 intent=now（不打断当前工具，当前批次结束就转向，回复里说明 after_current_tools），「做完这个再顺便…」用 intent=after；停下/停止用 interrupt_worker，且仅限用户明示（basis=user_explicit 或 user_reply_to），「停，然后改用 X」把 X 放进 then。转向不是停下：想停就说停。

@@ -8,6 +8,8 @@
 // providerMsgId, never from data stuffed into the button.
 import { ulid } from "@shepherd/protocol";
 import type { Ledger, ThreadRow } from "./ledger.ts";
+import { decideContinuation, renderHandoffBrief, type NewSessionReason } from "./handoff.ts";
+import type { WorkerRow } from "./ledger.ts";
 import { offlineAskCard } from "./report-template.ts";
 
 const ADD_MACHINE_RE = /^\/(?:加机器|添加机器|add-machine|addmachine)\s*$/;
@@ -92,6 +94,9 @@ export interface StartWorkerInput {
    * anything that may change code needs a workspace. The steward decides at dispatch; the
    * default — also when unsure — is write. */
   mode?: "write" | "readonly";
+  /** Issue #8 (spec §5.3 case 2): the user asked for a fresh, unbiased look (e.g. an
+   *  independent review) — always a new session, never a resume of the old context. */
+  freshReview?: boolean;
   /** The authorizing run: `user:<msgId>` / `evt:…` / `routine:…` (steward.md §7.1). */
   provenance: string;
   /** `tool:<taskId>` — the idempotency key for replays (protocol §7.1). */
@@ -100,8 +105,31 @@ export interface StartWorkerInput {
   createdFromMsg?: string | null;
 }
 
+/** How a dispatch continued the Thread (issue #8): reused session or new one. */
+export interface StartWorkerContinuation {
+  action: "resume" | "new_session";
+  reason?: NewSessionReason;
+  parentWorker: string | null;
+  base?: string;
+  /** The relay branch lives on another machine: it must exist there (push + fetch) or the
+   *  connector's start fails with worktree_failed — worth telling the user. */
+  crossMachine: boolean;
+  /** The task prompt carried a handoff brief (always true for a relayed new session). */
+  brief: boolean;
+}
+
 export type StartWorkerOutcome =
-  | { kind: "dispatched"; workerId: string; threadId: string; machineName: string; repoId: string; queued: boolean; created: boolean }
+  | {
+      kind: "dispatched";
+      workerId: string;
+      threadId: string;
+      machineName: string;
+      repoId: string;
+      queued: boolean;
+      created: boolean;
+      /** Issue #8 (spec §5.3): how this dispatch continues the Thread. */
+      continuation?: StartWorkerContinuation;
+    }
   /** The only machine with the repo is offline: the wait/cancel card went out (spec §9). */
   | { kind: "asked_offline"; threadId: string; machineName: string }
   | { kind: "refused"; reason: string };
@@ -264,7 +292,17 @@ export class Dispatcher {
           this.ledger.timeline.add(thread.threadId, "user_instruction", input.prompt, { provenance: input.provenance });
           created = true;
         }
-        await this.dispatchTo(thread, choice.deviceId, repoId, input.prompt, choice.queued, input.provenance, input.cmdId, input.mode);
+        const continuation = await this.continueThread(
+          thread,
+          choice.deviceId,
+          repoId,
+          input.prompt,
+          choice.queued,
+          input.provenance,
+          input.cmdId,
+          input.mode ?? "write",
+          input.freshReview === true,
+        );
         return {
           kind: "dispatched",
           workerId: this.ledger.workers.latestOnThread(thread.threadId)!.workerId,
@@ -273,6 +311,7 @@ export class Dispatcher {
           repoId,
           queued: choice.queued,
           created,
+          ...(continuation !== undefined ? { continuation } : {}),
         };
       }
     }
@@ -440,7 +479,7 @@ export class Dispatcher {
         return;
       }
       const prompt = thread.goal ?? thread.title;
-      await this.dispatchTo(thread, machine.deviceId, repoId, prompt, true, `card:${input.cardMsgId}`);
+      await this.continueThread(thread, machine.deviceId, repoId, prompt, true, `card:${input.cardMsgId}`, `card:${input.cardMsgId}:${thread.threadId}`, "write", false);
       await this.#deps.sendText(`已排队：${machine.name} 上线后自动开始，完成后汇报。`, threadId);
       return;
     }
@@ -454,6 +493,7 @@ export class Dispatcher {
         return;
       }
       if (latest.cmdId && this.#deps.cancelQueuedCommand(latest.cmdId)) {
+        this.ledger.workers.markResumeCancelled(latest.workerId, latest.cmdId); // queued resume → back to idle (issue #8)
         this.ledger.timeline.add(threadId!, "note", "用户取消：命令在送出前撤回", null);
         await this.#deps.sendText("已取消。想再派发时直接说即可。", threadId);
         return;
@@ -475,27 +515,108 @@ export class Dispatcher {
    * Registers the worker, then enqueues `start_worker`. Registration must precede the command:
    * the reducer skips events for unknown workers (advancing the watermark), so the row has to
    * exist before the connector can possibly emit `started`.
+   *
+   * Issue #8 (spec §5.3) — a continuation first decides resume vs new session:
+   * - resume: same agent + same machine (+ a usable session, same repo, same mode, context
+   *   not high) → the task lands in the EXISTING session as a send (the connector's §6.2
+   *   idle-cold relaunch is the resume mechanism); no brief — the session has its own context.
+   * - new session: otherwise, on the previous worker's branch, with the deterministic
+   *   handoff brief (pointers, not content) prefixed to the task; `parentWorker` records the
+   *   relay relationship.
    */
-  private async dispatchTo(
+  private async continueThread(
     thread: ThreadRow,
     deviceId: string,
     repoId: string,
     prompt: string,
     queued: boolean,
     provenance: string,
-    cmdId?: string,
-    mode: "write" | "readonly" = "write",
-  ): Promise<void> {
+    cmdId: string,
+    mode: "write" | "readonly",
+    freshReview: boolean,
+  ): Promise<StartWorkerContinuation | undefined> {
     // Review (other findings): a replayed call carrying a cmdId that already exists must not
-    // register a second worker row (the outbox dedupes the command, but the ghost `starting`
+    // re-register a second worker row (the outbox dedupes the command, but the ghost `starting`
     // worker would sit on the Thread forever). Re-entering an existing command is a no-op.
-    if (cmdId !== undefined && this.#deps.commandExists(cmdId)) return;
-    const workerId = `w_${ulid()}`;
-    // Relay (spec §5.3): a later worker on the same Thread continues from the previous branch.
-    const previous = this.ledger.workers.latestOnThread(thread.threadId);
-    const base = previous?.branch ?? undefined;
+    if (this.#deps.commandExists(cmdId)) return undefined;
+    const decision = decideContinuation({
+      previous: this.ledger.workers.latestOnThread(thread.threadId),
+      next: { agent: AGENT, deviceId, repoId, mode },
+      freshReview,
+    });
+    if (decision.action === "resume") {
+      return this.resumeSession(thread, decision.worker.workerId, prompt, queued, provenance, cmdId);
+    }
+    return this.startNewSession(thread, deviceId, repoId, prompt, queued, provenance, cmdId, mode, decision);
+  }
+
+  /** The resume half: deliver the task into the existing session. `intent: "after"` when the
+   *  previous run is still going — the task queues as a follow-up instead of steering it. */
+  private async resumeSession(
+    thread: ThreadRow,
+    workerId: string,
+    prompt: string,
+    queued: boolean,
+    provenance: string,
+    cmdId: string,
+  ): Promise<StartWorkerContinuation> {
+    const worker = this.ledger.workers.get(workerId)!;
+    const machineName = this.ledger.machines.get(worker.deviceId)?.name ?? worker.deviceId;
+    const intent = worker.state === "running" || worker.state === "recovering" ? "after" : "auto";
     this.ledger.questions.closeOpen(thread.threadId, "用户重新派发");
-    this.ledger.workers.register({ workerId, threadId: thread.threadId, deviceId, repoId, agent: AGENT, mode });
+    const { cmdId: finalCmdId } = await this.#deps.enqueueCommand(
+      worker.deviceId,
+      "send",
+      { workerId, text: prompt, intent },
+      // notAfter null: an offline machine gets the task at its next hello, exactly like a
+      // queued start (the user was told it would continue when the machine returns).
+      { workerId, notAfter: queued ? null : undefined, cmdId },
+    );
+    // Resume-pending bookkeeping: the Thread reads running-shaped immediately; a failed send
+    // reverts through markResumeFailed (the worker row still points at this cmdId).
+    this.ledger.workers.markResumePending(workerId, finalCmdId);
+    this.ledger.threads.setLastMachine(thread.threadId, worker.deviceId);
+    this.ledger.recomputeThreadState(thread.threadId);
+    this.ledger.timeline.add(
+      thread.threadId,
+      "dispatch",
+      `接续原会话 ${workerId}（${machineName}）${queued ? "（离线排队）" : ""}：${prompt}`,
+      { workerId, cmdId: finalCmdId, provenance },
+    );
+    return { action: "resume", parentWorker: null, crossMachine: false, brief: false };
+  }
+
+  /** The new-session half: new worker row (parentWorker = the leg it continues from), relay
+   *  base = the Thread's latest worker branch, handoff brief prefixed to the task. */
+  private async startNewSession(
+    thread: ThreadRow,
+    deviceId: string,
+    repoId: string,
+    prompt: string,
+    queued: boolean,
+    provenance: string,
+    cmdId: string,
+    mode: "write" | "readonly",
+    decision: { from: WorkerRow | null; reason?: NewSessionReason },
+  ): Promise<StartWorkerContinuation> {
+    const workerId = `w_${ulid()}`;
+    // Relay (spec §5.3): base = the Thread's latest worker branch — skipping legs that never
+    // got one (readonly runs, never-started starts). relaySource also nulls a same-machine
+    // repo switch: that branch belongs to another repo and must not be relayed.
+    const previous = this.ledger.workers.relaySource(thread.threadId, { deviceId, repoId });
+    const baseWorker = previous?.branch ? previous : this.ledger.workers.latestBranchOnThread(thread.threadId);
+    const brief = previous ? this.ledger.handoff.build(thread.threadId, previous.workerId) : null;
+    const fullPrompt = brief ? `${renderHandoffBrief(brief)}${prompt}` : prompt;
+    this.ledger.questions.closeOpen(thread.threadId, "用户重新派发");
+    this.ledger.workers.register({
+      workerId,
+      threadId: thread.threadId,
+      deviceId,
+      repoId,
+      agent: AGENT,
+      mode,
+      parentWorker: previous?.workerId,
+    });
     this.ledger.threads.setLastMachine(thread.threadId, deviceId);
     this.ledger.recomputeThreadState(thread.threadId);
     const machineName = this.ledger.machines.get(deviceId)?.name ?? deviceId;
@@ -507,20 +628,32 @@ export class Dispatcher {
         threadId: thread.threadId,
         repoId,
         mode,
-        prompt,
-        ...(mode === "write" && base ? { base } : {}),
+        prompt: fullPrompt,
+        ...(baseWorker ? { base: baseWorker.branch! } : {}),
       },
       // Offline queueing is exactly `notAfter: null` (protocol §4.2): no expiry, delivered at
       // the next hello; the idle sweep still fails it after ~30 min of the machine not returning.
       { workerId, notAfter: queued ? null : undefined, cmdId },
     );
     this.ledger.workers.setCmdId(workerId, finalCmdId);
+    const reasonText =
+      decision.from === null
+        ? ""
+        : `（接续 ${decision.from.workerId} 的分支${decision.reason ? `，原因 ${decision.reason}` : ""}，已附交接简报）`;
     this.ledger.timeline.add(
       thread.threadId,
       "dispatch",
-      `派发给 ${machineName}${queued ? "（离线排队）" : ""}：${prompt}`,
-      { workerId, cmdId: finalCmdId, repoId, provenance },
+      `派发给 ${machineName}${queued ? "（离线排队）" : ""}${reasonText}：${prompt}`,
+      { workerId, cmdId: finalCmdId, repoId, provenance, ...(baseWorker ? { base: baseWorker.branch } : {}) },
     );
+    return {
+      action: "new_session",
+      ...(decision.reason !== undefined ? { reason: decision.reason } : {}),
+      parentWorker: previous?.workerId ?? null,
+      ...(baseWorker ? { base: baseWorker.branch! } : {}),
+      crossMachine: baseWorker !== null && baseWorker.deviceId !== deviceId,
+      brief: brief !== null,
+    };
   }
 }
 

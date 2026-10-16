@@ -1130,7 +1130,14 @@ export class Steward extends Agent<Env> {
     const row = this.sql<{ workerId: string | null; kind: string }>`
       SELECT workerId, kind FROM outbox WHERE cmdId = ${cmdId}
     `[0];
-    if (!row || row.kind !== "start_worker" || !row.workerId) return;
+    if (!row || !row.workerId) return;
+    // A failed resume send (issue #8): revert the resume-pending `starting` back to idle —
+    // the session itself is intact — and push the failure to the user.
+    if (row.kind === "send" && this.ledger.workers.markResumeFailed(row.workerId, cmdId, reason)) {
+      void this.drainNotifications();
+      return;
+    }
+    if (row.kind !== "start_worker") return;
     if (this.ledger.workers.markStartFailed(row.workerId, cmdId, reason)) {
       void this.drainNotifications();
     }
@@ -1248,6 +1255,15 @@ export class Steward extends Agent<Env> {
 
     // failure_push: either the start never happened or the run ended in a failure class that
     // needs a human (steward.md §5.3); the matching open question carries the specifics.
+    if (worker.lastOutcome?.startsWith("resume_failed:")) {
+      return failureCard(
+        `接续原会话失败`,
+        `${worker.lastOutcome.slice("resume_failed:".length)}。原会话未受影响，重新说一次要做什么即可。`,
+        thread.title,
+        footer,
+        detailsUrl ?? undefined,
+      );
+    }
     if (worker.lastOutcome?.startsWith("start_failed:")) {
       return failureCard(
         `派发失败：任务没有开始`,
@@ -2523,6 +2539,35 @@ export class Steward extends Agent<Env> {
       provenance: "test",
       cmdId: input.cmdId ?? `test:${ulid()}`,
     });
+  }
+
+  /** Test-only: force a worker's recorded context usage percent (the connector reports it
+   *  in settled.usage.contextUsage; issue #8's high-context rule reads it at dispatch). */
+  async setWorkerContextForTest(workerId: string, percent: number | null): Promise<void> {
+    this.sql`UPDATE sh_worker SET contextPercent = ${percent} WHERE workerId = ${workerId}`;
+  }
+
+  /** Test read of the memory module's handoff brief (issue #8, steward.md §2.6). */
+  async handoffForTest(
+    threadId: string,
+    fromWorker?: string,
+  ): Promise<import("./handoff.ts").HandoffBrief | null> {
+    return this.ledger.handoff.build(threadId, fromWorker);
+  }
+
+  /** Test read of the summary-version state (issue #8, steward.md §2.6). */
+  async summaryStateForTest(
+    threadId: string,
+  ): Promise<{ versions: Array<{ version: number; summary: string }>; status: { updates: number; rewriteDue: boolean } }> {
+    return {
+      versions: this.ledger.threads.summaryVersions(threadId).map((v) => ({ version: v.version, summary: v.summary })),
+      status: this.ledger.threads.summaryStatus(threadId),
+    };
+  }
+
+  /** Test-only: writes through the ledger's threads.update (the update_thread tool's path). */
+  async updateThreadForTest(threadId: string, patch: { title?: string; goal?: string; summary?: string }): Promise<boolean> {
+    return this.ledger.threads.update(threadId, patch);
   }
 
   /** Test-only: pushes a thread's lastActivityAt back `days` — the idle-attach band (#7). */
