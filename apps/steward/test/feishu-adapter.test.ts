@@ -14,10 +14,10 @@ const CREDS: FeishuCredentials = { appId: TEST_APP_ID, appSecret: TEST_APP_SECRE
 class MemoryTokenStore implements TokenStore {
   token: string | null = null;
   expiresAt = 0;
-  getCachedToken() {
+  async getCachedToken() {
     return this.token === null ? null : { token: this.token, expiresAt: this.expiresAt };
   }
-  saveToken(token: string, expiresAt: number): void {
+  async saveToken(token: string, expiresAt: number): Promise<void> {
     this.token = token;
     this.expiresAt = expiresAt;
   }
@@ -160,7 +160,7 @@ describe("FeishuAdapter.send and token cache", () => {
   it("classifies 5xx/429/network as retriable and 4xx/api errors as permanent", async () => {
     const mk = (status: number) =>
       adapter(
-        { getCachedToken: () => ({ token: "t", expiresAt: Date.now() + 3_600_000 }), saveToken: () => {} },
+        { getCachedToken: async () => ({ token: "t", expiresAt: Date.now() + 3_600_000 }), saveToken: async () => {} },
         (async () => Response.json({ code: 0, data: {} }, { status })) as unknown as typeof fetch,
       );
     await expect(mk(500).send(msg)).rejects.toBeInstanceOf(RetriableChannelError);
@@ -173,7 +173,7 @@ describe("FeishuAdapter.send and token cache", () => {
       throw new Error("must not be called");
     };
     const a = adapter(
-      { getCachedToken: () => ({ token: "t", expiresAt: Date.now() + 3_600_000 }), saveToken: () => {} },
+      { getCachedToken: async () => ({ token: "t", expiresAt: Date.now() + 3_600_000 }), saveToken: async () => {} },
       boom,
     );
     await expect(a.send({ id: "out_big", to: "ou_owner", kind: "text", text: "x".repeat(MAX_SERIALIZED_BYTES) })).rejects.toBeInstanceOf(

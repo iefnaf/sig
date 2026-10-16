@@ -40,6 +40,23 @@ export interface PiAdapterOptions {
   env?: Record<string, string | undefined>;
 }
 
+/** Env for the agent child (§4.2: "inherit the user's environment; the connector's own
+ * credentials are not passed through", issue #27). The connector's state lives under
+ * SHEPHERD_* variables (SHEPHERD_HOME points at the SQLite file holding the device token),
+ * so the whole namespace is stripped; the device token itself never was an env var. */
+export function childEnv(
+  source: Record<string, string | undefined> = process.env,
+  extra?: Record<string, string | undefined>,
+): Record<string, string | undefined> {
+  const env: Record<string, string | undefined> = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (key.startsWith("SHEPHERD_")) continue;
+    env[key] = value;
+  }
+  if (extra) Object.assign(env, extra);
+  return env;
+}
+
 const PI_CAPABILITIES: AgentCapabilities = {
   steer: true,
   followUp: true,
@@ -141,7 +158,7 @@ export class PiAdapter implements AgentAdapter {
       command: this.options.command ?? ["pi"],
       args: this.buildArgs(spec, this.assets),
       cwd: spec.cwd,
-      env: { ...process.env, ...this.options.env },
+      env: childEnv(process.env, this.options.env),
       onEvent: (record) => this.onPiEvent(runtime, record),
       onExit: (info) => this.onPiExit(runtime, info),
     });

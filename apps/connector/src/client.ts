@@ -181,6 +181,12 @@ export class ConnectorClient {
       case "welcome": {
         this.backoffMs = this.minBackoffMs;
         const welcome = message as unknown as WelcomeMessage;
+        // SERVER_KEY rotation (issue #27): a welcome carrying `token` means the connection
+        // authenticated with a key the steward is rotating away from; persist the fresh
+        // primary-key token so the next reconnect uses it (no re-pairing needed).
+        if (typeof welcome.token === "string" && welcome.token) {
+          this.store.updateToken(welcome.token);
+        }
         // welcome.acks doubles as a cumulative events_ack: everything <= upTo is durably
         // persisted server-side, so truncate locally, then replay what is still unacked (§4.3).
         for (const [workerId, upTo] of Object.entries(welcome.acks ?? {})) {

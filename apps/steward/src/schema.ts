@@ -108,6 +108,8 @@ export const MIGRATIONS: readonly Migration[] = [
         channel TEXT NOT NULL, reason TEXT NOT NULL, detail TEXT
       )`;
       // tenant_access_token cache (steward.md §9.2), refreshed ahead of expiry by an alarm.
+      // The token is a Feishu bearer credential: sealed at rest (issue #27; the column is
+      // renamed to tokenEnc by migration 004).
       sql`CREATE TABLE IF NOT EXISTS sh_channel_token (
         channel TEXT PRIMARY KEY, token TEXT NOT NULL, expiresAt INTEGER NOT NULL
       )`;
@@ -116,6 +118,36 @@ export const MIGRATIONS: readonly Migration[] = [
         channel TEXT NOT NULL, receiveId TEXT NOT NULL, lastSendAt INTEGER NOT NULL,
         PRIMARY KEY (channel, receiveId)
       )`;
+    },
+  },
+  {
+    // Security hardening (issue #27): /pair brute-force lockout + sealed credentials.
+    id: "004_security_hardening",
+    up: (sql) => {
+      // Sliding failure windows for /pair (protocol doc §5.2): 5 failures lock the bucket for
+      // 15 minutes. One row per source IP (`scope='ip'`) plus one global bucket (`scope='all'`)
+      // so a distributed guesser cannot sidestep the per-IP lock.
+      sql`CREATE TABLE IF NOT EXISTS pair_fail (
+        scope TEXT NOT NULL,
+        key TEXT NOT NULL,
+        fails INTEGER NOT NULL DEFAULT 0,
+        windowStart INTEGER NOT NULL,
+        lockedUntil INTEGER NOT NULL DEFAULT 0,
+        updatedAt INTEGER NOT NULL,
+        PRIMARY KEY (scope, key)
+      )`;
+      // Model provider credentials (spec §12.2 "model keys stored encrypted"): single row,
+      // apiKey AES-GCM sealed under SERVER_KEY exactly like the Feishu secrets. The LLM wiring
+      // (M2) reads it back through Steward.modelConfig(); nothing stores the raw key.
+      sql`CREATE TABLE IF NOT EXISTS sh_model (
+        id INTEGER PRIMARY KEY CHECK (id = 0),
+        provider TEXT NOT NULL,
+        apiKeyEnc TEXT NOT NULL,
+        updatedAt INTEGER NOT NULL
+      )`;
+      // The cached tenant_access_token is a Feishu bearer credential — seal it too. 003 always
+      // ran before this (fresh and existing installs alike), so the rename never misses.
+      sql`ALTER TABLE sh_channel_token RENAME COLUMN token TO tokenEnc`;
     },
   },
 ];

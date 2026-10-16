@@ -20,11 +20,28 @@ The spike code (protocol prototype, steward M1/M2, full e2e loop, pi-rpc scripts
 
 ```sh
 cd apps/steward
-wrangler secret put SERVER_KEY    # signs device tokens; rotate by re-running and restarting
+wrangler secret put SERVER_KEY    # signs device tokens and seals stored secrets
 wrangler secret put SETUP_TOKEN   # one-time bootstrap secret for the setup page
 wrangler deploy
 ```
 
 After deploy, open `https://<your-domain>/setup?token=<SETUP_TOKEN>` and follow the steps there: create a Feishu custom app, enter its App ID / App Secret / Verification Token (validated live against Feishu), point the app's event subscription at `https://<your-domain>/channels/feishu/events` with the `im.message.receive_v1` event, republish the app, then DM the bot once — the sender becomes the owner and the setup page closes permanently (ADR-0001 decisions 8–9).
+
+Secrets at rest: the Feishu credentials and the model provider API key are AES-GCM sealed under `SERVER_KEY` inside the Durable Object's storage; a raw storage dump alone exposes neither. `/pair` is brute-force guarded per source IP and globally (5 failed codes lock pairing for 15 minutes), and the Feishu webhook rejects events whose verification token or app id mismatch and whose timestamp skews more than an hour.
+
+### Rotating SERVER_KEY
+
+`SERVER_KEY` is rotatable without re-pairing every machine — tokens carry the signing key's id, and `SERVER_KEY_PREVIOUS` keeps a verification window open (details in the [protocol design](docs/design/connector-do-protocol.md) §5.1):
+
+```sh
+wrangler secret put SERVER_KEY_PREVIOUS   # the OLD key
+wrangler secret put SERVER_KEY            # the NEW key (openssl rand -hex 32)
+wrangler deploy                            # evicts isolates still pinning the old secrets
+# …let every machine reconnect once (each welcome hands the connector a rekeyed token)…
+wrangler secret delete SERVER_KEY_PREVIOUS
+wrangler deploy
+```
+
+Machines that never reconnect during the window must re-pair after it closes.
 
 Mainland-China users must bind a custom domain to the Worker: `*.workers.dev` is unreachable there, which breaks the web app, the connector, and Feishu's webhook delivery alike (see the [Feishu research](docs/research/feishu-channel.md) §3 and §8.2).
