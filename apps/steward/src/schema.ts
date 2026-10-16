@@ -9,13 +9,32 @@ export interface Migration {
   up: (sql: SqlExecutor) => void;
 }
 
-export function runMigrations(sql: SqlExecutor, migrations: readonly Migration[]): void {
+/**
+ * Idempotent migration runner (spike bug 2: `CREATE TABLE IF NOT EXISTS` never adds columns
+ * to an existing table; a ledger of applied migration ids plus plain ALTER statements fixes it).
+ *
+ * `tx` (when provided — the DO passes `ctx.storage.transactionSync`) wraps each migration's
+ * `up()` AND its `_migrations` ledger-row write in one atomic transaction, so a
+ * multi-statement rebuild can never persist half of itself. Reviews #47-2 and #48 finding 3
+ * hit the same DROP→RENAME window from two sides (the 011 timeline rebuild, the 010_routing
+ * question rebuild). The ledger write stays INSIDE the transaction deliberately: with it
+ * outside, a crash after commit but before the row write re-runs the migration — safe only
+ * when every `up()` is re-run-safe, and the copy-drop-rename shapes are not (a re-run
+ * re-copies with candidates→NULL and wipes in-flight ask buttons).
+ */
+export function runMigrations(sql: SqlExecutor, migrations: readonly Migration[], tx?: <T>(fn: () => T) => T): void {
   sql`CREATE TABLE IF NOT EXISTS _migrations (id TEXT PRIMARY KEY, appliedAt INTEGER)`;
   for (const migration of migrations) {
     const applied = sql<{ id: string }>`SELECT id FROM _migrations WHERE id = ${migration.id}`;
     if (applied.length > 0) continue;
-    migration.up(sql);
-    sql`INSERT INTO _migrations (id, appliedAt) VALUES (${migration.id}, ${Date.now()})`;
+    // The ledger row commits atomically with the migration (review #48 finding 3): the
+    // copy-drop-rename migrations are not re-run-safe, so a crash-then-re-run would lose data.
+    const apply = (): void => {
+      migration.up(sql);
+      sql`INSERT INTO _migrations (id, appliedAt) VALUES (${migration.id}, ${Date.now()})`;
+    };
+    if (tx === undefined) apply();
+    else tx(apply);
   }
 }
 
@@ -361,12 +380,294 @@ export const MIGRATIONS: readonly Migration[] = [
     },
   },
   {
+    // History relay (issue #23, protocol §6.6): bookkeeping only — which browser connection
+    // asked, which worker/machine, the byte meter, and the deadline. Chunk CONTENT never
+    // reaches this table (or any other): it passes through DO memory between sockets.
+    // (Number 009 collides with 009_web — ids are unique, which is what the ledger keys on.)
+    id: "009_history_relay",
+    up: (sql) => {
+      // state lives in SQLite because the DO may sleep between chunks (§6.6). `cursor` is the
+      // last entry id forwarded — an id, not content — so a DO-side cap cut can still tell
+      // the browser where it stopped and how to continue. (Created here on fresh databases;
+      // 010's ALTER adds it on ones that ran the pre-review 009.)
+      sql`CREATE TABLE IF NOT EXISTS history_relay (
+        reqId TEXT PRIMARY KEY,
+        webConnId TEXT NOT NULL,
+        workerId TEXT NOT NULL,
+        deviceId TEXT NOT NULL,
+        maxBytes INTEGER NOT NULL,
+        sentBytes INTEGER NOT NULL DEFAULT 0,
+        cursor TEXT,
+        expiresAt INTEGER NOT NULL,
+        createdAt INTEGER NOT NULL
+      )`;
+      sql`CREATE INDEX IF NOT EXISTS history_relay_conn ON history_relay (webConnId)`;
+      sql`CREATE INDEX IF NOT EXISTS history_relay_device ON history_relay (deviceId)`;
+    },
+  },
+  {
+    // Issue #23 review: 009 originally shipped without `cursor` (head 1efaaf3) and was then
+    // edited in place — but runMigrations skips by applied id, so any dev/preview DO that
+    // already ran the old 009 would never see the new column and the relay's SELECT would
+    // throw. This is the repo's spike-bug-2 pattern: the column is added by ALTER, and the
+    // duplicate-column error on fresh databases (where 009's CREATE TABLE already made it)
+    // is tolerated by ignoringDuplicateColumn.
+    id: "010_history_relay_cursor",
+    up: (sql) => {
+      ignoringDuplicateColumn(() => {
+        sql`ALTER TABLE history_relay ADD COLUMN cursor TEXT`;
+      });
+    },
+  },
+  {
+    // Proactive behavior (issue #20, steward.md §8, spec §8): routines (recurring or one-shot
+    // prescriptions the owner made by conversation) and follow-ups (a Thread-scoped alarm the
+    // steward sets itself). Every row traces back to something the owner said — createdFromMsg
+    // / sourceRef are NOT NULL, the data-layer half of "proactive behavior must have
+    // provenance" (spec §8.3). Suggestions (steward.md §8.5) send a button card only; the
+    // offer row holds the spec until the owner taps it.
+    // (Numbered 011: main's #23 took 009_history_relay/010_history_relay_cursor; ids are
+    // unique, which is what the ledger keys on — the number just keeps the order readable.)
+    id: "011_routines_followups",
+    up: (sql) => {
+      // kind: 'digest' (deterministic ledger summary, no LLM — spike-conclusions §2) or
+      // 'instruction' (a ⟦routine⟧ steward input executes it).
+      // status: active | paused | done (a once-routine that fired) | cancelled.
+      // lastFireKey = the latest processed `routine:<id>:<fireTime>` — the SDK may re-dispatch
+      // a job (retry after handler error); the key makes the whole fire idempotent.
+      sql`CREATE TABLE IF NOT EXISTS sh_routine (
+        routineId TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        createdFromMsg TEXT NOT NULL,
+        scheduleKind TEXT NOT NULL,
+        cron TEXT,
+        onceAt INTEGER,
+        instruction TEXT NOT NULL,
+        repoId TEXT,
+        threadId TEXT,
+        status TEXT NOT NULL DEFAULT 'active',
+        scheduleId TEXT,
+        lastRunAt INTEGER,
+        lastFireKey TEXT,
+        lastResult TEXT,
+        outcomeRecorded INTEGER NOT NULL DEFAULT 0,
+        createdAt INTEGER NOT NULL
+      )`;
+      // A Thread-scoped "look at this again in two hours" (steward.md §8.3). createdBy=
+      // 'steward' rows must carry a sourceRef pointing at the user message or routine that
+      // authorized them (verified at creation — checkProvenanceRef).
+      sql`CREATE TABLE IF NOT EXISTS sh_followup (
+        followupId TEXT PRIMARY KEY,
+        threadId TEXT NOT NULL,
+        dueAt INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        createdBy TEXT NOT NULL,
+        sourceRef TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'open',
+        scheduleId TEXT,
+        firedAt INTEGER,
+        lastResult TEXT,
+        outcomeRecorded INTEGER NOT NULL DEFAULT 0,
+        createdAt INTEGER NOT NULL
+      )`;
+      // A suggestion sent as a button card (steward.md §8.5): the spec waits here until the
+      // owner taps; the tap is the consent that create_routine would otherwise lack.
+      sql`CREATE TABLE IF NOT EXISTS sh_routine_offer (
+        offerId TEXT PRIMARY KEY,
+        spec TEXT NOT NULL,
+        sourceMsg TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'offered',
+        outboundId TEXT,
+        createdAt INTEGER NOT NULL
+      )`;
+      // Routine fires may be Thread-less (a digest scans everything); the timeline's
+      // threadId becomes nullable so every fire still leaves an auditable entry (§8.6).
+      // Table rebuild: SQLite cannot relax NOT NULL in place. Each interruption point must
+      // be recoverable even without a wrapping transaction (review #47-2) — most critically
+      // the DROP→RENAME window, where sh_timeline_new holds the ONLY copy: a rerun RENAMES
+      // it instead of dropping it. The runner's per-migration transactionSync (steward.ts)
+      // makes the window unreachable in production; this guard covers non-transactional
+      // callers (tests) and is harmless on re-runs.
+      const tables = sql<{ name: string }>`
+        SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('sh_timeline', 'sh_timeline_new')
+      `.map((r) => r.name);
+      if (tables.includes("sh_timeline_new")) {
+        if (tables.includes("sh_timeline")) {
+          sql`DROP TABLE sh_timeline_new`; // stale partial copy; the original is intact — redo
+        } else {
+          sql`ALTER TABLE sh_timeline_new RENAME TO sh_timeline`; // the copy is the only copy
+        }
+      } else if (tables.includes("sh_timeline")) {
+        sql`CREATE TABLE sh_timeline_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, threadId TEXT, ts INTEGER NOT NULL,
+          kind TEXT NOT NULL, text TEXT NOT NULL, refs TEXT
+        )`;
+        sql`INSERT INTO sh_timeline_new (id, threadId, ts, kind, text, refs) SELECT id, threadId, ts, kind, text, refs FROM sh_timeline`;
+        sql`DROP TABLE sh_timeline`;
+        sql`ALTER TABLE sh_timeline_new RENAME TO sh_timeline`;
+      } else {
+        // Neither exists (a ledger that skipped 004 — unreachable in the ordered list, but
+        // the rebuild must not be what explodes): create the nullable shape directly.
+        sql`CREATE TABLE sh_timeline (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, threadId TEXT, ts INTEGER NOT NULL,
+          kind TEXT NOT NULL, text TEXT NOT NULL, refs TEXT
+        )`;
+      }
+      sql`CREATE INDEX IF NOT EXISTS sh_timeline_thread ON sh_timeline (threadId, id)`;
+    },
+  },
+  {
+    // Routing (issue #7, steward.md §3): the FTS5 index behind threads.findCandidates, the
+    // question shape ask_user's candidate buttons need, and the per-run dispatch counter the
+    // settle-time verification compares against "dispatched" claims (spike-conclusions §2).
+    // (Stays numbered 010 from the branch: the ledger keys on the full id string, so it does
+    // not collide with main's 010_history_relay_cursor — same precedent as 009_web vs
+    // 009_history_relay above. Renaming it would re-run the NOT re-runnable sh_question
+    // rebuild on every DO that already applied this branch's 010.)
+    id: "010_routing",
+    up: (sql) => {
+      // §2.2: full-text index over title + goal + summary + the latest report summary. The
+      // trigram tokenizer gives substring matching for both CJK and latin text (verified in
+      // workerd and node:sqlite — see docs/routing-eval.md); queries under 3 characters are
+      // covered by findCandidates' bigram scorer, never by this index alone.
+      sql`CREATE VIRTUAL TABLE IF NOT EXISTS sh_thread_fts USING fts5(threadId UNINDEXED, body, tokenize='trigram')`;
+      // Trigger-synced (§13 lists this as unverified before #7): every write path keeps the
+      // index current — insert, title/goal/summary updates, delete, and each new report
+      // (whose summary joins the body as the thread's freshest facet).
+      sql`CREATE TRIGGER IF NOT EXISTS sh_thread_fts_ai AFTER INSERT ON sh_thread BEGIN
+        INSERT INTO sh_thread_fts (threadId, body) VALUES (
+          new.threadId,
+          COALESCE(new.title, '') || ' ' || COALESCE(new.goal, '') || ' ' || COALESCE(new.summary, '')
+        );
+      END`;
+      sql`CREATE TRIGGER IF NOT EXISTS sh_thread_fts_au AFTER UPDATE OF title, goal, summary ON sh_thread BEGIN
+        DELETE FROM sh_thread_fts WHERE threadId = new.threadId;
+        INSERT INTO sh_thread_fts (threadId, body) VALUES (
+          new.threadId,
+          COALESCE(new.title, '') || ' ' || COALESCE(new.goal, '') || ' ' || COALESCE(new.summary, '') || ' ' ||
+            COALESCE((SELECT r.summary FROM sh_report r WHERE r.threadId = new.threadId ORDER BY r.receivedAt DESC, r.seq DESC LIMIT 1), '')
+        );
+      END`;
+      sql`CREATE TRIGGER IF NOT EXISTS sh_thread_fts_ad AFTER DELETE ON sh_thread BEGIN
+        DELETE FROM sh_thread_fts WHERE threadId = old.threadId;
+      END`;
+      sql`CREATE TRIGGER IF NOT EXISTS sh_thread_fts_report AFTER INSERT ON sh_report BEGIN
+        DELETE FROM sh_thread_fts WHERE threadId = new.threadId;
+        INSERT INTO sh_thread_fts (threadId, body) SELECT
+          new.threadId,
+          COALESCE(t.title, '') || ' ' || COALESCE(t.goal, '') || ' ' || COALESCE(t.summary, '') || ' ' || COALESCE(new.summary, '')
+          FROM sh_thread t WHERE t.threadId = new.threadId;
+      END`;
+      // Backfill for deployments that already have threads (idempotent guard: only rows the
+      // index does not have yet — INSERT OR IGNORE cannot dedupe here because fts5 rows have
+      // no unique constraint on the UNINDEXED column, so delete-then-insert per missing row).
+      sql`INSERT INTO sh_thread_fts (threadId, body)
+        SELECT th.threadId, COALESCE(th.title, '') || ' ' || COALESCE(th.goal, '') || ' ' || COALESCE(th.summary, '') || ' ' ||
+          COALESCE((SELECT r.summary FROM sh_report r WHERE r.threadId = th.threadId ORDER BY r.receivedAt DESC, r.seq DESC LIMIT 1), '')
+        FROM sh_thread th
+        WHERE NOT EXISTS (SELECT 1 FROM sh_thread_fts f WHERE f.threadId = th.threadId)`;
+
+      // ask_user's routing questions belong to no particular Thread (steward.md §3.3): the
+      // question row is rebuilt with a nullable threadId, and `candidates` stores the button
+      // mapping ({threadId, label}[] JSON) the card-action handler resolves clicks against.
+      // The copy-drop-rename below is the one non-reentrant stretch in this migration — the
+      // runner wraps each migration in the caller's transaction (storage.transactionSync in
+      // the DO), so a crash rolls the whole rebuild back instead of stranding the deployment
+      // between the DROP and the RENAME (review #48 finding 3).
+      sql`CREATE TABLE IF NOT EXISTS sh_question_v2 (
+        qid TEXT PRIMARY KEY, threadId TEXT, workerId TEXT,
+        text TEXT NOT NULL, options TEXT, candidates TEXT,
+        status TEXT NOT NULL DEFAULT 'open', askedAt INTEGER NOT NULL, answeredAt INTEGER
+      )`;
+      sql`INSERT INTO sh_question_v2 (qid, threadId, workerId, text, options, candidates, status, askedAt, answeredAt)
+        SELECT qid, threadId, workerId, text, options, NULL, status, askedAt, answeredAt FROM sh_question`;
+      sql`DROP TABLE sh_question`;
+      sql`ALTER TABLE sh_question_v2 RENAME TO sh_question`;
+      sql`CREATE INDEX IF NOT EXISTS sh_question_thread ON sh_question (threadId, status)`;
+
+      // Settle-time dispatch verification (spike-conclusions §2): how many real dispatches
+      // happened inside this run. 0 + a reply claiming "dispatched" triggers the corrective
+      // follow-up (see steward.ts settleRun).
+      ignoringDuplicateColumn(() => {
+        sql`ALTER TABLE sh_run ADD COLUMN dispatchCount INTEGER NOT NULL DEFAULT 0`;
+      });
+    },
+  },
+  {
+    // Notes: the layered memory (issue #18, steward.md §2.3-§2.5, spec §10). resident =
+    // always-loaded preferences/conventions (2,400-char hard cap); project = per-repo
+    // conventions (1,500 per repo); archive = superseded/demoted/evicted entries — never
+    // deleted, fetched on demand. Writes are two-phase (notes_propose → notes_commit with
+    // `replaces`); every change lands in sh_note_log and is relayed to the user with the
+    // next reply (spec §10.3: silent memory is unacceptable).
+    id: "012_notes",
+    up: (sql) => {
+      // status: 'active' = current knowledge (any layer — an evicted/demoted entry stays
+      // valid content in the archive); 'superseded' = replaced by a newer note; 'removed' =
+      // deleted at the user's word (kept as a tombstone; the layer always reads 'archive').
+      // `bytes` is the normalized text's character count — the unit of both layer caps.
+      sql`CREATE TABLE IF NOT EXISTS sh_note (
+        noteId TEXT PRIMARY KEY,
+        layer TEXT NOT NULL,
+        scope_repoId TEXT,
+        kind TEXT NOT NULL,
+        text TEXT NOT NULL,
+        bytes INTEGER NOT NULL,
+        source TEXT NOT NULL,
+        evidence TEXT,
+        -- The message that carried the owner's confirmation (notes_confirm); the
+        -- promotion path inherits this so the row itself says who confirmed it (PR #44 R3).
+        confirmedBy TEXT,
+        confirmed INTEGER NOT NULL DEFAULT 0,
+        pinned INTEGER NOT NULL DEFAULT 0,
+        createdAt INTEGER NOT NULL,
+        lastUsedAt INTEGER,
+        useCount INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'active',
+        supersededBy TEXT
+      )`;
+      sql`CREATE INDEX IF NOT EXISTS sh_note_placement ON sh_note (layer, scope_repoId, status)`;
+      // FTS5 trigram (verified against workerd for issue #18, incl. CJK substring matching
+      // and trigger sync): substring search that works for Chinese text, where the default
+      // unicode61 tokenizer would collapse whole sentences into single tokens. External
+      // content table: the index can never drift from sh_note because only the triggers
+      // below ever write it.
+      sql`CREATE VIRTUAL TABLE IF NOT EXISTS sh_note_fts USING fts5(text, content = 'sh_note', content_rowid = 'rowid', tokenize = 'trigram')`;
+      sql`CREATE TRIGGER IF NOT EXISTS sh_note_fts_ai AFTER INSERT ON sh_note BEGIN
+            INSERT INTO sh_note_fts (rowid, text) VALUES (new.rowid, new.text);
+          END`;
+      sql`CREATE TRIGGER IF NOT EXISTS sh_note_fts_ad AFTER DELETE ON sh_note BEGIN
+            INSERT INTO sh_note_fts (sh_note_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
+          END`;
+      sql`CREATE TRIGGER IF NOT EXISTS sh_note_fts_au AFTER UPDATE OF text ON sh_note BEGIN
+            INSERT INTO sh_note_fts (sh_note_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
+            INSERT INTO sh_note_fts (rowid, text) VALUES (new.rowid, new.text);
+          END`;
+      // Every change (noted/superseded/evicted/demoted/suggest_demote/pinned/unpinned/
+      // removed/confirmed) with a text snapshot, so the relay renders even after the note
+      // itself changes. `reportedAt` = already relayed to the user; the next user reply
+      // drains pending rows (steward.md §2.1: the module reports, the steward relays).
+      sql`CREATE TABLE IF NOT EXISTS sh_note_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        op TEXT NOT NULL,
+        noteId TEXT NOT NULL,
+        text TEXT NOT NULL,
+        reason TEXT,
+        reportedAt INTEGER
+      )`;
+      sql`CREATE INDEX IF NOT EXISTS sh_note_log_pending ON sh_note_log (reportedAt, id)`;
+      sql`CREATE INDEX IF NOT EXISTS sh_note_log_note ON sh_note_log (noteId, op, ts)`;
+    },
+  },
+  {
     // Issue #13 review: when hello.workers reconciliation is gated behind undelivered events
     // (snap.lastSeq > processedUpTo), the DO remembers the pending verdict for a reaped
     // worker and applies it once the event stream catches up — otherwise a worker reaped
     // while its machine was offline stays `lost` forever even though it is alive (the events
-    // that would prove it are exactly the ones that blocked the reconcile). Numbered 010:
-    // #6's steward LLM renumbered the web migration to 009 on main first.
+    // that would prove it are exactly the ones that blocked the reconcile). (Number prefixes
+    // stopped being unique upstream — 009/010 are each used twice — the runner keys on the
+    // id string; listed last it applies after everything main already shipped.)
     id: "010_reap_reconcile",
     up: (sql) => {
       sql`CREATE TABLE IF NOT EXISTS sh_reap_pending (

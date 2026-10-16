@@ -5,7 +5,9 @@
 // The worker-pi slice adds the repo whitelist (§8.1) and worker lifecycle rows (§5.1); command
 // and event persistence live in CommandLog/EventLog over the same database. Issue #12 adds
 // the §9 recovery tables: descendant snapshots for orphan cleanup (§9.3) and the per-worker
-// auto-resume budget (§9.2), both read at startup before the first hello.
+// auto-resume budget (§9.2), both read at startup before the first hello. Issue #16 adds the
+// §8.2/§13 per-repo local settings — workspace mode and approveProject, CLI-settable only —
+// plus the serial-mode write queue.
 import { DatabaseSync } from "node:sqlite";
 import { chmodSync, existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
@@ -16,6 +18,15 @@ export interface Credentials {
   deviceId: string;
   token: string;
   connEpoch: number;
+}
+
+/** Per-repo workspace mode (connector-pi.md §8.2): how write tasks get a working directory. */
+export type WorkspaceMode = "worktree" | "serial" | "main";
+
+export const WORKSPACE_MODES: readonly WorkspaceMode[] = ["worktree", "serial", "main"];
+
+export function isWorkspaceMode(value: unknown): value is WorkspaceMode {
+  return typeof value === "string" && (WORKSPACE_MODES as readonly string[]).includes(value);
 }
 
 export class LocalStore {
@@ -75,6 +86,14 @@ export class LocalStore {
     // The worktree base (§8.2) persisted so a restarted connector can still collect git
     // facts for a retroactive report (§9.1) — spikes kept it only in memory.
     this.addColumnIfMissing("worker", "base", "TEXT");
+    // §8.2/§13 (issue #16): per-repo local settings. Both are CLI-only — a command from the
+    // steward gets their effects but can never set them.
+    this.addColumnIfMissing("repo", "workspace", "TEXT NOT NULL DEFAULT 'worktree'");
+    this.addColumnIfMissing("repo", "approved", "INTEGER NOT NULL DEFAULT 0");
+    // Review finding 5 (PR #43): marks a worktree removed by cleanup_worktree, so a later
+    // manual resume can be refused instead of silently running write-mode in the checkout.
+    // A NULL worktree alone cannot carry that meaning — synthetic/legacy rows have it NULL.
+    this.addColumnIfMissing("worker", "worktreeCleanedAt", "INTEGER");
     // §9.3: the latest 5-second descendant snapshot per running worker.
     this.db.exec(`CREATE TABLE IF NOT EXISTS orphan_snapshot (
       workerId TEXT PRIMARY KEY,
@@ -87,6 +106,15 @@ export class LocalStore {
       at INTEGER NOT NULL
     )`);
     this.db.exec(`CREATE INDEX IF NOT EXISTS worker_resume_worker_at ON worker_resume (workerId, at)`);
+    // §8.2 serial mode (issue #16): the start_worker args of write workers waiting for the
+    // repo's serial slot, so a connector restart re-arms the queue instead of stranding the
+    // Thread at `starting` forever (the command result already went out with queued:true).
+    this.db.exec(`CREATE TABLE IF NOT EXISTS queued_start (
+      workerId TEXT PRIMARY KEY,
+      commandId TEXT NOT NULL,
+      args TEXT NOT NULL,
+      queuedAt INTEGER NOT NULL
+    )`);
     chmodSync(path, 0o600);
   }
 
@@ -163,17 +191,30 @@ export class LocalStore {
   }
 
   getRepo(repoId: string): RegisteredRepo | null {
-    return (
-      (this.db
-        .prepare("SELECT repoId, name, path, defaultBranch, remote FROM repo WHERE repoId = ?")
-        .get(repoId) as RegisteredRepo | undefined) ?? null
-    );
+    const row = this.db
+      .prepare("SELECT repoId, name, path, defaultBranch, remote, workspace, approved FROM repo WHERE repoId = ?")
+      .get(repoId) as ({ repoId: string; name: string; path: string; defaultBranch: string | null; remote: string | null; workspace: string; approved: number } | undefined);
+    return row ? { ...row, workspace: row.workspace as WorkspaceMode, approved: row.approved === 1 } : null;
   }
 
   listRepos(): RegisteredRepo[] {
-    return this.db
-      .prepare("SELECT repoId, name, path, defaultBranch, remote FROM repo ORDER BY repoId")
-      .all() as unknown as RegisteredRepo[];
+    return (
+      this.db
+        .prepare("SELECT repoId, name, path, defaultBranch, remote, workspace, approved FROM repo ORDER BY repoId")
+        .all() as Array<{ repoId: string; name: string; path: string; defaultBranch: string | null; remote: string | null; workspace: string; approved: number }>
+    ).map((row) => ({ ...row, workspace: row.workspace as WorkspaceMode, approved: row.approved === 1 }));
+  }
+
+  /** Updates the local-only per-repo settings (§8.2/§13). False when the repo is unknown. */
+  setRepoConfig(repoId: string, patch: { workspace?: WorkspaceMode; approved?: boolean }): boolean {
+    if (!this.getRepo(repoId)) return false;
+    if (patch.workspace !== undefined) {
+      this.db.prepare("UPDATE repo SET workspace = ? WHERE repoId = ?").run(patch.workspace, repoId);
+    }
+    if (patch.approved !== undefined) {
+      this.db.prepare("UPDATE repo SET approved = ? WHERE repoId = ?").run(patch.approved ? 1 : 0, repoId);
+    }
+    return true;
   }
 
   // --- Workers (connector-pi.md §5.1) ----------------------------------------------------
@@ -208,7 +249,7 @@ export class LocalStore {
     return (
       (this.db
         .prepare(
-          `SELECT workerId, threadId, repoId, mode, state, sessionId, sessionFile, branch, worktree, base, lastOutcome, createdAt, updatedAt
+          `SELECT workerId, threadId, repoId, mode, state, sessionId, sessionFile, branch, worktree, base, worktreeCleanedAt, lastOutcome, createdAt, updatedAt
            FROM worker WHERE workerId = ?`,
         )
         .get(workerId) as WorkerRow | undefined) ?? null
@@ -222,12 +263,63 @@ export class LocalStore {
   }
 
   listWorkers(): WorkerRow[] {
+    // Creation order (workerId as tiebreak): the serial write queue drains FIFO on it.
     return this.db
       .prepare(
-        `SELECT workerId, threadId, repoId, mode, state, sessionId, sessionFile, branch, worktree, base, lastOutcome, createdAt, updatedAt
-         FROM worker ORDER BY workerId`,
+        `SELECT workerId, threadId, repoId, mode, state, sessionId, sessionFile, branch, worktree, base, worktreeCleanedAt, lastOutcome, createdAt, updatedAt
+         FROM worker ORDER BY createdAt, workerId`,
       )
       .all() as unknown as WorkerRow[];
+  }
+
+  /** Drops the worktree/branch columns after cleanup_worktree removed the directory. */
+  clearWorkerWorktree(workerId: string): void {
+    this.db
+      .prepare(
+        "UPDATE worker SET worktree = NULL, branch = NULL, base = NULL, worktreeCleanedAt = ?, updatedAt = ? WHERE workerId = ?",
+      )
+      .run(Date.now(), Date.now(), workerId);
+  }
+
+  /** Backfills the worktree columns on a row whose launch aborted around the spawn (PR #43
+   * review N3: the stop's settle already wrote state/lastOutcome — this must touch ONLY the
+   * worktree columns, never state, or the stop's bookkeeping gets clobbered). */
+  setWorkerWorktree(
+    workerId: string,
+    fields: { worktree: string; branch: string | null; base: string | null },
+  ): void {
+    this.db
+      .prepare(
+        "UPDATE worker SET worktree = ?, branch = ?, base = ?, worktreeCleanedAt = NULL, updatedAt = ? WHERE workerId = ?",
+      )
+      .run(fields.worktree, fields.branch, fields.base, Date.now(), workerId);
+  }
+
+  // --- Serial write queue (connector-pi.md §8.2, issue #16) ----------------------------
+
+  saveQueuedStart(workerId: string, commandId: string, args: unknown): void {
+    this.db
+      .prepare(
+        `INSERT INTO queued_start (workerId, commandId, args, queuedAt) VALUES (?, ?, ?, ?)
+         ON CONFLICT(workerId) DO UPDATE SET commandId = excluded.commandId, args = excluded.args, queuedAt = excluded.queuedAt`,
+      )
+      .run(workerId, commandId, JSON.stringify(args), Date.now());
+  }
+
+  getQueuedStart(workerId: string): { commandId: string; args: unknown } | null {
+    const row = this.db.prepare("SELECT commandId, args FROM queued_start WHERE workerId = ?").get(workerId) as
+      | { commandId: string; args: string }
+      | undefined;
+    if (!row) return null;
+    try {
+      return { commandId: row.commandId, args: JSON.parse(row.args) };
+    } catch {
+      return null;
+    }
+  }
+
+  deleteQueuedStart(workerId: string): void {
+    this.db.prepare("DELETE FROM queued_start WHERE workerId = ?").run(workerId);
   }
 
   // --- Recovery (connector-pi.md §9) -----------------------------------------------------
@@ -287,6 +379,11 @@ export interface RegisteredRepo {
   path: string;
   defaultBranch: string | null;
   remote: string | null;
+  /** How write tasks get a directory (§8.2): a fresh worktree (default), one-at-a-time serial
+   * worktrees, or the main checkout itself. */
+  workspace: WorkspaceMode;
+  /** approveProject (§13): run pi with --approve in this repo. Set on the machine only. */
+  approved: boolean;
 }
 
 export interface WorkerRow {
@@ -301,6 +398,8 @@ export interface WorkerRow {
   worktree?: string | null;
   /** The commit-ish the worktree branch started from (§8.2); git-facts input after a restart. */
   base?: string | null;
+  /** Set by cleanup_worktree (review finding 5): the worktree is gone on purpose. */
+  worktreeCleanedAt?: number | null;
   lastOutcome?: string | null;
   createdAt?: number;
   updatedAt?: number;

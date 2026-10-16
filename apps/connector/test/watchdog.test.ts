@@ -396,7 +396,12 @@ describe("worker stalls through the manager (fake-pi)", () => {
     // Two processes served the same session: the respawn ran in the SAME worktree and its
     // prompt was the original task plus the continuation note. (The child's cwd resolves
     // through macOS's /var → /private/var symlink, so compare the two fake-pi views.)
-    const prompts = readFileSync(logFile, "utf8").trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+    // FAKE_PI_LOG also records pi-side settles (the settle-lag sync point): prompts only.
+    const prompts = readFileSync(logFile, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .filter((entry) => entry.commandId !== undefined);
     expect(prompts).toHaveLength(2);
     expect(prompts[1]!.cwd).toBe(prompts[0]!.cwd);
     expect(String(prompts[1]!.cwd)).toContain(join("state", "worktrees"));

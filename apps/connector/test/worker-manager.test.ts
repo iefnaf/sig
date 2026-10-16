@@ -342,9 +342,14 @@ describe("WorkerManager over fake-pi (connector-pi.md §4–§8, §11)", () => {
     await manager.startWorker("cmd-marker-1", args({ prompt: "Fix the login bug" }));
     await waitFor(() => settled(), 15_000, "settled event");
 
-    const logged = readFileSync(logPath, "utf8").trim().split("\n").map((l) => JSON.parse(l) as { commandId: string | null; text: string });
-    // The log now also carries cwd/sessionId/pid (issue #13's watchdog tests compare the two
-    // respawned processes' cwds), so match on the fields this test cares about.
+    const logged = readFileSync(logPath, "utf8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as { commandId?: string; text?: string; type?: string })
+      // FAKE_PI_LOG also records pi-side settles (the settle-lag sync point), and issue #13
+      // enriched prompt records with cwd/sessionId/pid — this test cares only about the
+      // prompt delivery and its ADR-0001 marker.
+      .filter((entry) => entry.commandId !== undefined);
     expect(logged).toEqual([
       expect.objectContaining({ commandId: "cmd-marker-1", text: "Fix the login bug", at: expect.any(Number) }),
     ]);

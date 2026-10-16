@@ -111,7 +111,7 @@ Table names all carry the `sh_` prefix. Only semantics are listed below, not eve
 | `sh_routine` / `sh_watch` / `sh_followup` | See §8 | Proactive behavior |
 | `sh_command` | Protocol-layer `outbox` | Adds a `provenance` column for auditing |
 
-Full-text index for threads: `sh_thread_fts` (FTS5, covering `title + goal + summary + the latest report.summary`), kept in sync by triggers. FTS5 is supported in the DO's SQLite (official docs).
+Full-text index for threads: `sh_thread_fts` (FTS5, covering `title + goal + summary + the latest report.summary`), kept in sync by triggers. FTS5 is supported in the DO's SQLite (official docs; verified by #7 — trigram tokenizer included, see §13).
 
 ### 2.3 Notes: data model and layering
 
@@ -120,7 +120,9 @@ sh_note(noteId, layer, scope_repoId?, kind, text, bytes,
         source, evidence, confirmed, pinned,
         createdAt, lastUsedAt, useCount, status, supersededBy)
 sh_note_fts(text)                     -- FTS5
-sh_note_log(ts, op, noteId, reason)   -- all changes; drives ChangeReport
+sh_note_log(id, ts, op, noteId, text, reason, reportedAt)
+                                       -- all changes (text = snapshot for the relay);
+                                       -- reportedAt marks "already relayed with a reply" (issue #18)
 ```
 
 | Layer | `layer` | Contents | Capacity | How it loads |
@@ -239,6 +241,13 @@ Routing is the core of the product's value and needs a measurable bar. Build a f
 
 Re-run this evaluation set whenever the model, prompts, or candidate-assembly rules change.
 
+> **Implemented (issue #7).** The 106-case set was ported verbatim from `spike-final`
+> (ADR-0001 decision 1) into `apps/steward/eval/` with a runner over the real extension
+> (fresh in-memory world per case, node:sqlite + the trigram FTS index, the confidence gate
+> live). `pnpm --filter @shepherd/steward eval:routing` enforces the thresholds as the exit
+> code — the required merge check for routing changes per ADR-0001 decision 14. Recorded
+> runs, the key handling, and the OpenAI-compatible `--endpoint` override: [routing-eval.md](../routing-eval.md).
+
 ## 4. The steward (LLM)
 
 ### 4.1 Form
@@ -284,7 +293,7 @@ Five groups. Every tool returns compact text plus a few structured fields. The "
 | `find_threads(text, hints?)` | Candidates from §3 | safe |
 | `get_thread(threadId)` | Summary, workers, open questions, project-layer notes, recent timeline | safe |
 | `update_thread(threadId, {title?, goal?, summary?})` | Updates the summary | safe (idempotent overwrite) |
-| `notes_propose(draft)` / `notes_commit(draft, replaces?)` / `notes_pin(id, pinned)` / `notes_remove(id)` | Two-phase writes from §2.4 | propose: safe; commit: safe (idempotency key is the `taskId`) |
+| `notes_propose(draft)` / `notes_commit(draft, replaces?, confirmEvidence?)` / `notes_confirm(id, evidenceRef)` / `notes_pin(id, pinned)` / `notes_remove(id)` / `notes_list` | Two-phase writes from §2.4; confirm/list complete the conversation surface (issue #18). Resident writes require `evidence=user:<msgId>` (auto-attached from the triggering message in user runs); low-trust promotions require a confirmed predecessor or the run's own confirmation message | propose: safe; commit: safe (an exact-text duplicate absorbs the replay) |
 | `notes_search(q)` | Search the archive layer | safe |
 
 **Dispatch and control (via the protocol gateway)**
@@ -467,7 +476,9 @@ The `beforeTool` hook (pi-durable's `hook(ToolTask, { beforeTool })`) consults t
 
 The `provenance` rule (spec §8.3): in event-triggered runs, calling `start_worker`/`send_to_worker` requires a `provenance` that is an existing routine, follow-up, or watch ID, or a user message ID; an empty value is always rejected. This makes it impossible for the steward to decide to act "out of thin air".
 
-> **Implemented boundary (issue #6, PR #40 review #4):** in event/routine/follow-up-triggered runs the `start_worker` tool requires an explicit `provenanceRef`; `user:<msgId>` values are verified against `sh_inbound` (a message this deployment actually received), anything else — including the wake's own `evt:` id — is refused at the tool. Routine/follow-up/watch reference checks join when those tables land (#20).
+> **Implemented boundary (issue #9):** `send_to_worker` and `interrupt_worker` share the `start_worker` provenance rule: event-triggered runs need a verified `user:<msgId>` ref (PR #45 review round 1: `basis` labels are model-claimed, and an abort is at least as destructive as a steer — stopping follows an explicit instruction or a verifiable reference to one; routine/follow-up refs landed with #20, below.) The `beforeTool` hook additionally gates `interrupt_worker` to `basis ∈ {user_explicit, user_reply_to}` — anything else (e.g. `memory`) is blocked with a reason the model sees. The tools' replies state the delivery computed from the ledger at enqueue time; the connector's `cmd_result` — which the tools do not await, keeping delivery latency off the model's critical path — settles the outbox row, and failures land on the timeline deterministically. A `broken` worker is refused before the enqueue so the model cannot claim a delivery the connector is guaranteed to reject; the residual gap (a cmd_result that fails after an honest enqueue-time reply) is accepted: the failure is recorded, and re-issuing is the user's call.
+
+> **Implemented boundary (issue #6, PR #40 review #4; extended by #20):** in event/routine/follow-up-triggered runs the `start_worker` tool requires an explicit `provenanceRef`; `user:<msgId>` values are verified against `sh_inbound` (a message this deployment actually received), `routine:<id>` / `followup:<id>` against their ledger rows **and their liveness** (active; a done once-routine or freshly fired follow-up authorizes only while its fire is fresh — paused/cancelled are the owner's revocation), anything else — including the wake's own `evt:` id — is refused at the tool.
 
 The autonomy switch (cautious / balanced / hands-off) = three settings of this policy table; the MVP implements only "balanced", and the table structure leaves room for swapping in the others.
 
@@ -488,6 +499,8 @@ A non-null `createdFromMsg` is the data-layer guarantee of the spec's rule that 
 
 - Creation: the user says 「每个工作日早上 9 点……」 ("every workday at 9 a.m., …"); the steward repeats it back, confirms, then calls `create_routine`.
 - Triggering: via the Agents SDK's `this.schedule(cron, "fireRoutine", { routineId })` (cron scheduling is idempotent). On fire, the core submits `⟦routine R⟧ <instruction>` with `operationId = routine:<id>:<fireTime>`, so duplicate fires are never processed twice.
+
+> **Implemented (issue #20).** `fireTime` is the fire's scheduled second (the SDK hands the callback the due time, not the next occurrence), and `sh_routine.lastFireKey` gates the whole fire — an SDK re-dispatch after a handler error is a no-op for both digests and instruction wakes. Digest routines never reach the LLM at all (spike-conclusions §2 wins over the design's blanket "submit ⟦routine⟧"): the core renders running/waiting/unread into one card, stays silent when there is nothing to say, and only `instruction` routines queue a wake. Suggestions send a button card whose tap creates the routine deterministically (`sh_routine_offer`, resolved via the card's providerMsgId); `create_routine` refuses to run outside a user message. Every fire leaves `lastResult` and a timeline entry (thread-less when the routine has no Thread — `sh_timeline.threadId` is nullable since #20).
 - The steward executes per the instruction with `provenance = routine:<id>`; if there is nothing to do, `no_action`.
 
 ### 8.3 Follow-ups (setting an alarm for yourself)
@@ -600,9 +613,9 @@ Legend: ✓ verified in the protocol spike; ◦ seen only in docs or type declar
 | The `beforeRequest` hook replaces only the single request and persists nothing | ✓ (issue #6: verified by test — see §4.1) |
 | A tool result's `control.terminate` ends the turn | ✓ (issue #6: ask_user / no_action terminate) |
 | `input` with a custom `entry` (distinguishing user vs event) | ? `pi-durable@1.1.0` types disallow it, the repo README allows it; `PiHarness.submit` does not expose it. The MVP uses content markers (§4.2) |
-| DO SQLite supports FTS5 and JSON functions | ◦ (official docs); trigger-sync behavior unverified |
+| DO SQLite supports FTS5 and JSON functions | ✓ (issue #7): the trigram tokenizer works in workerd and node:sqlite; the sh_thread_fts triggers (insert / title-goal-summary update / delete / report insert) keep the index current — verified by probe and `test/schema.test.ts` (migration 010). ✓ (issue #18): external-content FTS5 with the `trigram` tokenizer verified by test in workerd — insert/update/delete triggers stay in sync, CJK substring `MATCH` works; the default unicode61 tokenizer would have collapsed Chinese sentences into single tokens |
 | `ctx.storage.transactionSync` | ◦ (DO storage API) |
-| `this.schedule(cron, ...)` idempotent | ◦ (Agents SDK docs) |
+| `this.schedule(cron, ...)` idempotent | ✓ (issue #20: cron dedups by expression+payload, one-shots opt in with `idempotent: true`; verified by tests incl. lost-schedule reconciliation) |
 | Feishu: QR-code creation (`registerApp` device flow) | ◦ official SDK source; no live scan performed |
 | Feishu: long-connection protocol, message send / reply / card update, rate limits and lengths | ◦ official SDK source and comments; not exercised live |
 | Feishu: switching a QR-created app to webhook, publish review, personal-account limits, long-connection stability inside the DO | ? unverified; see [feishu-channel.md](../research/feishu-channel.md) §6 |

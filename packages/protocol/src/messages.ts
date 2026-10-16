@@ -84,6 +84,8 @@ const ErrorCode = z.enum([
   "too_large",
   "rate_limited",
   "internal",
+  // History relay (§6.6): the worker exists but has no session to read (connector-pi.md §11.4).
+  "no_history",
 ]);
 
 export const ErrorMessageSchema = z.object({

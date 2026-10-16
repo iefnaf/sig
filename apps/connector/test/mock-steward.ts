@@ -12,12 +12,22 @@ export interface MockSteward {
   listen: () => Promise<number>;
   close: () => Promise<void>;
   waitConnected: (ms?: number) => Promise<void>;
+  /** Wait until `n` hellos (default 1) have been RECORDED. `waitConnected` only covers the
+   *  socket reaching OPEN — on slow CI runners the hello frame can still be in flight, and
+   *  reading `hellos().at(-1)` right after it races (observed as PR #44 / #13 CI flakes). */
+  waitHello: (n?: number, ms?: number) => Promise<void>;
   sendCmd: (kind: string, args: Record<string, unknown>, id?: string) => string;
+  /** §6.6: push a history_req; the DO's relay role, for contract tests. */
+  sendHistoryReq: (workerId: string, opts?: { since?: string; maxBytes?: number }) => string;
+  /** §6.6: relay a browser ack for chunk `n`. */
+  ackHistory: (reqId: string, n: number) => void;
   dropConn: () => void;
   events: () => Array<Record<string, unknown>>;
   hellos: () => Array<Record<string, unknown>>;
   acksFor: (cmdId: string) => Record<string, unknown> | undefined;
   resultsFor: (cmdId: string) => Record<string, unknown> | undefined;
+  historyChunksFor: (reqId: string) => Array<Record<string, unknown>>;
+  errorsFor: (re: string) => Record<string, unknown> | undefined;
   pings: () => number;
   upgrades: () => number;
   setSwallowAcks: (v: boolean) => void;
@@ -33,6 +43,8 @@ export function startMockSteward(): MockSteward {
   const hellos: Array<Record<string, unknown>> = [];
   const cmdAcks = new Map<string, Record<string, unknown>>();
   const cmdResults = new Map<string, Record<string, unknown>>();
+  const historyChunks = new Map<string, Array<Record<string, unknown>>>();
+  const errorReplies = new Map<string, Record<string, unknown>>();
   const ackedUpTo = new Map<string, number>();
   let welcomeAcks: Record<string, number> = {};
   let swallowAcks = false;
@@ -108,6 +120,15 @@ export function startMockSteward(): MockSteward {
           case "cmd_result":
             cmdResults.set(String(m.re), m);
             break;
+          case "history_chunk": {
+            const list = historyChunks.get(String(m.re)) ?? [];
+            list.push(m);
+            historyChunks.set(String(m.re), list);
+            break;
+          }
+          case "error":
+            if (typeof m.re === "string") errorReplies.set(m.re, m);
+            break;
           default:
             break;
         }
@@ -123,6 +144,15 @@ export function startMockSteward(): MockSteward {
     send({ t: "cmd", id, cseq: ackSeq++, kind, args });
     return id;
   };
+  const sendHistoryReq = (
+    workerId: string,
+    opts: { since?: string; maxBytes?: number } = {},
+    id: string = randomUUID(),
+  ): string => {
+    // Same wire as cmd but outside the outbox semantics (§6.6): no cseq, no re-send.
+    send({ t: "history_req", id, workerId, since: opts.since, maxBytes: opts.maxBytes });
+    return id;
+  };
 
   const waitConnected = (ms = 5000) =>
     new Promise<void>((resolve, reject) => {
@@ -132,6 +162,19 @@ export function startMockSteward(): MockSteward {
           ? resolve()
           : Date.now() - t0 > ms
             ? reject(new Error("connector never connected"))
+            : setTimeout(tick, 25);
+      tick();
+    });
+
+  // Same polling shape as waitConnected, but for recorded hello frames — see the interface.
+  const waitHello = (n = 1, ms = 5000) =>
+    new Promise<void>((resolve, reject) => {
+      const t0 = Date.now();
+      const tick = () =>
+        hellos.length >= n
+          ? resolve()
+          : Date.now() - t0 > ms
+            ? reject(new Error(`only ${hellos.length}/${n} hellos arrived`))
             : setTimeout(tick, 25);
       tick();
     });
@@ -153,6 +196,8 @@ export function startMockSteward(): MockSteward {
       }),
     waitConnected,
     sendCmd,
+    sendHistoryReq,
+    ackHistory: (reqId, n) => send({ t: "history_ack", re: reqId, n }),
     dropConn: () => {
       try {
         conn?.close();
@@ -161,8 +206,11 @@ export function startMockSteward(): MockSteward {
     },
     events: () => events,
     hellos: () => hellos,
+    waitHello,
     acksFor: (cmdId) => cmdAcks.get(cmdId),
     resultsFor: (cmdId) => cmdResults.get(cmdId),
+    historyChunksFor: (reqId) => historyChunks.get(reqId) ?? [],
+    errorsFor: (re) => errorReplies.get(re),
     pings: () => pingCount,
     upgrades: () => upgradeCount,
     setSwallowAcks: (v) => {

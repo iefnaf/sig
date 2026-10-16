@@ -50,6 +50,7 @@ describe("start_worker over the real transport (issue #3 + #30)", () => {
     ]);
     startApp(scenario);
     await mock.waitConnected();
+    await mock.waitHello(); // the frame can trail the OPEN on slow runners (CI flake)
 
     // hello carries the honest snapshot: the pi agent and the registered repo.
     const hello = mock.hellos().at(-1)!;

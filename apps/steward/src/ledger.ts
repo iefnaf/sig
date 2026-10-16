@@ -1,12 +1,14 @@
 // The memory module's ledger half (issue #5, steward.md §2): every sh_* table belongs to this
 // file and callers reach it only through the returned interface — never with raw SQL. The
 // event reducer (§5.1-5.3) is deterministic, runs in one transaction, and recomputes Thread
-// derived state (`running / waiting_you / idle`) plus unread after every change. Notes,
-// retrieval, and the situation brief's character budget arrive with M3; the interface below
-// is the M1 subset, shaped so those slot in without a rewrite.
+// derived state (`running / waiting_you / idle`) plus unread after every change. Notes (the
+// knowledge half, issue #18) live in notes.ts behind the `notes` handle below — same rule:
+// sh_note* is reached only through the memory module. The situation brief's character
+// budget is brief.ts's.
 import { ulid } from "@shepherd/protocol";
 import type { HelloMessage } from "@shepherd/protocol";
-import { eventWakeText } from "./wake-text.ts";
+import { createNotes, type NoteRow } from "./notes.ts";
+import { eventWakeText, queueReturnedWakeText } from "./wake-text.ts";
 
 /** Tagged-template SQL over the DO's SQLite (same shape schema.ts migrations use). */
 export type LedgerSql = <T = Record<string, unknown>>(
@@ -30,7 +32,7 @@ export interface LedgerDeps {
 
 export type ThreadState = "running" | "waiting_you" | "idle";
 /** Worker states that keep a Thread `running` (steward.md §5.2); lost/broken do not count. */
-export const ACTIVE_WORKER_STATES = ["starting", "running", "recovering"] as const;
+export const ACTIVE_WORKER_STATES = ["queued", "starting", "running", "recovering"] as const;
 
 export interface ThreadRow {
   threadId: string;
@@ -93,12 +95,19 @@ export interface GitFacts {
 
 export interface QuestionRow {
   qid: string;
-  threadId: string;
+  /** Null for ask_user's threadless routing questions (issue #7, steward.md §3.3). */
+  threadId: string | null;
   workerId: string | null;
   text: string;
   status: "open" | "answered";
   askedAt: number;
   answeredAt: number | null;
+}
+
+/** The ask_user question's button mapping (issue #7): what each card button means. */
+export interface AskCandidates {
+  options: string[];
+  candidates: Array<{ threadId: string; label: string }>;
 }
 
 export interface TimelineRow {
@@ -154,7 +163,7 @@ export interface WakeRow {
 /** One steward run (steward.md §6.3): a submitted input and how its outcome is handled. */
 export interface RunRow {
   operationId: string;
-  kind: "user" | "event" | "routine" | "followup";
+  kind: "user" | "event" | "routine" | "followup" | "verify";
   replyTo: string | null;
   channel: string | null;
   routedThreadId: string | null;
@@ -167,8 +176,158 @@ export interface RunRow {
   /** The run already produced user-facing output (notify_user/ask_user) — an empty final
    *  text is then legitimate, not a failure (review #9). */
   notified: boolean;
+  /** Real dispatches inside this run (settle-time verification, issue #7). */
+  dispatchCount: number;
   createdAt: number;
   settledAt: number | null;
+}
+
+// ---- routing (steward.md §3, issue #7) -----------------------------------------------------------
+
+/** One row of findCandidates' answer. */
+export interface RouteCandidate {
+  threadId: string;
+  title: string;
+  /** One-line summary (null when the thread has none yet). */
+  summary: string | null;
+  repos: string[];
+  state: ThreadState;
+  lastActivityAt: number;
+  /** Why this candidate is here: 进行中 / 等你拍板 / 关键词命中 / 最近活跃 / 回复指向. */
+  matchReason: string;
+  /** Below the recall cutoff's confidence band — attach on it alone is exactly the guess
+   *  the confidence gate exists to stop (spike eval tuning). */
+  weak: boolean;
+}
+
+/** §3.2's answer: an explicit short-circuit, or the assembled candidate set. */
+export interface RouteCandidates {
+  confidence: "explicit" | "candidates";
+  /** Set iff confidence is "explicit": the one thread signals 1–2 resolved to. */
+  explicitThread: RouteCandidate | null;
+  candidates: RouteCandidate[];
+}
+
+/** How many threads each recall bucket contributes (§3.2). */
+export const FTS_RECALL_LIMIT = 8;
+export const RECENT_RECALL_LIMIT = 5;
+/** The assembled set never exceeds this (§3.2). */
+export const CANDIDATE_CAP = 12;
+/** Bigram overlap at or above this counts as a real match (the spike eval's cutoff). */
+export const RECALL_SCORE_CUTOFF = 2;
+/** Weak below this — informative, but never attachable alone. */
+export const RECALL_WEAK_BELOW = 5;
+
+const routeSummaryOf = (summary: string | null): string | null =>
+  summary && summary.length > 0 ? (summary.length > 120 ? `${summary.slice(0, 119)}…` : summary) : null;
+
+/**
+ * The recall scorer behind findCandidates (spike-final's eval-tuned algorithm, ported):
+ * CJK has no spaces, so overlap is scored by character-bigram hits plus latin word matches —
+ * 「依赖升级…」 finds 「升级依赖」, and 「文档补完」 finds 「补 API 文档」. It covers the
+ * 2-character queries the trigram FTS index cannot match, and ranks the FTS-recalled bucket.
+ */
+export function recallScore(query: string, haystack: string): number {
+  const q = query.toLowerCase();
+  const hay = haystack.toLowerCase();
+  const gramSet = (text: string): Set<string> => {
+    const set = new Set<string>();
+    const chars = [...text];
+    for (let i = 0; i < chars.length - 1; i++) {
+      if (!/\s/.test(chars[i]!) && !/\s/.test(chars[i + 1]!)) set.add(chars[i]! + chars[i + 1]!);
+    }
+    return set;
+  };
+  const grams = gramSet(q);
+  const hayGrams = gramSet(hay);
+  const gramHits = [...grams].filter((g) => hayGrams.has(g)).length;
+  const latin = q.match(/[a-z0-9_./-]{2,}/g) ?? [];
+  const latinHits = latin.filter((t) => hay.includes(t)).length;
+  return gramHits + latinHits * 2;
+}
+
+/** The FTS5 MATCH expression for findCandidates: latin segments ≥3 chars stay whole (word
+ *  matches), CJK text contributes every 3-character window (the trigram index matches
+ *  substrings, so a whole long phrase would never hit). Quotes are stripped so user text can
+ *  never inject FTS operators; terms dedupe; the count stays bounded for long inputs. */
+export function ftsMatchExpression(text: string): string | null {
+  const terms = new Set<string>();
+  for (const segment of text.split(/[\s\p{P}\p{S}]+/u)) {
+    const clean = segment.replace(/"/g, "").trim();
+    if (clean.length === 0) continue;
+    if (/^[a-z0-9_./-]+$/i.test(clean)) {
+      if ([...clean].length >= 3) terms.add(clean.toLowerCase());
+      continue;
+    }
+    const chars = [...clean];
+    for (let i = 0; i + 2 < chars.length; i++) terms.add(chars.slice(i, i + 3).join(""));
+    if (chars.length === 3) terms.add(clean);
+  }
+  const ordered = [...terms].slice(0, 24);
+  if (ordered.length === 0) return null;
+  return ordered.map((term) => `"${term}"`).join(" OR ");
+}
+
+// ---- proactive behavior (issue #20, steward.md §8) ----------------------------------------------
+
+export type RoutineKind = "digest" | "instruction";
+export type RoutineStatus = "active" | "paused" | "done" | "cancelled";
+export type FollowupStatus = "open" | "fired" | "cancelled";
+
+export interface RoutineRow {
+  routineId: string;
+  kind: RoutineKind;
+  createdFromMsg: string;
+  scheduleKind: "cron" | "once";
+  cron: string | null;
+  onceAt: number | null;
+  instruction: string;
+  repoId: string | null;
+  threadId: string | null;
+  status: RoutineStatus;
+  scheduleId: string | null;
+  lastRunAt: number | null;
+  /** The latest processed `routine:<id>:<fireTime>` — the fire-level idempotency key. */
+  lastFireKey: string | null;
+  lastResult: string | null;
+  outcomeRecorded: boolean;
+  createdAt: number;
+}
+
+export interface FollowupRow {
+  followupId: string;
+  threadId: string;
+  dueAt: number;
+  reason: string;
+  createdBy: "user" | "steward";
+  sourceRef: string;
+  status: FollowupStatus;
+  scheduleId: string | null;
+  /** When it fired — the freshness bound for using it as a provenance ref (review #47-5). */
+  firedAt: number | null;
+  lastResult: string | null;
+  outcomeRecorded: boolean;
+  createdAt: number;
+}
+
+/** A routine suggestion waiting for the owner's button tap (steward.md §8.5). */
+export interface RoutineOfferRow {
+  offerId: string;
+  spec: RoutineSpecStored;
+  sourceMsg: string;
+  status: "offered" | "accepted" | "dismissed";
+  outboundId: string | null;
+  createdAt: number;
+}
+
+/** The offer's stored spec (JSON in sh_routine_offer.spec). */
+export interface RoutineSpecStored {
+  instruction: string;
+  kind: RoutineKind;
+  cron?: string;
+  onceAt?: number;
+  threadId?: string;
+  repoId?: string;
 }
 
 // ---- web read model (steward.md §10: pages are served from the memory module's views) -------------
@@ -191,6 +350,8 @@ export interface ThreadListEntry {
 export interface NewThreadInput {
   title: string;
   goal: string;
+  /** Stable id for eval/world seeding; generated when omitted. */
+  threadId?: string;
   createdFromMsg?: string;
   repoIds?: string[];
 }
@@ -277,7 +438,7 @@ const viewReport = (r: Record<string, unknown>): ReportRow => ({
 
 const viewQuestion = (r: Record<string, unknown>): QuestionRow => ({
   qid: r.qid as string,
-  threadId: r.threadId as string,
+  threadId: (r.threadId as string | null) ?? null,
   workerId: (r.workerId as string | null) ?? null,
   text: r.text as string,
   status: r.status as QuestionRow["status"],
@@ -285,9 +446,56 @@ const viewQuestion = (r: Record<string, unknown>): QuestionRow => ({
   answeredAt: (r.answeredAt as number | null) ?? null,
 });
 
+const viewRoutine = (r: Record<string, unknown>): RoutineRow => ({
+  routineId: r.routineId as string,
+  kind: r.kind as RoutineKind,
+  createdFromMsg: r.createdFromMsg as string,
+  scheduleKind: r.scheduleKind as RoutineRow["scheduleKind"],
+  cron: (r.cron as string | null) ?? null,
+  onceAt: (r.onceAt as number | null) ?? null,
+  instruction: r.instruction as string,
+  repoId: (r.repoId as string | null) ?? null,
+  threadId: (r.threadId as string | null) ?? null,
+  status: r.status as RoutineStatus,
+  scheduleId: (r.scheduleId as string | null) ?? null,
+  lastRunAt: (r.lastRunAt as number | null) ?? null,
+  lastFireKey: (r.lastFireKey as string | null) ?? null,
+  lastResult: (r.lastResult as string | null) ?? null,
+  outcomeRecorded: !!r.outcomeRecorded,
+  createdAt: r.createdAt as number,
+});
+
+const viewFollowup = (r: Record<string, unknown>): FollowupRow => ({
+  followupId: r.followupId as string,
+  threadId: r.threadId as string,
+  dueAt: r.dueAt as number,
+  reason: r.reason as string,
+  createdBy: r.createdBy as FollowupRow["createdBy"],
+  sourceRef: r.sourceRef as string,
+  status: r.status as FollowupStatus,
+  scheduleId: (r.scheduleId as string | null) ?? null,
+  firedAt: (r.firedAt as number | null) ?? null,
+  lastResult: (r.lastResult as string | null) ?? null,
+  outcomeRecorded: !!r.outcomeRecorded,
+  createdAt: r.createdAt as number,
+});
+
+const viewOffer = (r: Record<string, unknown>): RoutineOfferRow => ({
+  offerId: r.offerId as string,
+  spec: jsonOrNull<RoutineSpecStored>(r.spec as string | null) ?? { instruction: "", kind: "instruction" },
+  sourceMsg: r.sourceMsg as string,
+  status: r.status as RoutineOfferRow["status"],
+  outboundId: (r.outboundId as string | null) ?? null,
+  createdAt: r.createdAt as number,
+});
+
 export function createLedger(deps: LedgerDeps) {
   const { sql, tx } = deps;
   const now = deps.now ?? Date.now;
+
+  // The notes half of the memory module (issue #18, steward.md §2.3-§2.5): layered
+  // knowledge with a two-phase write. Same SQL handle, same transaction wrapper.
+  const notes = createNotes({ sql, tx, now });
 
   const threadFromRow = (r: Record<string, unknown>): ThreadRow => ({
     threadId: r.threadId as string,
@@ -359,13 +567,21 @@ export function createLedger(deps: LedgerDeps) {
         ORDER BY repoId
       `;
     },
+    /** All registered repos (the brief's repos line, issue #7). */
+    list(): Array<{ repoId: string; deviceId: string; name: string; online: boolean }> {
+      return sql<{ repoId: string; deviceId: string; name: string; online: boolean }>`
+        SELECT r.repoId, r.deviceId, r.name, COALESCE(m.online, 0) AS online
+        FROM sh_repo r LEFT JOIN sh_machine m ON m.deviceId = r.deviceId
+        ORDER BY r.name, r.repoId
+      `;
+    },
   };
 
   // ---- threads / workers -----------------------------------------------------------------------
 
   const threads = {
     create(input: NewThreadInput): ThreadRow {
-      const threadId = `t_${ulid()}`;
+      const threadId = input.threadId ?? `t_${ulid()}`;
       const ts = now();
       sql`
         INSERT INTO sh_thread (threadId, title, goal, state, unread, lastActivityAt, createdFromMsg, createdAt)
@@ -410,6 +626,142 @@ export function createLedger(deps: LedgerDeps) {
         WHERE threadId = ${threadId}
       `;
       return true;
+    },
+
+    /**
+     * threads.findCandidates (§3.2, issue #7): routing candidates for one utterance.
+     *
+     * 1. Signal 1 (reply-to / card click) never reaches here in production — the input is
+     *    routed before the model — but `explicitThreadId` short-circuits the same way when
+     *    the caller knows it. Signal 2 (explicit mention): the text contains exactly one
+     *    thread's title or a thread id (or `hints` name repos/machines that pin one thread).
+     *    A unique hit returns as `confidence: "explicit"` with just that thread.
+     * 2. Otherwise: all running + waiting-you threads, then the FTS-recalled top 8 over the
+     *    text (trigram index, ranked by the bigram scorer so 2-char queries count too), then
+     *    the 5 most recent — deduped, capped at 12, each with a match reason.
+     */
+    findCandidates(input: { text: string; hints?: string[]; explicitThreadId?: string | null }): RouteCandidates {
+      const all = sql<Record<string, unknown>>`
+        SELECT * FROM sh_thread WHERE archived = 0 ORDER BY lastActivityAt DESC, threadId
+      `.map(threadFromRow);
+      const reposOf = (threadId: string): string[] =>
+        sql<{ repoId: string }>`SELECT repoId FROM sh_thread_repo WHERE threadId = ${threadId}`.map((r) => r.repoId);
+      const toCandidate = (thread: ThreadRow, matchReason: string, weak = false): RouteCandidate => ({
+        threadId: thread.threadId,
+        title: thread.title,
+        summary: routeSummaryOf(thread.summary),
+        repos: reposOf(thread.threadId),
+        state: thread.state,
+        lastActivityAt: thread.lastActivityAt,
+        matchReason,
+        weak,
+      });
+
+      // ---- signal 1: the caller already resolved the thread (reply / card click) ----
+      if (input.explicitThreadId) {
+        const routed = all.find((t) => t.threadId === input.explicitThreadId);
+        if (routed) {
+          return {
+            confidence: "explicit",
+            explicitThread: toCandidate(routed, "回复/按钮显式指向"),
+            candidates: [toCandidate(routed, "回复/按钮显式指向")],
+          };
+        }
+      }
+
+      // ---- signal 2: explicit mention — the text names exactly one thread ----
+      const lower = input.text.toLowerCase();
+      const mentioned = all.filter((t) => t.title.length > 1 && lower.includes(t.title.toLowerCase()));
+      const byId = all.filter((t) => lower.includes(t.threadId.toLowerCase()));
+      // Hints (§3.1 signal 2): repo or machine names pin the thread set.
+      const hintThreads = new Set<string>();
+      for (const hint of input.hints ?? []) {
+        for (const row of repos.machinesHaving(hint)) {
+          for (const t of all) if (reposOf(t.threadId).includes(row.repoId)) hintThreads.add(t.threadId);
+        }
+        for (const machine of machines.list()) {
+          if (machine.name === hint || machine.deviceId === hint) {
+            for (const w of sql<{ threadId: string }>`SELECT DISTINCT threadId FROM sh_worker WHERE deviceId = ${machine.deviceId}`) {
+              hintThreads.add(w.threadId);
+            }
+          }
+        }
+      }
+      const explicitPicks = [...new Set([...mentioned, ...byId].map((t) => t.threadId))];
+      const explicitUnique =
+        explicitPicks.length === 1
+          ? (all.find((t) => t.threadId === explicitPicks[0]) ?? null)
+          : hintThreads.size === 1
+            ? (all.find((t) => t.threadId === [...hintThreads][0]) ?? null)
+            : null;
+      if (explicitUnique) {
+        const reason = mentioned.some((t) => t.threadId === explicitUnique.threadId)
+          ? "消息里点名了它的标题"
+          : byId.some((t) => t.threadId === explicitUnique.threadId)
+            ? "消息里带了它的 id"
+            : "仓库/机器指向它";
+        const candidate = toCandidate(explicitUnique, reason);
+        return { confidence: "explicit", explicitThread: candidate, candidates: [candidate] };
+      }
+
+      // ---- assembly (§3.2 step 2) ----
+      const active = all.filter((t) => t.state === "running" || t.state === "waiting_you");
+      const picked = new Set<string>(active.map((t) => t.threadId));
+      const candidates: RouteCandidate[] = active
+        .sort((a, b) => (a.state === b.state ? b.lastActivityAt - a.lastActivityAt : a.state === "running" ? -1 : 1))
+        .map((t) => toCandidate(t, t.state === "running" ? "进行中" : "等你拍板"));
+
+      // Recall: FTS over the text (trigram index), ranked by the bigram scorer; the scorer
+      // alone stands in when the index has no ≥3-char segment to match (or the runtime's
+      // SQLite lacks FTS5 — findCandidates must never throw over recall).
+      const scored = all
+        .map((thread) => {
+          const report = sql<{ summary: string | null }>`
+            SELECT summary FROM sh_report WHERE threadId = ${thread.threadId} ORDER BY receivedAt DESC, seq DESC LIMIT 1
+          `[0]?.summary;
+          const hay = `${thread.title} ${thread.goal ?? ""} ${thread.summary ?? ""} ${report ?? ""}`;
+          return { thread, score: recallScore(input.text, hay) + (thread.state !== "idle" ? 1 : 0) };
+        })
+        .filter((entry) => entry.score >= RECALL_SCORE_CUTOFF)
+        .sort((a, b) => b.score - a.score || b.thread.lastActivityAt - a.thread.lastActivityAt);
+
+      let ftsIds: string[] = [];
+      const match = ftsMatchExpression(input.text);
+      if (match !== null) {
+        try {
+          ftsIds = sql<{ threadId: string }>`
+            SELECT threadId FROM sh_thread_fts WHERE sh_thread_fts MATCH ${match} ORDER BY bm25(sh_thread_fts) LIMIT 32
+          `.map((r) => r.threadId);
+        } catch {
+          ftsIds = []; // no FTS5 / tokenizer in this runtime: the scorer above is the recall
+        }
+      }
+      const recallOrder = new Map<string, number>();
+      ftsIds.forEach((id, index) => recallOrder.set(id, index));
+      const recalled = [...scored]
+        .sort((a, b) => {
+          // The bigram scorer ranks (spike-eval-tuned); FTS presence is the recall net and
+          // bm25 order only breaks scorer ties — bm25 over OR'd trigrams is too noisy to lead.
+          const sa = recallOrder.has(a.thread.threadId) ? recallOrder.get(a.thread.threadId)! : 999;
+          const sb = recallOrder.has(b.thread.threadId) ? recallOrder.get(b.thread.threadId)! : 999;
+          return b.score - a.score || sa - sb || b.thread.lastActivityAt - a.thread.lastActivityAt;
+        })
+        .slice(0, FTS_RECALL_LIMIT);
+      for (const entry of recalled) {
+        if (picked.has(entry.thread.threadId)) continue;
+        if (candidates.length >= CANDIDATE_CAP) break;
+        picked.add(entry.thread.threadId);
+        candidates.push(toCandidate(entry.thread, `关键词命中（${entry.score}）`, entry.score < RECALL_WEAK_BELOW));
+      }
+
+      for (const thread of all.slice(0, RECENT_RECALL_LIMIT)) {
+        if (picked.has(thread.threadId)) continue;
+        if (candidates.length >= CANDIDATE_CAP) break;
+        picked.add(thread.threadId);
+        candidates.push(toCandidate(thread, "最近活跃", true));
+      }
+
+      return { confidence: "candidates", explicitThread: null, candidates };
     },
   };
 
@@ -676,6 +1028,42 @@ export function createLedger(deps: LedgerDeps) {
       `[0];
       return row ? viewQuestion(row) : null;
     },
+    get(qid: string): QuestionRow | null {
+      return (sql<Record<string, unknown>>`SELECT * FROM sh_question WHERE qid = ${qid}`[0] ?? null) as QuestionRow | null;
+    },
+    /** The ask_user button mapping (issue #7): plain options + routing candidates. */
+    payload(qid: string): AskCandidates | null {
+      const row = sql<{ options: string | null; candidates: string | null }>`
+        SELECT options, candidates FROM sh_question WHERE qid = ${qid}
+      `[0];
+      if (!row) return null;
+      return {
+        options: jsonOrNull<string[]>(row.options) ?? [],
+        candidates: jsonOrNull<AskCandidates["candidates"]>(row.candidates) ?? [],
+      };
+    },
+    /** ask_user's insert (issue #7): threadId null for a threadless routing ask. */
+    insert(input: { qid: string; threadId: string | null; workerId?: string | null; text: string; options?: string[]; candidates?: AskCandidates["candidates"] }): void {
+      sql`
+        INSERT OR IGNORE INTO sh_question (qid, threadId, workerId, text, options, candidates, status, askedAt)
+        VALUES (${input.qid}, ${input.threadId}, ${input.workerId ?? null}, ${input.text},
+                ${JSON.stringify(input.options ?? [])}, ${JSON.stringify(input.candidates ?? [])}, 'open', ${now()})
+      `;
+    },
+    /** Marks one question answered with what settled it (a click's chosen label). */
+    close(qid: string, answer: string): boolean {
+      sql`
+        UPDATE sh_question SET status = 'answered', answeredAt = ${now()}
+        WHERE qid = ${qid} AND status = 'open'
+      `;
+      const changed = sql<{ changes: number }>`SELECT changes() AS changes`[0]!.changes > 0;
+      const row = changed ? questions.get(qid) : null;
+      if (row?.threadId) {
+        timeline.add(row.threadId, "note", `问题已回答：${answer.slice(0, 120)}`, { qid });
+        recomputeThreadState(row.threadId);
+      }
+      return changed;
+    },
     /** A fresh dispatch supersedes what the Thread was waiting on (the user moved on). */
     closeOpen(threadId: string, reason: string): void {
       sql`
@@ -690,12 +1078,14 @@ export function createLedger(deps: LedgerDeps) {
   };
 
   const timeline = {
-    add(threadId: string, kind: string, text: string, refs: Record<string, unknown> | null): void {
+    /** A summary event. `threadId` null = a Thread-less record (a routine fire, §8.6) — kept
+     *  for audit; thread pages filter by id so it never leaks into a Thread's timeline. */
+    add(threadId: string | null, kind: string, text: string, refs: Record<string, unknown> | null): void {
       sql`
         INSERT INTO sh_timeline (threadId, ts, kind, text, refs)
         VALUES (${threadId}, ${now()}, ${kind}, ${text}, ${refs ? JSON.stringify(refs) : null})
       `;
-      sql`UPDATE sh_thread SET lastActivityAt = ${now()} WHERE threadId = ${threadId}`;
+      if (threadId !== null) sql`UPDATE sh_thread SET lastActivityAt = ${now()} WHERE threadId = ${threadId}`;
     },
     list(threadId: string): TimelineRow[] {
       return sql<TimelineRow>`SELECT id, threadId, ts, kind, text FROM sh_timeline WHERE threadId = ${threadId} ORDER BY id`;
@@ -761,6 +1151,13 @@ export function createLedger(deps: LedgerDeps) {
           SELECT threadId FROM sh_outbound WHERE providerMsgId = ${providerMsgId} AND threadId IS NOT NULL
         `[0]?.threadId ?? null
       );
+    },
+    /** The full routing row behind a provider message: id (button actions key off it — e.g.
+     *  `offer:` ids resolve a routine suggestion) plus its Thread, when bound. */
+    rowForProviderMsg(providerMsgId: string): { id: string; threadId: string | null } | null {
+      return sql<{ id: string; threadId: string | null }>`
+        SELECT id, threadId FROM sh_outbound WHERE providerMsgId = ${providerMsgId}
+      `[0] ?? null;
     },
     row(id: string): Record<string, unknown> | null {
       return sql<Record<string, unknown>>`SELECT * FROM sh_outbound WHERE id = ${id}`[0] ?? null;
@@ -839,11 +1236,20 @@ export function createLedger(deps: LedgerDeps) {
   // ---- steward runs and wake_requests (steward.md §5.1 step 4, §6.3) --------------------------
 
   /** `mergeMs` is the 3-second merge window (§5.4); rows merge into a still-pending wake of
-   *  the same kind without extending its dueAt, so wake latency stays bounded. */
+   *  the same kind without extending its dueAt, so wake latency stays bounded.
+   *  `opts.operationId` (routine/follow-up fires): a fixed id with NO merging — each fire is
+   *  its own steward input, and the operationId itself is the dedup (§8.2/§11). */
   const wakes = {
-    queue(kind: WakeRow["kind"], dedupeKey: string, text: string, opts: { priority?: WakeRow["priority"]; mergeMs?: number } = {}): void {
-      const mergeMs = opts.mergeMs ?? WAKE_MERGE_MS;
+    queue(kind: WakeRow["kind"], dedupeKey: string, text: string, opts: { priority?: WakeRow["priority"]; mergeMs?: number; operationId?: string; dueAt?: number } = {}): void {
       const ts = now();
+      if (opts.operationId !== undefined) {
+        sql`
+          INSERT OR IGNORE INTO sh_wake (operationId, kind, dedupeKey, text, priority, status, dueAt, createdAt)
+          VALUES (${opts.operationId}, ${kind}, ${dedupeKey}, ${text}, ${opts.priority ?? "normal"}, 'pending', ${opts.dueAt ?? ts}, ${ts})
+        `;
+        return;
+      }
+      const mergeMs = opts.mergeMs ?? WAKE_MERGE_MS;
       const open = sql<{ id: number; text: string }>`
         SELECT id, text FROM sh_wake WHERE kind = ${kind} AND status = 'pending' AND dueAt > ${ts} ORDER BY id LIMIT 1
       `[0];
@@ -899,6 +1305,10 @@ export function createLedger(deps: LedgerDeps) {
     get(operationId: string): RunRow | null {
       return (sql<RunRow>`SELECT * FROM sh_run WHERE operationId = ${operationId}`[0] ?? null);
     },
+    /** One more real dispatch happened inside this run (settle-time verification, issue #7). */
+    countDispatch(operationId: string): void {
+      sql`UPDATE sh_run SET dispatchCount = dispatchCount + 1 WHERE operationId = ${operationId}`;
+    },
     rows(): RunRow[] {
       return sql<RunRow>`SELECT * FROM sh_run ORDER BY createdAt, operationId`;
     },
@@ -909,6 +1319,149 @@ export function createLedger(deps: LedgerDeps) {
                           resultText = ${result.text ?? null}, replyOutboundId = ${replyOutboundId ?? null}, settledAt = ${now()}
         WHERE operationId = ${operationId} AND status = 'open'
       `;
+    },
+  };
+
+  // ---- routines / follow-ups / offers (issue #20, steward.md §8) -------------------------------
+
+  const routines = {
+    create(input: {
+      routineId: string;
+      kind: RoutineKind;
+      createdFromMsg: string;
+      scheduleKind: "cron" | "once";
+      cron?: string | null;
+      onceAt?: number | null;
+      instruction: string;
+      threadId?: string | null;
+      repoId?: string | null;
+    }): RoutineRow {
+      const ts = now();
+      sql`
+        INSERT OR IGNORE INTO sh_routine (routineId, kind, createdFromMsg, scheduleKind, cron, onceAt, instruction, repoId, threadId, status, createdAt)
+        VALUES (${input.routineId}, ${input.kind}, ${input.createdFromMsg}, ${input.scheduleKind}, ${input.cron ?? null}, ${input.onceAt ?? null},
+                ${input.instruction}, ${input.repoId ?? null}, ${input.threadId ?? null}, 'active', ${ts})
+      `;
+      return routines.get(input.routineId)!;
+    },
+    get(routineId: string): RoutineRow | null {
+      const row = sql<Record<string, unknown>>`SELECT * FROM sh_routine WHERE routineId = ${routineId}`[0];
+      return row ? viewRoutine(row) : null;
+    },
+    list(): RoutineRow[] {
+      return sql<Record<string, unknown>>`SELECT * FROM sh_routine ORDER BY createdAt, routineId`.map(viewRoutine);
+    },
+    exists(routineId: string): boolean {
+      return sql`SELECT 1 AS one FROM sh_routine WHERE routineId = ${routineId}`.length > 0;
+    },
+    setScheduleId(routineId: string, scheduleId: string): void {
+      sql`UPDATE sh_routine SET scheduleId = ${scheduleId} WHERE routineId = ${routineId}`;
+    },
+    setStatus(routineId: string, status: RoutineStatus): boolean {
+      sql`UPDATE sh_routine SET status = ${status} WHERE routineId = ${routineId}`;
+      return sql<{ changes: number }>`SELECT changes() AS changes`[0]!.changes > 0;
+    },
+    /**
+     * The fire-level gate (§8.2/§11): claims this exact fire (`routine:<id>:<fireTime>`)
+     * atomically. False = already processed — the SDK re-dispatched the job, or the alarm
+     * replayed it — and the caller must do nothing. Also stamps lastRunAt/lastResult and
+     * retires once-routines (a re-armed past onceAt must never fire twice).
+     */
+    beginFire(routineId: string, operationId: string, initialResult: string): boolean {
+      return tx(() => {
+        const row = sql<{ status: string; lastFireKey: string | null; scheduleKind: string }>`
+          SELECT status, lastFireKey, scheduleKind FROM sh_routine WHERE routineId = ${routineId}
+        `[0];
+        if (!row || row.status !== "active" || row.lastFireKey === operationId) return false;
+        sql`
+          UPDATE sh_routine SET lastFireKey = ${operationId}, lastRunAt = ${now()}, lastResult = ${initialResult},
+                                outcomeRecorded = 0,
+                                status = CASE WHEN scheduleKind = 'once' THEN 'done' ELSE status END
+          WHERE routineId = ${routineId}
+        `;
+        return true;
+      });
+    },
+    /** The run's outcome (explicit no_action, or the settle fallback). Explicit wins. */
+    recordOutcome(routineId: string, outcome: string): void {
+      sql`
+        UPDATE sh_routine SET lastResult = ${outcome}, outcomeRecorded = 1
+        WHERE routineId = ${routineId} AND outcomeRecorded = 0
+      `;
+    },
+  };
+
+  const followups = {
+    create(input: {
+      followupId: string;
+      threadId: string;
+      dueAt: number;
+      reason: string;
+      createdBy: "user" | "steward";
+      sourceRef: string;
+    }): FollowupRow {
+      sql`
+        INSERT OR IGNORE INTO sh_followup (followupId, threadId, dueAt, reason, createdBy, sourceRef, status, createdAt)
+        VALUES (${input.followupId}, ${input.threadId}, ${input.dueAt}, ${input.reason}, ${input.createdBy}, ${input.sourceRef}, 'open', ${now()})
+      `;
+      return followups.get(input.followupId)!;
+    },
+    get(followupId: string): FollowupRow | null {
+      const row = sql<Record<string, unknown>>`SELECT * FROM sh_followup WHERE followupId = ${followupId}`[0];
+      return row ? viewFollowup(row) : null;
+    },
+    listByThread(threadId: string): FollowupRow[] {
+      return sql<Record<string, unknown>>`SELECT * FROM sh_followup WHERE threadId = ${threadId} ORDER BY createdAt`.map(viewFollowup);
+    },
+    list(): FollowupRow[] {
+      return sql<Record<string, unknown>>`SELECT * FROM sh_followup ORDER BY createdAt, followupId`.map(viewFollowup);
+    },
+    exists(followupId: string): boolean {
+      return sql`SELECT 1 AS one FROM sh_followup WHERE followupId = ${followupId}`.length > 0;
+    },
+    setScheduleId(followupId: string, scheduleId: string): void {
+      sql`UPDATE sh_followup SET scheduleId = ${scheduleId} WHERE followupId = ${followupId}`;
+    },
+    setStatus(followupId: string, status: FollowupStatus): boolean {
+      sql`UPDATE sh_followup SET status = ${status} WHERE followupId = ${followupId}`;
+      return sql<{ changes: number }>`SELECT changes() AS changes`[0]!.changes > 0;
+    },
+    /** The fire gate: only an `open` follow-up fires exactly once (status flips to `fired`). */
+    beginFire(followupId: string, initialResult: string): boolean {
+      return tx(() => {
+        sql`
+          UPDATE sh_followup SET status = 'fired', firedAt = ${now()}, lastResult = ${initialResult}, outcomeRecorded = 0
+          WHERE followupId = ${followupId} AND status = 'open'
+        `;
+        return sql<{ changes: number }>`SELECT changes() AS changes`[0]!.changes > 0;
+      });
+    },
+    recordOutcome(followupId: string, outcome: string): void {
+      sql`
+        UPDATE sh_followup SET lastResult = ${outcome}, outcomeRecorded = 1
+        WHERE followupId = ${followupId} AND outcomeRecorded = 0
+      `;
+    },
+  };
+
+  const offers = {
+    create(input: { offerId: string; spec: RoutineSpecStored; sourceMsg: string; outboundId: string }): RoutineOfferRow {
+      sql`
+        INSERT OR IGNORE INTO sh_routine_offer (offerId, spec, sourceMsg, status, outboundId, createdAt)
+        VALUES (${input.offerId}, ${JSON.stringify(input.spec)}, ${input.sourceMsg}, 'offered', ${input.outboundId}, ${now()})
+      `;
+      return offers.get(input.offerId)!;
+    },
+    get(offerId: string): RoutineOfferRow | null {
+      const row = sql<Record<string, unknown>>`SELECT * FROM sh_routine_offer WHERE offerId = ${offerId}`[0];
+      return row ? viewOffer(row) : null;
+    },
+    /** The tap consumes the offer exactly once; false = already handled or unknown. */
+    consume(offerId: string, status: "accepted" | "dismissed"): RoutineOfferRow | null {
+      const row = offers.get(offerId);
+      if (!row || row.status !== "offered") return null;
+      sql`UPDATE sh_routine_offer SET status = ${status} WHERE offerId = ${offerId} AND status = 'offered'`;
+      return { ...row, status };
     },
   };
 
@@ -972,6 +1525,21 @@ export function createLedger(deps: LedgerDeps) {
       sql`SELECT 1 AS one FROM sh_reap_pending WHERE workerId = ${workerId}`.length === 0;
 
     switch (type) {
+      case "queued": {
+        // §8.2 serial repos (issue #16): the connector parked this write worker behind the
+        // repo's current one; `started` follows when the slot frees. Not a failure — the
+        // Thread stays running-shaped.
+        sql`
+          UPDATE sh_worker SET state = 'queued', lastEventAt = ${ts}, updatedAt = ${now()}
+          WHERE workerId = ${workerId}
+        `;
+        timeline.add(worker.threadId, "note", "排队中：等同一仓库的前一个写任务结束（serial 模式）", {
+          workerId,
+          seq,
+          behind: event.behind ?? null,
+        });
+        break;
+      }
       case "started": {
         sql`
           UPDATE sh_worker SET state = 'running', sessionId = ${str(event.sessionId)}, branch = ${str(event.branch)},
@@ -1128,6 +1696,30 @@ export function createLedger(deps: LedgerDeps) {
         timeline.add(worker.threadId, type, lostResumedText(type, event), { workerId, seq });
         break;
       }
+      case "queue_returned": {
+        // §6.2: texts `clear_queue` handed back at interrupt time — they never reached the
+        // worker. Recorded on the timeline, and the steward is woken to decide their fate
+        // (resend with authorization, tell the user, or drop).
+        const texts = (Array.isArray(event.texts) ? event.texts : []).map((t) => String(t).slice(0, 200));
+        timeline.add(worker.threadId, "note", `中断时取回 ${texts.length} 条未送达消息：${texts.join("；") || "（空）"}`, {
+          workerId,
+          seq,
+          texts,
+        });
+        if (texts.length > 0) {
+          wakes.queue(
+            "event",
+            `queue_returned:${workerId}:${seq}`,
+            queueReturnedWakeText({
+              thread: threads.get(worker.threadId),
+              worker: workers.get(workerId)!,
+              machine: machines.get(worker.deviceId),
+              texts,
+            }),
+          );
+        }
+        break;
+      }
       case "external_activity": {
         timeline.add(worker.threadId, "note", "检测到会话在机器上被直接使用过", { workerId, seq });
         break;
@@ -1149,7 +1741,7 @@ export function createLedger(deps: LedgerDeps) {
     sql`
       UPDATE sh_thread SET state = CASE
         WHEN EXISTS (
-          SELECT 1 FROM sh_worker w WHERE w.threadId = sh_thread.threadId AND w.state IN ('starting', 'running', 'recovering')
+          SELECT 1 FROM sh_worker w WHERE w.threadId = sh_thread.threadId AND w.state IN ('queued', 'starting', 'running', 'recovering')
         ) THEN 'running'
         WHEN EXISTS (
           SELECT 1 FROM sh_question q WHERE q.threadId = sh_thread.threadId AND q.status = 'open'
@@ -1195,10 +1787,18 @@ export function createLedger(deps: LedgerDeps) {
     snapshot(): {
       machines: MachineRow[];
       threads: Array<ThreadRow & { repoIds: string[]; workers: WorkerRow[]; questions: QuestionRow[]; timeline: TimelineRow[] }>;
+      /** Every question row, threadless routing asks included (issue #7). */
+      questions: QuestionRow[];
       pendingNotifications: NotifyRow[];
       runs: RunRow[];
       wakes: WakeRow[];
-    } {
+      notes: NoteRow[];
+      noteLog: Array<{ id: number; ts: number; op: string; noteId: string; text: string; reason: string | null; reportedAt: number | null }>;
+      routines: RoutineRow[];
+      followups: FollowupRow[];
+      offers: RoutineOfferRow[];
+      /** The newest timeline entries across ALL threads — routine fires may be Thread-less. */
+      timelineRecent: Array<{ id: number; threadId: string | null; ts: number; kind: string; text: string }>;    } {
       return {
         machines: machines.list(),
         threads: threads.list().map((t) => ({
@@ -1211,16 +1811,34 @@ export function createLedger(deps: LedgerDeps) {
           `,
           timeline: timeline.list(t.threadId),
         })),
+        questions: sql<QuestionRow>`
+          SELECT qid, threadId, workerId, text, status, askedAt, answeredAt
+          FROM sh_question ORDER BY askedAt
+        `,
         pendingNotifications: notifications.pending(),
         runs: runs.rows(),
         wakes: sql<WakeRow>`SELECT * FROM sh_wake ORDER BY id`,
+        notes: sql<Record<string, unknown>>`SELECT * FROM sh_note ORDER BY createdAt, noteId`.map((r) => ({
+          ...r,
+          confirmed: !!r.confirmed,
+          pinned: !!r.pinned,
+        })) as unknown as NoteRow[],
+        noteLog: sql<{ id: number; ts: number; op: string; noteId: string; text: string; reason: string | null; reportedAt: number | null }>`
+          SELECT id, ts, op, noteId, text, reason, reportedAt FROM sh_note_log ORDER BY id
+        `,
+        routines: routines.list(),
+        followups: followups.list(),
+        offers: sql<Record<string, unknown>>`SELECT * FROM sh_routine_offer ORDER BY createdAt`.map(viewOffer),
+        timelineRecent: sql<{ id: number; threadId: string | null; ts: number; kind: string; text: string }>`
+          SELECT id, threadId, ts, kind, text FROM sh_timeline ORDER BY id DESC LIMIT 20
+        `.reverse(),
       };
     },
   };
 
   return {
     machines, repos, threads, workers, reports, questions, timeline, notifications, outbound,
-    runs, wakes, views, applyPendingEvents, recomputeThreadState, debug,
+    runs, wakes, notes, routines, followups, offers, views, applyPendingEvents, recomputeThreadState, debug,
   };
 }
 

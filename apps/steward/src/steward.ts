@@ -16,6 +16,11 @@
 // poll, §6.3), worker events wake it for bookkeeping through the durable wake queue (§5.1/
 // §5.4), and in event-triggered runs its plain text is discarded by structure (§6.2): only
 // notify_user / ask_user reach the user.
+//
+// Proactive behavior (issue #20, steward.md §8): routines and follow-ups schedule through
+// the Agents SDK (`fireRoutine`/`fireFollowup`); digest routines render deterministically
+// with no LLM, instruction fires submit ⟦routine⟧ inputs whose operationId
+// (routine:<id>:<fireTime>) dedups duplicate fires; every row traces back to a user message.
 import { Agent, type Connection, type ConnectionContext, type WSMessage } from "agents";
 import { PiHarness } from "agents/harness/pi";
 import { Harness, createRegistry, type Extension, type Registry } from "@earendil-works/pi-durable";
@@ -27,6 +32,11 @@ import {
   EventsGapMessageSchema,
   EventsMessageSchema,
   HelloMessageSchema,
+  HISTORY_MAX_BYTES,
+  HISTORY_RELAY_TTL_MS,
+  HistoryAckMessageSchema,
+  HistoryChunkMessageSchema,
+  HistoryOpenMessageSchema,
   PingMessageSchema,
   PROTOCOL_VERSION,
   generatePairingCode,
@@ -36,6 +46,8 @@ import {
   type CmdMessage,
   type ErrorMessage,
   type EventsAckMessage,
+  type HistoryReqMessage,
+  type MachineOfflineMessage,
   type PongMessage,
   type ResyncMessage,
   type ServerKey,
@@ -69,14 +81,17 @@ import {
   type StewardModels,
 } from "./llm/models.ts";
 import { createLedger, type Ledger, type LedgerSql, type NotifyRow, type RunRow } from "./ledger.ts";
-import { failureCard, notifyCard, askUserText, reportCardFor, stallCard } from "./report-template.ts";
+import { RoutineService } from "./routines.ts";
+import { failureCard, notifyCard, askUserCard, reportCardFor, stallCard, type AskCardButton } from "./report-template.ts";
 import { MIGRATIONS, runMigrations } from "./schema.ts";
 import { openSecret, sealSecret } from "./secretbox.ts";
 import { renderSetupPage, type SetupView } from "./setup-page.ts";
-import { escapeMarkers } from "./wake-text.ts";
-import { WebApp, linkTargetForThread } from "./web.ts";
+import { escapeMarkers, verifyWakeText } from "./wake-text.ts";
+import { WebApp, linkTargetForThread, parseSessionCookie } from "./web.ts";
 
 interface ConnState {
+  /** Set on browser connections (the L3 stream consumers); connector connections carry deviceId. */
+  role?: "web";
   deviceId: string;
   epoch: number;
   /** Key that authenticated the connection (issue #27): ≠ primary ⇒ welcome rekeys. */
@@ -122,6 +137,10 @@ const REAP_OFFLINE_MS = 10 * 60_000;
 const REAP_SILENT_MS = 45 * 60_000;
 const WORKER_SWEEP_INTERVAL_S = 60;
 
+// History relay (protocol §6.6, issue #23): a relay row older than this is dropped; the
+// browser's stream JS treats silence past its own deadline as the end. Shrunk in tests.
+const HISTORY_RELAY_TTL_DEFAULT_MS = HISTORY_RELAY_TTL_MS;
+
 // ---- Channel: Feishu webhook inbound + outbound queue (steward.md §6.1, §9; spike bugs 1, 3) ----
 // A claim is the double-send guard (bug 1): the conditional UPDATE hands a row to exactly one
 // delivery pass; it outlives the 10s send timeout so a merely-slow send keeps its owner.
@@ -138,6 +157,18 @@ const OWNER_BOUND_REPLY = "✅ 已绑定，设置完成。此后直接在这里�
 // steward.md §6.3: while any sh_run is open, an alarm-driven task polls every 2 seconds; on
 // settlement a user run's final text becomes the reply, everything else is discarded.
 const RUN_POLL_S = 2;
+/** Settle-time verification (issue #7, spike-conclusions §2): reply phrases that claim a
+ *  dispatch. Zero false positives observed live in the spike; keep the set tight — an
+ *  over-broad pattern would spam corrective runs. */
+const DISPATCH_CLAIM_RE = /已派活|已重派|已派出|已派发|派给了|已经派出|新 worker|worker 会|worker 将/;
+export const claimsDispatch = (text: string): boolean => DISPATCH_CLAIM_RE.test(text);
+// §7.2 (review #47-5): a fired once-routine / follow-up authorizes the run its fire spawned
+// — bounded in time, so a long-dead fire is not a standing authorization. Generous enough
+// for a wake queued behind a busy harness (whenBusy: followUp), short enough to revoke.
+const PROVENANCE_FIRE_FRESHNESS_MS = 10 * 60_000;
+// steward.md §2.5 (issue #18): notes maintenance (decay, demotion suggestions, capacity
+// backstop) runs once a day via alarm; its ChangeReports relay with the next user reply.
+const NOTES_MAINTENANCE_DAY_S = 86_400;
 // Sent when the first event lands on the webhook after the QR switch: only a delivered event
 // proves the transport actually moved (research §8.2 — the API's callback_type report stays
 // out of sync with real delivery until the console republish lands).
@@ -188,6 +219,11 @@ export interface ShOutboundRow {
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+/** UTF-8 size of a serialized relay message — the byte meter is numbers only, never content. */
+function jsonByteLength(value: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(value)).length;
+}
+
 function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -206,13 +242,23 @@ export type PairResult =
 // cast at the read/write sites instead (same tradeoff the do-protocol spike made).
 export class Steward extends Agent<Env> {
   onStart(): void {
-    runMigrations(this.sql.bind(this), MIGRATIONS);
+    // Each migration commits atomically WITH its ledger row (reviews #47-2 + #48 finding 3):
+    // a multi-statement rebuild can never persist half of itself, and the ledger write
+    // cannot lag the commit (the copy-drop-rename migrations are not re-runnable).
+    runMigrations(this.sql.bind(this), MIGRATIONS, (fn) => this.ctx.storage.transactionSync(fn));
+    // Notes maintenance is daily and idempotent (steward.md §2.5): arming at boot covers a
+    // fresh deployment; the handler re-arms itself with the review-#1 cancel-then-schedule
+    // pattern so the chain never dies with an evicted isolate.
+    void this.schedule(NOTES_MAINTENANCE_DAY_S, "notesMaintenance", undefined, { idempotent: true });
     // A DO restart clears the in-memory arm-dedupe while storage alarms keep their own
     // clock: re-arm maintenance so a restart never strands active workers unwatched.
     this.armWorkerSweeps();
     // Wakes queued by past reducers (crash between queue and submit, §11) drain now.
     void this.drainWakes();
     void this.pollRuns();
+    // Routine/follow-up rows and their SDK schedules live in different stores — a crash
+    // between INSERT and schedule() must not silently kill a routine (issue #20, §11).
+    void this.reconcileRoutineSchedules();
   }
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -317,6 +363,8 @@ export class Steward extends Agent<Env> {
   // Tests shrink the /pair lockout (see feishuSendTimeoutMs for the same pattern).
   protected pairLockMs = PAIR_LOCK_MS;
 
+  // Tests shrink the history relay TTL to exercise the alarm-driven sweep quickly.
+  protected historyRelayTtlMs = HISTORY_RELAY_TTL_DEFAULT_MS;
 
   // The memory module (steward.md §2): all sh_* ledger SQL lives behind this handle. Bound
   // lazily because `sql`/`ctx` only mean something once the DO is live.
@@ -362,7 +410,59 @@ export class Steward extends Agent<Env> {
       createPairing: () => this.createPairing(),
       deployOrigin: () => this.web.origin(),
       webLinkUrl: (target) => this.web.linkUrl(target),
+      // Routine suggestion cards (`offer:` outbound ids) route their taps here (§8.5).
+      onOfferTap: (offerId, action) => this.routineService.handleOfferTap(offerId, action),
     }));
+  }
+
+  // The proactive-behavior service (issue #20, steward.md §8): routines, follow-ups, offers.
+  // Same lazy-bind pattern as the ledger/dispatcher.
+  private routineService_?: RoutineService;
+  protected get routineService(): RoutineService {
+    return (this.routineService_ ??= new RoutineService({
+      ledger: this.ledger,
+      schedule: (when, callback, payload, opts) => this.schedule(when, callback, payload, opts),
+      cancelSchedule: (id) => this.cancelSchedule(id),
+      enqueueOutbound: (input) => this.enqueueOutbound(input),
+      ownerOpenId: () => this.ownerOpenIdSync(),
+      onWakeQueued: () => {
+        void this.drainWakes();
+        void this.pollRuns();
+      },
+      audit: (kind, detail) => this.logChannel(kind, detail),
+    }));
+  }
+
+  /** Agents SDK callback (this.schedule(cron, "fireRoutine", { routineId }), §8.2). */
+  async fireRoutine(payload?: { routineId?: string }, schedule?: { id?: string; time?: number }): Promise<void> {
+    if (!payload?.routineId) return;
+    try {
+      await this.routineService.fire(payload.routineId, schedule);
+    } catch (err) {
+      this.logChannel("routine_fire_failed", `${payload.routineId} ${errorText(err)}`);
+    }
+  }
+
+  /** Agents SDK callback for a due follow-up (§8.3): submits ⟦followup F⟧. */
+  async fireFollowup(payload?: { followupId?: string }): Promise<void> {
+    if (!payload?.followupId) return;
+    try {
+      await this.routineService.fireFollowup(payload.followupId);
+    } catch (err) {
+      this.logChannel("followup_fire_failed", `${payload.followupId} ${errorText(err)}`);
+    }
+  }
+
+  /** onStart reconciliation driver (§11): rows ↔ SDK schedules must agree after any crash. */
+  async reconcileRoutineSchedules(): Promise<void> {
+    try {
+      const schedules = await this.listSchedules();
+      await this.routineService.reconcile(
+        schedules.map((s) => ({ id: s.id, callback: s.callback, type: s.type, time: s.time, payload: s.payload })),
+      );
+    } catch (err) {
+      this.logChannel("routine_reconcile_failed", errorText(err));
+    }
   }
 
   // The signed-link web app (issue #22, steward.md §10): login exchange, Thread timeline,
@@ -378,6 +478,7 @@ export class Steward extends Agent<Env> {
           SELECT deviceId, name, revoked FROM device ORDER BY createdAt, deviceId
         `.map((d) => ({ deviceId: d.deviceId, name: d.name, revoked: !!d.revoked })),
       revokeDevice: (deviceId) => void this.revoke(deviceId),
+      machineConnected: (deviceId) => this.connFor(deviceId) !== undefined,
       audit: (reason, detail) => this.logChannel(reason, detail),
     }));
   }
@@ -389,24 +490,69 @@ export class Steward extends Agent<Env> {
       buildBrief: () => buildSituationBrief(this.ledger),
       currentRun: () => this.currentRunBinding(),
       checkProvenanceRef: async (ref) => {
-        // §7.2 (review #4): a `user:<msgId>` reference is valid only if this deployment
-        // actually received that message. Routine/followup/watch ids join when #20 lands.
-        if (!ref.startsWith("user:")) return false;
+        // §7.2 (review #4 + #47-5): a provenance reference is valid only if this deployment
+        // actually holds — and has not revoked — what it points at. Routine/follow-up ids
+        // authorize while their fire is live: an `active` routine, a `done` once-routine
+        // whose fire may still be executing (bounded by PROVENANCE_FIRE_FRESHNESS), a
+        // freshly `fired` follow-up. Paused/cancelled are the owner's revocation.
+        if (ref.startsWith("user:")) {
+          const msgId = ref.slice("user:".length);
+          if (msgId.length === 0) return false;
+          return this.sql`SELECT 1 AS one FROM sh_inbound WHERE channel = 'feishu' AND msgId = ${msgId}`.length > 0;
+        }
+        if (ref.startsWith("routine:")) {
+          const routineId = ref.slice("routine:".length);
+          if (routineId.length === 0) return false;
+          const routine = this.ledger.routines.get(routineId);
+          if (!routine) return false;
+          if (routine.status === "active") return true;
+          return routine.status === "done" && (routine.lastRunAt ?? 0) > Date.now() - PROVENANCE_FIRE_FRESHNESS_MS;
+        }
+        if (ref.startsWith("followup:")) {
+          const followupId = ref.slice("followup:".length);
+          if (followupId.length === 0) return false;
+          const followup = this.ledger.followups.get(followupId);
+          // `open` has not happened yet and authorizes nothing; `fired` is live only while fresh.
+          return followup?.status === "fired" && (followup.firedAt ?? 0) > Date.now() - PROVENANCE_FIRE_FRESHNESS_MS;
+        }
+        return false;
+      },
+      messageReceivedAt: async (ref) => {
+        // Notes' temporal binding (PR #44 review finding 3b): when the owner's message
+        // arrived, so a confirmation can be required to postdate the note it confirms.
+        if (!ref.startsWith("user:")) return null;
         const msgId = ref.slice("user:".length);
-        if (msgId.length === 0) return false;
-        return this.sql`SELECT 1 AS one FROM sh_inbound WHERE channel = 'feishu' AND msgId = ${msgId}`.length > 0;
+        if (msgId.length === 0) return null;
+        return (
+          this.sql<{ receivedAt: number }>`
+            SELECT receivedAt FROM sh_inbound WHERE channel = 'feishu' AND msgId = ${msgId}
+          `[0]?.receivedAt ?? null
+        );
       },
       startWorker: async (input) => {
+        const run = await this.currentRunBinding();
         const outcome = await this.dispatcher.startWorker(input);
         // Review #8: a dispatch in this run picks/creates the Thread the conversation is now
         // about — backfill it onto the run so the run's reply (and quote-replies to it)
         // route to that Thread, exactly like an explicit quote-route does.
         if (outcome.kind === "dispatched" || outcome.kind === "asked_offline") {
-          const run = await this.currentRunBinding();
           if (run && run.routedThreadId === null) {
             this.sql`UPDATE sh_run SET routedThreadId = ${outcome.threadId} WHERE operationId = ${run.operationId} AND routedThreadId IS NULL`;
           }
+          // Issue #7: count the real dispatch for the settle-time verification — a reply
+          // claiming "dispatched" with dispatchCount 0 gets the corrective follow-up.
+          if (run) this.ledger.runs.countDispatch(run.operationId);
         }
+        return outcome;
+      },
+      sendToWorker: async (input) => {
+        const outcome = await this.dispatcher.sendToWorker(input);
+        if (outcome.kind === "sent") await this.backfillRunThread(outcome.threadId);
+        return outcome;
+      },
+      interruptWorker: async (input) => {
+        const outcome = await this.dispatcher.interruptWorker(input);
+        if (outcome.kind === "interrupted") await this.backfillRunThread(outcome.threadId);
         return outcome;
       },
       notifyUser: async (input) => {
@@ -437,24 +583,47 @@ export class Steward extends Agent<Env> {
         const owner = this.ownerOpenIdSync();
         if (!owner) return;
         const thread = input.threadId ? this.ledger.threads.get(input.threadId) : null;
+        // §4.3 (issue #7): ask_user creates the sh_question — thread-scoped when it belongs
+        // to one Thread (flipping it to waiting_you), threadless for routing asks, where the
+        // candidates column carries the button mapping a click resolves against. One
+        // question per call: a unique id (review #3 — a per-run id collided and INSERT OR
+        // IGNORE silently swallowed repeats).
+        const qid = `q_steward_${ulid()}`;
+        this.ledger.questions.insert({
+          qid,
+          threadId: thread?.threadId ?? null,
+          workerId: null,
+          text: input.question,
+          options: input.options,
+          candidates: input.candidates,
+        });
         if (thread) {
-          // §4.3: ask_user creates the question, flips the Thread to waiting_you, and ends the
-          // turn. Answering later happens as a quote-reply routed back to the Thread (which
-          // closes it — see submitUserMessage). One question per call: unique id (review #3 —
-          // a per-run id collided and INSERT OR IGNORE silently swallowed repeats).
-          const qid = `q_steward_${ulid()}`;
-          this.sql`
-            INSERT OR IGNORE INTO sh_question (qid, threadId, workerId, text, options, status, askedAt)
-            VALUES (${qid}, ${thread.threadId}, NULL, ${input.question}, ${JSON.stringify(input.options)}, 'open', ${Date.now()})
-          `;
           this.ledger.recomputeThreadState(thread.threadId);
           this.sql`UPDATE sh_thread SET unread = 1 WHERE threadId = ${thread.threadId}`; // news landed (§5.2)
         }
+        // The card (issue #7): ≤3 candidate buttons + 「新开一件事」 for routing asks; plain
+        // option buttons otherwise; no buttons for open questions (answer via quote-reply,
+        // which the outbound row's threadId routes). Button values carry only the opaque
+        // action string — Thread identity resolves server-side (§3.1, spike bug list).
+        const buttons: AskCardButton[] =
+          input.candidates.length > 0
+            ? [
+                ...input.candidates.map((candidate, index) => ({
+                  label: candidate.label,
+                  action: `ask:${qid}:${index}`,
+                })),
+                { label: "新开一件事", action: `asknew:${qid}`, primary: true },
+              ]
+            : input.options.map((option, index) => ({ label: option, action: `ask:${qid}:${index}` }));
         await this.enqueueOutbound({
           id: input.dedupeId,
-          kind: "text",
+          kind: "card",
           to: owner,
-          text: askUserText(input.question, input.options, thread?.title),
+          card: askUserCard({
+            question: input.question,
+            ...(thread ? { threadTitle: thread.title } : {}),
+            buttons,
+          }),
           threadId: thread?.threadId ?? null,
           urgency: "push",
         });
@@ -462,6 +631,17 @@ export class Steward extends Agent<Env> {
       },
       audit: (kind, detail) => {
         this.logChannel(kind, detail);
+      },
+      routines: this.routineService,
+      // §8.6 (audit trail): an explicit in-run outcome (no_action) beats the settle fallback.
+      recordProactiveOutcome: (operationId, outcome) => {
+        const followup = /^followup:(f_.+)$/.exec(operationId);
+        if (followup) {
+          this.ledger.followups.recordOutcome(followup[1]!, outcome);
+          return;
+        }
+        const routine = /^routine:(r_.+):\d+$/.exec(operationId);
+        if (routine) this.ledger.routines.recordOutcome(routine[1]!, outcome);
       },
     };
   }
@@ -472,6 +652,9 @@ export class Steward extends Agent<Env> {
    * the oldest unsettled sh_run, is what tools are executing inside (a queued followUp starts
    * the moment the previous run answers, while sh_run only settles at the next 2s poll).
    * Falls back to the oldest open run between runs (passive entry writes, wake drains).
+   *
+   * The provenance (§7.1): a user run is its own message id; a verify run (#7) is authorized
+   * by the user message it corrects (replyTo), so its provenance is `user:<msgId>` too.
    */
   private async currentRunBinding(): Promise<{
     operationId: string;
@@ -482,21 +665,37 @@ export class Steward extends Agent<Env> {
     const running = (await this.piHarness.pending()).find((p) => p.status === "running");
     if (running) {
       const row = this.ledger.runs.get(running.operationId);
-      if (row) {
-        // §7.1: the provenance of an event run is the wake's operationId; a user run's is
-        // `user:<msgId>` — what start_worker records as createdFromMsg.
-        return { operationId: row.operationId, kind: row.kind, provenance: row.operationId, routedThreadId: row.routedThreadId };
-      }
+      if (row) return this.runBindingOf(row);
     }
     const open = this.ledger.runs.openRows()[0];
     if (!open) return null;
-    return { operationId: open.operationId, kind: open.kind, provenance: open.operationId, routedThreadId: open.routedThreadId };
+    return this.runBindingOf(open);
+  }
+
+  private runBindingOf(row: RunRow): {
+    operationId: string;
+    kind: string;
+    provenance: string;
+    routedThreadId: string | null;
+  } {
+    const provenance = row.kind === "verify" && row.replyTo !== null ? `user:${row.replyTo}` : row.operationId;
+    return { operationId: row.operationId, kind: row.kind, provenance, routedThreadId: row.routedThreadId };
   }
 
   /** Records that the *executing* run already produced user-facing output (review #9). */
   private async markRunNotified(): Promise<void> {
     const run = await this.currentRunBinding();
     if (run) this.sql`UPDATE sh_run SET notified = 1 WHERE operationId = ${run.operationId}`;
+  }
+
+  /** Issue #9: an intervention resolves the Thread this run's reply belongs to (same
+   *  rationale as a dispatch, review #8) — the tool resolved the worker; the routing
+   *  backfill never passes through model judgment (§3.1). */
+  private async backfillRunThread(threadId: string): Promise<void> {
+    const run = await this.currentRunBinding();
+    if (run && run.routedThreadId === null) {
+      this.sql`UPDATE sh_run SET routedThreadId = ${threadId} WHERE operationId = ${run.operationId} AND routedThreadId IS NULL`;
+    }
   }
 
   private ownerOpenIdSync(): string | null {
@@ -536,6 +735,9 @@ export class Steward extends Agent<Env> {
   }
 
   async getConnectionTags(_connection: Connection, ctx: ConnectionContext): Promise<string[]> {
+    // §5.3: the role query param routes/tags the connection; legitimacy is decided by the
+    // credential — device token for connectors (onConnect), session cookie for browsers.
+    if (new URL(ctx.request.url).searchParams.get("role") === "web") return ["web"];
     const parsed = await parseToken(await this.serverKeys(), bearer(ctx.request));
     return parsed ? [`dev:${parsed.deviceId}`] : [];
   }
@@ -545,6 +747,24 @@ export class Steward extends Agent<Env> {
   }
 
   async onConnect(connection: Connection, ctx: ConnectionContext): Promise<void> {
+    // Browser connections (§5.3 `web` role): authenticated by the session cookie the Worker
+    // layer already HMAC-verified (index.ts onBeforeConnect); liveness stays a DB fact here.
+    if (new URL(ctx.request.url).searchParams.get("role") === "web") {
+      const raw = (ctx.request.headers.get("cookie") ?? "")
+        .split(/;\s*/)
+        .find((part) => part.startsWith("shepherd_session="))
+        ?.slice("shepherd_session=".length) ?? null;
+      const sid = await parseSessionCookie(
+        [this.env.SERVER_KEY, this.env.SERVER_KEY_PREVIOUS].filter((k): k is string => typeof k === "string" && k.length > 0),
+        raw,
+      );
+      if (!sid || !this.web.sessionAlive(sid)) {
+        connection.close(CloseCode.UNAUTHORIZED, "unauthorized");
+        return;
+      }
+      connection.setState({ role: "web", deviceId: "", epoch: 0, keyId: "" } satisfies ConnState);
+      return;
+    }
     const parsed = await parseToken(await this.serverKeys(), bearer(ctx.request));
     if (!parsed) {
       connection.close(CloseCode.UNAUTHORIZED, "unauthorized");
@@ -569,11 +789,28 @@ export class Steward extends Agent<Env> {
 
   onClose(connection: Connection): void {
     const state = connection.state as unknown as ConnState | null;
-    if (!state?.deviceId) return;
+    if (!state) return;
+    if (state.role === "web") {
+      // §6.6 termination: the browser closing its connection ends every stream it opened.
+      this.sql`DELETE FROM history_relay WHERE webConnId = ${connection.id}`;
+      return;
+    }
+    if (!state.deviceId) return;
     // A superseded old connection closes after its replacement is live: only the last
     // connection for the device takes the machine offline.
     const remaining = [...this.getConnections<ConnState>(`dev:${state.deviceId}`)].filter((c) => c.id !== connection.id);
-    if (remaining.length === 0) this.ledger.machines.setOnline(state.deviceId, false);
+    if (remaining.length > 0) return; // superseded, not offline — its relays die with the
+    // connector-side reset; the browser's silence watchdog ends the view.
+    // The machine really went offline: every relay through it dies with the connection, and
+    // each browser hears why (§6.6 machine_offline) instead of waiting out its own timeout.
+    const orphaned = this.sql<{ reqId: string; webConnId: string }>`
+      SELECT reqId, webConnId FROM history_relay WHERE deviceId = ${state.deviceId}
+    `;
+    for (const relay of orphaned) {
+      this.sql`DELETE FROM history_relay WHERE reqId = ${relay.reqId}`;
+      this.getConnection(relay.webConnId)?.send(JSON.stringify({ t: "machine_offline", re: relay.reqId } satisfies MachineOfflineMessage));
+    }
+    this.ledger.machines.setOnline(state.deviceId, false);
   }
 
   async onMessage(connection: Connection, raw: WSMessage): Promise<void> {
@@ -585,7 +822,34 @@ export class Steward extends Agent<Env> {
       this.sendError(connection, "bad_request", "invalid JSON");
       return;
     }
+    // §5.3 role fence: browsers only stream history; connectors do everything else. A
+    // cross-role message is answered with forbidden and never reaches a handler.
+    const state = connection.state as unknown as ConnState | null;
     const t = (message as { t?: unknown }).t;
+    if (state?.role === "web") {
+      switch (t) {
+        case "history_open":
+          this.handleHistoryOpen(connection, message);
+          return;
+        case "history_ack":
+          this.handleHistoryAck(connection, message);
+          return;
+        default:
+          this.sendError(connection, "forbidden", `message type ${JSON.stringify(t)} is not allowed on a web connection`);
+          return;
+      }
+    }
+    if (t === "history_open" || t === "history_ack") {
+      // §5.3: browser-type messages on a connector connection.
+      const id = (message as { id?: unknown }).id;
+      this.sendError(
+        connection,
+        "forbidden",
+        `message type ${JSON.stringify(t)} is not allowed on a connector connection`,
+        typeof id === "string" ? id : undefined,
+      );
+      return;
+    }
     switch (t) {
       case "hello":
         this.handleHello(connection, message);
@@ -608,6 +872,14 @@ export class Steward extends Agent<Env> {
         // the DO just accepts the report instead of answering "unsupported".
         EventsGapMessageSchema.safeParse(message);
         return;
+      case "history_chunk":
+        this.handleHistoryChunk(connection, message);
+        return;
+      case "error":
+        // A connector reply to something the DO itself sent. The only DO-originated requests
+        // are history pulls (§6.6): relay a failure to the waiting browser and end its stream.
+        this.relayHistoryError(connection, message);
+        return;
       default:
         break;
     }
@@ -621,6 +893,126 @@ export class Steward extends Agent<Env> {
     const parsed = PingMessageSchema.safeParse(raw);
     if (!parsed.success) return;
     connection.send(JSON.stringify({ t: "pong", re: parsed.data.id } satisfies PongMessage));
+  }
+
+  // ---- History relay (protocol §6.6, issue #23) ---------------------------------------------------
+  // The DO is a pure pipe: ids and byte meters in SQLite, content only ever in memory
+  // between the two sockets. Nothing here logs or persists entry text.
+
+  /** browser → DO: resolve the worker, refuse offline machines, then ask the connector. */
+  private handleHistoryOpen(connection: Connection, raw: unknown): void {
+    const parsed = HistoryOpenMessageSchema.safeParse(raw);
+    if (!parsed.success) {
+      this.sendError(connection, "bad_request", "invalid history_open");
+      return;
+    }
+    const open = parsed.data;
+    const worker = this.ledger.workers.get(open.workerId);
+    if (!worker) {
+      this.sendError(connection, "not_found", `worker ${open.workerId} is unknown`, open.id);
+      return;
+    }
+    const deviceConn = this.connFor(worker.deviceId);
+    if (!deviceConn) {
+      // §6.6: offline is answered directly — the transcript lives on that machine only.
+      connection.send(JSON.stringify({ t: "machine_offline", re: open.id } satisfies MachineOfflineMessage));
+      return;
+    }
+    const reqId = ulid();
+    const maxBytes = Math.min(open.maxBytes ?? HISTORY_MAX_BYTES, HISTORY_MAX_BYTES);
+    const now = Date.now();
+    // One live stream per browser connection — a re-open supersedes the previous one.
+    this.sql`DELETE FROM history_relay WHERE webConnId = ${connection.id}`;
+    this.sql`
+      INSERT INTO history_relay (reqId, webConnId, workerId, deviceId, maxBytes, sentBytes, expiresAt, createdAt)
+      VALUES (${reqId}, ${connection.id}, ${open.workerId}, ${worker.deviceId}, ${maxBytes}, 0, ${now + this.historyRelayTtlMs}, ${now})
+    `;
+    void this.schedule(Math.max(1, Math.ceil(this.historyRelayTtlMs / 1000)), "sweepHistoryRelays");
+    const req: HistoryReqMessage = {
+      t: "history_req",
+      id: reqId,
+      workerId: open.workerId,
+      maxBytes,
+      ...(open.since ? { since: open.since } : {}),
+    };
+    deviceConn.send(JSON.stringify(req));
+  }
+
+  /** browser → DO → connector: the ack that slides the connector's window (§6.6 step 4). */
+  private handleHistoryAck(connection: Connection, raw: unknown): void {
+    const parsed = HistoryAckMessageSchema.safeParse(raw);
+    if (!parsed.success) return;
+    const relay = this.sql<{ webConnId: string; deviceId: string }>`
+      SELECT webConnId, deviceId FROM history_relay WHERE reqId = ${parsed.data.re}
+    `[0];
+    // Unknown reqId (stream already finished) or another connection's stream: drop.
+    if (!relay || relay.webConnId !== connection.id) return;
+    this.connFor(relay.deviceId)?.send(JSON.stringify(parsed.data));
+  }
+
+  /** connector → DO → browser: forward one chunk, meter the bytes, end finished streams. */
+  private handleHistoryChunk(connection: Connection, raw: unknown): void {
+    const parsed = HistoryChunkMessageSchema.safeParse(raw);
+    if (!parsed.success) return;
+    const chunk = parsed.data;
+    const relay = this.sql<{ webConnId: string; deviceId: string; maxBytes: number; sentBytes: number; cursor: string | null; expiresAt: number }>`
+      SELECT webConnId, deviceId, maxBytes, sentBytes, cursor, expiresAt FROM history_relay WHERE reqId = ${chunk.re}
+    `[0];
+    if (!relay) return; // swept/timed out/done: nothing is waiting for this chunk
+    // The relay belongs to one machine: only its connection's chunks travel on. reqIds are
+    // unguessable ULIDs, so this is defense in depth against a confused connector, not auth.
+    if ((connection.state as unknown as ConnState | null)?.deviceId !== relay.deviceId) return;
+    if (relay.expiresAt <= Date.now()) {
+      this.sql`DELETE FROM history_relay WHERE reqId = ${chunk.re}`;
+      return;
+    }
+    const webConn = this.getConnection(relay.webConnId);
+    if (!webConn) {
+      this.sql`DELETE FROM history_relay WHERE reqId = ${chunk.re}`;
+      return;
+    }
+    const bytes = jsonByteLength(raw);
+    if (relay.sentBytes + bytes > relay.maxBytes) {
+      // Defense in depth (the connector budgets maxBytes first): cut the stream here rather
+      // than forward past the cap, and tell the browser it ended — continuing from the last
+      // FORWARDED cursor, never the dropped chunk's (the browser never saw its entries).
+      webConn.send(
+        JSON.stringify({ t: "history_chunk", re: chunk.re, n: chunk.n, entries: [], cursor: relay.cursor, done: true, truncated: true }),
+      );
+      this.sql`DELETE FROM history_relay WHERE reqId = ${chunk.re}`;
+      return;
+    }
+    webConn.send(JSON.stringify(chunk));
+    if (chunk.done) {
+      this.sql`DELETE FROM history_relay WHERE reqId = ${chunk.re}`;
+    } else {
+      this.sql`
+        UPDATE history_relay SET sentBytes = ${relay.sentBytes + bytes}, cursor = ${chunk.cursor ?? null}
+        WHERE reqId = ${chunk.re}
+      `;
+    }
+  }
+
+  /** A connector `error` replying to a history_req: forward the reason, end the stream. */
+  private relayHistoryError(connection: Connection, raw: unknown): void {
+    const re = (raw as { re?: unknown }).re;
+    if (typeof re !== "string") return;
+    const relay = this.sql<{ webConnId: string; deviceId: string }>`
+      SELECT webConnId, deviceId FROM history_relay WHERE reqId = ${re}
+    `[0];
+    if (!relay) return; // not a history reply; nothing else to do with connector errors today
+    if ((connection.state as unknown as ConnState | null)?.deviceId !== relay.deviceId) return;
+    this.sql`DELETE FROM history_relay WHERE reqId = ${re}`;
+    this.getConnection(relay.webConnId)?.send(JSON.stringify(raw));
+  }
+
+  /** Alarm-driven §6.6 termination: relays older than the TTL disappear, browser or not. */
+  async sweepHistoryRelays(): Promise<void> {
+    this.sql`DELETE FROM history_relay WHERE expiresAt <= ${Date.now()}`;
+    const next = this.sql<{ m: number | null }>`SELECT MIN(expiresAt) AS m FROM history_relay`[0]?.m;
+    if (typeof next === "number") {
+      void this.schedule(Math.max(1, Math.ceil((next - Date.now()) / 1000)), "sweepHistoryRelays");
+    }
   }
 
   private async handleHello(connection: Connection, raw: unknown): Promise<void> {
@@ -1870,8 +2262,12 @@ export class Steward extends Agent<Env> {
     await this.submitUserMessage({ msgId: ev.msgId, text: ev.text ?? "", parentId: ev.parentId });
   }
 
-  /** A user message becomes one steward input, idempotent on the msgId (steward.md §9.1/§11). */
-  private async submitUserMessage(input: { msgId: string; text: string; parentId?: string }): Promise<void> {
+  /** A user message becomes one steward input, idempotent on the msgId (steward.md §9.1/§11).
+   * `prefilledNote`/`routedThreadId` serve the ask-card clicks (#7): the click's choice is
+   * submitted as a system-noted user action already routed to the picked Thread. */
+  private async submitUserMessage(
+    input: { msgId: string; text: string; parentId?: string; prefilledNote?: string; routedThreadId?: string | null },
+  ): Promise<void> {
     const operationId = `user:${input.msgId}`;
     // Signal 1 (§3.1): a quote of one of our messages routes to that Thread directly.
     const routed = input.parentId ? this.ledger.outbound.threadIdForProviderMsg(input.parentId) : null;
@@ -1887,11 +2283,15 @@ export class Steward extends Agent<Env> {
     // the routing note is prefixed as clearly-marked system metadata (never the ⟦ form, so
     // the input still reads as user-originated).
     const escaped = escapeMarkers(input.text);
-    const note = routedThread
-      ? `（系统注：这条消息是对 Thread「${routedThread.title}」（${routedThread.threadId}）消息的回复，已确定归属该 Thread。）\n`
-      : "";
+    const note =
+      input.prefilledNote !== undefined
+        ? input.prefilledNote
+        : routedThread
+          ? `（系统注：这条消息是对 Thread「${escapeMarkers(routedThread.title)}」（${routedThread.threadId}）消息的回复，已确定归属该 Thread。）\n`
+          : "";
     const text = `${note}${escaped}`;
-    if (!this.ledger.runs.open(operationId, "user", text, { replyTo: input.msgId, channel: "feishu", routedThreadId: routedThread?.threadId ?? null })) {
+    const routedId = input.routedThreadId ?? routedThread?.threadId ?? null;
+    if (!this.ledger.runs.open(operationId, "user", text, { replyTo: input.msgId, channel: "feishu", routedThreadId: routedId })) {
       return; // already submitted (sh_inbound dedup normally catches this first)
     }
     try {
@@ -1952,59 +2352,120 @@ export class Steward extends Agent<Env> {
   }
 
   private settleRun(run: RunRow, result: { status: string; reason?: string; text?: string }): void {
+    // §8.6: every fire leaves a result. An explicit in-run outcome (no_action) was recorded
+    // during the run; the settle summary is the fallback for everything else.
+    this.recordSettledProactiveOutcome(run, result);
     if (run.kind === "user") {
       const owner = this.ownerOpenIdSync();
       const hasText = Boolean(result.text && result.text.trim().length > 0);
+      // spec §10.3 (issue #18): every memory ChangeReport rides on the next reply —
+      // deterministic, so "remembered: …" reaches the user even if the model never says it.
+      // Ordering (review finding 4): the relay is RENDERED here but marked reported only
+      // after the reply row is durably enqueued — a crash in the remaining window costs at
+      // most a duplicate announcement (the outbound queue owns delivery retries), never a
+      // silent one. `upTo` bounds the marking: a change landing between render and mark
+      // stays pending and rides the reply after it.
+      const relay = this.ledger.notes.renderPendingForReply();
+      const withRelay = (text: string): string => (relay.text === "" ? text : `${text}\n${relay.text}`);
       // Review #9: a `done` run with no final text is legitimate when the model already
       // produced user-facing output (ask_user terminates the turn right after its push;
       // notify_user cards went out mid-run). Only a silent empty answer is treated as a
       // failure the user must hear about.
       const alreadyNotified = Boolean(run.notified);
+      const reply = async (text: string): Promise<void> => {
+        // §6.2 source 3: the final text of a user-triggered run IS the reply. The outbound
+        // id is keyed to the run (review #6): concurrent polls and interrupted settle windows
+        // converge on one message. The enqueue's insert is synchronous inside the call, so
+        // once it returns the announcement cannot be lost; only then is the relay marked.
+        try {
+          const { id } = await this.enqueueOutbound({
+            id: `reply:${run.operationId}`,
+            kind: "text",
+            to: owner!,
+            text,
+            threadId: run.routedThreadId,
+            urgency: "push",
+          });
+          this.ledger.notes.markPendingReported(relay.upTo);
+          this.ledger.runs.settle(run.operationId, result, id);
+        } catch (err) {
+          // Nothing durable went out: the run stays open and the next poll retries, with the
+          // relay still pending — the announcement is never silently consumed.
+          this.logChannel("reply_enqueue_failed", `${run.operationId} ${errorText(err)}`);
+        }
+      };
       if (owner && result.status === "done" && hasText) {
-        // §6.2 source 3: the final text of a user-triggered run IS the reply. Carrying the
-        // routed thread keeps quote-reply chains on the same Thread (§3.1) — either the
-        // quote-route resolved at submit time or the run's own dispatch backfilled it.
-        // The outbound id is keyed to the run (review #6): concurrent polls and interrupted
-        // settle windows converge on one message.
-        void this.enqueueOutbound({
-          id: `reply:${run.operationId}`,
-          kind: "text",
-          to: owner,
-          text: result.text!,
-          threadId: run.routedThreadId,
-          urgency: "push",
-        }).then(({ id }) => this.ledger.runs.settle(run.operationId, result, id));
+        // §6.2 source 3: the final text of a user-triggered run IS the reply; the notes
+        // module's pending ChangeReport rides on it (spec §10.3), and the outbound id is
+        // keyed to the run (review #6) so concurrent polls and interrupted settle windows
+        // converge on one message.
+        void reply(withRelay(result.text!));
+        // Settle-time dispatch verification (issue #7, spike-conclusions §2): the reply
+        // claims a dispatch but dispatchCount says none happened — a corrective follow-up
+        // makes the steward actually dispatch or visibly correct itself. The claim phrase
+        // set is the spike's (zero false positives observed there); it is tested on the
+        // raw final text, not the notes-relay rendering appended to the reply.
+        if (run.dispatchCount === 0 && claimsDispatch(result.text!)) {
+          void this.queueVerifyRun(run, result.text!);
+        }
         return;
       }
       if (owner && result.status !== "done") {
         // No template exists for user replies; a one-line notice beats silence (the budget
         // cap and its degradation behavior are #28's to refine).
-        void this.enqueueOutbound({
-          id: `reply:${run.operationId}`,
-          kind: "text",
-          to: owner,
-          text: "⚠️ 总管这轮没有跑成（模型调用失败或被中断），这条消息我没能处理；稍后再试或重发一次。",
-          threadId: run.routedThreadId,
-          urgency: "push",
-        }).then(({ id }) => this.ledger.runs.settle(run.operationId, result, id));
+        void reply(withRelay("⚠️ 总管这轮没有跑成（模型调用失败或被中断），这条消息我没能处理；稍后再试或重发一次。"));
         return;
       }
       if (owner && result.status === "done" && !hasText && !alreadyNotified) {
         // Review #9: done, empty, and nothing reached the user — say so instead of silence.
-        void this.enqueueOutbound({
-          id: `reply:${run.operationId}`,
-          kind: "text",
-          to: owner,
-          text: "⚠️ 总管这轮没有给出回复（可能只调用了内部工具）；需要的话再说一次。",
-          threadId: run.routedThreadId,
-          urgency: "push",
-        }).then(({ id }) => this.ledger.runs.settle(run.operationId, result, id));
+        void reply(withRelay("⚠️ 总管这轮没有给出回复（可能只调用了内部工具）；需要的话再说一次。"));
         return;
       }
+
     }
     // Event/routine/follow-up runs, and user runs that already reached the user: the text is
     // kept for audit and nothing more is sent (§6.2).
     this.ledger.runs.settle(run.operationId, result);
+  }
+
+  /** The settle-time lastResult for routine/follow-up runs (§8.6), when none was recorded. */
+  private recordSettledProactiveOutcome(run: RunRow, result: { status: string; reason?: string; text?: string }): void {
+    const summary =
+      `${result.status}${result.reason !== undefined && result.reason !== null ? `:${result.reason}` : ""}` +
+      (result.text && result.text.trim().length > 0 ? ` — ${result.text.trim().slice(0, 140)}` : "");
+    const followup = /^followup:(f_.+)$/.exec(run.operationId);
+    if (followup) {
+      this.ledger.followups.recordOutcome(followup[1]!, summary);
+      return;
+    }
+    const routine = /^routine:(r_.+):\d+$/.exec(run.operationId);
+    if (routine) this.ledger.routines.recordOutcome(routine[1]!, summary);
+  }
+
+  /**
+   * The corrective ⟦verify⟧ follow-up (issue #7): submitted with whenBusy=followUp so it runs
+   * right after the flawed reply; its kind carries the original user message as replyTo, so
+   * start_worker inside it is authorized by that message (§7.1) without a provenanceRef.
+   * routedThreadId rides along too (review #48 finding 2): a corrective attach to the
+   * quote-routed thread is then explicit for the confidence gate — without the copy the
+   * verify run would hit the very gate the original run passed, and the wake text's “现在
+   * 真正调用 start_worker” could never succeed.
+   */
+  private async queueVerifyRun(run: RunRow, claimed: string): Promise<void> {
+    const operationId = `verify:${run.operationId}`;
+    const text = verifyWakeText(claimed);
+    if (!this.ledger.runs.open(operationId, "verify", text, { replyTo: run.replyTo ?? undefined, channel: run.channel ?? undefined, routedThreadId: run.routedThreadId })) {
+      return; // already queued by a racing poll
+    }
+    this.logChannel("verify_dispatch_claim", `${run.operationId} "${claimed.slice(0, 80)}"`);
+    try {
+      await this.ensureRootModel();
+      await this.piHarness.submit(text, { operationId, whenBusy: "followUp" });
+    } catch (err) {
+      this.logChannel("submit_failed", `${operationId} ${errorText(err)}`);
+      // Row stays open: the poll's not_found path resubmits (§11).
+    }
+    void this.pollRuns();
   }
 
   /**
@@ -2049,8 +2510,28 @@ export class Steward extends Agent<Env> {
     if (submitted) void this.pollRuns();
   }
 
+  /**
+   * The notes lifecycle pass (issue #18, steward.md §2.5): 60-day project demotions, 90-day
+   * resident demotion *suggestions* (never automatic — resident entries have broad impact),
+   * and the capacity backstop. Deterministic; its ChangeReports land in sh_note_log and
+   * reach the user with the next reply (spec §10.3) — no wake, no push of their own.
+   */
+  async notesMaintenance(_payload?: unknown, schedule?: { id: string }): Promise<void> {
+    try {
+      this.ledger.notes.maintenance(Date.now());
+    } catch (err) {
+      this.logChannel("notes_maintenance_failed", errorText(err));
+    }
+    // Rearm daily (review #1's pattern: cancel the running job's schedule first, else the
+    // idempotent insert dedups onto a job the driver deletes when this handler returns).
+    if (schedule !== undefined) await this.cancelSchedule(schedule.id).catch(() => {});
+    await this.schedule(NOTES_MAINTENANCE_DAY_S, "notesMaintenance", undefined, { idempotent: true });
+  }
+
   // Card button callbacks (issue #5): the Thread is resolved from the card's providerMsgId —
-  // never from data stuffed into the button (steward.md §3.1, spike bug list).
+  // never from data stuffed into the button (steward.md §3.1, spike bug list). The ask-card
+  // buttons (#7) are answered here instead: the click closes its question and routes back
+  // into the steward as a user action with basis=user_reply_to.
   private async dispatchCardAction(ev: InboundEvent, ownerOpenId: string | null): Promise<void> {
     if (ownerOpenId === null || !ev.operatorId || !ev.cardMsgId) {
       this.logChannel("ignored_card_no_owner", `${ev.eventId}`);
@@ -2060,7 +2541,81 @@ export class Steward extends Agent<Env> {
       this.logChannel("ignored_card_not_owner", `${ev.operatorId} ${ev.eventId}`);
       return;
     }
-    await this.dispatcher.handleCardAction({ operatorId: ev.operatorId, action: ev.action ?? "", cardMsgId: ev.cardMsgId });
+    const action = ev.action ?? "";
+    if (action.startsWith("ask:") || action.startsWith("asknew:")) {
+      await this.handleAskCardAction(ev, action, ev.cardMsgId);
+      return;
+    }
+    await this.dispatcher.handleCardAction({ operatorId: ev.operatorId, action, cardMsgId: ev.cardMsgId });
+  }
+
+  /**
+   * An ask-card button click (#7, steward.md §9.1): the action string is `ask:<qid>:<idx>`
+   * (a candidate or plain option) or `asknew:<qid>`. The click closes the question, then
+   * becomes one steward input — a routing candidate submits already-routed to that Thread
+   * (basis=user_reply_to; start_worker attaches without further confidence), 「新开一件事」
+   * submits unrouted, and a plain option submits the chosen text as the answer. The steward
+   * conversation remembers its own question; the note gives it everything else.
+   */
+  private async handleAskCardAction(ev: InboundEvent, action: string, cardMsgId: string): Promise<void> {
+    const [verb, qid, idxRaw] = action.split(":");
+    const question = this.ledger.questions.get(qid ?? "");
+    if (!question) {
+      await this.dispatcher.replyToCard(cardMsgId, "这张提问卡片关联的问题已不存在。");
+      return;
+    }
+    const payload = this.ledger.questions.payload(question.qid);
+    const isNew = verb === "asknew";
+    const idx = Number(idxRaw);
+    const candidate = !isNew && payload ? payload.candidates[idx] ?? null : null;
+    const option = !isNew && !candidate && payload ? payload.options[idx] ?? null : null;
+    if (!isNew && !candidate && !option) {
+      await this.dispatcher.replyToCard(cardMsgId, "这个选项已经失效，直接回复文字说明即可。");
+      return;
+    }
+
+    const chosenThread = candidate ? this.ledger.threads.get(candidate.threadId) : null;
+    // Answered already (a racing click or a quote-reply got here first): say so, no second run.
+    if (question.status === "answered") {
+      await this.dispatcher.replyToCard(cardMsgId, "这个问题已经回答过了。", chosenThread?.threadId);
+      return;
+    }
+    this.ledger.questions.close(question.qid, candidate?.label ?? option ?? "新开一件事");
+
+    if (candidate && chosenThread) {
+      this.ledger.threads.markRead(chosenThread.threadId); // a click is both read and a reply (§6.5)
+      this.ledger.timeline.add(chosenThread.threadId, "note", `用户在提问卡片上选择了它（${question.text.slice(0, 80)}）`, {
+        qid: question.qid,
+        eventId: ev.eventId,
+      });
+    }
+
+    const label = candidate?.label ?? option ?? "新开一件事";
+    // Review #48 finding 5: every model/user-authored fragment embedded in a system note is
+    // marker-escaped (only input.text was before) — a question or option containing ⟦…⟧
+    // must never smuggle a fake system wake into the input the model reads.
+    const q = escapeMarkers(question.text.slice(0, 80));
+    const picked = escapeMarkers(label);
+    // Review #48 finding 4: an option click answers that Thread's question — route the run
+    // there (question.threadId), symmetric with quote-replying the same card, which the
+    // outbound row's threadId already routes. Candidate clicks route to the picked thread;
+    // 「新开一件事」 stays unrouted.
+    const routedThreadId = candidate ? (chosenThread?.threadId ?? null) : isNew ? null : question.threadId;
+    const note = candidate
+      ? chosenThread
+        ? `（系统注：用户在提问卡片「${q}」上选择了「${picked}」——归属已定为 Thread「${escapeMarkers(chosenThread.title)}」（${chosenThread.threadId}），basis=user_reply_to，可直接接续派发。）\n`
+        : `（系统注：用户在提问卡片上选择的 Thread 已不存在，请如实告知并用 ask_user 重新确认。）\n`
+      : isNew
+        ? `（系统注：用户在提问卡片「${q}」上选择了「新开一件事」——请按之前的话语新建 Thread 继续处理。）\n`
+        : question.threadId
+          ? `（系统注：用户在提问卡片「${q}」上选择了「${picked}」——这是对你提问的回答，已确定归属该 Thread（${question.threadId}）。）\n`
+          : `（系统注：用户在提问卡片「${q}」上选择了「${picked}」——这是对你提问的回答。）\n`;
+    await this.submitUserMessage({
+      msgId: ev.eventId,
+      text: label,
+      prefilledNote: note,
+      routedThreadId,
+    });
   }
 
   private logChannel(reason: string, detail: string): void {
@@ -2122,6 +2677,44 @@ export class Steward extends Agent<Env> {
     });
   }
 
+  /** Test-only: pushes a thread's lastActivityAt back `days` — the idle-attach band (#7). */
+  async ageThreadForTest(threadId: string, days: number): Promise<void> {
+    this.sql`UPDATE sh_thread SET lastActivityAt = ${Date.now() - days * 86_400_000} WHERE threadId = ${threadId}`;
+}
+
+  /** Test entry into the intervention half of the dispatch service (send/interrupt). */
+  async sendForTest(
+    input: Omit<import("./dispatch.ts").SendToWorkerInput, "provenance" | "cmdId"> & { cmdId?: string },
+  ): Promise<import("./dispatch.ts").SendToWorkerOutcome> {
+    return this.dispatcher.sendToWorker({ ...input, provenance: "test", cmdId: input.cmdId ?? `test:${ulid()}` });
+  }
+
+  /** Test entry into the intervention half of the dispatch service (send/interrupt). */
+  async interruptForTest(
+    input: Omit<import("./dispatch.ts").InterruptWorkerInput, "provenance" | "cmdId"> & { cmdId?: string },
+  ): Promise<import("./dispatch.ts").InterruptWorkerOutcome> {
+    return this.dispatcher.interruptWorker({ ...input, provenance: "test", cmdId: input.cmdId ?? `test:${ulid()}` });
+  }
+
+  /** Test entry into the proactive-behavior service (issue #20): create + arm a routine. */
+  async createRoutineForTest(
+    input: import("./routines.ts").RoutineSpecInput & { routineId?: string; createdFromMsg?: string },
+  ): Promise<{ ok: true; routineId: string } | { ok: false; reason: string }> {
+    const outcome = await this.routineService.create({
+      ...input,
+      routineId: input.routineId ?? `r_test_${ulid()}`,
+      createdFromMsg: input.createdFromMsg ?? "om_test_source",
+    });
+    return outcome.ok ? { ok: true, routineId: outcome.routine.routineId } : { ok: false, reason: outcome.reason };
+  }
+
+  /** Test read: the fireRoutine/fireFollowup schedule rows the Agents SDK currently holds. */
+  async routineSchedulesForTest(): Promise<Array<{ id: string; callback: string; type: string; time: number; payload: unknown }>> {
+    return (await this.listSchedules())
+      .filter((s) => s.callback === "fireRoutine" || s.callback === "fireFollowup")
+      .map((s) => ({ id: s.id, callback: s.callback, type: s.type, time: s.time, payload: s.payload }));
+  }
+
   // ---- Steward-LLM test surface (the `faux` provider is configured via STEWARD_MODEL) ----
 
   /** Queues scripted model replies (FIFO); each model request consumes one step. */
@@ -2171,6 +2764,17 @@ export class Steward extends Agent<Env> {
     this.ctx.storage.sql.exec("DELETE FROM sh_run");
     this.ctx.storage.sql.exec("DELETE FROM sh_wake");
     if (this.llmModels.faux) this.llmModels.faux.reset();
+  }
+
+  /** Test-only: cancels every routine/follow-up schedule and clears the proactive tables. */
+  async resetRoutineStateForTests(): Promise<void> {
+    for (const s of await this.listSchedules()) {
+      if (s.callback === "fireRoutine" || s.callback === "fireFollowup") await this.cancelSchedule(s.id).catch(() => {});
+    }
+    this.ctx.storage.sql.exec("DELETE FROM sh_routine");
+    this.ctx.storage.sql.exec("DELETE FROM sh_followup");
+    this.ctx.storage.sql.exec("DELETE FROM sh_routine_offer");
+    this.routineService_ = undefined;
   }
 
   // Scheduled callback (also fired inline after each enqueue): claims due rows, sends them

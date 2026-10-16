@@ -146,6 +146,8 @@ export interface WebDeps {
   listDevices(): Array<{ deviceId: string; name: string | null; revoked: boolean }>;
   /** Revocation bumps the epoch and closes the connection with 4403 (protocol §5.1). */
   revokeDevice(deviceId: string): void;
+  /** Whether the device has a live protocol connection — the L3 stream's precondition. */
+  machineConnected(deviceId: string): boolean;
   audit(reason: string, detail: string): void;
   now?(): number;
 }
@@ -338,6 +340,15 @@ export class WebApp {
     this.#sql`DELETE FROM sh_web_session WHERE expiresAt < ${now}`;
   }
 
+  /** Session liveness for browser WebSocket upgrades (the Worker layer only checks the MAC). */
+  sessionAlive(sid: string): boolean {
+    return (
+      this.#sql<{ n: number }>`
+        SELECT COUNT(*) AS n FROM sh_web_session WHERE sid = ${sid} AND expiresAt > ${this.#now()}
+      `[0]!.n > 0
+    );
+  }
+
   async #sessionFromRequest(request: Request): Promise<SessionRow | null> {
     const cookie = request.headers.get("cookie") ?? "";
     const raw = cookie.split(/;\s*/).find((part) => part.startsWith(`${SESSION_COOKIE}=`))?.slice(SESSION_COOKIE.length + 1) ?? null;
@@ -365,6 +376,11 @@ export class WebApp {
 
     const timeline = /^\/app\/threads\/([\w-]+)$/.exec(url.pathname);
     if (timeline && request.method === "GET") return this.timelinePage(timeline[1]!);
+
+    // L3 raw process (spec §7.4): the server-rendered shell plus the little vanilla JS that
+    // streams chunks over a web-role WebSocket (ADR-0001 decision 12).
+    const rawProcess = /^\/app\/threads\/([\w-]+)\/workers\/([A-Za-z0-9._-]+)$/.exec(url.pathname);
+    if (rawProcess && request.method === "GET") return this.rawProcessPage(rawProcess[1]!, rawProcess[2]!);
 
     return new Response("not found", { status: 404 });
   }
@@ -399,6 +415,57 @@ export class WebApp {
     const view = this.#ledger.views.timeline(threadId);
     if (!view) return new Response("not found", { status: 404 });
     return html(layout(view.thread.title, "threads", renderTimeline(view, this.#now())));
+  }
+
+  /**
+   * The L3 page (spec §7.4): one worker's raw conversation and tool calls, streamed from the
+   * machine through the DO without being stored there (protocol §6.6). Offline machines show
+   * why the transcript is unavailable instead of a stream (connector-pi.md §11.4).
+   */
+  private rawProcessPage(threadId: string, workerId: string): Response {
+    const thread = this.#ledger.threads.get(threadId);
+    const worker = this.#ledger.workers.get(workerId);
+    if (!thread || !worker || worker.threadId !== threadId) return new Response("not found", { status: 404 });
+    const machine = this.#ledger.machines.get(worker.deviceId);
+    const machineName = machine?.name ?? worker.deviceId;
+    const meta = [
+      `<a href="/app/threads/${esc(threadId)}" style="color:inherit">← ${esc(thread.title)}</a>`,
+      `${esc(worker.agent)} @ ${esc(machineName)}${worker.branch ? ` · 分支 ${esc(worker.branch)}` : ""}`,
+      `会话 ${esc(worker.sessionId ?? workerId)}`,
+    ].join("<br>");
+    const content = `<h1>原始过程</h1>${stateBadge(worker.state === "running" || worker.state === "starting" ? "running" : "idle")}
+<p class="meta">${meta}</p>
+<style>
+  #entries { margin: 8px 0; }
+  .entry { display: flex; gap: 10px; padding: 10px 0; border-bottom: 1px solid rgba(127,127,127,.18); }
+  .entry .who { flex: 0 0 44px; font-size: 12px; color: rgba(127,127,127,.95); padding-top: 2px; }
+  .entry.user .who { color: #3370ff; }
+  .entry .body { flex: 1; min-width: 0; }
+  .entry pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
+  .entry .tool { font-size: 13px; color: rgba(127,127,127,.95); margin-top: 4px; overflow-wrap: anywhere; }
+  #stream-status { font-size: 13px; color: rgba(127,127,127,.95); margin: 12px 0; min-height: 1em; }
+  #more { background: #3370ff; margin-top: 8px; }
+  .offline { border: 1px solid rgba(127,127,127,.4); border-radius: 8px; padding: 14px 16px; margin: 16px 0; }
+</style>
+${
+      machine?.online && this.#machineConnected(worker.deviceId)
+        ? `<div id="stream-status">连接中…</div>
+<div id="entries"></div>
+<button id="more" type="button" hidden onclick="loadMore()">继续加载</button>
+<noscript><p class="hint">这个页面需要 JavaScript 才能流式显示原始对话。</p></noscript>
+<script>
+${rawProcessScript(workerId)}
+</script>`
+        : `<div class="offline"><strong>machine_offline：机器当前不在线</strong><br>
+<span class="hint">原始对话和工具调用只保存在这台机器上，不会上传保存；机器连上后刷新此页即可查看。</span></div>`
+    }`;
+    return html(layout(`原始过程 · ${thread.title}`, "threads", content));
+  }
+
+  /** The web-role socket gate mirrors the machines page's data: online ledger state plus a
+   * live protocol connection (the same signal history_open uses; both can drift briefly). */
+  #machineConnected(deviceId: string): boolean {
+    return this.#deps.machineConnected(deviceId);
   }
 
   private machinesPage(session: SessionRow): Response {
@@ -476,6 +543,153 @@ function html(markup: string): Response {
   return new Response(markup, { headers: { "content-type": "text/html; charset=utf-8" } });
 }
 
+/**
+ * The L3 stream client (ADR-0001 decision 12: "a little vanilla JS only for the raw-process
+ * stream"). Opens a web-role WebSocket, sends history_open, renders each chunk's entries with
+ * DOM APIs (textContent — entry text is untrusted content, never innerHTML), acks every chunk
+ * to slide the connector's window, and re-opens with the cursor when the byte budget ran out.
+ */
+function rawProcessScript(workerId: string): string {
+  return `(function () {
+  "use strict";
+  var workerId = ${JSON.stringify(workerId)};
+  var maxBytes = 2097152;
+  var entriesEl = document.getElementById("entries");
+  var statusEl = document.getElementById("stream-status");
+  var moreBtn = document.getElementById("more");
+  var cursor = null;
+  var ws = null;
+  var waiting = false;
+  var total = 0;
+  // The relay ends some streams silently (DO TTL sweep, connector idle sweep): anything
+  // silent past ~65 s is dead by protocol (the relay row's 60 s TTL + schedule granularity),
+  // so stop waiting and say so instead of parking on 连接中… forever.
+  var SILENCE_MS = 65000;
+  var watchdog = null;
+
+  function say(text) { statusEl.textContent = text; }
+
+  function stopWatchdog() {
+    if (watchdog !== null) { clearTimeout(watchdog); watchdog = null; }
+  }
+
+  function armWatchdog() {
+    stopWatchdog();
+    watchdog = setTimeout(function () {
+      waiting = false;
+      say("连接超时：流式连接中断，请刷新重试。");
+      try { ws.close(); } catch (e) {}
+    }, SILENCE_MS);
+  }
+
+  function endStream(message, offerMore) {
+    waiting = false;
+    stopWatchdog();
+    say(message);
+    if (moreBtn) moreBtn.hidden = !(offerMore && cursor);
+    try { ws.close(); } catch (e) {}
+  }
+
+  function offline() {
+    waiting = false;
+    stopWatchdog();
+    say("");
+    var box = document.createElement("div");
+    box.className = "offline";
+    var strong = document.createElement("strong");
+    strong.textContent = "machine_offline：机器当前不在线";
+    var hint = document.createElement("span");
+    hint.className = "hint";
+    hint.textContent = "原始对话只保存在那台机器上；机器连上后刷新此页即可查看。";
+    box.appendChild(strong);
+    box.appendChild(document.createElement("br"));
+    box.appendChild(hint);
+    entriesEl.parentNode.insertBefore(box, entriesEl);
+    if (moreBtn) moreBtn.hidden = true;
+  }
+
+  function addEntry(entry) {
+    var row = document.createElement("div");
+    row.className = "entry " + entry.role;
+    var who = document.createElement("span");
+    who.className = "who";
+    who.textContent = entry.role === "user" ? "指令" : "agent";
+    var body = document.createElement("div");
+    body.className = "body";
+    var text = document.createElement("pre");
+    text.textContent = entry.text;
+    body.appendChild(text);
+    var tools = entry.tools || [];
+    for (var i = 0; i < tools.length; i++) {
+      var tool = document.createElement("div");
+      tool.className = "tool";
+      tool.textContent = "[工具] " + tools[i].name + (tools[i].args ? " · " + tools[i].args : "");
+      body.appendChild(tool);
+    }
+    row.appendChild(who);
+    row.appendChild(body);
+    entriesEl.appendChild(row);
+  }
+
+  function stream(since) {
+    waiting = true;
+    say(since ? "加载中…" : "连接中…");
+    var proto = location.protocol === "https:" ? "wss:" : "ws:";
+    ws = new WebSocket(proto + "//" + location.host + "/agents/steward/owner?role=web");
+    var openId = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random());
+    ws.onopen = function () {
+      var msg = { t: "history_open", id: openId, workerId: workerId, maxBytes: maxBytes };
+      if (since) msg.since = since;
+      ws.send(JSON.stringify(msg));
+    };
+    ws.onmessage = function (ev) {
+      var m;
+      try { m = JSON.parse(ev.data); } catch (e) { return; }
+      armWatchdog();
+      if (m.t === "history_chunk") {
+        total += m.entries.length;
+        for (var i = 0; i < m.entries.length; i++) addEntry(m.entries[i]);
+        ws.send(JSON.stringify({ t: "history_ack", re: m.re, n: m.n }));
+        if (m.cursor) cursor = m.cursor;
+        if (m.done) {
+          // The connector says whether the page was budget-cut (truncated) — never guess from
+          // byte counts: the budget is UTF-8 while string lengths are UTF-16, so CJK cuts
+          // would read as "everything loaded" and strand the tail. An empty terminating page
+          // means "nothing more" — distinct from a session that never had any content.
+          if (m.truncated) {
+            endStream(cursor ? "已达单次加载上限（2 MB）；可以继续加载后面的内容。" : "已达单次加载上限（2 MB）。", true);
+          } else if (total === 0) {
+            endStream("还没有任何对话内容。", false);
+          } else if (m.entries.length === 0) {
+            endStream("没有更多内容了。", false);
+          } else {
+            endStream("已加载全部内容。", false);
+          }
+        }
+      } else if (m.t === "machine_offline") {
+        stopWatchdog();
+        try { ws.close(); } catch (e) {}
+        offline();
+      } else if (m.t === "error") {
+        endStream("读取失败：" + (m.message || m.code || "未知错误"), false);
+      }
+    };
+    ws.onclose = function () {
+      if (waiting) offline(); // died mid-stream without done: treat as unavailable
+    };
+    ws.onerror = function () { say(""); };
+    armWatchdog();
+  }
+
+  window.loadMore = function () {
+    if (moreBtn) moreBtn.hidden = true;
+    if (cursor) stream(cursor);
+  };
+
+  stream(null);
+})();`;
+}
+
 function progressText(lastProgress: string): string {
   try {
     const p = JSON.parse(lastProgress) as { phase?: unknown; tool?: unknown; target?: unknown };
@@ -509,8 +723,15 @@ export function renderTimeline(view: TimelineView, now: number): string {
     return `<li><span class="k">${esc(label)}</span><span class="t">${esc(entry.text)}</span><span class="ts">${relTime(entry.ts, now)}</span></li>`;
   });
   const workerRows = workers.map((w) => {
-    const state = w.state === "running" || w.state === "starting" ? "▶" : w.state === "broken" ? "❌" : "·";
-    return `<li>${state} ${esc(w.agent)} @ ${esc(w.machineName)}${w.branch ? ` · 分支 ${esc(w.branch)}` : ""}${w.lastOutcome ? ` · ${esc(w.lastOutcome)}` : ""}</li>`;
+    const state =
+      w.state === "running" || w.state === "starting" || w.state === "recovering"
+        ? "▶"
+        : w.state === "queued"
+          ? "⏳"
+          : w.state === "broken"
+            ? "❌"
+            : "·";
+    return `<li>${state} ${esc(w.agent)} @ ${esc(w.machineName)}${w.branch ? ` · 分支 ${esc(w.branch)}` : ""}${w.lastOutcome ? ` · ${esc(w.lastOutcome)}` : ""} · <a href="/app/threads/${esc(view.thread.threadId)}/workers/${esc(w.workerId)}">原始过程</a></li>`;
   });
   return `<h1>${thread.unread ? "● " : ""}${esc(thread.title)}</h1>${stateBadge(thread.state)}
 <p class="meta">${meta}</p>

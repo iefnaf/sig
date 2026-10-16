@@ -6,17 +6,21 @@ import type {
   AgentAdapter,
   AgentCapabilities,
   Delivery,
+  InterruptResult,
   RawAdapterEvent,
   ReportPayload,
   SessionUsage,
   StartSpec,
   WorkerHandle,
 } from "./agent.ts";
+import { PartialInterruptError } from "./agent.ts";
 import { adjudicate, type RunWindow } from "./adjudication.ts";
+import { normalizeSessionEntries } from "./session-history.ts";
 import { installAssets, type InstalledAssets } from "./install.ts";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { PiProcess } from "./pi-process.ts";
+import type { HistoryPage } from "@shepherd/protocol";
 
 /** Must match COMMAND_NAME in ./ext/shepherd-pi.ts (locked together by a test). */
 const SHEPHERD_COMMAND = "shepherd";
@@ -144,7 +148,9 @@ export class PiAdapter implements AgentAdapter {
       assets.extensionPath,
       "--append-system-prompt",
       assets.promptPath,
-      "--no-approve",
+      // §13: --no-approve unless the repo is locally approved (approveProject is a
+      // connector-local per-repo setting, never taken from a command).
+      spec.approveProject === true ? "--approve" : "--no-approve",
     ];
     if (spec.mode === "readonly") args.push("--tools", "read,grep,find,ls,report");
     if (spec.model) args.push("--model", spec.model);
@@ -232,13 +238,16 @@ export class PiAdapter implements AgentAdapter {
 
   async send(
     id: string,
-    input: { text: string; images?: { data: string; mimeType: string }[] },
+    input: { text: string; images?: { data: string; mimeType: string }[]; commandId?: string },
     how: Delivery,
   ): Promise<{ effect?: string }> {
     const runtime = this.require(id);
     const images = input.images?.map((i) => ({ type: "image", data: i.data, mimeType: i.mimeType }));
     if (how === "prompt") {
-      await runtime.process.rpc({ type: "prompt", message: input.text, images });
+      // A prompt-path send goes through the same `/shepherd` wrapper as the initial prompt,
+      // so the commandId marker lands in the session (ADR-0001: ambiguous-command detection).
+      const message = input.commandId ? wrapPrompt(input.commandId, input.text) : input.text;
+      await runtime.process.rpc({ type: "prompt", message, images });
       return {};
     }
     const type = how === "steer" ? "steer" : "follow_up";
@@ -247,9 +256,23 @@ export class PiAdapter implements AgentAdapter {
     return { effect: how === "steer" ? "after_current_tools" : undefined };
   }
 
-  async interrupt(id: string): Promise<void> {
+  /** §6.2: `clear_queue` first — the returned texts ride the `queue_returned` event so the
+   *  steward can decide whether to resend — then `abort`. If `abort` fails after
+   *  `clear_queue` already emptied pi's queue, the retrieved texts ride a
+   *  PartialInterruptError so the manager can still surface them (R2-3: pi has no copy). */
+  async interrupt(id: string): Promise<InterruptResult> {
     const runtime = this.require(id);
-    await runtime.process.rpc({ type: "abort" });
+    const queue = (await runtime.process.rpc({ type: "clear_queue" })) as {
+      steering?: unknown;
+      followUp?: unknown;
+    };
+    const returned = [...queueTexts(queue.steering), ...queueTexts(queue.followUp)];
+    try {
+      await runtime.process.rpc({ type: "abort" });
+    } catch (err) {
+      throw new PartialInterruptError(returned, err instanceof Error ? err : new Error(String(err)));
+    }
+    return { returned };
   }
 
   async resume(id: string, reason: string): Promise<void> {
@@ -280,6 +303,11 @@ export class PiAdapter implements AgentAdapter {
     return !!runtime && !runtime.process.hasExited;
   }
 
+  isStreaming(id: string): boolean {
+    const runtime = this.runtimes.get(id);
+    return !!runtime && !runtime.process.hasExited && runtime.window.open;
+  }
+
   /** Live worker pids for the descendant-snapshot loop (connector-pi.md §9.3). */
   workerPids(): Array<{ workerId: string; pid: number }> {
     const out: Array<{ workerId: string; pid: number }> = [];
@@ -300,6 +328,21 @@ export class PiAdapter implements AgentAdapter {
       }
     }
     return out;
+  }
+
+  /** §11.4 live path: `get_entries{since}` is pi's only incremental read (research §3). */
+  async history(id: string, since: string | undefined, maxBytes: number): Promise<HistoryPage> {
+    const runtime = this.runtimes.get(id);
+    if (!runtime || runtime.process.hasExited) {
+      throw new AdapterError("not_running", `no live pi process for worker ${id}`);
+    }
+    const response = await runtime.process.rpc(
+      { type: "get_entries", ...(since ? { since } : {}) },
+      10_000,
+    );
+    const entries = Array.isArray(response.entries) ? (response.entries as Record<string, unknown>[]) : [];
+    // `since` filtering already happened inside pi; the normalizer only budgets the bytes.
+    return normalizeSessionEntries(entries, { maxBytes });
   }
 
   /** Test support: emulate a connector crash — every child is SIGKILLed with no graceful
@@ -483,6 +526,17 @@ function extractText(content: unknown): string {
 }
 
 export { extractText as extractAssistantText };
+
+/** `clear_queue` hands back the queued messages (real pi queues plain strings); tolerate
+ *  message-shaped items too so a future pi change cannot silently drop texts. */
+function queueTexts(items: unknown): string[] {
+  if (!Array.isArray(items)) return [];
+  return items
+    .map((item) =>
+      typeof item === "string" ? item : extractText((item as { content?: unknown } | null)?.content),
+    )
+    .filter((text) => text.length > 0);
+}
 
 /** First 80 chars of a path or command — never file contents or command output (§11.2). */
 function extractTarget(args: unknown): string | undefined {

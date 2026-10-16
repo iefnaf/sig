@@ -6,7 +6,8 @@
 // resume with the fixed prompt, 30 s backoff, and the ≤2/hour budget (§9.2) — and the stall
 // watchdog (issue #13, ADR-0001): silent + cold-CPU workers get one in-place respawn, then
 // settle as error:stall.
-import type { AgentAdapter, ErrorClass, RawAdapterEvent, StartSpec, WorkerMode } from "./agent.ts";
+import type { AgentAdapter, Delivery, ErrorClass, RawAdapterEvent, StartSpec, WorkerHandle, WorkerMode } from "./agent.ts";
+import { PartialInterruptError } from "./agent.ts";
 import { classifyError } from "./adjudication.ts";
 import { killOrphans, listDescendants, type ProcRef } from "./descendants.ts";
 import { collectGitFacts } from "./git-facts.ts";
@@ -14,7 +15,9 @@ import { acquireLock, markLocksHeldByDeadProcess, releaseLock, removeStaleLocks 
 import { RESUME_PROMPT, PiAdapter } from "./pi-adapter.ts";
 import { ProgressThrottle } from "./progress.ts";
 import { inspectSessionTail, type SessionTail } from "./session-tail.ts";
-import type { LocalStore, WorkerRow } from "./store.ts";
+import { readSessionHistory } from "./session-history.ts";
+import type { HistoryPage } from "@shepherd/protocol";
+import type { LocalStore, RegisteredRepo, WorkerRow } from "./store.ts";
 import { StallWatchdog, stallContinueNote, type StallWatchdogOptions, type WatchdogCandidate } from "./watchdog.ts";
 import { WorktreeManager } from "./worktree.ts";
 import { join } from "node:path";
@@ -29,6 +32,49 @@ export class CommandError extends Error {
     this.name = "CommandError";
   }
 }
+
+/** `send` args (connector-pi.md §6.1/§6.2): intent picks the delivery per the state table. */
+export interface SendArgs {
+  workerId: string;
+  text: string;
+  intent: "now" | "after" | "auto";
+  images?: { data: string; mimeType: string }[];
+}
+
+export interface SendResult {
+  delivery: "prompt" | "steer" | "follow_up" | "queued";
+  /** §6.2: steer waits for the current tool batch — the steward relays this to the user. */
+  effect?: "after_current_tools";
+  /** True when an idle-cold send relaunched the process with `--session-id` (§6.2). */
+  relaunched?: boolean;
+}
+
+/** `interrupt` args (§6.1): abort, optionally followed by one new instruction. */
+export interface InterruptArgs {
+  workerId: string;
+  then?: string;
+}
+
+export interface InterruptOutcome {
+  aborted: boolean;
+  /** How many undelivered texts came back via `clear_queue` (also in `queue_returned`). */
+  queueReturned: number;
+  /** Delivery report for the `then` instruction, when one was given. */
+  then?: SendResult;
+}
+
+/** A `send` held while the worker is starting/recovering/lost (§6.2 queue rows). */
+interface PendingSend {
+  commandId: string;
+  text: string;
+  intent: SendArgs["intent"];
+  images?: { data: string; mimeType: string }[];
+  resolve: (result: SendResult) => void;
+  reject: (err: CommandError) => void;
+}
+
+const DEFAULT_IDLE_RECLAIM_MS = 10 * 60_000;
+const DEFAULT_ABORT_SETTLE_TIMEOUT_MS = 5_000;
 
 /** `start_worker` args (connector-pi.md §6.1 / protocol §6.2). */
 export interface StartWorkerArgs {
@@ -47,6 +93,9 @@ export interface StartWorkerResult {
   branch?: string;
   cwd: string;
   worktree?: string;
+  /** §8.2 serial mode: the write worker waits for the repo's current write worker instead of
+   * starting now. The `started` event follows when the slot frees. */
+  queued?: boolean;
 }
 
 /** Knobs and seams for the §9 recovery paths (tests shrink timers and inject process I/O). */
@@ -59,6 +108,10 @@ export interface RecoveryOptions {
   maxAutoResumesPerHour?: number;
   /** The rolling window the budget counts over (default 1 h). */
   resumeWindowMs?: number;
+  /** Idle window before the process is reclaimed (§4.1; default 10 min). The session stays. */
+  idleReclaimMs?: number;
+  /** How long `interrupt` waits for the aborted run's `agent_settled` (default 5 s). */
+  abortSettleTimeoutMs?: number;
   /** Process-table seam (tests inject a deterministic ps). */
   listDescendants?: (pid: number) => Promise<ProcRef[]>;
   /** Kill seam (tests record signals instead of signalling real pids). */
@@ -90,6 +143,15 @@ const WORKER_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]*[a-zA-Z0-9]$/;
  * `lost` workers additionally get their pending resume re-scheduled at startup. */
 const IN_FLIGHT_STATES = new Set(["starting", "running", "recovering"]);
 
+/** §8.2 serial mode: states in which a write worker holds the repo's single write slot —
+ * in-flight, awaiting an automatic resume (`lost`), or itself queued ahead of another. */
+const SERIAL_SLOT_STATES = new Set(["starting", "running", "recovering", "lost", "queued"]);
+
+/** §8.2/§13 (issue #16): settings that live in the connector's LocalStore and are set only
+ * by the machine's owner via the CLI. A command carrying one is rejected outright — the
+ * last line of defense against a compromised steward (connector-do-protocol §6.2). */
+const LOCAL_ONLY_ARGS = ["approveProject", "approve", "workspace", "workspaceMode"];
+
 export class WorkerManager {
   private readonly store: LocalStore;
   private readonly stateDir: string;
@@ -111,6 +173,14 @@ export class WorkerManager {
   private readonly inspectTailFn: (sessionFile: string | null | undefined) => SessionTail;
   private snapshotTimer?: NodeJS.Timeout;
   private readonly resumeTimers = new Map<string, NodeJS.Timeout>();
+  /** Repos with a queued-write launch in flight (guards pump re-entry). */
+  private readonly pumpingRepos = new Set<string>();
+  /** Workers with a launch between its synchronous `starting` claim and `running` — the
+   * window in which a stop cannot reach the process through the adapter yet. */
+  private readonly launching = new Set<string>();
+  /** Workers stopped while `launching`: the launch checks this after every await and bails
+   * without touching the stop's bookkeeping (review finding 3). */
+  private readonly stopRequested = new Set<string>();
   /** Set by simulateCrash: a crashed instance processes nothing further. */
   private crashed = false;
 
@@ -122,6 +192,21 @@ export class WorkerManager {
    * start_worker for the same id overwrites it.
    */
   private readonly runPrompts = new Map<string, string>();
+
+  // --- §6.1/§6.2 intervention state -----------------------------------------------------------
+  /** Sends held while the worker is starting/recovering/lost (§6.2 queue rows); drained
+   *  when the transition completes, superseded by an interrupt (protocol §7.4). */
+  private readonly pendingSends = new Map<string, PendingSend[]>();
+  /** The in-flight start/resume transition per worker: what `interrupt` waits out and what
+   *  drains the send queue when it settles. */
+  private readonly transitions = new Map<string, Promise<unknown>>();
+  /** §4.1 idle reclamation: per-worker timer from the last settle to stopProcess. */
+  private readonly idleTimers = new Map<string, NodeJS.Timeout>();
+  private readonly idleReclaimMs: number;
+  /** Waiter sets resolved by the next `settled` adapter event (the interrupt flow's
+   *  wait-for-agent_settled{aborted:true} step). */
+  private readonly abortWaiters = new Map<string, Set<() => void>>();
+  private readonly abortSettleTimeoutMs: number;
 
   constructor(options: WorkerManagerOptions) {
     this.store = options.store;
@@ -135,6 +220,8 @@ export class WorkerManager {
     this.autoResumeBackoffMs = recovery.autoResumeBackoffMs ?? 30_000;
     this.maxAutoResumes = recovery.maxAutoResumesPerHour ?? 2;
     this.resumeWindowMs = recovery.resumeWindowMs ?? 3_600_000;
+    this.idleReclaimMs = recovery.idleReclaimMs ?? DEFAULT_IDLE_RECLAIM_MS;
+    this.abortSettleTimeoutMs = recovery.abortSettleTimeoutMs ?? DEFAULT_ABORT_SETTLE_TIMEOUT_MS;
     this.listDescendantsFn = recovery.listDescendants ?? listDescendants;
     this.killOrphansFn = recovery.killOrphans ?? killOrphans;
     this.inspectTailFn = recovery.inspectTail ?? inspectSessionTail;
@@ -163,7 +250,19 @@ export class WorkerManager {
   ): Promise<unknown> {
     switch (kind) {
       case "start_worker":
-        return this.startWorker(commandId, parseStartWorkerArgs(args));
+        // §8.2/§13 (issue #16): local-only settings are rejected at the entrance, before
+        // the transition is even opened.
+        rejectLocalOnlyArgs(args);
+        // Tracked as a transition: an interrupt arriving mid-start waits it out, and queued
+        // sends (§6.2) drain when startup completes.
+        return this.withTransition(
+          commandWorkerId(args, envelopeWorkerId, kind),
+          () => this.startWorker(commandId, parseStartWorkerArgs(args)),
+        );
+      case "send":
+        return this.sendToWorker(commandId, parseSendArgs(args, envelopeWorkerId));
+      case "interrupt":
+        return this.interruptWorker(commandId, parseInterruptArgs(args, envelopeWorkerId));
       case "stop_process": {
         const workerId = commandWorkerId(args, envelopeWorkerId, kind);
         await this.stopProcess(workerId);
@@ -172,9 +271,15 @@ export class WorkerManager {
       case "resume": {
         const workerId = commandWorkerId(args, envelopeWorkerId, kind);
         const reason = typeof args.reason === "string" && args.reason.length > 0 ? args.reason : "manual";
-        const count = this.store.recordResume(workerId, this.resumeWindowMs);
-        await this.resumeWorker(workerId, reason, count);
-        return { resumed: true, count };
+        return this.withTransition(workerId, async () => {
+          const count = this.store.recordResume(workerId, this.resumeWindowMs);
+          await this.resumeWorker(workerId, reason, count);
+          return { resumed: true, count };
+        });
+      }
+      case "cleanup_worktree": {
+        const workerId = commandWorkerId(args, envelopeWorkerId, kind);
+        return this.cleanupWorktree(workerId, args.force === true);
       }
       default:
         throw new CommandError("unsupported_command", `command kind '${kind}' is not implemented yet`);
@@ -206,63 +311,128 @@ export class WorkerManager {
       throw new CommandError("not_registered_repo", `repo '${args.repoId}' is not registered on this machine`);
     }
 
+    // --- §8.2 serial mode: only one write worker at a time in the repo. A second write task
+    // is queued (FIFO) and starts when the current one settles; the command result says so,
+    // and the `started` event follows when the slot frees. Readonly tasks are never isolated
+    // (§8.3) and never queue.
+    if (args.mode === "write" && repo.workspace === "serial") {
+      const holder = this.writeSlotHolder(args.repoId, args.workerId);
+      if (holder) {
+        this.store.upsertWorker({
+          workerId: args.workerId,
+          threadId: args.threadId,
+          repoId: args.repoId,
+          mode: "write",
+          state: "queued",
+          branch: null,
+          worktree: null,
+          base: args.base ?? null,
+        });
+        // The args persist so a connector restart re-arms the queue (the command result
+        // with queued:true already went out; losing the start would strand the Thread).
+        this.store.saveQueuedStart(args.workerId, commandId, args);
+        await this.emitEvent(args.workerId, "queued", { behind: holder });
+        return { queued: true, sessionId: "", cwd: repo.path };
+      }
+    }
+
+    return this.launchWorker(commandId, args, repo);
+  }
+
+  /** Everything after validation: lock, workspace resolution (§8.2), the `starting` row,
+   * adapter start, and the `started` event. Both the direct path and the serial pump land
+   * here; launch failures surface as CommandError (the direct path forwards them to
+   * cmd_result, the pump breaks the worker instead).
+   *
+   * The `starting` row is written BEFORE the first await: from the serial queue check in
+   * startWorker to this claim there is no await, so overlapping start_worker commands can
+   * never both see an empty slot (review finding 1 — commands run concurrently in the
+   * client, only the single JS turn serializes them). The same claim closes the stop-vs-pump
+   * window (finding 3): a stop landing after the claim sees `starting`, not `queued`. */
+  private async launchWorker(commandId: string, args: StartWorkerArgs, repo: RegisteredRepo): Promise<StartWorkerResult> {
     // --- One process per session (§4.3): lock file, `lock_held` when alive, stale removed.
     const lock = acquireLock(this.stateDir, args.workerId);
     if (!lock.ok) {
       throw new CommandError("lock_held", `worker ${args.workerId} is locked by pid ${lock.pid}`, true);
     }
+    this.launching.add(args.workerId);
 
-    // --- Write tasks get a dedicated worktree (§8.2).
-    let cwd = repo.path;
-    let branch: string | undefined;
-    let base: string | undefined;
-    let worktree: string | undefined;
-    if (args.mode === "write") {
-      try {
-        const created = await this.worktrees.create({ repoPath: repo.path, threadId: args.threadId, base: args.base });
-        cwd = created.path;
-        branch = created.branch;
-        base = created.base;
-        worktree = created.path;
-      } catch (err) {
-        releaseLock(this.stateDir, args.workerId);
-        const message = err instanceof Error ? err.message : String(err);
-        throw new CommandError("worktree_failed", `could not create worktree: ${message}`);
-      }
-    }
-
+    // Synchronous slot claim: the row exists (state `starting`) before any await, so a
+    // concurrent start_worker / stop_process / pump decision reads this launch, not a void.
     this.store.upsertWorker({
       workerId: args.workerId,
       threadId: args.threadId,
       repoId: args.repoId,
       mode: args.mode,
       state: "starting",
-      branch,
-      worktree,
-      base,
     });
-    this.active.set(args.workerId, { repoId: args.repoId, worktree, branch, base });
-    this.runPrompts.set(args.workerId, args.prompt);
-
-    const spec: StartSpec = {
-      workerId: args.workerId,
-      threadId: args.threadId,
-      cwd,
-      mode: args.mode,
-      prompt: args.prompt,
-      commandId,
-      images: args.images,
-      model: args.model,
-    };
-
+    let handle: WorkerHandle | undefined;
+    let worktree: string | undefined;
+    let branch: string | undefined;
+    let base: string | undefined;
     try {
-      const handle = await this.adapter.start(spec);
+      // --- §8.2 workspace resolution. Write + worktree/serial → a dedicated worktree; write +
+      // main, and every readonly run (§8.3) → the repository's own checkout, no worktree.
+      const useWorktree = args.mode === "write" && repo.workspace !== "main";
+      let cwd = repo.path;
+      if (useWorktree) {
+        try {
+          const created = await this.worktrees.create({ repoPath: repo.path, threadId: args.threadId, base: args.base });
+          cwd = created.path;
+          branch = created.branch;
+          base = created.base;
+          worktree = created.path;
+          if (this.stopRequested.has(args.workerId)) throw new CommandError("aborted", "worker was stopped during startup");
+        } catch (err) {
+          if (err instanceof CommandError) throw err;
+          const message = err instanceof Error ? err.message : String(err);
+          throw new CommandError("worktree_failed", `could not create worktree: ${message}`);
+        }
+      }
+      // `main` mode ignores `base`: the checkout is whatever the owner left it at — the
+      // connector never checks branches out in the user's own working directory.
+      if (this.stopRequested.has(args.workerId)) {
+        throw new CommandError("aborted", "worker was stopped during startup");
+      }
+
+      this.active.set(args.workerId, { repoId: args.repoId, worktree, branch, base });
+      this.runPrompts.set(args.workerId, args.prompt);
+
+      const spec: StartSpec = {
+        workerId: args.workerId,
+        threadId: args.threadId,
+        cwd,
+        mode: args.mode,
+        prompt: args.prompt,
+        commandId,
+        // §13: approveProject comes from the repo's local config, never from the command.
+        approveProject: repo.approved === true ? true : undefined,
+        images: args.images,
+        model: args.model,
+      };
+
+      try {
+        handle = await this.adapter.start(spec);
+      } catch (err) {
+        if (this.stopRequested.has(args.workerId)) {
+          // The stop could not kill what had not spawned; the start raced it and lost.
+          throw new CommandError("aborted", "worker was stopped during startup");
+        }
+        throw err;
+      }
+      if (this.stopRequested.has(args.workerId)) {
+        // The process did spawn after all — reclaim it, leave the stop's bookkeeping alone.
+        await this.adapter.stopProcess(args.workerId).catch(() => undefined);
+        throw new CommandError("aborted", "worker was stopped during startup");
+      }
+
       const result: StartWorkerResult = {
         sessionId: handle.sessionId,
         branch,
         cwd,
         worktree,
       };
+      this.stopRequested.delete(args.workerId);
       this.store.upsertWorker({
         workerId: args.workerId,
         threadId: args.threadId,
@@ -288,18 +458,672 @@ export class WorkerManager {
       releaseLock(this.stateDir, args.workerId);
       this.active.delete(args.workerId);
       this.runPrompts.delete(args.workerId);
+      if (err instanceof CommandError && err.code === "aborted") {
+        // A stop settled this worker (idle + settled:aborted) while the launch was
+        // in flight; the launch must not overwrite that with broken/running state or events.
+        this.stopRequested.delete(args.workerId);
+        await this.discardLaunchArtifacts(args.workerId, repo, { worktree, branch, base }, handle !== undefined);
+        throw err;
+      }
       this.store.setWorkerState(args.workerId, "broken");
       const code = (err as { code?: string }).code ?? "startup_failed";
       const message = err instanceof Error ? err.message : String(err);
       throw new CommandError(code, message);
+    } finally {
+      this.launching.delete(args.workerId);
+      // PR #43 review N1: a stop can land between the launch's last marker check and this
+      // finally (it saw `running` + `launching` and had to assume a launch in flight). Past
+      // this point every stop settles itself through the adapter, so the marker must never
+      // outlive the launch — a stale one would abort-and-strand the NEXT start of this
+      // workerId at `starting`, deadlocking a serial repo all over again.
+      this.stopRequested.delete(args.workerId);
     }
   }
 
-  /** stop_process (§6.1): reclaim the process, keep the session on disk. */
-  async stopProcess(workerId: string): Promise<void> {
+  /** PR #43 review N3: a launch that aborts before `started` leaves its just-allocated
+   * worktree behind. Before the process ever ran, the allocation is undone on the spot —
+   * the directory holds only the base checkout, no agent ever touched it, so this is
+   * undoing our own allocation, not an automatic delete of anyone's work. After a process
+   * ran in it, the columns are backfilled on the row (without touching state — the stop's
+   * settle stands) so the explicit cleanup_worktree command can deal with what's there. */
+  private async discardLaunchArtifacts(
+    workerId: string,
+    repo: RegisteredRepo,
+    created: { worktree?: string; branch?: string; base?: string },
+    processRan: boolean,
+  ): Promise<void> {
+    if (!created.worktree) return;
+    if (!processRan) {
+      await this.worktrees.cleanup(repo.path, created.worktree, { force: true }).catch((err) => {
+        console.error(`[shepherd] could not undo the allocated worktree ${created.worktree}:`, err);
+      });
+      return;
+    }
+    this.store.setWorkerWorktree(workerId, {
+      worktree: created.worktree,
+      branch: created.branch ?? null,
+      base: created.base ?? null,
+    });
+  }
+
+  /** stop_process (§6.1): reclaim the process, keep the session on disk.
+   *
+   * Bookkeeping by state (review findings 2/3):
+   * - `queued` (§8.2): no process yet — drop the pending start so the queue does not launch
+   *   a task the user tried to stop. Race-free: a concurrent pump flips the row to `starting`
+   *   synchronously before its first await, so this branch can only win the row outright.
+   * - in flight or `lost`: the run ends here — an expected process_exit carries no state and
+   *   no settled event, so without this the worker (and a serial repo's write slot) would be
+   *   stuck `running` until a connector restart. The worker settles `aborted`, stays idle
+   *   (resumable), a pending auto-resume is cancelled, and the serial queue is pumped.
+   * - otherwise (idle-hot reclaim, broken): the memory play it always was — nothing to settle. */
+  /** The stall watchdog's stop (issue #13): an EXPECTED exit — the run continues via a
+   * respawn or ends with the watchdog's own error:stall settle. Deliberately skips
+   * stopProcess's full semantics (#9 folds idle + settled:aborted into it): emitting
+   * aborted here would tell the steward the run ended right before it un-ends. */
+  private async stopProcessExpected(workerId: string): Promise<void> {
     await this.adapter.stopProcess(workerId); // process_exit handler releases the lock
     // §9.3: a stop that had to escalate to SIGKILL may have orphaned tool children.
     await this.cleanupOrphans(workerId);
+  }
+
+  async stopProcess(workerId: string): Promise<void> {
+    this.cancelIdleReclaim(workerId);
+    const worker = this.store.getWorker(workerId);
+    if (worker?.state === "queued") {
+      this.store.deleteQueuedStart(workerId);
+      this.store.setWorkerState(workerId, "idle", "stopped_while_queued");
+      await this.emitEvent(workerId, "settled", { outcome: "aborted" });
+      return;
+    }
+    const inFlight = worker ? IN_FLIGHT_STATES.has(worker.state) || worker.state === "lost" : false;
+    if (inFlight && this.launching.has(workerId)) this.stopRequested.add(workerId);
+    // Cancel a pending automatic resume: the stop is the user's final word for this run.
+    const timer = this.resumeTimers.get(workerId);
+    if (timer) {
+      clearTimeout(timer);
+      this.resumeTimers.delete(workerId);
+    }
+    await this.adapter.stopProcess(workerId); // process_exit handler releases the lock
+    // §9.3: a stop that had to escalate to SIGKILL may have orphaned tool children.
+    await this.cleanupOrphans(workerId);
+    if (inFlight) {
+      this.store.setWorkerState(workerId, "idle", "stopped");
+      await this.emitEvent(workerId, "settled", { outcome: "aborted" });
+      // §8.2: the serial write slot freed with the runner.
+      this.pumpQueuedWorkers();
+    }
+  }
+
+  // --- Serial write queue (connector-pi.md §8.2) --------------------------------------------
+
+  /** The write worker holding the repo's serial slot, if any (creation order; `lost` still
+   * holds the slot while an automatic resume may bring it back). `exclude` keeps a worker
+   * from blocking itself. */
+  private writeSlotHolder(repoId: string, excludeWorkerId?: string): string | undefined {
+    const holders = this.store
+      .listWorkers()
+      .filter(
+        (w) =>
+          w.repoId === repoId &&
+          w.mode === "write" &&
+          w.workerId !== excludeWorkerId &&
+          SERIAL_SLOT_STATES.has(w.state),
+      );
+    // Name the live runner, not another queued worker, when one exists.
+    return holders.find((w) => w.state !== "queued")?.workerId ?? holders[0]?.workerId;
+  }
+
+  /** §8.2 (issue #16 merge with #45): whether ANOTHER write worker holds this worker's
+   * serial repo slot — the condition under which a continuation (send-relaunch, hot prompt,
+   * manual resume) must wait instead of putting a second live write run in the repo. */
+  private serialSlotHeldByAnother(worker: WorkerRow): boolean {
+    if (worker.mode !== "write") return false; // readonly tasks are never isolated (§8.3)
+    const repo = this.store.getRepo(worker.repoId);
+    return repo?.workspace === "serial" && this.writeSlotHolder(worker.repoId, worker.workerId) !== undefined;
+  }
+
+  /** Starts the next queued write worker of every repo whose slot freed up. Triggered by
+   * settle/break transitions, reconciliation, and queue-loss cleanup — never by a timer.
+   * Best-effort by design: it runs from void-fired continuations (including after a
+   * shutdown), so a failed kick is logged, never thrown. */
+  private pumpQueuedWorkers(): void {
+    if (this.crashed) return;
+    try {
+      const repos = new Set(
+        this.store
+          .listWorkers()
+          .filter((w) => w.state === "queued" && !this.pumpingRepos.has(w.repoId))
+          .map((w) => w.repoId),
+      );
+      for (const repoId of repos) {
+        this.pumpOnce(repoId);
+      }
+      // Parked sends (§8.2 serial, the deliverSend guard above): a slot that freed with no
+      // queued worker may still owe a send-relaunch. Idle workers only — entries parked for
+      // a starting/lost run drain from their own transition's finally, not from here.
+      for (const workerId of [...this.pendingSends.keys()]) {
+        const worker = this.store.getWorker(workerId);
+        if (worker?.state === "idle" && !this.serialSlotHeldByAnother(worker)) {
+          void this.drainPendingSends(workerId);
+        }
+      }
+    } catch (err) {
+      console.error("[shepherd] serial queue pump failed:", err);
+    }
+  }
+
+  /** A repo's oldest queued write worker launches when no write worker is in flight. The
+   * `pumpingRepos` guard makes re-entrant pumps (settle during a launch) a no-op. */
+  private pumpOnce(repoId: string): void {
+    if (this.crashed || this.pumpingRepos.has(repoId)) return;
+    const workers = this.store.listWorkers().filter((w) => w.repoId === repoId);
+    const inFlight = workers.some((w) => w.mode === "write" && IN_FLIGHT_STATES.has(w.state));
+    const lost = workers.some((w) => w.mode === "write" && w.state === "lost"); // resume may still bring it back
+    const next = workers.find((w) => w.state === "queued"); // creation order (FIFO)
+    if (!next || inFlight || lost) return;
+    const queued = this.store.getQueuedStart(next.workerId);
+    if (!queued) {
+      // The persisted start args vanished (e.g. a queue row from before this feature's
+      // schema): break honestly instead of stranding the Thread at `queued` forever.
+      void this.breakWorker(
+        next.workerId,
+        "unknown",
+        "Queued start was lost in a connector restart; re-dispatch the task.",
+        "queue_lost",
+      );
+      return;
+    }
+    this.pumpingRepos.add(repoId);
+    void this.launchQueued(next, queued).finally(() => {
+      this.pumpingRepos.delete(repoId);
+      // The launch may itself unblock another queued worker (e.g. it broke immediately).
+      this.pumpQueuedWorkers();
+    });
+  }
+
+  private async launchQueued(worker: WorkerRow, queued: { commandId: string; args: unknown }): Promise<void> {
+    if (this.crashed) return;
+    this.store.deleteQueuedStart(worker.workerId);
+    if (typeof queued.args !== "object" || queued.args === null) {
+      await this.breakWorker(worker.workerId, "unknown", "Queued start args were unreadable; re-dispatch the task.", "queue_lost");
+      return;
+    }
+    const args = parseStartWorkerArgs(queued.args as Record<string, unknown>);
+    const repo = this.store.getRepo(worker.repoId);
+    if (!repo) {
+      await this.breakWorker(worker.workerId, "unknown", `repo '${worker.repoId}' is no longer registered`, "startup_failed");
+      return;
+    }
+    try {
+      // The command result already went out with queued:true; the `started` event (emitted
+      // by launchWorker) is what tells the steward the run is now live.
+      await this.launchWorker(queued.commandId, args, repo);
+    } catch (err) {
+      if (err instanceof CommandError && err.code === "aborted") {
+        // A stop_process settled this worker while the launch was between its synchronous
+        // claim and the spawn — the stop's bookkeeping (idle + settled:aborted) stands.
+        return;
+      }
+      const message = err instanceof Error ? err.message : String(err);
+      await this.breakWorker(worker.workerId, "unknown", `Queued start failed: ${message}`, "startup_failed");
+    }
+  }
+
+  // --- cleanup_worktree (connector-pi.md §6.1/§8.2) -----------------------------------------
+
+  /** Explicit-only worktree removal: refuses dirty or unpushed worktrees unless `force`, and
+   * refuses outright while the worker may still use it (in flight, queued, or awaiting a
+   * resume). Nothing in the connector ever deletes a worktree on its own (§8.2). */
+  async cleanupWorktree(workerId: string, force: boolean): Promise<{ removed: string }> {
+    const worker = this.store.getWorker(workerId);
+    if (!worker) throw new CommandError("not_found", `worker ${workerId} is unknown on this machine`);
+    if (!worker.worktree) {
+      throw new CommandError(
+        "no_worktree",
+        `worker ${workerId} ran without a worktree (readonly task or main-checkout repo)`,
+      );
+    }
+    if (SERIAL_SLOT_STATES.has(worker.state)) {
+      throw new CommandError(
+        "worker_running",
+        `worker ${workerId} is ${worker.state}; stop it and let it settle before cleaning up its worktree`,
+      );
+    }
+    // Settled but still idle-hot: the process is alive inside that directory — never delete
+    // under it (review finding 5's other half; also keeps resume-after-cleanup cold).
+    if (this.adapter.isRunning?.(workerId) === true) {
+      throw new CommandError(
+        "worker_running",
+        `worker ${workerId} still has a live (idle) process in its worktree; stop_process first`,
+      );
+    }
+    const repo = this.store.getRepo(worker.repoId);
+    if (!repo) throw new CommandError("not_registered_repo", `repo '${worker.repoId}' is not registered on this machine`);
+    try {
+      await this.worktrees.cleanup(repo.path, worker.worktree, { force });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new CommandError("worktree_dirty", message);
+    }
+    this.store.clearWorkerWorktree(workerId);
+    return { removed: worker.worktree };
+  }
+
+  // --- §6.1/§6.2: send and interrupt -----------------------------------------------------------
+
+  /** Tracks an in-flight start/resume so an interrupt can wait it out and the send queue
+   *  drains exactly once when the transition settles (success or failure). Transitions on
+   *  one worker chain — the second runs only after the first settles — so the map keeps its
+   *  "one live transition per worker" invariant for interrupt-waiting, and two transitions
+   *  can never race the process or the lock (PR #45 review round 2, R2-1). */
+  private async withTransition<T>(workerId: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.transitions.get(workerId);
+    const run = (async () => {
+      // Serialize: fn starts only after the previous transition settles, so the map's
+      // "one live transition per worker" invariant holds for interrupt-waiting and no two
+      // transitions race the process or the lock (PR #45 review round 2, R2-1).
+      await previous?.catch(() => undefined);
+      return fn();
+    })();
+    const transition = run.finally(() => {
+      // Identity-keyed: never delete a *later* transition's registration.
+      if (this.transitions.get(workerId) === transition) this.transitions.delete(workerId);
+    });
+    this.transitions.set(workerId, transition);
+    try {
+      return await transition;
+    } finally {
+      await this.drainPendingSends(workerId);
+    }
+  }
+
+  /**
+   * `send` (§6.2): delivery per the state table — running steers (or follow_up for
+   * `after`), idle-hot prompts, idle-cold relaunches the process with `--session-id`, and
+   * starting/lost/recovering queue until the transition completes. §6.3 image cap applies.
+   */
+  private async sendToWorker(commandId: string, args: SendArgs): Promise<SendResult> {
+    const worker = this.requireWorker(args.workerId);
+    if (args.text.length === 0) throw new CommandError("bad_request", "text is required");
+    for (const image of args.images ?? []) {
+      if (!image.data || image.data.length > 4 * 1024 * 1024) {
+        throw new CommandError("too_large", "image exceeds the 4 MB base64 limit");
+      }
+    }
+    if (worker.state === "broken") {
+      throw new CommandError("broken_worker", `worker ${args.workerId} is broken and needs a human decision`);
+    }
+    this.cancelIdleReclaim(args.workerId); // the send revives the worker
+    if (worker.state === "starting" || worker.state === "recovering" || worker.state === "lost") {
+      // §6.2 queue rows: hold until startup/resume completes (or an interrupt supersedes).
+      return new Promise<SendResult>((resolve, reject) => {
+        const queue = this.pendingSends.get(args.workerId) ?? [];
+        this.pendingSends.set(args.workerId, queue);
+        queue.push({
+          commandId,
+          text: args.text,
+          intent: args.intent,
+          images: args.images,
+          resolve,
+          reject,
+        });
+      });
+    }
+    return this.deliverSend(worker, commandId, args);
+  }
+
+  /** The state table's delivery cells for idle/running workers (§6.2). */
+  private async deliverSend(
+    worker: WorkerRow,
+    commandId: string,
+    input: { text: string; intent: SendArgs["intent"]; images?: SendArgs["images"] },
+  ): Promise<SendResult> {
+    const { workerId } = worker;
+    // §8.2 serial repos (issue #16): an idle/reviving write worker must re-acquire the
+    // repo's single write slot before it may run again — a hot prompt or cold relaunch
+    // while another write task holds the slot would put two live write runs in a repo the
+    // owner pinned to one-at-a-time. The send parks in the same pendingSends queue that
+    // holds sends for lost/recovering workers and drains when the slot frees (the serial
+    // pump calls drainPendingSends); it is never dropped and never races the holder.
+    if (this.serialSlotHeldByAnother(worker)) {
+      return new Promise<SendResult>((resolve, reject) => {
+        const queue = this.pendingSends.get(workerId) ?? [];
+        this.pendingSends.set(workerId, queue);
+        queue.push({
+          commandId,
+          text: input.text,
+          intent: input.intent,
+          images: input.images,
+          resolve,
+          reject,
+        });
+      });
+    }
+    const hot = this.adapter.isRunning?.(workerId) ?? false;
+    if (worker.state === "running" || worker.state === "recovering") {
+      if (!hot) {
+        throw new CommandError(
+          "not_running",
+          `worker ${workerId} is ${worker.state} but has no live process; wait for reconciliation`,
+          true,
+        );
+      }
+      // Steer/follow_up are the only safe deliveries mid-run: pi rejects a bare prompt into a
+      // streaming agent, and the store's `running` can lag the real settle (the settled
+      // handler first collects git facts) — a steer that lands after the run ended simply
+      // waits in pi's queue for the next one. Never lost, never racing.
+      const how: Delivery = input.intent === "after" ? "follow_up" : "steer";
+      await this.adapter.send(workerId, { text: input.text, images: input.images }, how);
+      return how === "steer" ? { delivery: "steer", effect: "after_current_tools" } : { delivery: "follow_up" };
+    }
+    // idle: prompt starts the next run in the same session. State flips first so a
+    // concurrent send cannot double-prompt; on failure it rolls back to idle.
+    if (hot) return this.deliverHotPrompt(worker, commandId, input);
+    // idle-cold relaunch is a tracked transition exactly like a resume: a send racing the
+    // cold-start window queues on the `starting` row and drains when the relaunch settles
+    // — success *or* failure — instead of hanging until some later interrupt supersedes it
+    // (PR #45 review #1); an interrupt arriving mid-relaunch waits it out (§6.2 "stop right
+    // after dispatch").
+    return this.withTransition(workerId, () => this.relaunchForSend(worker, commandId, input));
+  }
+
+  /** The idle-hot prompt cell: the state flips to `running` before the RPC so a concurrent
+   *  send cannot double-prompt. A failed RPC rolls back to idle and re-arms §4.1 idle
+   *  reclamation — the timer was cancelled when the send was accepted, and without the
+   *  re-arm a failed prompt would strand the process hot forever (PR #45 review #3). */
+  private async deliverHotPrompt(
+    worker: WorkerRow,
+    commandId: string,
+    input: { text: string; images?: SendArgs["images"] },
+  ): Promise<SendResult> {
+    const { workerId } = worker;
+    this.store.setWorkerState(workerId, "running");
+    try {
+      await this.adapter.send(workerId, { text: input.text, images: input.images, commandId }, "prompt");
+    } catch (err) {
+      this.store.setWorkerState(workerId, "idle");
+      this.armIdleReclaim(workerId);
+      throw err;
+    }
+    await this.emitEvent(workerId, "started", { sessionId: worker.sessionId ?? workerId, cwd: worker.worktree ?? undefined });
+    return { delivery: "prompt" };
+  }
+
+  /** §6.2 idle-cold row: relaunch the process with the same `--session-id` and deliver the
+   *  text as its prompt — same lock discipline as a resume (§4.3/§9.2), session untouched. */
+  private async relaunchForSend(
+    worker: WorkerRow,
+    commandId: string,
+    input: { text: string; images?: SendArgs["images"] },
+  ): Promise<SendResult> {
+    const { workerId } = worker;
+    const repo = this.store.getRepo(worker.repoId);
+    const cwd = worker.worktree ?? repo?.path;
+    if (!cwd) throw new CommandError("startup_failed", `no worktree or repo path to reach worker ${workerId} in`);
+    const lock = acquireLock(this.stateDir, workerId);
+    if (!lock.ok) throw new CommandError("lock_held", `worker ${workerId} is locked by pid ${lock.pid}`, true);
+    this.store.setWorkerState(workerId, "starting");
+    this.active.set(workerId, {
+      repoId: worker.repoId,
+      worktree: worker.worktree ?? undefined,
+      branch: worker.branch ?? undefined,
+      base: worker.base ?? undefined,
+    });
+    const spec: StartSpec = {
+      workerId,
+      threadId: worker.threadId,
+      cwd,
+      mode: worker.mode === "readonly" ? "readonly" : "write",
+      prompt: input.text,
+      commandId,
+      // §13: approveProject comes from the repo's local config on every spawn — the
+      // send-relaunch path included (issue #16 merge stitch).
+      approveProject: repo?.approved === true ? true : undefined,
+      images: input.images,
+    };
+    try {
+      const handle = await this.adapter.start(spec);
+      this.store.upsertWorker({
+        workerId,
+        threadId: worker.threadId,
+        repoId: worker.repoId,
+        mode: spec.mode,
+        state: "running",
+        sessionId: handle.sessionId,
+        sessionFile: handle.sessionFile ?? null,
+        branch: worker.branch,
+        worktree: worker.worktree,
+        base: worker.base,
+      });
+      this.startSnapshotLoop();
+      await this.emitEvent(workerId, "started", {
+        sessionId: handle.sessionId,
+        cwd,
+        branch: worker.branch ?? undefined,
+      });
+      return { delivery: "prompt", relaunched: true };
+    } catch (err) {
+      releaseLock(this.stateDir, workerId);
+      this.active.delete(workerId);
+      this.store.setWorkerState(workerId, "idle");
+      this.armIdleReclaim(workerId); // no live process → the reclaim no-ops; keeps the idle paths symmetric
+      const code = (err as { code?: string }).code ?? "startup_failed";
+      const message = err instanceof Error ? err.message : String(err);
+      throw new CommandError(code, `cold-start send failed: ${message}`);
+    }
+  }
+
+  /**
+   * `interrupt` (§6.2): connector-queued sends ahead of it are superseded (protocol §7.4);
+   * then `clear_queue` (texts → `queue_returned`), `abort`, wait for `agent_settled{aborted:
+   * true}`, and — when `then` is present — deliver it as the next prompt.
+   */
+  private async interruptWorker(commandId: string, args: InterruptArgs): Promise<InterruptOutcome> {
+    this.requireWorker(args.workerId);
+    this.cancelIdleReclaim(args.workerId);
+    this.supersedePendingSends(args.workerId);
+    // A start/resume still in flight owns the process; let it land (bounded by its own
+    // timeouts) so the abort hits a known state — "stop that one" right after dispatch.
+    const transition = this.transitions.get(args.workerId);
+    if (transition) await transition.catch(() => undefined);
+    let returned: string[] = [];
+    let aborted = false;
+    let then: SendResult | undefined;
+    try {
+      if (this.adapter.isRunning?.(args.workerId)) {
+        let interruptResult: Awaited<ReturnType<AgentAdapter["interrupt"]>>;
+        try {
+          interruptResult = await this.adapter.interrupt(args.workerId);
+        } catch (err) {
+          // R2-3: clear_queue may already have emptied the agent's queue — the retrieved
+          // texts ride a PartialInterruptError; surface them as queue_returned before
+          // failing, or they are lost (the agent holds no copy either).
+          if (err instanceof PartialInterruptError && err.returned.length > 0) {
+            await this.emitEvent(args.workerId, "queue_returned", { texts: err.returned });
+          }
+          throw err;
+        }
+        returned = interruptResult.returned;
+        if (returned.length > 0) {
+          await this.emitEvent(args.workerId, "queue_returned", { texts: returned });
+        }
+        aborted = true;
+        // Wait out the abort only when a run window is open — an interrupt on an idle-hot
+        // worker has nothing settling, and the wait must not stall the command (§6.2).
+        if (this.adapter.isStreaming?.(args.workerId)) await this.waitForAbortSettle(args.workerId);
+      }
+      if (args.then !== undefined) {
+        const worker = await this.awaitSettleBeforeThen(args.workerId);
+        if (worker.state === "broken") {
+          throw new CommandError("broken_worker", `worker ${args.workerId} is broken and needs a human decision`);
+        }
+        const runWindowOpen = this.adapter.isStreaming?.(args.workerId) ?? false;
+        const storeSettled = worker.state !== "running" && worker.state !== "recovering";
+        if (!runWindowOpen && !storeSettled) {
+          // PR #45 review #2: the settle pipeline stalled past the bound while pi's run window
+          // is observably closed. §6.2 says then = prompt — force the idle-hot prompt cell (a
+          // prompt into an idle process is safe); a steer would park the then-text in pi's
+          // queue with no run left to apply it.
+          try {
+            then = await this.deliverHotPrompt(worker, commandId, { text: args.then });
+          } catch (err) {
+            if ((err as { code?: string }).code !== "not_running") throw err;
+            // R2-2: the process died during the settle wait — fall through to the state
+            // table, whose fresh row now reads idle-cold and cold-relaunches with the
+            // then-text instead of failing the command.
+            const fresh = this.requireWorker(args.workerId);
+            if (fresh.state === "broken") {
+              throw new CommandError("broken_worker", `worker ${args.workerId} is broken and needs a human decision`);
+            }
+            then = await this.deliverSend(fresh, commandId, { text: args.then, intent: "auto" });
+          }
+        } else {
+          then = await this.deliverSend(worker, commandId, { text: args.then, intent: "auto" });
+        }
+      }
+    } finally {
+      // §4.1 (PR #45 review #3): paths that leave the worker idle without a settle of their
+      // own (an interrupt on an idle-hot worker has nothing aborting; a failed then-prompt
+      // rolls back) must re-arm the idle window — the timer was cancelled on entry and
+      // nothing else would bring it back.
+      this.rearmIdleReclaimIfIdle(args.workerId);
+    }
+    return { aborted, queueReturned: returned.length, ...(then !== undefined ? { then } : {}) };
+  }
+
+  /**
+   * A fresh worker row for the `then` delivery, after waiting out the settle lag: pi's run
+   * window closes the moment `agent_settled` arrives, but the store's `running` lags that by
+   * the settle pipeline (`get_session_stats` RPC + report/git facts). §6.2 says then =
+   * prompt, so when no run window is open while the store still says running we wait
+   * (bounded by abortSettleTimeoutMs) for the settle to land before applying the state
+   * table — otherwise the then-text would be steered into a run that already ended (PR #45
+   * review #2). With a run window still open (an abort that outlived its settle timeout),
+   * the state table applies as-is: a steer pi queues and never loses.
+   */
+  private async awaitSettleBeforeThen(workerId: string): Promise<WorkerRow> {
+    const worker = this.requireWorker(workerId);
+    if (this.adapter.isStreaming?.(workerId)) return worker; // a run window is open: §6.2's table applies
+    if (worker.state !== "running" && worker.state !== "recovering") return worker; // store already caught up
+    await this.waitForAbortSettle(workerId); // the settle is in flight; bounded by abortSettleTimeoutMs
+    return this.requireWorker(workerId);
+  }
+
+  /** Resolved by the worker's next `settled` adapter event, or the timeout — whichever first. */
+  private waitForAbortSettle(workerId: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      const waiters = this.abortWaiters.get(workerId) ?? new Set<() => void>();
+      this.abortWaiters.set(workerId, waiters);
+      const waiter = () => {
+        clearTimeout(timer);
+        waiters.delete(waiter);
+        resolve(true);
+      };
+      const timer = setTimeout(() => {
+        waiters.delete(waiter);
+        resolve(false);
+      }, this.abortSettleTimeoutMs);
+      timer.unref?.();
+      waiters.add(waiter);
+    });
+  }
+
+  /** Delivers everything queued for the worker (§6.2); every entry settles its command. */
+  private async drainPendingSends(workerId: string): Promise<void> {
+    const queue = this.pendingSends.get(workerId);
+    if (!queue || queue.length === 0) return;
+    const sends = [...queue];
+    queue.length = 0;
+    for (const send of sends) {
+      if (this.crashed) {
+        send.reject(new CommandError("connector_down", "connector is shutting down", true));
+        continue;
+      }
+      try {
+        const worker = this.requireWorker(workerId);
+        if (worker.state === "broken") throw new CommandError("broken_worker", `worker ${workerId} is broken`);
+        // The state table applies at delivery time: after startup/resume the worker is
+        // running, so the queued message steers (or follows up) rather than prompting into
+        // a busy agent — pi rejects a bare prompt mid-run ("Agent is already processing").
+        send.resolve(await this.deliverSend(worker, send.commandId, send));
+      } catch (err) {
+        send.reject(err instanceof CommandError ? err : new CommandError("internal", String(err)));
+      }
+    }
+  }
+
+  /** Protocol §7.4: sends queued ahead of an interrupt whose delivery never started answer
+   *  `result{ok:false, code:"superseded"}` — their instruction is the user's to re-issue. */
+  private supersedePendingSends(workerId: string): void {
+    const queue = this.pendingSends.get(workerId);
+    if (!queue) return;
+    this.pendingSends.delete(workerId);
+    for (const send of queue) {
+      send.reject(new CommandError("superseded", "superseded by an interrupt on the same worker"));
+    }
+  }
+
+  // --- §4.1 idle reclamation -------------------------------------------------------------------
+
+  private armIdleReclaim(workerId: string): void {
+    this.cancelIdleReclaim(workerId);
+    if (this.crashed) return;
+    const timer = setTimeout(() => {
+      this.idleTimers.delete(workerId);
+      void this.reclaimIdleProcess(workerId);
+    }, this.idleReclaimMs);
+    timer.unref?.();
+    this.idleTimers.set(workerId, timer);
+  }
+
+  private cancelIdleReclaim(workerId: string): void {
+    const timer = this.idleTimers.get(workerId);
+    if (timer) {
+      clearTimeout(timer);
+      this.idleTimers.delete(workerId);
+    }
+  }
+
+  /** Re-arm the idle window when an intervention ends with the worker idle: no-op unless
+   *  the store actually says idle (a live run's settle arms its own timer, §4.1). */
+  private rearmIdleReclaimIfIdle(workerId: string): void {
+    if (this.store.getWorker(workerId)?.state === "idle") this.armIdleReclaim(workerId);
+  }
+
+  /** §4.1: past the idle window the process is closed and the session stays on disk. The
+   *  next `send` relaunches with `--session-id` (cold start ≈ 350 ms, measured). */
+  private async reclaimIdleProcess(workerId: string): Promise<void> {
+    if (this.crashed) return;
+    const worker = this.store.getWorker(workerId);
+    if (!worker || worker.state !== "idle") return;
+    if (!(this.adapter.isRunning?.(workerId) ?? false)) return;
+    await this.stopProcess(workerId).catch((err) => {
+      console.error(`[shepherd] idle reclaim failed for ${workerId}:`, err);
+    });
+  }
+
+  /**
+   * On-demand raw history (connector-pi.md §11.4): while the process is running, increments
+   * come from `get_entries{since}` over RPC; otherwise the session JSONL is parsed directly
+   * along the current branch. Normalized, truncated, capped at maxBytes, cursor-addressed.
+   */
+  async history(workerId: string, since: string | undefined, maxBytes: number): Promise<HistoryPage> {
+    const worker = this.store.getWorker(workerId);
+    if (!worker) throw new CommandError("not_found", `worker ${workerId} is unknown on this machine`);
+    if (typeof this.adapter.history === "function" && this.adapter.isRunning?.(workerId)) {
+      try {
+        return await this.adapter.history(workerId, since, maxBytes);
+      } catch (err) {
+        // The process died between the isRunning check and the RPC: the run is over, so the
+        // session file is now the truth — fall through instead of surfacing the race.
+        if ((err as { code?: string }).code !== "not_running") throw err;
+      }
+    }
+    if (!worker.sessionFile) {
+      throw new CommandError("no_history", `worker ${workerId} has no session file to read`);
+    }
+    return readSessionHistory(worker.sessionFile, { since, maxBytes });
   }
 
   // --- Startup reconciliation (connector-pi.md §9.1) ----------------------------------------
@@ -332,6 +1156,8 @@ export class WorkerManager {
         console.error(`[shepherd] session-tail reconciliation failed for ${worker.workerId}:`, err);
       }
     }
+    // Queued write workers whose runner settled or broke over the restart can start now.
+    this.pumpQueuedWorkers();
   }
 
   private async reconcileWorkerTail(worker: WorkerRow): Promise<void> {
@@ -346,6 +1172,7 @@ export class WorkerManager {
       await this.emitEvent(worker.workerId, "report", { ...tail.report, ...(git ? { git } : {}) });
       await this.emitEvent(worker.workerId, "settled", { outcome: "reported" });
       this.store.setWorkerState(worker.workerId, "idle", "reported");
+      this.pumpQueuedWorkers(); // §8.2: the serial slot freed
       return;
     }
     if (tail.kind === "not_started") {
@@ -410,8 +1237,16 @@ export class WorkerManager {
     }
     this.store.setWorkerState(workerId, "recovering");
     try {
-      await this.resumeWorker(workerId, reason, count);
+      // Tracked as a transition: queued sends (§6.2) drain when the resume completes, and an
+      // interrupt waits it out instead of racing the relaunch.
+      await this.withTransition(workerId, () => this.resumeWorker(workerId, reason, count));
     } catch (err) {
+      if (err instanceof CommandError && err.code === "aborted") {
+        // PR #43 review N2: a stop_process settled this worker while the resume relaunch was
+        // in flight. That is the user's stop, not a resume failure — write nothing here (the
+        // stop owns the row and its settled:aborted) and let it be.
+        return;
+      }
       const message = err instanceof Error ? err.message : String(err);
       const errorClass: ErrorClass = classifyError(message) === "auth" ? "auth" : "unknown";
       await this.breakWorker(workerId, errorClass, `Automatic resume failed: ${message}`, "resume_failed");
@@ -426,6 +1261,22 @@ export class WorkerManager {
   private async resumeWorker(workerId: string, reason: string, count: number): Promise<void> {
     const worker = this.store.getWorker(workerId);
     if (!worker) throw new CommandError("not_found", `worker ${workerId} is unknown on this machine`);
+    if (worker.state === "queued") {
+      // §8.2: a queued write worker has no session yet — there is nothing to resume. It
+      // starts on its own when the repo's serial slot frees.
+      throw new CommandError("not_started", `worker ${workerId} is queued behind another write task; it starts when that one settles`);
+    }
+    // §8.2 (issue #16 merge with #45): a manual resume is a continuation that must
+    // re-acquire a serial repo's write slot; retriable because the holder settles on its
+    // own. The automatic path never trips this — a `lost` worker holds its own slot until
+    // it breaks, so no other write worker can have taken it.
+    if (this.serialSlotHeldByAnother(worker)) {
+      throw new CommandError(
+        "slot_busy",
+        `another write task holds this serial repo's single write slot; resume again once it settles`,
+        true,
+      );
+    }
     if (this.adapter.isRunning?.(workerId)) {
       await this.adapter.resume(workerId, reason);
       this.store.setWorkerState(workerId, "running");
@@ -433,6 +1284,21 @@ export class WorkerManager {
       return;
     }
     const repo = this.store.getRepo(worker.repoId);
+    // Review finding 5: a write worker whose worktree was explicitly cleaned up must not
+    // silently resume in the owner's main checkout. (A NULL worktree alone is not the
+    // signal — legacy rows never had one; only the cleanup marker counts.)
+    if (
+      worker.mode === "write" &&
+      repo &&
+      repo.workspace !== "main" &&
+      !worker.worktree &&
+      worker.worktreeCleanedAt
+    ) {
+      throw new CommandError(
+        "no_worktree",
+        `worker ${workerId}'s worktree was cleaned up; re-dispatch the task instead of resuming`,
+      );
+    }
     const cwd = worker.worktree ?? repo?.path;
     if (!cwd) throw new CommandError("startup_failed", `no worktree or repo path to resume worker ${workerId} in`);
     const lock = acquireLock(this.stateDir, workerId);
@@ -444,6 +1310,8 @@ export class WorkerManager {
       mode: worker.mode === "readonly" ? "readonly" : "write",
       prompt: RESUME_PROMPT,
       commandId: `resume-${count}-${this.now()}`,
+      // §13: the repo's local trust applies to resumes exactly like first starts.
+      approveProject: repo?.approved === true ? true : undefined,
     };
     this.active.set(workerId, {
       repoId: worker.repoId,
@@ -451,8 +1319,20 @@ export class WorkerManager {
       branch: worker.branch ?? undefined,
       base: worker.base ?? undefined,
     });
+    this.launching.add(workerId);
     try {
-      const handle = await this.adapter.start(spec);
+      let handle: WorkerHandle;
+      try {
+        handle = await this.adapter.start(spec);
+      } catch (err) {
+        if (this.stopRequested.has(workerId)) throw new CommandError("aborted", "worker was stopped during resume");
+        throw err;
+      }
+      if (this.stopRequested.has(workerId)) {
+        await this.adapter.stopProcess(workerId).catch(() => undefined);
+        throw new CommandError("aborted", "worker was stopped during resume");
+      }
+      this.stopRequested.delete(workerId);
       this.store.upsertWorker({
         workerId,
         threadId: worker.threadId,
@@ -471,7 +1351,16 @@ export class WorkerManager {
     } catch (err) {
       releaseLock(this.stateDir, workerId);
       this.active.delete(workerId);
+      if (err instanceof CommandError && err.code === "aborted") {
+        // The stop already settled this worker (idle + settled:aborted); leave its
+        // bookkeeping untouched (review finding 3, same window on the resume path).
+        this.stopRequested.delete(workerId);
+      }
       throw err;
+    } finally {
+      // N1, same invariant as launchWorker: markers never outlive their launch window.
+      this.launching.delete(workerId);
+      this.stopRequested.delete(workerId);
     }
   }
 
@@ -482,7 +1371,18 @@ export class WorkerManager {
     this.watchdog.forget(workerId);
     this.runPrompts.delete(workerId);
     this.store.setWorkerState(workerId, "broken", lastOutcome);
+    // A broken worker can never deliver what is still queued on it (§6.2): settle those
+    // commands now instead of leaving them pending until a restart marks them ambiguous.
+    const queue = this.pendingSends.get(workerId);
+    if (queue) {
+      this.pendingSends.delete(workerId);
+      for (const send of queue) {
+        send.reject(new CommandError("broken_worker", `worker ${workerId} is broken: ${detail}`));
+      }
+    }
     await this.emitEvent(workerId, "settled", { outcome: "error", errorClass, lastText: detail });
+    // §8.2: a broken write worker frees the repo's serial slot for the next queued one.
+    this.pumpQueuedWorkers();
   }
 
   // --- Stall watchdog (issue #13, ADR-0001) --------------------------------------------------
@@ -510,7 +1410,7 @@ export class WorkerManager {
     await this.emitEvent(workerId, "progress", { phase: "tool", tool: "stall-watchdog", target: why.slice(0, 80) });
     if (strike === 1) {
       this.store.setWorkerState(workerId, "recovering", "stall");
-      await this.stopProcess(workerId); // expected exit: releases the lock, no lost/auto-resume
+      await this.stopProcessExpected(workerId); // expected exit: releases the lock, no lost/auto-resume
       // The process_exit handler's releaseLock rides a microtask; release again rather than
       // race it — releaseLock on an already-removed file is a no-op.
       releaseLock(this.stateDir, workerId);
@@ -522,7 +1422,7 @@ export class WorkerManager {
       }
       return;
     }
-    await this.stopProcess(workerId);
+    await this.stopProcessExpected(workerId);
     releaseLock(this.stateDir, workerId);
     await this.breakWorker(workerId, "stall", `${why}; still wedged after one automatic restart`, "error:stall");
   }
@@ -619,13 +1519,18 @@ export class WorkerManager {
 
   // --- Shutdown ------------------------------------------------------------------------------
 
-  /** Graceful shutdown: stop background loops. Worker processes are left to the OS — on
-   * connector exit stdin closes and pi disposes of its tool tree itself (§9.1 measurement). */
+  /** Graceful shutdown: stop background loops and take the manager out of service — no
+   * further queue pumps, launches, or event handling (a late void-fired continuation must
+   * never spawn work after the caller closed the store). Worker processes are left to the
+   * OS — on connector exit stdin closes and pi disposes of its tool tree itself (§9.1). */
   stop(): void {
+    this.crashed = true;
     this.stopSnapshotLoop();
     this.watchdog.stop();
     for (const timer of this.resumeTimers.values()) clearTimeout(timer);
     this.resumeTimers.clear();
+    for (const timer of this.idleTimers.values()) clearTimeout(timer);
+    this.idleTimers.clear();
   }
 
   /** Test support: emulate a connector crash — every child is SIGKILLed with no graceful
@@ -638,6 +1543,8 @@ export class WorkerManager {
     this.watchdog.stop();
     for (const timer of this.resumeTimers.values()) clearTimeout(timer);
     this.resumeTimers.clear();
+    for (const timer of this.idleTimers.values()) clearTimeout(timer);
+    this.idleTimers.clear();
     this.adapter.simulateCrash?.();
     markLocksHeldByDeadProcess(this.stateDir);
   }
@@ -681,13 +1588,23 @@ export class WorkerManager {
           this.store.setWorkerState(event.workerId, "broken", "error:auth");
         } else {
           this.store.setWorkerState(event.workerId, "idle", event.outcome);
+          // §4.1: the process stays for the idle window (hot idle), then is reclaimed.
+          this.armIdleReclaim(event.workerId);
         }
+        // An interrupt waiting for agent_settled{aborted:true} (§6.2) is released by any
+        // settle — the run is over either way.
+        for (const waiter of this.abortWaiters.get(event.workerId) ?? []) waiter();
+        this.abortWaiters.delete(event.workerId);
         this.throttles.delete(event.workerId);
         this.watchdog.forget(event.workerId);
         this.runPrompts.delete(event.workerId);
         if (event.outcome === "error" && event.errorClass === "transient") {
           // §5.2/§9.2: one automatic resume for transient-class errors (backoff + budget apply).
           this.scheduleAutoResume(event.workerId, "error:transient");
+        } else {
+          // §8.2: a settled write worker frees the repo's serial slot. (A transient error's
+          // resume keeps the slot — the run is still in flight from the queue's viewpoint.)
+          this.pumpQueuedWorkers();
         }
         return;
       }
@@ -696,6 +1613,7 @@ export class WorkerManager {
         releaseLock(this.stateDir, event.workerId);
         this.throttles.delete(event.workerId);
         this.active.delete(event.workerId);
+        this.cancelIdleReclaim(event.workerId); // the process is gone; nothing to reclaim
         // Deliberately NOT forgetting watchdog strikes here: an expected exit is often the
         // stall respawn's own stop (forgetting would reset strike 2 to strike 1 and loop
         // forever), and after an unexpected exit + auto-resume the same task keeps its
@@ -724,12 +1642,61 @@ export class WorkerManager {
     const clean = Object.fromEntries(Object.entries(payload).filter(([, v]) => v !== undefined));
     this.emit?.(workerId, { type, ...clean });
   }
+
+  private requireWorker(workerId: string): WorkerRow {
+    const worker = this.store.getWorker(workerId);
+    if (!worker) throw new CommandError("not_found", `worker ${workerId} is unknown on this machine`);
+    return worker;
+  }
 }
 
 function commandWorkerId(args: Record<string, unknown>, envelopeWorkerId: string | undefined, kind: string): string {
   const workerId = typeof args.workerId === "string" && args.workerId.length > 0 ? args.workerId : envelopeWorkerId;
   if (!workerId) throw new CommandError("bad_request", `${kind} requires a workerId`);
   return workerId;
+}
+
+/** §8.2/§13 (issue #16): local-only settings arriving inside a command are rejected before
+ * anything runs — even a fully authenticated steward must not flip approveProject or the
+ * workspace mode from afar; the owner sets them with `shepherd repo-config` on the machine. */
+function rejectLocalOnlyArgs(args: Record<string, unknown>): void {
+  for (const key of LOCAL_ONLY_ARGS) {
+    if (key in args) {
+      throw new CommandError(
+        "local_only_setting",
+        `'${key}' is a connector-local setting; set it on the machine with 'shepherd repo-config' (§13)`,
+      );
+    }
+  }
+}
+
+function parseImages(args: Record<string, unknown>): { data: string; mimeType: string }[] | undefined {
+  if (!Array.isArray(args.images)) return undefined;
+  return (args.images as { data: string; mimeType: string }[]).map((img) => ({
+    data: String(img.data),
+    mimeType: String(img.mimeType),
+  }));
+}
+
+/** `send` (§6.1): `text, images?, intent` — intent defaults to `auto`. */
+function parseSendArgs(args: Record<string, unknown>, envelopeWorkerId: string | undefined): SendArgs {
+  const intent = args.intent === "now" || args.intent === "after" ? args.intent : "auto";
+  return {
+    workerId: commandWorkerId(args, envelopeWorkerId, "send"),
+    text: typeof args.text === "string" ? args.text : "",
+    intent,
+    images: parseImages(args),
+  };
+}
+
+/** `interrupt` (§6.1): `then?: { text }`. */
+function parseInterruptArgs(args: Record<string, unknown>, envelopeWorkerId: string | undefined): InterruptArgs {
+  const then =
+    typeof (args.then as { text?: unknown } | undefined)?.text === "string" &&
+    String((args.then as { text: unknown }).text).length > 0
+      ? String((args.then as { text: unknown }).text)
+      : undefined;
+  return { workerId: commandWorkerId(args, envelopeWorkerId, "interrupt"), ...(then !== undefined ? { then } : {}) };
 }
 
 function parseStartWorkerArgs(args: Record<string, unknown>): StartWorkerArgs {

@@ -78,12 +78,70 @@ export function eventWakeText(input: EventWakeInput): string {
   ].join("\n");
 }
 
-/** ⟦routine R⟧ inputs (steward.md §4.2); queued by the routines ticket (#20). */
-export function routineWakeText(routineId: string, instruction: string): string {
-  return `${MARK_OPEN}routine ${routineId}${MARK_CLOSE} ${instruction}`;
+/** ⟦routine R⟧ inputs (steward.md §4.2/§8.2); queued when a routine fire reaches the LLM. */
+export function routineWakeText(
+  routineId: string,
+  instruction: string,
+  ctx?: { schedule?: string; createdFromMsg?: string | null; thread?: { threadId: string; title: string } | null },
+): string {
+  const meta: string[] = [];
+  if (ctx?.schedule) meta.push(`触发：${ctx.schedule}`);
+  if (ctx?.createdFromMsg) meta.push(`由用户消息 ${ctx.createdFromMsg} 设立`);
+  if (ctx?.thread) meta.push(`归属 Thread：${ctx.thread.threadId}「${ctx.thread.title}」`);
+  return [
+    `${MARK_OPEN}routine ${routineId}${MARK_CLOSE} ${instruction}`,
+    ...(meta.length > 0 ? [`（${meta.join("；")}）`] : []),
+    `按指令执行；要派发必须带 provenanceRef=routine:${routineId}（或指令里引用的真实用户消息 user:<om_…>）；无事可做用 no_action 结束。`,
+  ].join("\n");
 }
 
-/** ⟦followup F⟧ inputs (steward.md §4.2); queued by the follow-up ticket (#20). */
-export function followupWakeText(followupId: string, reason: string): string {
-  return `${MARK_OPEN}followup ${followupId}${MARK_CLOSE} ${reason}`;
+/** ⟦followup F⟧ inputs (steward.md §4.2/§8.3); queued when a follow-up comes due. */
+export function followupWakeText(
+  followupId: string,
+  reason: string,
+  ctx?: { thread?: { threadId: string; title: string } | null; sourceRef?: string | null; createdBy?: string },
+): string {
+  const meta: string[] = [];
+  if (ctx?.thread) meta.push(`Thread：${ctx.thread.threadId}「${ctx.thread.title}」`);
+  if (ctx?.createdBy) meta.push(ctx.createdBy === "user" ? "用户设定的回看" : "总管自己设定的回看");
+  if (ctx?.sourceRef) meta.push(`来源：${ctx.sourceRef}`);
+  return [
+    `${MARK_OPEN}followup ${followupId}${MARK_CLOSE} ${reason}`,
+    ...(meta.length > 0 ? [`（${meta.join("；")}）`] : []),
+    "再看一眼这个 Thread 的状况，决定是否需要行动（派发需带 provenanceRef，或引用真实用户消息）；无事可做用 no_action 结束。",
+  ].join("\n");
+}
+
+/** The ⟦event⟧ wake for a `queue_returned` (connector-pi.md §6.2/§11.1): texts pi handed
+ *  back at interrupt time never reached the worker — the steward decides their fate. */
+export function queueReturnedWakeText(input: {
+  thread: ThreadRow | null;
+  worker: WorkerRow;
+  machine: MachineRow | null;
+  texts: string[];
+}): string {
+  const { thread, worker, machine } = input;
+  return [
+    `${MARK_OPEN}event${MARK_CLOSE} thread=${thread?.threadId ?? "?"} 「${thread?.title ?? "已归档"}」`,
+    `- worker ${worker.workerId}（${worker.agent}@${machine?.name ?? worker.deviceId}）被中断时，有 ${input.texts.length} 条排队消息未送达就被取回：`,
+    ...input.texts.slice(0, 5).map((text) => `  · ${text.slice(0, 120)}`),
+    "这些消息没有送到 worker。请决定：重发（send_to_worker，需用户授权或用户消息佐证）、告知用户，或确认作废；无事可做用 no_action 结束。",
+  ].join("\n");
+}
+
+/**
+ * ⟦verify⟧ inputs (issue #7, spike-conclusions §2 “post-dispatch settle-time verification”):
+ * the corrective follow-up when a user run claimed a dispatch that never happened. The
+ * original user message's provenance rides on the run (replyTo), so the steward may still
+ * dispatch — or must correct itself to the user via notify_user. The claimed phrase is
+ * marker-escaped (review #48 finding 5): the model wrote it, so it may itself contain ⟦…⟧,
+ * and an unescaped embed would smuggle a fake system wake into this input. The routing
+ * hint (finding 2): only an explicitly-routed attach skips routing — the same §3.3 policy
+ * holds inside a verify run, or the corrective dispatch just hits the same gate.
+ */
+export function verifyWakeText(claim: string): string {
+  return [
+    `${MARK_OPEN}verify${MARK_CLOSE} 你上一条回复声称已派发任务（“${escapeMarkers(claim).slice(0, 80)}”），但这次运行中没有发生任何 start_worker 调用。`,
+    "请现在真正调用 start_worker 完成派发（接续非显式路由的 Thread 时同样要带 routing: {confidence: 'high', reason}；系统注已定归属或 find_threads 给了 explicit 的除外）；如果其实不该派发，用 notify_user 向用户发一句更正。",
+  ].join("\n");
 }
