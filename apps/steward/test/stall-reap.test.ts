@@ -201,9 +201,19 @@ describe("the §8.4 stall alarm (online machine, lastEventAt + 20 min)", () => {
     // Generous window: #6's wake/run machinery shares the DO's alarm slot, so under suite
     // load the 1 s maintenance alarm can lag.
     const deadline = Date.now() + 22_000;
+    let zzIter = 0;
     while (Date.now() < deadline) {
       const row = await workerRow(workerId);
       if (row!.thread.timeline.some((e) => e.kind === "stall")) break;
+      if (zzIter++ % 4 === 0) {
+        const zz = await runInDurableObject(ownerStub(), (instance: Steward, state: DurableObjectState) => {
+          const knobs = instance as unknown as { stallAlarmMs: number; workerSweepIntervalS: number; zzSweeps?: unknown[]; zzStarts?: number[] };
+          const w = state.storage.sql.exec(`SELECT state, lastEventAt FROM sh_worker WHERE workerId = '${workerId}'`).toArray();
+          const tables = state.storage.sql.exec("SELECT name FROM sqlite_master WHERE type='table'").toArray().map((r) => String((r as Record<string, unknown>).name));
+          return { t: Date.now(), stallAlarmMs: knobs.stallAlarmMs, intervalS: knobs.workerSweepIntervalS, worker: w, tables, zzSweeps: knobs.zzSweeps?.slice(-6), zzStarts: knobs.zzStarts };
+        });
+        console.log("ZZ poll:", JSON.stringify(zz));
+      }
       await new Promise((resolve) => setTimeout(resolve, 250));
     }
     await waitWhileOutboundPending();

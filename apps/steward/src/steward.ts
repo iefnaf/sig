@@ -206,6 +206,9 @@ export type PairResult =
 // cast at the read/write sites instead (same tradeoff the do-protocol spike made).
 export class Steward extends Agent<Env> {
   onStart(): void {
+    const zz = this as unknown as { zzStarts?: number[] }; // ZZ temp diagnostic
+    (zz.zzStarts ??= []).push(Date.now());
+    console.log("[ZZ] onStart", Date.now());
     runMigrations(this.sql.bind(this), MIGRATIONS);
     // A DO restart clears the in-memory arm-dedupe while storage alarms keep their own
     // clock: re-arm maintenance so a restart never strands active workers unwatched.
@@ -1116,6 +1119,8 @@ export class Steward extends Agent<Env> {
   protected workerSweepIntervalS = WORKER_SWEEP_INTERVAL_S;
   /** In-memory dedupe of pending schedule() rows (the SDK fires every row; see armWorkerSweeps). */
   private lastSweepArmAt = 0;
+  /** The cadence of that arm — a leftover LONGER alarm must not suppress a shorter re-arm. */
+  private lastSweepArmIntervalS = 0;
 
   /** Arms the maintenance alarm while any worker is in an active state. Called from every
    * point that can change that (event reduction, hello reconciliation, dispatch enqueue);
@@ -1126,10 +1131,18 @@ export class Steward extends Agent<Env> {
     `[0]!.n;
     if (active === 0) return;
     // schedule() rows each fire once: without this guard every wake that touches a worker
-    // would add another row and the alarm would fan out. A DO reset clears the flag — the
-    // cost is at most one redundant no-op pass.
-    if (Date.now() - this.lastSweepArmAt < this.workerSweepIntervalS * 1000 * 0.9) return;
+    // would add another row and the alarm would fan out. Only skip when the pending arm is
+    // at this cadence or faster — an arm left over from a WIDER cadence (interval shrunk
+    // since, e.g. tests) can be up to that wider interval away and must not block this one.
+    // A DO reset clears the flags — the cost is at most one redundant no-op pass.
+    if (
+      this.lastSweepArmIntervalS <= this.workerSweepIntervalS &&
+      Date.now() - this.lastSweepArmAt < this.workerSweepIntervalS * 1000 * 0.9
+    ) {
+      return;
+    }
     this.lastSweepArmAt = Date.now();
+    this.lastSweepArmIntervalS = this.workerSweepIntervalS;
     void this.schedule(this.workerSweepIntervalS, "sweepWorkers");
   }
 
@@ -1150,6 +1163,9 @@ export class Steward extends Agent<Env> {
     let stalled = 0;
     let reaped = 0;
     const now = Date.now();
+    const zzProbe = this as unknown as { zzSweeps?: Array<Record<string, unknown>> }; // ZZ temp diagnostic
+    (zzProbe.zzSweeps ??= []).push({ phase: "entry", t: now, stallAlarmMs: this.stallAlarmMs, reapOfflineMs: this.reapOfflineMs, intervalS: this.workerSweepIntervalS });
+    console.log("[ZZ] sweepWorkers entry", { now, stallAlarmMs: this.stallAlarmMs, reapOfflineMs: this.reapOfflineMs, intervalS: this.workerSweepIntervalS });
     try {
       // Query with the shorter threshold and classify per worker in one pass.
       for (const worker of this.ledger.workers.silentSince(Math.min(this.reapOfflineMs, this.stallAlarmMs))) {
@@ -1192,10 +1208,16 @@ export class Steward extends Agent<Env> {
       }
       // A settled queue-timeout queues a failure push (markStartFailed); drain for reaps too.
       if (stalled > 0 || reaped > 0) void this.drainNotifications();
+    } catch (err) {
+      ((this as unknown as { zzSweeps?: Array<Record<string, unknown>> }).zzSweeps ??= []).push({ phase: "threw", t: Date.now(), err: String(err) }); // ZZ temp diagnostic
+      console.log("[ZZ] sweepWorkers threw", String(err));
+      throw err;
     } finally {
       // Re-arm even when a pass throws mid-way: a ledger error must not kill the alarm chain.
       this.armWorkerSweeps();
     }
+    (zzProbe.zzSweeps ??= []).push({ phase: "done", t: Date.now(), stalled, reaped }); // ZZ temp diagnostic
+    console.log("[ZZ] sweepWorkers done", { stalled, reaped });
     return { stalled, reaped };
   }
 
