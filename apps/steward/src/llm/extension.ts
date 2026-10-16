@@ -18,7 +18,7 @@ import {
   type Extension,
 } from "@earendil-works/pi-durable";
 import { MAX_THREAD_SUMMARY, type Ledger } from "../ledger.ts";
-import { LOW_TRUST_SOURCES, type NoteDraft, type NoteKind, type NoteSource } from "../notes.ts";
+import { LOW_TRUST_SOURCES, sameClaim, type NoteDraft, type NoteKind, type NoteSource } from "../notes.ts";
 import { titleOf, type StartWorkerInput, type StartWorkerOutcome } from "../dispatch.ts";
 import { MAX_CONCLUSION, MAX_DID_ITEM, MAX_DID_ITEMS, MAX_NEEDS_YOU, type Tone } from "../report-template.ts";
 
@@ -376,16 +376,35 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
       if (args.layer === "resident" && LOW_TRUST_SOURCES.includes(draft.source)) {
         // A confirmed LOW-TRUST predecessor is the parked-then-promoted path: notes_confirm
         // already bound the owner's message to it (temporally), so the promotion inherits
-        // that proof. A confirmed user_said/connector note proves nothing about this claim.
-        const replacesActive = (args.replaces ?? [])
+        // that proof — for THE SAME CLAIM only (review R1): a confirmation must not be
+        // spendable on unrelated text, and the promoted note carries the predecessor's
+        // evidence so the "who confirmed this" trail survives on the row itself.
+        const basis = (args.replaces ?? [])
           .map((id) => ctx.ledger.notes.get(id))
-          .filter(
+          .find(
             (n): n is NonNullable<typeof n> =>
-              n !== null && n.status === "active" && n.confirmed && LOW_TRUST_SOURCES.includes(n.source),
+              n !== null &&
+              n.status === "active" &&
+              n.confirmed &&
+              LOW_TRUST_SOURCES.includes(n.source) &&
+              sameClaim(draft.text, n.text),
           );
-        if (replacesActive.length > 0) {
+        if (basis !== undefined) {
           // Parked → confirmed (notes_confirm bound the owner's message to it) → promoted.
           draft.confirmed = true;
+          draft.evidence = draft.evidence ?? basis.evidence ?? undefined;
+      } else if (
+          (args.replaces ?? []).some((id) => {
+            const n = ctx.ledger.notes.get(id);
+            return n !== null && n.status === "active" && n.confirmed && LOW_TRUST_SOURCES.includes(n.source);
+          })
+        ) {
+          // A confirmed low-trust note is present but matches no claim in the draft: that is
+          // the laundering shape (review R1) — fail closed; a confirmed user_said note in
+          // replaces is an ordinary supersession and does not trip this.
+          return err(
+            "refused: replaces 里有已确认的条目，但内容和要写入的不是同一件事——确认不能挪用。先在项目层记录这条新内容，等用户确认后再提升。",
+          );
         } else {
           const run = await ctx.currentRun();
           if (!args.confirmEvidence || !(await ctx.checkProvenanceRef(args.confirmEvidence))) {

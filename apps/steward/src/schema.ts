@@ -407,7 +407,7 @@ export const MIGRATIONS: readonly Migration[] = [
     // deleted, fetched on demand. Writes are two-phase (notes_propose → notes_commit with
     // `replaces`); every change lands in sh_note_log and is relayed to the user with the
     // next reply (spec §10.3: silent memory is unacceptable).
-    id: "010_notes",
+    id: "011_notes",
     up: (sql) => {
       // status: 'active' = current knowledge (any layer — an evicted/demoted entry stays
       // valid content in the archive); 'superseded' = replaced by a newer note; 'removed' =

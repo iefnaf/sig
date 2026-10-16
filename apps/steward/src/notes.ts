@@ -196,6 +196,15 @@ export function noteSimilarity(a: string, b: string): number {
   return shared / (ta.size + tb.size - shared);
 }
 
+/** Same claim, allowing rephrasing: identical normalized text, or trigram similarity at the
+ *  "similar neighbors" floor. The promotion path uses this so a confirmation can only be
+ *  spent on the claim it was given for (PR #44 review R1) — unrelated text fails it. */
+export function sameClaim(a: string, b: string): boolean {
+  const na = normalizeNoteText(a);
+  const nb = normalizeNoteText(b);
+  return na === nb || noteSimilarity(na, nb) >= SIMILAR_MIN;
+}
+
 /** steward.md §2.5: recency × usage × source trust × confirmation. Lower evicted first. */
 export function retentionScore(note: NoteRow, now: number): number {
   const ageMs = Math.max(0, now - (note.lastUsedAt ?? note.createdAt));

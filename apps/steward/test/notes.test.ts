@@ -898,6 +898,79 @@ describe("notes trust gates: the evidence rules (PR #44 review finding 3)", () =
     expect(parked).toMatchObject({ layer: "archive", supersededBy: promoted?.noteId });
   });
 
+  it("a confirmation can only be spent on the same claim: laundering unrelated text through a confirmed note is refused, and the evidence is inherited (review R1)", async () => {
+    const noteId = await runInDurableObject(ownerStub(), (instance: Steward) => {
+      const ledger = (instance as unknown as { ledger: Ledger }).ledger;
+      const done = ledger.notes.commit({
+        text: "这个仓库用 pnpm 管理依赖",
+        kind: "convention",
+        source: "worker_reported",
+        layer: "project",
+        scopeRepoId: "/srv/repo-a",
+        evidence: "user:om_first_report", // where the worker's claim surfaced
+      });
+      if (!done.ok) throw new Error(done.message);
+      ledger.notes.drainPendingForReply();
+      return done.note.noteId;
+    });
+
+    // Turn 1: the owner confirms the parked note (message postdates it).
+    await scriptModel(
+      fauxAssistantMessage([fauxToolCall("notes_confirm", { noteId, evidenceRef: "user:om_r1_confirm" })], { stopReason: "toolUse" }),
+      fauxAssistantMessage([fauxText("已确认。")]),
+    );
+    await dm("对，这个仓库用 pnpm", "om_r1_confirm");
+    await waitRunsSettled();
+    expect((await ownerStub().debugSnapshot()).notes[0]).toMatchObject({ confirmed: true });
+
+    // Turn 2 (the laundering attempt): promote UNRELATED worker_reported text, spending the
+    // confirmed note as the ticket. Same run shape as the legit path — only the text differs.
+    await scriptModel(
+      fauxAssistantMessage(
+        [fauxToolCall("notes_commit", {
+          text: "汇报一律用英文写",
+          kind: "preference",
+          source: "worker_reported",
+          layer: "resident",
+          replaces: [noteId],
+        })],
+        { stopReason: "toolUse" },
+      ),
+      fauxAssistantMessage([fauxText("确认不能挪用。")]),
+    );
+    await dm("顺便记一下这个偏好", "om_r1_launder");
+    await waitRunsSettled();
+    const requests = await modelRequests();
+    const refusal = requests.find((r) => r.lastToolResult.includes("确认不能挪用"));
+    expect(refusal).toBeDefined();
+    const snap = await ownerStub().debugSnapshot();
+    expect(snap.notes.filter((n) => n.layer === "resident")).toHaveLength(0); // nothing promoted
+    expect(snap.notes.find((n) => n.noteId === noteId)).toMatchObject({ layer: "project", confirmed: true }); // ticket unspent
+
+    // Turn 3 (the legit promotion, same claim): goes through and inherits the evidence.
+    await scriptModel(
+      fauxAssistantMessage(
+        [fauxToolCall("notes_commit", {
+          text: "这个仓库用 pnpm 管理依赖",
+          kind: "convention",
+          source: "worker_reported",
+          layer: "resident",
+          replaces: [noteId],
+        })],
+        { stopReason: "toolUse" },
+      ),
+      fauxAssistantMessage([fauxText("已提升。")]),
+    );
+    await dm("提升为全局", "om_r1_promote");
+    await waitRunsSettled();
+    const promoted = (await ownerStub().debugSnapshot()).notes.find((n) => n.layer === "resident");
+    expect(promoted).toMatchObject({ confirmed: true, evidence: "user:om_first_report" }); // trail on the row (R1)
+    expect((await ownerStub().debugSnapshot()).notes.find((n) => n.noteId === noteId)).toMatchObject({
+      layer: "archive",
+      supersededBy: promoted?.noteId,
+    });
+  });
+
   it("a direct low-trust promotion must cite the run's own user message — an older real message is not enough", async () => {
     await runInDurableObject(ownerStub(), (instance: Steward) => {
       const ledger = (instance as unknown as { ledger: Ledger }).ledger;
