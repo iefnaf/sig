@@ -6,6 +6,7 @@ import type {
   AgentAdapter,
   AgentCapabilities,
   Delivery,
+  InterruptResult,
   RawAdapterEvent,
   ReportPayload,
   SessionUsage,
@@ -232,13 +233,16 @@ export class PiAdapter implements AgentAdapter {
 
   async send(
     id: string,
-    input: { text: string; images?: { data: string; mimeType: string }[] },
+    input: { text: string; images?: { data: string; mimeType: string }[]; commandId?: string },
     how: Delivery,
   ): Promise<{ effect?: string }> {
     const runtime = this.require(id);
     const images = input.images?.map((i) => ({ type: "image", data: i.data, mimeType: i.mimeType }));
     if (how === "prompt") {
-      await runtime.process.rpc({ type: "prompt", message: input.text, images });
+      // A prompt-path send goes through the same `/shepherd` wrapper as the initial prompt,
+      // so the commandId marker lands in the session (ADR-0001: ambiguous-command detection).
+      const message = input.commandId ? wrapPrompt(input.commandId, input.text) : input.text;
+      await runtime.process.rpc({ type: "prompt", message, images });
       return {};
     }
     const type = how === "steer" ? "steer" : "follow_up";
@@ -247,9 +251,17 @@ export class PiAdapter implements AgentAdapter {
     return { effect: how === "steer" ? "after_current_tools" : undefined };
   }
 
-  async interrupt(id: string): Promise<void> {
+  /** §6.2: `clear_queue` first — the returned texts ride the `queue_returned` event so the
+   *  steward can decide whether to resend — then `abort`. */
+  async interrupt(id: string): Promise<InterruptResult> {
     const runtime = this.require(id);
+    const queue = (await runtime.process.rpc({ type: "clear_queue" })) as {
+      steering?: unknown;
+      followUp?: unknown;
+    };
+    const returned = [...queueTexts(queue.steering), ...queueTexts(queue.followUp)];
     await runtime.process.rpc({ type: "abort" });
+    return { returned };
   }
 
   async resume(id: string, reason: string): Promise<void> {
@@ -278,6 +290,11 @@ export class PiAdapter implements AgentAdapter {
   isRunning(id: string): boolean {
     const runtime = this.runtimes.get(id);
     return !!runtime && !runtime.process.hasExited;
+  }
+
+  isStreaming(id: string): boolean {
+    const runtime = this.runtimes.get(id);
+    return !!runtime && !runtime.process.hasExited && runtime.window.open;
   }
 
   /** Live worker pids for the descendant-snapshot loop (connector-pi.md §9.3). */
@@ -471,6 +488,17 @@ function extractText(content: unknown): string {
 }
 
 export { extractText as extractAssistantText };
+
+/** `clear_queue` hands back the queued messages (real pi queues plain strings); tolerate
+ *  message-shaped items too so a future pi change cannot silently drop texts. */
+function queueTexts(items: unknown): string[] {
+  if (!Array.isArray(items)) return [];
+  return items
+    .map((item) =>
+      typeof item === "string" ? item : extractText((item as { content?: unknown } | null)?.content),
+    )
+    .filter((text) => text.length > 0);
+}
 
 /** First 80 chars of a path or command — never file contents or command output (§11.2). */
 function extractTarget(args: unknown): string | undefined {

@@ -6,7 +6,7 @@
 // is the M1 subset, shaped so those slot in without a rewrite.
 import { ulid } from "@shepherd/protocol";
 import type { HelloMessage } from "@shepherd/protocol";
-import { eventWakeText } from "./wake-text.ts";
+import { eventWakeText, queueReturnedWakeText } from "./wake-text.ts";
 
 /** Tagged-template SQL over the DO's SQLite (same shape schema.ts migrations use). */
 export type LedgerSql = <T = Record<string, unknown>>(
@@ -957,6 +957,30 @@ export function createLedger(deps: LedgerDeps) {
           workerId,
           seq,
         });
+        break;
+      }
+      case "queue_returned": {
+        // §6.2: texts `clear_queue` handed back at interrupt time — they never reached the
+        // worker. Recorded on the timeline, and the steward is woken to decide their fate
+        // (resend with authorization, tell the user, or drop).
+        const texts = (Array.isArray(event.texts) ? event.texts : []).map((t) => String(t).slice(0, 200));
+        timeline.add(worker.threadId, "note", `中断时取回 ${texts.length} 条未送达消息：${texts.join("；") || "（空）"}`, {
+          workerId,
+          seq,
+          texts,
+        });
+        if (texts.length > 0) {
+          wakes.queue(
+            "event",
+            `queue_returned:${workerId}:${seq}`,
+            queueReturnedWakeText({
+              thread: threads.get(worker.threadId),
+              worker: workers.get(workerId)!,
+              machine: machines.get(worker.deviceId),
+              texts,
+            }),
+          );
+        }
         break;
       }
       case "external_activity": {

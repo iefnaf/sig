@@ -87,3 +87,20 @@ export function routineWakeText(routineId: string, instruction: string): string 
 export function followupWakeText(followupId: string, reason: string): string {
   return `${MARK_OPEN}followup ${followupId}${MARK_CLOSE} ${reason}`;
 }
+
+/** The ⟦event⟧ wake for a `queue_returned` (connector-pi.md §6.2/§11.1): texts pi handed
+ *  back at interrupt time never reached the worker — the steward decides their fate. */
+export function queueReturnedWakeText(input: {
+  thread: ThreadRow | null;
+  worker: WorkerRow;
+  machine: MachineRow | null;
+  texts: string[];
+}): string {
+  const { thread, worker, machine } = input;
+  return [
+    `${MARK_OPEN}event${MARK_CLOSE} thread=${thread?.threadId ?? "?"} 「${thread?.title ?? "已归档"}」`,
+    `- worker ${worker.workerId}（${worker.agent}@${machine?.name ?? worker.deviceId}）被中断时，有 ${input.texts.length} 条排队消息未送达就被取回：`,
+    ...input.texts.slice(0, 5).map((text) => `  · ${text.slice(0, 120)}`),
+    "这些消息没有送到 worker。请决定：重发（send_to_worker，需用户授权或用户消息佐证）、告知用户，或确认作废；无事可做用 no_action 结束。",
+  ].join("\n");
+}

@@ -80,6 +80,8 @@ State lives under `~/.shepherd/` (set `SHEPHERD_HOME` to move it): credentials i
 
 The Feishu bot is the steward LLM: a pi conversation hosted in the Durable Object, talking to the model configured above. Natural language in, natural language out — the model dispatches through its `start_worker` tool (machine choice, branch relay, and the three-part done-report card stay deterministic), keeps Thread summaries current when workers report back, and only ever disturbs you on its own initiative through `notify_user`/`ask_user`. In event-triggered runs its plain text output is discarded by structure — quiet by default is guaranteed by the code, not the prompt.
 
+You can also reach a worker mid-run: 「改用 pnpm」 goes out as a steer (applied after the current tool batch, never interrupting it), 「做完后顺便补测试」 queues as a follow-up, and 「停下那个」 aborts the run — stopping only ever follows your explicit instruction. Anything the worker hadn't received when it stopped is reported back and kept on the Thread.
+
 Two exact phrases stay deterministic and never reach the model — they mint credentials, so they must work without one:
 
 | Phrase | What it does |

@@ -55,10 +55,16 @@ export interface ScenarioStep {
   exit?: number;
 }
 
-/** Writes a fake-pi scenario file and returns its path. */
-export function writeScenario(dir: string, name: string, runs: ScenarioStep[][]): string {
+/** Writes a fake-pi scenario file and returns its path. `startup` models a held-back or
+ *  crashing get_state (the connector's `starting` window), e.g. `{ delayMs: 500 }`. */
+export function writeScenario(
+  dir: string,
+  name: string,
+  runs: ScenarioStep[][],
+  startup?: Record<string, unknown>,
+): string {
   const path = join(dir, `${name}.scenario.json`);
-  writeFileSync(path, JSON.stringify({ runs }));
+  writeFileSync(path, JSON.stringify({ ...(startup ? { startup } : {}), runs }));
   return path;
 }
 

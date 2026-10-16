@@ -47,6 +47,12 @@ export interface WorkerHandle {
 
 export type Delivery = "prompt" | "steer" | "follow_up";
 
+/** `interrupt` (connector-pi.md §6.2): the texts pi's `clear_queue` handed back — the
+ *  undelivered steer/follow_up messages, surfaced to the steward as `queue_returned`. */
+export interface InterruptResult {
+  returned: string[];
+}
+
 /** Report tool payload, connector-pi.md §7.2 (v1 fields). */
 export interface ReportPayload {
   status: "done" | "blocked" | "needs_decision";
@@ -113,15 +119,18 @@ export interface AgentAdapter {
   start(spec: StartSpec): Promise<WorkerHandle>; // must
   send(
     id: string,
-    input: { text: string; images?: { data: string; mimeType: string }[] },
+    input: { text: string; images?: { data: string; mimeType: string }[]; commandId?: string },
     how: Delivery,
   ): Promise<{ effect?: string }>; // must
-  interrupt(id: string): Promise<void>; // must
+  interrupt(id: string): Promise<InterruptResult>; // must
   resume(id: string, reason: string): Promise<void>; // must
   stopProcess(id: string): Promise<void>; // must; frees memory, the session stays on disk
   on(event: "worker-event", fn: (e: RawAdapterEvent) => void): void;
   /** Whether the worker's process is alive (idle-hot counts). Used to pick the resume path (§9.2). */
   isRunning?(id: string): boolean;
+  /** Whether a run window is open (between agent_start and agent_settled) — i.e. there is
+   *  something for `interrupt` to abort, and a settle event must follow the abort. */
+  isStreaming?(id: string): boolean;
   /** Live worker pids for the descendant-snapshot loop (connector-pi.md §9.3). */
   workerPids?(): Array<{ workerId: string; pid: number }>;
   /** Test support: emulate a hard crash of the connector (children SIGKILLed, no cleanup). */

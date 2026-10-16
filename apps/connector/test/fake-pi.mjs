@@ -15,7 +15,8 @@
 //
 // Scenario file:
 //   {
-//     "startup": { "exit": 9 },            // optional: exit before answering get_state
+//     "startup": { "exit": 9, "delayMs": 300 },  // optional: exit before answering get_state,
+//                                               // or hold the get_state answer (a `starting` window)
 //     "runs": [ [ <step>, ... ], ... ]     // runs[k] plays on the k-th prompt
 //   }
 // Step:
@@ -25,6 +26,10 @@
 //   { "shell": "git add -A" }              // run in cwd, ignore failures
 //   { "session": { ... } }                 // append one entry to the session JSONL
 //   { "exit": 7 }                          // crash the fake pi process
+//
+// steer/follow_up messages queue like real pi ( disposition "queued"); clear_queue hands
+// them back; abort stops the scripted run and emits agent_settled{aborted:true} — the
+// §6.2 intervention surface the connector drives.
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { exec } from "node:child_process";
 import { join } from "node:path";
@@ -84,16 +89,27 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function playRun(steps) {
   for (const step of steps ?? []) {
     if (step.delayMs) await sleep(step.delayMs);
+    // abort() takes effect between steps: the run ends and agent_settled{aborted:true}
+    // fires (research #3: abort responds in ~3 ms and the process accepts new commands).
+    if (aborting) break;
     if (step.emit) writeLine(step.emit);
     if (step.raw) process.stdout.write(step.raw);
     if (step.session) appendSessionEntry(step.session);
     if (step.shell) await new Promise((r) => exec(step.shell, () => r(undefined)));
     if (step.exit !== undefined) process.exit(step.exit);
   }
+  if (aborting) {
+    aborting = false;
+    writeLine({ type: "agent_settled", aborted: true });
+  }
 }
 
 let buffer = "";
 let promptCount = 0;
+let aborting = false;
+/** Queued steer/follow_up texts — what clear_queue hands back (real pi queues strings). */
+let steeringQueue = [];
+let followUpQueue = [];
 
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
@@ -116,9 +132,11 @@ process.stdin.on("end", () => {
 
 async function handle(command) {
   const id = command.id;
+  const messageText = () => (typeof command.message === "string" ? command.message : "");
   switch (command.type) {
     case "get_state": {
       if (scenario.startup?.exit !== undefined) process.exit(scenario.startup.exit);
+      if (scenario.startup?.delayMs) await sleep(scenario.startup.delayMs);
       respond(id, "get_state", {
         sessionId,
         sessionFile,
@@ -145,15 +163,24 @@ async function handle(command) {
     }
     case "steer":
     case "follow_up": {
+      const text = messageText();
+      (command.type === "steer" ? steeringQueue : followUpQueue).push(text);
+      logPrompt({ type: command.type, text, at: Date.now() });
       respond(id, command.type, { disposition: "queued" });
       return;
     }
     case "abort": {
+      aborting = true;
+      logPrompt({ type: "abort", at: Date.now() });
       respond(id, "abort", {});
       return;
     }
     case "clear_queue": {
-      respond(id, "clear_queue", { steering: [], followUp: [] });
+      const returned = { steering: steeringQueue, followUp: followUpQueue };
+      steeringQueue = [];
+      followUpQueue = [];
+      logPrompt({ type: "clear_queue", returned, at: Date.now() });
+      respond(id, "clear_queue", returned);
       return;
     }
     case "get_session_stats": {

@@ -195,6 +195,8 @@ Key points:
 - `interrupt` implementation: first `clear_queue` (retrieve the text of undelivered queued messages into the event so the steward can decide whether to resend), then `abort`, wait for `agent_settled{aborted:true}`; if `then` is present, `prompt` again.
 - Images are passed as base64 in `images`; the connector checks size at the entrance (4 MB base64 per image by default) and rejects and reports anything larger rather than letting pi handle it.
 
+> **Implementation note (issue #9):** the queue rows' "prompt once startup completes" is applied through the state table at *delivery* time: when a queued send drains, the worker is `running`, so it is delivered as `steer`/`follow_up` by intent. Measured against pi 1.2's RPC, a bare `prompt` into a streaming agent is rejected ("Agent is already processing. Specify streamingBehavior…"), so mid-run deliveries are always `steer`/`follow_up` — which pi queues and never loses. A `send` that lands on an idle worker (hot or cold) is a `prompt` as written.
+
 ### 6.3 Idempotency and "at most once"
 
 pi's `prompt` has no `requestId`, so deduplication is the connector's job. The `command` table:
