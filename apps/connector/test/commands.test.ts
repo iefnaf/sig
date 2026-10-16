@@ -112,6 +112,7 @@ describe("command dedup (at-least-once from the DO, exactly-once execution here)
       },
     });
     await mock.waitConnected();
+    await mock.waitHello(2); // the RESTART's hello is the second frame (CI flake guard)
     // The restart's hello carries the crashed command as ambiguous in pendingAcks.
     const hello = mock.hellos().at(-1) as { pendingAcks: Array<{ cmdId: string; state: string }> };
     expect(hello.pendingAcks).toContainEqual({ cmdId, state: "ambiguous" });

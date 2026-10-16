@@ -120,7 +120,9 @@ sh_note(noteId, layer, scope_repoId?, kind, text, bytes,
         source, evidence, confirmed, pinned,
         createdAt, lastUsedAt, useCount, status, supersededBy)
 sh_note_fts(text)                     -- FTS5
-sh_note_log(ts, op, noteId, reason)   -- all changes; drives ChangeReport
+sh_note_log(id, ts, op, noteId, text, reason, reportedAt)
+                                       -- all changes (text = snapshot for the relay);
+                                       -- reportedAt marks "already relayed with a reply" (issue #18)
 ```
 
 | Layer | `layer` | Contents | Capacity | How it loads |
@@ -291,7 +293,7 @@ Five groups. Every tool returns compact text plus a few structured fields. The "
 | `find_threads(text, hints?)` | Candidates from §3 | safe |
 | `get_thread(threadId)` | Summary, workers, open questions, project-layer notes, recent timeline | safe |
 | `update_thread(threadId, {title?, goal?, summary?})` | Updates the summary | safe (idempotent overwrite) |
-| `notes_propose(draft)` / `notes_commit(draft, replaces?)` / `notes_pin(id, pinned)` / `notes_remove(id)` | Two-phase writes from §2.4 | propose: safe; commit: safe (idempotency key is the `taskId`) |
+| `notes_propose(draft)` / `notes_commit(draft, replaces?, confirmEvidence?)` / `notes_confirm(id, evidenceRef)` / `notes_pin(id, pinned)` / `notes_remove(id)` / `notes_list` | Two-phase writes from §2.4; confirm/list complete the conversation surface (issue #18). Resident writes require `evidence=user:<msgId>` (auto-attached from the triggering message in user runs); low-trust promotions require a confirmed predecessor or the run's own confirmation message | propose: safe; commit: safe (an exact-text duplicate absorbs the replay) |
 | `notes_search(q)` | Search the archive layer | safe |
 
 **Dispatch and control (via the protocol gateway)**
@@ -610,7 +612,7 @@ Legend: ✓ verified in the protocol spike; ◦ seen only in docs or type declar
 | The `beforeRequest` hook replaces only the single request and persists nothing | ✓ (issue #6: verified by test — see §4.1) |
 | A tool result's `control.terminate` ends the turn | ✓ (issue #6: ask_user / no_action terminate) |
 | `input` with a custom `entry` (distinguishing user vs event) | ? `pi-durable@1.1.0` types disallow it, the repo README allows it; `PiHarness.submit` does not expose it. The MVP uses content markers (§4.2) |
-| DO SQLite supports FTS5 and JSON functions | ✓ (issue #7): the trigram tokenizer works in workerd and node:sqlite; the sh_thread_fts triggers (insert / title-goal-summary update / delete / report insert) keep the index current — verified by probe and `test/schema.test.ts` (migration 010) |
+| DO SQLite supports FTS5 and JSON functions | ✓ (issue #7): the trigram tokenizer works in workerd and node:sqlite; the sh_thread_fts triggers (insert / title-goal-summary update / delete / report insert) keep the index current — verified by probe and `test/schema.test.ts` (migration 010). ✓ (issue #18): external-content FTS5 with the `trigram` tokenizer verified by test in workerd — insert/update/delete triggers stay in sync, CJK substring `MATCH` works; the default unicode61 tokenizer would have collapsed Chinese sentences into single tokens |
 | `ctx.storage.transactionSync` | ◦ (DO storage API) |
 | `this.schedule(cron, ...)` idempotent | ✓ (issue #20: cron dedups by expression+payload, one-shots opt in with `idempotent: true`; verified by tests incl. lost-schedule reconciliation) |
 | Feishu: QR-code creation (`registerApp` device flow) | ◦ official SDK source; no live scan performed |
