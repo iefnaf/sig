@@ -8,12 +8,10 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   configureAndBind,
   connectAndHello,
-  messageEvent,
   mockCalls,
   mockReset,
   ownerStub,
   pairDevice,
-  postEvent,
   resetLedgerState,
   sendCalls,
   waitWhileOutboundPending,
@@ -41,13 +39,14 @@ async function connectMachine() {
   };
 }
 
-/** Dispatches via the webhook and resolves the workerId from the start_worker command. */
+/** Dispatches through the deterministic service (the start_worker tool's code path — issue #6
+ *  replaced the fixed phrases with the LLM) and resolves the workerId from the command. */
 async function dispatchAndAwaitWorker(
   wsSend: { send: (data: string) => void },
   reader: { nextWhere: (pred: (m: Record<string, unknown>) => boolean, timeoutMs?: number) => Promise<Record<string, unknown>> },
 ): Promise<string> {
-  const res = await postEvent(messageEvent({ msgId: `om_${crypto.randomUUID().slice(0, 8)}`, text: "/派发 repo-a 修复登录 bug" }));
-  expect(res.status).toBe(200);
+  const outcome = await ownerStub().dispatchForTest({ prompt: "修复登录 bug", repoRef: "repo-a", newTitle: "修复登录 bug" });
+  expect(outcome.kind).toBe("dispatched");
   const cmd = await reader.nextWhere((m) => m.t === "cmd");
   wsSend.send(JSON.stringify({ t: "cmd_ack", re: cmd.id, status: "accepted" }));
   return String((cmd.args as Record<string, unknown>).workerId);

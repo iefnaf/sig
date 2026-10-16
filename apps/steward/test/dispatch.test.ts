@@ -1,51 +1,37 @@
-// Fixed-phrase parsing and deterministic machine choice (issue #5): no LLM anywhere —
-// the phrase grammar and the ADR-0001 decision-6 rule are pure functions under test.
-import { describe, expect, it } from "vitest";
-import { chooseMachine, parseOwnerText, type MachineCandidate } from "../src/dispatch.ts";
+// Deterministic machine choice and the dispatch service (issue #5 → #6): ADR-0001 decision 6
+// as a pure function, and — through the DO — the service the steward's start_worker tool calls:
+// thread create/attach, refusal texts, and the offline ask card. The M1 phrases are gone
+// (natural language reaches the LLM); the two that remain (issue #22) and everything else
+// deterministic stay tested deterministically.
+import { beforeEach, describe, expect, it } from "vitest";
+import { chooseMachine, parseOwnerCommand, type MachineCandidate } from "../src/dispatch.ts";
+import {
+  configureAndBind,
+  mockReset,
+  ownerStub,
+  pairFakeConnector,
+  resetLedgerState,
+  waitWhileOutboundPending,
+} from "./helpers.ts";
 
-describe("parseOwnerText: the M1 fixed phrases", () => {
-  it("parses /派发 with repo, optional @machine, and the prompt", () => {
-    expect(parseOwnerText("/派发 repo-a 修复登录 bug")).toEqual({
-      kind: "dispatch",
-      repoRef: "repo-a",
-      machineHint: null,
-      prompt: "修复登录 bug",
-    });
-    expect(parseOwnerText("  /dispatch repo-a@mac-studio   修复登录 bug，顺便加测试  ")).toEqual({
-      kind: "dispatch",
-      repoRef: "repo-a",
-      machineHint: "mac-studio",
-      prompt: "修复登录 bug，顺便加测试",
-    });
-    expect(parseOwnerText("/run repo-a multiline prompts\nkeep their lines")).toMatchObject({
-      kind: "dispatch",
-      prompt: "multiline prompts\nkeep their lines",
-    });
-  });
-
-  it("parses the status phrase", () => {
-    expect(parseOwnerText("/状态")).toEqual({ kind: "status" });
-    expect(parseOwnerText("/status ")).toEqual({ kind: "status" });
-  });
-
+describe("parseOwnerCommand: the two deterministic chat commands (issue #22)", () => {
   it("parses the add-machine and web-link phrases", () => {
-    expect(parseOwnerText("/加机器")).toEqual({ kind: "add_machine" });
-    expect(parseOwnerText("/添加机器 ")).toEqual({ kind: "add_machine" });
-    expect(parseOwnerText("/add-machine")).toEqual({ kind: "add_machine" });
-    expect(parseOwnerText("/addmachine")).toEqual({ kind: "add_machine" });
-    expect(parseOwnerText("/网页")).toEqual({ kind: "web_link" });
-    expect(parseOwnerText("/web ")).toEqual({ kind: "web_link" });
-    expect(parseOwnerText("/login")).toEqual({ kind: "web_link" });
-    // Trailing content means it is not the fixed phrase — it falls through to dispatch/help.
-    expect(parseOwnerText("/加机器 现在")).toBeNull();
-    expect(parseOwnerText("/网页 login.html")).toBeNull();
+    expect(parseOwnerCommand("/加机器")).toEqual({ kind: "add_machine" });
+    expect(parseOwnerCommand("/添加机器 ")).toEqual({ kind: "add_machine" });
+    expect(parseOwnerCommand("/add-machine")).toEqual({ kind: "add_machine" });
+    expect(parseOwnerCommand("/addmachine")).toEqual({ kind: "add_machine" });
+    expect(parseOwnerCommand("/网页")).toEqual({ kind: "web_link" });
+    expect(parseOwnerCommand("/web ")).toEqual({ kind: "web_link" });
+    expect(parseOwnerCommand("/login")).toEqual({ kind: "web_link" });
+    // Trailing content means it is not the fixed phrase — it falls through to the LLM.
+    expect(parseOwnerCommand("/加机器 现在")).toBeNull();
+    expect(parseOwnerCommand("/网页 login.html")).toBeNull();
   });
 
-  it("rejects everything else: natural language waits for the M2 steward", () => {
-    expect(parseOwnerText("帮我把登录 bug 修一下")).toBeNull();
-    expect(parseOwnerText("/派发")).toBeNull(); // no repo, no prompt
-    expect(parseOwnerText("/派发 repo-a")).toBeNull(); // no prompt
-    expect(parseOwnerText("/派发 repo-a@ 修复")).toBeNull(); // empty machine qualifier
+  it("everything else is the steward LLM's, including the retired M1 phrases", () => {
+    expect(parseOwnerCommand("帮我把登录 bug 修一下")).toBeNull();
+    expect(parseOwnerCommand("/派发 repo-a 修复登录 bug")).toBeNull();
+    expect(parseOwnerCommand("/状态")).toBeNull();
   });
 });
 
@@ -135,5 +121,85 @@ describe("chooseMachine: ADR-0001 decision 6, deterministic", () => {
 
   it("no candidates at all is no_match", () => {
     expect(chooseMachine({ candidates: [], machineHint: null, lastMachine: null, continuation: false })).toEqual({ kind: "no_match" });
+  });
+});
+
+// The dispatch service behind the start_worker tool, exercised through the DO with a paired
+// machine — the same code path the steward LLM's tool calls take (issue #6).
+describe("the dispatch service (Dispatcher.startWorker)", () => {
+  beforeEach(async () => {
+    await resetLedgerState();
+    await mockReset();
+    await configureAndBind("ou_owner");
+  });
+
+  it("refuses an unknown repo with actionable guidance and dispatches nothing", async () => {
+    const fake = await pairFakeConnector("mac-studio", { run: null });
+    await fake.connect();
+    const outcome = await ownerStub().dispatchForTest({ prompt: "修个东西", repoRef: "no-such-repo", newTitle: "修东西" });
+    expect(outcome).toMatchObject({ kind: "refused" });
+    expect((outcome as { reason: string }).reason).toContain("没有机器登记过仓库");
+    expect(fake.cmds).toHaveLength(0);
+    fake.close();
+  });
+
+  it("asks with buttons when the only machine with the repo is offline, creating the Thread", async () => {
+    const fake = await pairFakeConnector("mac-studio", { run: null });
+    await fake.connect();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    fake.close(); // hello registered the repo; the socket dying takes the machine offline
+    for (;;) {
+      const snap = await ownerStub().debugSnapshot();
+      if (snap.machines.every((m) => !m.online)) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+
+    const outcome = await ownerStub().dispatchForTest({ prompt: "修个东西", repoRef: "repo-a", newTitle: "修个东西" });
+    expect(outcome).toMatchObject({ kind: "asked_offline", machineName: "mac-studio" });
+    const snap = await ownerStub().debugSnapshot();
+    expect(snap.threads).toHaveLength(1); // the ask created the Thread and set affinity
+    expect(snap.threads[0]!.workers).toHaveLength(0); // nothing dispatched: ask, don't decide
+    expect(snap.threads[0]!.lastMachine).toBe(fake.deviceId);
+    await waitWhileOutboundPending();
+    const cards = (await ownerStub().outboundRows(10)).filter((r) => r.kind === "card" && r.status === "sent");
+    expect(JSON.stringify(cards[0]?.payload)).toContain("排队等上线");
+  });
+
+  it("attaches to an existing thread and relays the previous branch as base", async () => {
+    const fake = await pairFakeConnector("mac-studio", {
+      run: { status: "done", summary: "第一段完成", branch: "shepherd/leg-1" },
+    });
+    await fake.connect();
+    const first = await ownerStub().dispatchForTest({ prompt: "第一段任务", repoRef: "repo-a", newTitle: "第一段任务" });
+    expect(first).toMatchObject({ kind: "dispatched", created: true });
+    await fake.waitForCmds(1);
+    for (;;) {
+      const snap = await ownerStub().debugSnapshot();
+      if (snap.threads[0]!.workers[0]?.state === "idle") break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    const threadId = (await ownerStub().debugSnapshot()).threads[0]!.threadId;
+
+    const second = await ownerStub().dispatchForTest({ prompt: "第二段任务", repoRef: "repo-a", threadId });
+    expect(second).toMatchObject({ kind: "dispatched", created: false, threadId });
+    const [, cmd2] = await fake.waitForCmds(2);
+    expect((cmd2!.args as Record<string, unknown>).base).toBe("shepherd/leg-1"); // relay (spec §5.3)
+    // cmdId = tool:<taskId> is asserted in llm-reply.test.ts, where the real tool runs
+    fake.close();
+  });
+
+  it("a duplicate cmdId converges on the same command row (replay idempotency)", async () => {
+    const fake = await pairFakeConnector("mac-studio", { run: null });
+    await fake.connect();
+    const first = await ownerStub().dispatchForTest({ prompt: "任务", repoRef: "repo-a", newTitle: "任务" });
+    expect(first).toMatchObject({ kind: "dispatched" });
+    const [cmd] = await fake.waitForCmds(1);
+    const threadId = (first as { threadId: string }).threadId;
+    // Same cmdId again (what a replayed tool call would produce): one command, ever.
+    const outcome = await ownerStub().dispatchForTest({ prompt: "任务", repoRef: "repo-a", threadId, cmdId: String(cmd!.id) });
+    expect(outcome).toMatchObject({ kind: "dispatched" });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(fake.cmds).toHaveLength(1);
+    fake.close();
   });
 });

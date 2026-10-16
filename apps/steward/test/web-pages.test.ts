@@ -63,7 +63,9 @@ describe("report cards carry the one-time 查看详情 link", () => {
       run: { status: "done", summary: "登录 bug 修好，测试通过", changes: ["auth/session.ts 补上过期刷新"], branch: "shepherd/login-1" },
     });
     await fake.connect();
-    await ownerDm("/派发 repo-a 修复登录 bug");
+    // The steward LLM owns natural language now (issue #6); the deterministic dispatch path
+    // its start_worker tool drives is entered directly here — same Thread, timeline, and card.
+    await ownerStub().dispatchForTest({ prompt: "修复登录 bug", repoRef: "repo-a", newTitle: "修复登录 bug" });
     await waitForWorkerIdle();
     await waitWhileOutboundPending();
 
@@ -100,7 +102,7 @@ describe("report cards carry the one-time 查看详情 link", () => {
       run: { status: "needs_decision", summary: "卡住了", question: "要不要删库？" },
     });
     await fake.connect();
-    await ownerDm("/派发 repo-a 干件大事");
+    await ownerStub().dispatchForTest({ prompt: "干件大事", repoRef: "repo-a", newTitle: "干件大事" });
     await waitForWorkerIdle();
     await waitWhileOutboundPending();
     const [card] = await sentCards();

@@ -14,7 +14,6 @@ import {
   connectWeb,
   mockReset,
   nextClose,
-  ownerDm,
   ownerStub,
   pairFakeConnector,
   resetLedgerState,
@@ -34,9 +33,10 @@ function scriptedHistory(): Array<Record<string, unknown>> {
   }));
 }
 
-/** Dispatches one worker through the real /派发 path and waits for it to settle. */
+/** Dispatches one worker through the deterministic path (post-#6: the model's start_worker
+ * tool drives this same code) and waits for the scripted fake run to settle. */
 async function dispatchOneWorker(fake: FakeConnector): Promise<{ threadId: string; workerId: string }> {
-  await ownerDm("/派发 repo-a 修复登录 bug");
+  await ownerStub().dispatchForTest({ prompt: "修复登录 bug", repoRef: "repo-a", newTitle: "修复登录 bug" });
   return waitForWorkerState("idle");
 }
 

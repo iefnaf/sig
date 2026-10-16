@@ -8,6 +8,15 @@
 // are generated at deploy time through the Deploy-to-Cloudflare form (root .dev.vars.example
 // + cloudflare.bindings descriptions in the root package.json) or set manually with
 // `wrangler secret put`. See docs/deploy.md.
+//
+// The steward's model selection (issue #6, ADR-0001 decision 11) is deploy config — set
+// `vars.STEWARD_MODEL` here to override the default deepseek/deepseek-flash (the eval
+// baseline), e.g.:
+//   "vars": { "STEWARD_MODEL": "{\"provider\": \"deepseek\", \"modelId\": \"deepseek-v4-pro\"}" }
+// The API key never rides in vars: it is the sealed sh_model row (seeded from MODEL_KEY at
+// deploy, or set via setModelConfig), and the provider is built with an inline
+// auth.apiKey.resolve (spike bug 7). A missing key or unknown provider/model fails visibly
+// (`sh_run` settles `unanswered`), never with a silently different model.
 {
   "name": "shepherd-steward",
   "main": "apps/steward/src/index.ts",

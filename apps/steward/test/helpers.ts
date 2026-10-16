@@ -1,6 +1,6 @@
 import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { expect } from "vitest";
-import type { Steward } from "../src/steward.ts";
+import type { ShOutboundRow, Steward } from "../src/steward.ts";
 
 export function ownerStub() {
   const id = env.Steward.idFromName("owner");
@@ -33,7 +33,11 @@ export async function resetChannelState(): Promise<void> {
 /** Clears everything issue #5's loop touches: the ledger tables, the protocol queues, pairing. */
 export async function resetLedgerState(): Promise<void> {
   await resetChannelState();
-  await runInDurableObject(ownerStub(), (instance: Steward) => {
+  await runInDurableObject(ownerStub(), async (instance: Steward) => {
+    // The steward conversation must not leak between tests: dispose pi, drop its tables,
+    // and clear the run/wake bookkeeping (sh_run/sh_wake are ledger-owned but reset here as
+    // part of the LLM state, together with the pi tables they mirror).
+    await instance.resetLlmStateForTests();
     // The tagged template needs literal fragments; table names are looped, so use the raw
     // storage executor instead (same SQLite the migrations run on). `ctx` is protected on the
     // SDK class, hence the shape cast.
@@ -46,6 +50,67 @@ export async function resetLedgerState(): Promise<void> {
       storage.sql.exec(`DELETE FROM ${table}`);
     }
   });
+}
+
+/** llmState's shape, declared locally: through the RPC stub's inferred type the class method's
+ *  return collapses to `never`, so tests read it through this view instead. */
+export interface LlmStateView {
+  runs: Array<{ operationId: string; kind: string; status: string; resultStatus: string | null; resultReason: string | null; resultText: string | null; replyOutboundId: string | null; routedThreadId: string | null }>;
+  inputs: Array<{ operationId: string; kind: string; text: string }>;
+  assistantTexts: string[];
+  raw: unknown[];
+}
+
+export async function llmState(): Promise<LlmStateView> {
+  return ownerStub().llmState();
+}
+
+// ---- The scripted steward model (issue #6) -------------------------------------------------------
+// The DO's STEWARD_MODEL binding points at the faux provider; these helpers queue replies and
+// read back what the model saw. Steps are built with fauxAssistantMessage/fauxToolCall from
+// pi-ai (plain JSON, RPC-serializable).
+
+export async function scriptModel(...steps: unknown[]): Promise<void> {
+  await ownerStub().fauxScript(steps as never[]);
+}
+
+export async function modelRequests(): Promise<Array<{ at: number; userText: string; brief: string | null; lastToolResult: string }>> {
+  return ownerStub().fauxRequests();
+}
+
+/**
+ * Polls ONLY the outbound queue until a sent text row equals `text` — deliberately never
+ * touches pollRuns/drainWakes, so alarm-driven paths (review #1's regression) must carry the
+ * run home on their own.
+ */
+export async function waitForSentText(text: string, timeoutMs = 25_000): Promise<ShOutboundRow | null> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const rows = await ownerStub().outboundRows(50);
+    const hit = rows.find((r) => r.kind === "text" && r.status === "sent" && (JSON.parse(r.payload as string) as { text?: string }).text === text);
+    if (hit) return hit;
+    if (Date.now() > deadline) throw new Error(`sent text never arrived: ${text} (rows: ${JSON.stringify(rows.map((r) => [r.kind, r.status]))})`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+/** Polls until every sh_run row is settled and no wake is pending (the alarm paths settle). */
+export async function waitRunsSettled(timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const state = await llmState();
+    const snap = await ownerStub().debugSnapshot();
+    const openRuns = state.runs.filter((r) => r.status === "open");
+    const pendingWakes = snap.wakes.filter((w) => w.status === "pending");
+    if (openRuns.length === 0 && pendingWakes.length === 0) return;
+    if (Date.now() > deadline) {
+      throw new Error(`runs/wakes still pending: ${JSON.stringify({ runs: state.runs, wakes: snap.wakes })}`);
+    }
+    // The alarm-driven poll runs every 2s in production; nudge it for deterministic tests.
+    await ownerStub().pollRuns();
+    await ownerStub().drainWakes();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
 }
 
 // ---- Feishu mock (service binding FEISHU_API, wired in vitest.config.ts) ----
@@ -594,7 +659,7 @@ export class FakeConnector {
     this.send({ t: "events", id: `evt-${workerId}-${seq}`, batch: [{ workerId, seq, ts: Date.now(), type: kind, ...fields }] });
   }
 
-  private send(message: Record<string, unknown>): void {
+  send(message: Record<string, unknown>): void {
     if (!this.ws) throw new Error("fake connector not connected");
     this.ws.send(JSON.stringify(message));
   }
@@ -614,10 +679,16 @@ export class FakeConnector {
 /** Pairs a device for the fake connector and returns it, ready to connect. */
 export async function pairFakeConnector(
   name = "mac-studio",
-  options: { run?: FakeWorkerRun | null; repos?: FakeRepo[] } = {},
+  options: { run?: FakeWorkerRun | null; repos?: FakeRepo[]; autorun?: boolean } = {},
 ): Promise<FakeConnector> {
   const { deviceId, token } = await pairDevice(name);
-  return new FakeConnector({ deviceId, token, repos: options.repos ?? [{ repoId: "/srv/repo-a", name: "repo-a" }], run: options.run });
+  return new FakeConnector({
+    deviceId,
+    token,
+    repos: options.repos ?? [{ repoId: "/srv/repo-a", name: "repo-a" }],
+    run: options.run,
+    ...(options.autorun === undefined ? {} : { autorun: options.autorun }),
+  });
 }
 
 // ---- The owner's web session (issue #22 login, reused by the L3 stream tests) -------------------

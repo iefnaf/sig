@@ -8,7 +8,7 @@ import {
   FakeConnector,
   configureAndBind,
   mockReset,
-  ownerDm,
+  ownerStub,
   pairFakeConnector,
   resetLedgerState,
   waitForWorkerState,
@@ -22,7 +22,9 @@ beforeEach(async () => {
 });
 
 async function dispatchOneWorker(fake: FakeConnector): Promise<{ threadId: string; workerId: string }> {
-  await ownerDm("/派发 repo-a 修复登录 bug");
+  // Post-#6 the owner's natural language goes through the steward LLM; its start_worker tool
+  // drives the deterministic dispatch path, entered directly here (same as web-pages tests).
+  await ownerStub().dispatchForTest({ prompt: "修复登录 bug", repoRef: "repo-a", newTitle: "修复登录 bug" });
   return waitForWorkerState("idle");
 }
 
