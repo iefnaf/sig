@@ -7,7 +7,7 @@ export type Channel = "feishu";
 
 /** An accepted inbound event; `msgId` is the caller's dedup key (§9.1, §11). */
 export interface InboundEvent {
-  kind: "message" | "other";
+  kind: "message" | "card_action" | "other";
   msgId: string;
   eventId: string;
   eventType: string;
@@ -19,6 +19,12 @@ export interface InboundEvent {
   /** Quoted message id — the strongest routing signal (steward.md §3.1). */
   parentId?: string;
   createAt?: number;
+  /** Card callbacks: who clicked. */
+  operatorId?: string;
+  /** Card callbacks: the button's value action (identity never rides in the button). */
+  action?: string;
+  /** Card callbacks: the card's message id — resolves the Thread via providerMsgId (§3.1). */
+  cardMsgId?: string;
   raw: unknown;
 }
 
