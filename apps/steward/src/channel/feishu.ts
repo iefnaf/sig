@@ -60,10 +60,11 @@ export interface ApplicationConfigPatch {
   };
 }
 
-/** Minimal cache surface the DO implements (sh_channel_token + the refresh alarm). */
+/** Minimal cache surface the DO implements (sh_channel_token + the refresh alarm). The
+ * stored form is sealed (secretbox), so both halves are async. */
 export interface TokenStore {
-  getCachedToken(): { token: string; expiresAt: number } | null;
-  saveToken(token: string, expiresAt: number): void;
+  getCachedToken(): Promise<{ token: string; expiresAt: number } | null>;
+  saveToken(token: string, expiresAt: number): Promise<void>;
 }
 
 export interface FeishuAdapterOptions {
@@ -257,7 +258,7 @@ export class FeishuAdapter implements ChannelAdapter {
 
   /** tenant_access_token cached by the DO and refreshed ahead of expiry (steward.md §9.2). */
   async getTenantAccessToken(): Promise<string> {
-    const cached = this.#tokens.getCachedToken();
+    const cached = await this.#tokens.getCachedToken();
     const now = this.#now();
     if (cached && cached.expiresAt - TOKEN_REFRESH_MARGIN_MS > now) return cached.token;
     const data = (await this.#api("/open-apis/auth/v3/tenant_access_token/internal", {
@@ -269,7 +270,7 @@ export class FeishuAdapter implements ChannelAdapter {
       throw new Error("tenant_access_token response malformed");
     }
     const expiresAt = now + data.expire * 1000;
-    this.#tokens.saveToken(data.tenant_access_token, expiresAt);
+    await this.#tokens.saveToken(data.tenant_access_token, expiresAt);
     return data.tenant_access_token;
   }
 

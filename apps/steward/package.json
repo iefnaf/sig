@@ -4,10 +4,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
-    "cf-typegen": "wrangler types",
-    "typecheck": "wrangler types && tsc --noEmit",
+    "dev": "wrangler dev --config ../../wrangler.jsonc",
+    "deploy": "wrangler deploy --config ../../wrangler.jsonc",
+    "cf-typegen": "wrangler types --config ../../wrangler.jsonc worker-configuration.d.ts",
+    "typecheck": "wrangler types --config ../../wrangler.jsonc worker-configuration.d.ts && tsc --noEmit",
     "test": "vitest run"
   },
   "dependencies": {

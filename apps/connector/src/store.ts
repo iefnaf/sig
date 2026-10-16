@@ -101,6 +101,12 @@ export class LocalStore {
     return next;
   }
 
+  /** Replaces just the token — SERVER_KEY rotation (issue #27): the steward hands the
+   * connector a rekeyed token on welcome; serverUrl/deviceId/epoch are unchanged. */
+  updateToken(token: string): void {
+    this.db.prepare("UPDATE credentials SET token = ? WHERE id = 0").run(token);
+  }
+
   clearCredentials(): void {
     this.db.exec("DELETE FROM credentials");
   }

@@ -1,0 +1,20 @@
+// The deploy target (issue #25): Deploy-to-Cloudflare buttons and Workers Builds read the
+// Wrangler config from the repository root, and the default deploy command `npx wrangler
+// deploy` runs there — so the steward Worker's config lives here, pointing into the monorepo
+// (ADR-0001 decision 2) instead of apps/steward/. Local dev/tests pass
+// `--config ../../wrangler.jsonc` from apps/steward.
+//
+// SERVER_KEY, SETUP_TOKEN, and MODEL_KEY are secrets, deliberately NOT declared here: they
+// are generated at deploy time through the Deploy-to-Cloudflare form (root .dev.vars.example
+// + cloudflare.bindings descriptions in the root package.json) or set manually with
+// `wrangler secret put`. See docs/deploy.md.
+{
+  "name": "shepherd-steward",
+  "main": "apps/steward/src/index.ts",
+  "compatibility_date": "2026-10-10",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [{ "name": "Steward", "class_name": "Steward" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Steward"] }]
+}

@@ -140,15 +140,28 @@ Both ends can crash at any moment; exactly-once is unattainable. The trade-off: 
 The token is issued by the DO at pairing time, in the format:
 
 ```
-st1.<deviceId>.<epoch>.<issuedAt>.<mac>
-mac = HMAC-SHA256(SERVER_KEY, "st1." + deviceId + "." + epoch + "." + issuedAt)
+st1.<keyId>.<deviceId>.<epoch>.<issuedAt>.<mac>
+mac   = HMAC-SHA256(key.secret, "st1." + keyId + "." + deviceId + "." + epoch + "." + issuedAt)
+keyId = first 8 hex chars of SHA-256("shepherd:keyid:v1:" + key.secret)
 ```
 
-- `SERVER_KEY` is a random value generated at deploy time and stored as a Worker secret.
-- **Worker-layer pre-check** (`onBeforeConnect`, does not wake the DO): validates the format and the `mac`, returning 401 outright on failure. Blindly probed requests never reach the DO and trigger no DO billing.
+- `SERVER_KEY` is a random value generated at deploy time and stored as a Worker secret. The optional `SERVER_KEY_PREVIOUS` secret holds the preceding key during a rotation window (below); the verifier accepts tokens signed by either — tokens minted before the `keyId` segment existed (`st1.<deviceId>.<epoch>.<issuedAt>.<mac>`) are tried against every configured key.
+- **Worker-layer pre-check** (`onBeforeConnect`, does not wake the DO): validates the format and the `mac` against the key set, returning 401 outright on failure. Blindly probed requests never reach the DO and trigger no DO billing.
 - **DO-layer check** (`onConnect`): consults the `device` table and confirms the device exists, its `epoch` matches the current one, and it has not been revoked; otherwise it closes with `4401` / `4403`.
 - Revocation = increment the device's `epoch` and close its connection; every previously issued token becomes invalid at once, so there is no blacklist to maintain.
 - The token is a **bearer token**: whoever steals it can impersonate the device. Mitigations: transport is TLS-only; it is stored locally with `0600` permissions; revocation is cheap; it can later be upgraded to a device key pair with a signed challenge — the protocol already reserves room for that (the `hello.auth` extension field).
+
+#### SERVER_KEY rotation procedure (no re-pairing)
+
+The `keyId` segment plus the `SERVER_KEY_PREVIOUS` window make the key rotatable without invalidating paired machines:
+
+1. `wrangler secret put SERVER_KEY_PREVIOUS` — paste the **old** `SERVER_KEY`.
+2. `wrangler secret put SERVER_KEY` — paste the **new** key (generate e.g. with `openssl rand -hex 32`).
+3. `wrangler deploy` — a resident isolate pins the secrets it started with (spike-conclusions §3), so redeploy to evict it.
+4. Wait for every machine to reconnect once. Each `welcome` on a connection authenticated with the previous key carries a rekeyed `token` (§6.1) minted under the new key; the connector persists it and uses it for every future reconnect. Sealed secrets (Feishu/model credentials) are re-sealed under the new key on their next read.
+5. `wrangler secret delete SERVER_KEY_PREVIOUS` + `wrangler deploy` — close the window. Machines that never reconnected during the window (or that keep a pre-`keyId` token) fail auth with `4401` and must re-pair; sealed secrets that were never re-read re-open as unconfigured and accept fresh credentials via the setup flow.
+
+Leaving `SERVER_KEY_PREVIOUS` unset at step 1 (rotating "cold") is the same as jumping straight to step 5: every existing token and sealed secret becomes invalid.
 
 ### 5.2 Pairing flow
 
@@ -217,11 +230,13 @@ A connector connection sending browser-type messages, or a browser connection se
   "t": "welcome", "re": "<hello.id>",
   "protocol": 1, "serverTime": 1791965696285, "sessionId": "…",
   "acks": { "w…": 126 },
-  "limits": { "maxMessageBytes": 262144, "batchMs": 250, "batchEvents": 50 }
+  "limits": { "maxMessageBytes": 262144, "batchMs": 250, "batchEvents": 50 },
+  "token": "st1.<keyId>.<deviceId>.<epoch>.<issuedAt>.<mac>"
 }
 ```
 
 - `acks`: the highest `seq` per worker already persisted by the DO. The connector replays from after it.
+- `token`: present only during a `SERVER_KEY` rotation window (§5.1), when the connection authenticated with a non-primary key. The connector persists it and uses it for future reconnects; absent on normal welcomes.
 - Failed negotiation: `4426`, with the supported version range given in the close reason.
 
 The DO then re-sends the unacknowledged commands in `outbox` (§4.2).

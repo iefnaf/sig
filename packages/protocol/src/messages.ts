@@ -64,6 +64,10 @@ export const WelcomeMessageSchema = z.object({
     batchMs: z.number().int(),
     batchEvents: z.number().int(),
   }),
+  // SERVER_KEY rotation (issue #27): when the connection authenticated with a non-primary
+  // key, the DO hands the connector a freshly minted primary-key token; the connector
+  // persists it and uses it for every future reconnect. Absent on normal welcomes.
+  token: z.string().optional(),
 });
 
 export type WelcomeMessage = z.infer<typeof WelcomeMessageSchema>;
