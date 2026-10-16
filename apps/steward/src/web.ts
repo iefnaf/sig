@@ -169,6 +169,14 @@ const KIND_LABELS: Record<string, string> = {
   stall: "长时间静默",
 };
 
+/** Worker `lastOutcome` codes this feature adds, rendered in the UI's language; every other
+ *  code keeps its raw form (the pre-existing pattern, e.g. `start_failed:…`). */
+const OUTCOME_LABELS: Record<string, string> = {
+  reaped: "失联（DO 回收）",
+  cancelled: "命令已撤回",
+  "error:stall": "挂死（重启一次仍无输出）",
+};
+
 function relTime(ts: number, now: number): string {
   const delta = Math.max(0, now - ts);
   if (delta < 60_000) return "刚刚";
@@ -510,7 +518,8 @@ export function renderTimeline(view: TimelineView, now: number): string {
   });
   const workerRows = workers.map((w) => {
     const state = w.state === "running" || w.state === "starting" ? "▶" : w.state === "broken" ? "❌" : "·";
-    return `<li>${state} ${esc(w.agent)} @ ${esc(w.machineName)}${w.branch ? ` · 分支 ${esc(w.branch)}` : ""}${w.lastOutcome ? ` · ${esc(w.lastOutcome)}` : ""}</li>`;
+    const outcome = w.lastOutcome ? ` · ${esc(OUTCOME_LABELS[w.lastOutcome] ?? w.lastOutcome)}` : "";
+    return `<li>${state} ${esc(w.agent)} @ ${esc(w.machineName)}${w.branch ? ` · 分支 ${esc(w.branch)}` : ""}${outcome}</li>`;
   });
   return `<h1>${thread.unread ? "● " : ""}${esc(thread.title)}</h1>${stateBadge(thread.state)}
 <p class="meta">${meta}</p>

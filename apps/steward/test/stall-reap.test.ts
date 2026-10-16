@@ -43,6 +43,15 @@ async function connectMachine(): Promise<FakeConnector> {
   return fake;
 }
 
+/** Dispatches to an online machine and never emits `started` — a wedged connector's shape. */
+async function dispatchCmdWithoutStart(): Promise<{ fake: FakeConnector; workerId: string }> {
+  const fake = await connectMachine();
+  const outcome = await ownerStub().dispatchForTest({ prompt: "卡在启动", repoRef: "repo-a", newTitle: "卡在启动" });
+  if (outcome.kind !== "dispatched") throw new Error(`dispatch failed: ${outcome.kind}`);
+  await fake.waitForCmds(1);
+  return { fake, workerId: outcome.workerId };
+}
+
 /** Dispatches a task through the deterministic service, acks the command, and emits `started`. */
 async function dispatchRunningWorker(prompt: string): Promise<{ fake: FakeConnector; workerId: string; threadId: string }> {
   const fake = await connectMachine();
@@ -512,13 +521,115 @@ describe("a queued start_worker is never reaped into a duplicate dispatch (issue
     fake.close();
     void (await mockCalls());
   }, 30_000);
+});
 
-  /** Dispatches to an online machine and never emits `started` — a wedged connector's shape. */
-  async function dispatchCmdWithoutStart(): Promise<{ fake: FakeConnector; workerId: string }> {
-    const fake = await connectMachine();
-    const outcome = await ownerStub().dispatchForTest({ prompt: "卡在启动", repoRef: "repo-a", newTitle: "卡在启动" });
-    if (outcome.kind !== "dispatched") throw new Error(`dispatch failed: ${outcome.kind}`);
-    await fake.waitForCmds(1);
-    return { fake, workerId: outcome.workerId };
+describe("terminal start_worker verdicts close wedged starting workers (PR #41 review findings 1-2)", () => {
+  /** Rewrites the worker's start_worker outbox row and backdates its silence clock. */
+  async function setCommandAndClock(
+    workerId: string,
+    cmdSql: string,
+    silentMinutes: number,
+  ): Promise<void> {
+    await runInDurableObject(ownerStub(), (instance: Steward, state: DurableObjectState) => {
+      if (cmdSql) state.storage.sql.exec(cmdSql);
+      state.storage.sql.exec(`UPDATE sh_worker SET createdAt = ${Date.now() - silentMinutes * MIN} WHERE workerId = '${workerId}'`);
+    });
   }
+
+  it("a lapsed notAfter delivery window is a queue timeout: broken + push, never \"已撤回\"", async () => {
+    const { fake, workerId } = await dispatchCmdWithoutStart();
+    fake.close(); // the machine drops before the command is acked; the row stays `sent`
+
+    // The ack deadline and the delivery window both lapse (the resendUnacked alarm path is
+    // the writer in production — deliver() flips the row instead of re-sending).
+    await setCommandAndClock(
+      workerId,
+      `UPDATE outbox SET notAfter = 1, ackDeadline = 1 WHERE workerId = '${workerId}'`,
+      11,
+    );
+    await ownerStub().resendUnacked();
+    const cmdRow = await runInDurableObject(ownerStub(), (instance: Steward, state: DurableObjectState) =>
+      state.storage.sql.exec(`SELECT state, failReason FROM outbox WHERE workerId = '${workerId}'`).toArray(),
+    );
+    expect(cmdRow[0]).toMatchObject({ state: "failed", failReason: "not_after" });
+
+    expect(await sweep()).toEqual({ stalled: 0, reaped: 1 });
+    const row = await waitForWorkerState(workerId, "broken");
+    expect(row!.worker.lastOutcome).toMatch(/^start_failed:命令过期未送达/);
+    // The timeline records a failed dispatch, NOT a user withdrawal (finding 1's lie).
+    expect(row!.thread.timeline.some((e) => e.text.includes("派发失败"))).toBe(true);
+    expect(row!.thread.timeline.some((e) => e.text.includes("已撤回"))).toBe(false);
+    expect(row!.thread.state).toBe("idle"); // nothing is running; re-dispatch is open
+    await waitWhileOutboundPending();
+    const [card] = await sentCards();
+    expect(JSON.stringify(JSON.parse(card!.payload as string))).toContain("命令过期未送达");
+    void (await mockCalls());
+  }, 30_000);
+
+  it("an ambiguous start_worker closes as quiet lost+reaped at the silent horizon — and resurrects if alive", async () => {
+    const { fake, workerId } = await dispatchCmdWithoutStart();
+
+    // The connector crashed mid-send (§4.2: terminal, never re-delivered, undecidable).
+    await setCommandAndClock(workerId, `UPDATE outbox SET state = 'ambiguous' WHERE workerId = '${workerId}'`, 46);
+    expect(await sweep()).toEqual({ stalled: 0, reaped: 1 });
+
+    const row = await waitForWorkerState(workerId, "lost");
+    expect(row!.worker.lastOutcome).toBe("reaped");
+    expect(row!.thread.state).toBe("idle"); // no push: "it failed" might be a lie
+    await waitWhileOutboundPending();
+    expect((await sentCards()).length).toBe(0);
+
+    // Undecidable means maybe-alive: a live event after the close brings the worker back.
+    await fake.emit("progress", workerId, { phase: "tool", tool: "edit", target: "src/ambiguous.ts", turn: 1 });
+    const back = await waitForWorkerState(workerId, "running");
+    expect(back!.worker.lastOutcome).toBeNull();
+    fake.close();
+    void (await mockCalls());
+  }, 30_000);
+
+  it("a worker whose command row never existed closes with a start-failure push", async () => {
+    const { fake, workerId } = await dispatchCmdWithoutStart();
+
+    // Registration succeeded but setCmdId never ran (enqueue threw): no outbox row at all.
+    await setCommandAndClock(workerId, `UPDATE sh_worker SET cmdId = NULL WHERE workerId = '${workerId}'`, 46);
+    expect(await sweep()).toEqual({ stalled: 0, reaped: 1 });
+
+    const row = await waitForWorkerState(workerId, "broken");
+    expect(row!.worker.lastOutcome).toMatch(/^start_failed:派发命令未能创建/);
+    expect(row!.thread.state).toBe("idle");
+    await waitWhileOutboundPending();
+    expect((await sentCards()).length).toBe(1);
+    fake.close();
+    void (await mockCalls());
+  }, 30_000);
+
+  it("an accepted-but-never-resulted start_worker closes at the online-silent horizon (PR #46 review finding 1)", async () => {
+    const { fake, workerId } = await dispatchCmdWithoutStart();
+
+    // The connector acked (accepted), then died or hung before any cmd_result — nothing
+    // else ever transitions that row, and a hung connector keeps the machine reading online.
+    await setCommandAndClock(workerId, `UPDATE outbox SET state = 'accepted' WHERE workerId = '${workerId}'`, 46);
+    expect(await sweep()).toEqual({ stalled: 0, reaped: 1 });
+
+    const row = await waitForWorkerState(workerId, "lost");
+    expect(row!.worker.lastOutcome).toBe("reaped");
+    expect(row!.thread.state).toBe("idle"); // the Thread no longer wedges in running
+    await waitWhileOutboundPending();
+    expect((await sentCards()).length).toBe(0); // quiet: the run may be alive on the machine
+    fake.close();
+    void (await mockCalls());
+  }, 30_000);
+
+  it("a done start on a machine offline for a measured 11 minutes reaps at the offline clock, not 45 (PR #46 review finding 4)", async () => {
+    const { fake, workerId } = await dispatchCmdWithoutStart();
+    fake.close(); // the connector died right after the successful start
+    await setMachineOffline(11);
+    await setCommandAndClock(workerId, `UPDATE outbox SET state = 'done' WHERE workerId = '${workerId}'`, 11);
+
+    expect(await sweep()).toEqual({ stalled: 0, reaped: 1 });
+    const row = await waitForWorkerState(workerId, "lost");
+    expect(row!.worker.lastOutcome).toBe("reaped");
+    expect(row!.thread.state).toBe("idle");
+    void (await mockCalls());
+  }, 30_000);
 });

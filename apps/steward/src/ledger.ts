@@ -501,7 +501,12 @@ export function createLedger(deps: LedgerDeps) {
           );
           recomputeThreadState(worker.threadId);
         } else if (worker.state === "lost" && snapActive) {
-          sql`UPDATE sh_worker SET state = ${snap.state}, updatedAt = ${now()} WHERE workerId = ${worker.workerId}`;
+          sql`
+            UPDATE sh_worker SET state = ${snap.state},
+                                lastOutcome = CASE WHEN lastOutcome = 'reaped' THEN NULL ELSE lastOutcome END,
+                                updatedAt = ${now()}
+            WHERE workerId = ${worker.workerId}
+          `;
           timeline.add(worker.threadId, "resumed", "已恢复运行（连接器重启后对账）", {
             workerId: worker.workerId,
             reconciled: true,
@@ -524,8 +529,10 @@ export function createLedger(deps: LedgerDeps) {
      * A start_worker the connector rejected or that failed (cmd_ack rejected / cmd_result
      * ok:false). Marks the worker broken, records it on the timeline, and queues a failure
      * push — deterministic, idempotent (duplicate cmd_results re-settle the same command).
+     * `cmdId` may be null when the command row never came to exist (enqueue threw): the
+     * dedupe key then falls back to the workerId.
      */
-    markStartFailed(workerId: string, cmdId: string, reason: string): boolean {
+    markStartFailed(workerId: string, cmdId: string | null, reason: string): boolean {
       const worker = workers.get(workerId);
       if (!worker || worker.state === "broken") return false;
       sql`
@@ -534,7 +541,7 @@ export function createLedger(deps: LedgerDeps) {
       `;
       timeline.add(worker.threadId, "note", `派发失败（${reason}）`, { workerId, cmdId });
       sql`UPDATE sh_thread SET unread = 1, lastActivityAt = ${now()} WHERE threadId = ${worker.threadId}`;
-      notifications.queue(`start_failed:${cmdId}`, "failure_push", worker.threadId, workerId);
+      notifications.queue(`start_failed:${cmdId ?? workerId}`, "failure_push", worker.threadId, workerId);
       recomputeThreadState(worker.threadId);
       return true;
     },
@@ -614,40 +621,46 @@ export function createLedger(deps: LedgerDeps) {
             ?.processedUpTo ?? 0;
         if (pending.lastSeq > processed) continue; // still gated
         const worker = workers.get(pending.workerId);
-        sql`DELETE FROM sh_reap_pending WHERE workerId = ${pending.workerId}`;
-        resolved += 1;
-        if (!worker || worker.state !== "lost" || worker.lastOutcome !== "reaped") continue; // the story moved on
-        const snapActive = (ACTIVE_WORKER_STATES as readonly string[]).includes(pending.snapState);
-        if (snapActive) {
-          sql`
-            UPDATE sh_worker SET state = 'running', lastOutcome = NULL, updatedAt = ${now()}
-            WHERE workerId = ${pending.workerId}
-          `;
-          timeline.add(pending.threadId, "resumed", "已恢复运行（回收后按连接器快照对账）", {
-            workerId: pending.workerId,
-            reconciled: true,
-          });
-        } else {
-          // The connector says the run ended while it was unreachable: take its word for it.
-          sql`
-            UPDATE sh_worker SET state = ${pending.snapState}, updatedAt = ${now()}
-            WHERE workerId = ${pending.workerId}
-          `;
-          timeline.add(pending.threadId, "note", `对账：连接器报告运行已结束（${pending.snapState}）`, {
-            workerId: pending.workerId,
-            reconciled: true,
-          });
-        }
-        recomputeThreadState(pending.threadId);
+        // One verdict, one transaction (PR #46 review finding 3): the delete and the state
+        // writes commit together — a crash between them would lose the parked verdict and
+        // leave the worker lost+reaped with nothing left to resolve it.
+        tx(() => {
+          sql`DELETE FROM sh_reap_pending WHERE workerId = ${pending.workerId}`;
+          resolved += 1;
+          if (!worker || worker.state !== "lost" || worker.lastOutcome !== "reaped") return; // the story moved on
+          const snapActive = (ACTIVE_WORKER_STATES as readonly string[]).includes(pending.snapState);
+          if (snapActive) {
+            sql`
+              UPDATE sh_worker SET state = 'running', lastOutcome = NULL, updatedAt = ${now()}
+              WHERE workerId = ${pending.workerId}
+            `;
+            timeline.add(pending.threadId, "resumed", "已恢复运行（回收后按连接器快照对账）", {
+              workerId: pending.workerId,
+              reconciled: true,
+            });
+          } else {
+            // The connector says the run ended while it was unreachable: take its word for it.
+            sql`
+              UPDATE sh_worker SET state = ${pending.snapState}, updatedAt = ${now()}
+              WHERE workerId = ${pending.workerId}
+            `;
+            timeline.add(pending.threadId, "note", `对账：连接器报告运行已结束（${pending.snapState}）`, {
+              workerId: pending.workerId,
+              reconciled: true,
+            });
+          }
+          recomputeThreadState(pending.threadId);
+        });
       }
       return resolved;
     },
 
     /**
-     * A start_worker that will never be delivered (user-cancelled `expired`, or failed) ends
+     * A start_worker the user withdrew (the dispatcher's `expired` — its only writer) ends
      * its still-`starting` worker quietly — timeline only, no push: the user already knows
-     * (they cancelled, or the failure push comes from markStartFailed). Opens the Thread for
-     * a fresh dispatch instead of wedging it behind a worker that will never run.
+     * they cancelled. Opens the Thread for a fresh dispatch instead of wedging it behind a
+     * worker that will never run. (notAfter queue timeouts are `failed/not_after` and route
+     * through markStartFailed with a push — the owner did NOT ask for that one.)
      */
     settleWithdrawnStart(workerId: string): boolean {
       const worker = workers.get(workerId);

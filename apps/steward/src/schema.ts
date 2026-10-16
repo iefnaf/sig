@@ -48,7 +48,10 @@ export const MIGRATIONS: readonly Migration[] = [
     up: (sql) => {
       // state machine: queued -> sent -> accepted -> done/failed/expired/ambiguous (protocol §4.2).
       // failReason distinguishes failed rows hello should redeliver (ack_timeout) from terminal
-      // ones it should not (rejected by the connector, or idle-expired while the device was offline).
+      // ones it should not (rejected by the connector, idle-expired while the device was
+      // offline, or not_after — the delivery window lapsed; issue #13 review: notAfter expiry
+      // must not read as the user's cancellation). `expired` is the dispatcher's user-cancel
+      // state and nothing else writes it.
       sql`CREATE TABLE IF NOT EXISTS outbox (
         cmdId TEXT PRIMARY KEY, deviceId TEXT NOT NULL, workerId TEXT, cseq INTEGER NOT NULL,
         kind TEXT NOT NULL, payload TEXT NOT NULL, notAfter INTEGER,

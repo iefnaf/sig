@@ -52,10 +52,15 @@ export class ConnectorApp {
       adapter: options.adapter,
       recovery: options.recovery,
       // Detection failures must surface in the daemon log, never as an unhandled rejection
-      // (Node's default would crash the connector over its own watchdog).
+      // (Node's default would crash the connector over its own watchdog). A caller-supplied
+      // onError runs FIRST and unconditionally — it may be the only sink wired (PR #46
+      // review finding 2: the spread used to let the log overwrite it).
       watchdog: {
         ...options.watchdog,
-        onError: (err) => this.log?.("watchdog_error", { error: err instanceof Error ? err.message : String(err) }),
+        onError: (err) => {
+          options.watchdog?.onError?.(err);
+          this.log?.("watchdog_error", { error: err instanceof Error ? err.message : String(err) });
+        },
       },
       emit: (workerId, fields) => {
         this.log?.("worker_event", { workerId, type: fields.type });

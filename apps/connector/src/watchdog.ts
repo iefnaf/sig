@@ -59,7 +59,14 @@ export interface TreeCpuSample {
   members: string[];
 }
 
-/** Linux reads /proc (10 ms tick resolution); elsewhere one `ps` pass over the tree. */
+/** Linux reads /proc (10 ms tick resolution); elsewhere one `ps` pass over the tree.
+ *
+ * Quantization caveat (PR #41 review, non-blocking): where `ps time=` is whole seconds
+ * (procps; BSDs), a tree accruing under ~1 CPU-second across the ~2.6 s sample window can
+ * floor to a zero delta and read "cold" → one false strike-1 respawn. Linux never takes
+ * this path while /proc is readable (tick resolution), and macOS prints centiseconds, so
+ * this bites only BSD-family platforms; the cost is bounded (one respawn) and the
+ * member-churn and freshness guards still hold. */
 async function cumulativeCpuMs(members: TreeMember[]): Promise<Map<number, number> | undefined> {
   const out = new Map<number, number>();
   let sawProc = false;

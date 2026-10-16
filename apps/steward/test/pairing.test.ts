@@ -113,15 +113,17 @@ describe("POST /pair brute-force lockout (protocol doc §5.2, issue #27)", () =>
   });
 
   it("the lock lifts after it expires and the window restarts", async () => {
-    // Shrink the lockout to 60ms inside the DO (same pattern as feishuSendTimeoutMs).
+    // Shrink the lockout inside the DO (same pattern as feishuSendTimeoutMs). 400ms/500ms,
+    // not 60ms/90ms: the pair round trips themselves can outlive a 60ms lock when the
+    // shared workerd is loaded (observed flake — the "locked" request landed post-expiry).
     await runInDurableObject(ownerStub(), (instance: Steward) => {
-      (instance as unknown as { pairLockMs: number }).pairLockMs = 60;
+      (instance as unknown as { pairLockMs: number }).pairLockMs = 400;
     });
     for (let i = 0; i < 5; i++) await postPair("WRONGCODE", "m", ip(10));
     const { code } = await ownerStub().createPairing();
     const locked = await postPair(code, "m", ip(10));
     expect(locked.status).toBe(429);
-    await new Promise((resolve) => setTimeout(resolve, 90));
+    await new Promise((resolve) => setTimeout(resolve, 500));
     const { code: fresh } = await ownerStub().createPairing();
     expect((await postPair(fresh, "m", ip(10))).status).toBe(200);
   });

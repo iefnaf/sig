@@ -167,4 +167,45 @@ describe("start_worker over the real transport (issue #3 + #30)", () => {
     expect(events.find((e) => e.type === "resumed")).toMatchObject({ reason: "stall", count: 1 });
     expect(events.find((e) => e.type === "settled")).toMatchObject({ outcome: "error", errorClass: "stall" });
   }, 60_000);
+
+  // PR #46 review finding 2: a caller-supplied watchdog.onError is composed with the daemon
+  // log, not discarded by it — with no `log` wired it is the ONLY sink, and it must fire.
+  it("routes watchdog detection errors to a caller-supplied onError even without a daemon log", async () => {
+    const runsFile = join(dir, "runs-shared.txt");
+    writeFileSync(runsFile, "0");
+    const scenario = writeScenario(dir, "scenario", [[{ delayMs: 20_000 }]]);
+    const seen: unknown[] = [];
+    app = new ConnectorApp({
+      store,
+      stateDir,
+      adapter: fakePiAdapter(stateDir, scenario, { FAKE_PI_RUNS_FILE: runsFile }),
+      // Deliberately no `log`: the caller's onError is the only error sink.
+      watchdog: {
+        stallMs: 300,
+        tickMs: 50,
+        cpuSampleGapMs: 10,
+        sampleTreeCpu: () => Promise.reject(new Error("sampler exploded")),
+        onError: (err) => seen.push(err),
+      },
+    });
+    await app.start();
+    await mock.waitConnected();
+
+    const cmdId = mock.sendCmd("start_worker", {
+      workerId: "w-e2e-onerr",
+      threadId: "t",
+      repoId: repo,
+      mode: "write",
+      prompt: "go quiet",
+    });
+    await waitFor(() => mock.resultsFor(cmdId), 15_000, "cmd_result");
+
+    // The silent worker becomes a candidate; the sampler rejects; the error must reach the
+    // caller's hook — and must not crash the connector, which still answers commands.
+    await waitFor(() => (seen.length > 0 ? seen[0] : undefined), 10_000, "onError called");
+    expect(String(seen[0])).toContain("sampler exploded");
+    const stopId = mock.sendCmd("stop_process", { workerId: "w-e2e-onerr" });
+    const stopResult = await waitFor(() => mock.resultsFor(stopId), 10_000, "stop_process result");
+    expect(stopResult).toMatchObject({ ok: true });
+  }, 60_000);
 });

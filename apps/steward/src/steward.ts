@@ -1045,7 +1045,12 @@ export class Steward extends Agent<Env> {
     if (!row || (row.state !== "queued" && row.state !== "sent")) return false;
     const now = Date.now();
     if (row.notAfter !== null && row.notAfter < now) {
-      this.sql`UPDATE outbox SET state = 'expired' WHERE cmdId = ${cmdId}`;
+      // The delivery window lapsed (queue timeout). NOT the user's cancellation — that is the
+      // dispatcher's `expired` state (steward.ts cancelQueuedCommand), and conflating the two
+      // made the sweep close the worker as a silent "user withdrew it". `failed/not_after`
+      // is terminal: redeliverOutbox only re-queues `failed/ack_timeout`, and the connector
+      // would reject a past-notAfter command anyway (protocol §4.2).
+      this.sql`UPDATE outbox SET state = 'failed', failReason = 'not_after' WHERE cmdId = ${cmdId}`;
       return false;
     }
     const connection = this.connFor(row.deviceId);
@@ -1163,20 +1168,39 @@ export class Steward extends Agent<Env> {
           if (cmd && (cmd.state === "failed" || cmd.state === "expired")) {
             const settled =
               cmd.state === "expired"
-                ? // The user withdrew it: close quietly, no push (they already know).
+                ? // The user withdrew it (`expired` is the dispatcher's cancel state and its
+                  // only writer): close quietly, no push (they already know).
                   this.ledger.workers.settleWithdrawnStart(worker.workerId)
-                : // Failed undelivered (queue timeout, ack exhaustion): the owner clicked
-                  // "排队等上线" and must hear that it never happened.
-                  this.ledger.workers.markStartFailed(
-                    worker.workerId,
-                    worker.cmdId!,
-                    cmd.failReason === "idle" ? "排队超时（机器长时间未上线）" : `命令失败（${cmd.failReason ?? cmd.state}）`,
-                  );
+                : // Failed undelivered — queue timeout (`idle`), delivery-window lapse
+                  // (`not_after`), ack exhaustion (`ack_timeout`→terminal), or a connector
+                  // rejection: the owner must hear that it never started.
+                  this.ledger.workers.markStartFailed(worker.workerId, worker.cmdId, this.startFailureText(cmd));
             if (settled) reaped += 1;
-          } else if (cmd?.state === "done" && silentMs >= this.reapSilentMs) {
-            // Delivered and acknowledged, yet nothing ever started and no events arrived:
-            // the wedge backstop, only at the online-but-silent horizon.
-            if (this.ledger.workers.reapWorker(worker.workerId, worker.machineOnline)) reaped += 1;
+            continue;
+          }
+          if (cmd && (cmd.state === "queued" || cmd.state === "sent")) {
+            // Still deliverable (hello redelivery / the resend alarm): the run is queued, not
+            // lost — the wait_online flow depends on the sweep never touching these.
+            continue;
+          }
+          // The remaining shapes may or may not have started on the machine: `done` (resulted,
+          // but the `started` event never landed), `accepted` (acked, then the connector died
+          // before resulting — nothing else ever transitions that row), `ambiguous` (§4.2:
+          // terminal but undecidable), or no command row at all (enqueue threw). Close only at
+          // the online-but-silent horizon OR the measured-offline clock the running/recovering
+          // reap uses — a connector that died right after acking must not lock the Thread for a
+          // full 45 minutes (PR #46 review findings 1 and 4).
+          const horizon =
+            silentMs >= this.reapSilentMs ||
+            (!worker.machineOnline && now - worker.machineLastSeen >= this.reapOfflineMs);
+          if (!horizon) continue;
+          if (cmd === null) {
+            // The command row never came to exist: nothing can ever start. Close it with a
+            // push so the owner re-dispatches.
+            if (this.ledger.workers.markStartFailed(worker.workerId, null, "派发命令未能创建（内部错误）")) reaped += 1;
+          } else if (this.ledger.workers.reapWorker(worker.workerId, worker.machineOnline)) {
+            // Quiet lost+reaped: "it failed" might be a lie, and a live event resurrects.
+            reaped += 1;
           }
           continue;
         }
@@ -1208,6 +1232,21 @@ export class Steward extends Agent<Env> {
     return this.sql<{ state: string; failReason: string | null }>`
       SELECT state, failReason FROM outbox WHERE cmdId = ${cmdId}
     `[0] ?? null;
+  }
+
+  /** The owner-facing reason a start_worker command failed before the worker ever ran. */
+  private startFailureText(cmd: { state: string; failReason: string | null }): string {
+    switch (cmd.failReason) {
+      case "idle":
+        // The wait-online queue gave up: the machine never came back within ~30 min.
+        return "排队超时（机器长时间未上线）";
+      case "not_after":
+        // The delivery window lapsed while the machine was unreachable; when it reconnected
+        // the command was too old to run (protocol §4.2 notAfter).
+        return "命令过期未送达（机器断线太久，超出送达时限）";
+      default:
+        return `命令失败（${cmd.failReason ?? cmd.state}）`;
+    }
   }
 
   // =================================================================================================
