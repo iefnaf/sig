@@ -81,7 +81,7 @@ afterEach(async () => {
   }
   await new Promise((resolve) => setTimeout(resolve, 100));
   store?.close();
-  rmSync(dir, { recursive: true, force: true });
+  rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
 });
 
 function setup(

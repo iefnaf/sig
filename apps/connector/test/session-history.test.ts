@@ -15,7 +15,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  rmSync(dir, { recursive: true, force: true });
+  rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
 });
 
 function entry(id: string, parentId: string | null, body: Record<string, unknown>): Record<string, unknown> {

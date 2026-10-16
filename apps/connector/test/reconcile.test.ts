@@ -58,7 +58,7 @@ beforeEach(async () => {
 afterEach(async () => {
   await new Promise((resolve) => setTimeout(resolve, 50));
   store?.close();
-  rmSync(dir, { recursive: true, force: true });
+  rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
 });
 
 /** The wrap-up tail of a completed run (prompt → report tool call → result → final message). */
