@@ -14,6 +14,8 @@ import type {
 } from "./agent.ts";
 import { adjudicate, type RunWindow } from "./adjudication.ts";
 import { installAssets, type InstalledAssets } from "./install.ts";
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
 import { PiProcess } from "./pi-process.ts";
 
 /** Must match COMMAND_NAME in ./ext/shepherd-pi.ts (locked together by a test). */
@@ -38,6 +40,25 @@ export interface PiAdapterOptions {
   getStateTimeoutMs?: number;
   /** Extra env passed to the child (tests). The connector's own credentials never ride along. */
   env?: Record<string, string | undefined>;
+  /** Where per-worker stderr tails are kept (§12); default <stateDir>/logs. Pass null to disable. */
+  workerLogsDir?: string | null;
+}
+
+/** Env for the agent child (§4.2: "inherit the user's environment; the connector's own
+ * credentials are not passed through", issue #27). The connector's state lives under
+ * SHEPHERD_* variables (SHEPHERD_HOME points at the SQLite file holding the device token),
+ * so the whole namespace is stripped; the device token itself never was an env var. */
+export function childEnv(
+  source: Record<string, string | undefined> = process.env,
+  extra?: Record<string, string | undefined>,
+): Record<string, string | undefined> {
+  const env: Record<string, string | undefined> = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (key.startsWith("SHEPHERD_")) continue;
+    env[key] = value;
+  }
+  if (extra) Object.assign(env, extra);
+  return env;
 }
 
 const PI_CAPABILITIES: AgentCapabilities = {
@@ -79,12 +100,14 @@ export class PiAdapter implements AgentAdapter {
   readonly capabilities = PI_CAPABILITIES;
 
   private readonly options: PiAdapterOptions;
+  private readonly workerLogsDir: string | null;
   private readonly runtimes = new Map<string, WorkerRuntime>();
   private readonly listeners: ((e: RawAdapterEvent) => void)[] = [];
   private assets?: InstalledAssets;
 
   constructor(options: PiAdapterOptions) {
     this.options = options;
+    this.workerLogsDir = options.workerLogsDir === null ? null : (options.workerLogsDir ?? join(options.stateDir, "logs"));
   }
 
   on(event: "worker-event", fn: (e: RawAdapterEvent) => void): void {
@@ -135,13 +158,15 @@ export class PiAdapter implements AgentAdapter {
       throw new AdapterError("lock_held", `a pi process for ${spec.workerId} is already running`);
     }
     this.assets = this.assets ?? installAssets(this.options.stateDir);
+    if (this.workerLogsDir) mkdirSync(this.workerLogsDir, { recursive: true });
 
     let runtime!: WorkerRuntime;
     const proc = new PiProcess({
       command: this.options.command ?? ["pi"],
       args: this.buildArgs(spec, this.assets),
       cwd: spec.cwd,
-      env: { ...process.env, ...this.options.env },
+      env: childEnv(process.env, this.options.env),
+      stderrFile: this.workerLogsDir ? join(this.workerLogsDir, `pi-${spec.workerId}.log`) : undefined,
       onEvent: (record) => this.onPiEvent(runtime, record),
       onExit: (info) => this.onPiExit(runtime, info),
     });

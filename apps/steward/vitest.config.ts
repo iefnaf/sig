@@ -116,11 +116,20 @@ const feishuMock = async (request: Request): Promise<Response> => {
 export default defineConfig({
   plugins: [
     cloudflareTest({
-      wrangler: { configPath: "./wrangler.jsonc" },
+      // The Worker's config lives at the repo root (issue #25: Deploy-to-Cloudflare reads it
+      // there); paths inside it resolve relative to the config file.
+      wrangler: { configPath: "../../wrangler.jsonc" },
       // SERVER_KEY and SETUP_TOKEN are `wrangler secret put` values in real deployments; tests
       // supply deterministic stand-ins instead of relying on committed or ambient secrets.
       miniflare: {
-        bindings: { SERVER_KEY: "test-server-key-not-a-secret", SETUP_TOKEN: "test-setup-token-not-a-secret" },
+        bindings: {
+          SERVER_KEY: "test-server-key-not-a-secret",
+          // The rotation-window key (issue #27): tests mint "pre-rotation" tokens with it.
+          SERVER_KEY_PREVIOUS: "test-previous-server-key-not-a-secret",
+          SETUP_TOKEN: "test-setup-token-not-a-secret",
+          // The deploy-form model key (issue #25): modelConfig() seeds sh_model from it once.
+          MODEL_KEY: "test-model-key-not-a-secret",
+        },
         serviceBindings: { FEISHU_API: feishuMock },
       },
     }),

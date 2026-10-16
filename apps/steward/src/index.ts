@@ -1,6 +1,6 @@
 import { getAgentByName, routeAgentRequest } from "agents";
 import { parseToken } from "@shepherd/protocol";
-import { bearer } from "./auth.ts";
+import { bearer, resolveServerKeys } from "./auth.ts";
 import { Steward } from "./steward.ts";
 
 export { Steward };
@@ -32,12 +32,24 @@ export default {
       if (typeof code !== "string" || typeof name !== "string") {
         return json({ error: "bad_request" }, 400);
       }
+      // CF-Connecting-IP is set by the Cloudflare edge and not client-overridable in
+      // production; requests without one (local `wrangler dev`) share the "unknown" bucket.
+      const clientIp = request.headers.get("CF-Connecting-IP") ?? "unknown";
       const stub = await getAgentByName(env.Steward, "owner");
-      const result = await stub.pair(code, name);
-      if (!result) return json({ error: "invalid code" }, 400);
-      const wsScheme = url.protocol === "https:" ? "wss:" : "ws:";
-      const wsUrl = `${wsScheme}//${url.host}/agents/steward/owner`;
-      return json({ ...result, wsUrl });
+      const result = await stub.pair(code, name, clientIp);
+      if (result.ok) {
+        const wsScheme = url.protocol === "https:" ? "wss:" : "ws:";
+        const wsUrl = `${wsScheme}//${url.host}/agents/steward/owner`;
+        return json({ deviceId: result.deviceId, token: result.token, wsUrl });
+      }
+      if (result.reason === "rate_limited") {
+        // Brute-force lockout (protocol doc §5.2): per-IP and global, 5 failures → 15 min.
+        return new Response(JSON.stringify({ error: "rate_limited" }), {
+          status: 429,
+          headers: { "content-type": "application/json", "retry-after": String(result.retryAfterSec) },
+        });
+      }
+      return json({ error: "invalid code" }, 400);
     }
 
     // The setup page opens only with SETUP_TOKEN (ADR-0001 decision 8) and 404s otherwise —
@@ -59,9 +71,11 @@ export default {
     }
 
     const routed = await routeAgentRequest(request, env, {
-      // Stateless pre-check: a bad token never wakes the Durable Object.
+      // Stateless pre-check: a bad token never wakes the Durable Object. The key set includes
+      // SERVER_KEY_PREVIOUS during a rotation window (issue #27) so existing device tokens
+      // keep passing the pre-check until the operator closes the window.
       onBeforeConnect: async (req) => {
-        const parsed = await parseToken(env.SERVER_KEY, bearer(req));
+        const parsed = await parseToken(await resolveServerKeys(env), bearer(req));
         if (!parsed) return new Response("unauthorized", { status: 401 });
       },
     });

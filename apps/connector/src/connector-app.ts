@@ -21,6 +21,11 @@ export interface ConnectorAppOptions {
   adapter?: import("./agent.ts").AgentAdapter;
   /** §9 recovery knobs (tests shrink timers and inject process I/O). */
   recovery?: RecoveryOptions;
+  /** Coarse lifecycle logging (daemon): event names and ids only, never session content. */
+  log?: (event: string, fields?: Record<string, unknown>) => void;
+  /** Connection lifecycle hooks, forwarded to the client (the daemon logs these). */
+  onWelcome?: ClientOptions["onWelcome"];
+  onClose?: ClientOptions["onClose"];
 }
 
 /** §12: clamp(floor(0.5 × total memory MB / 250 MB), 1, 8), configurable later. */
@@ -30,18 +35,23 @@ export function maxWorkersFromMemory(): number {
 
 export class ConnectorApp {
   private readonly store: LocalStore;
+  private readonly log?: (event: string, fields?: Record<string, unknown>) => void;
   readonly manager: WorkerManager;
   readonly client: ConnectorClient;
 
   constructor(options: ConnectorAppOptions) {
     this.store = options.store;
+    this.log = options.log;
     const events = new EventLog(options.store.database);
     this.manager = new WorkerManager({
       store: options.store,
       stateDir: options.stateDir,
       adapter: options.adapter,
       recovery: options.recovery,
-      emit: (workerId, fields) => this.client.emit(workerId, fields),
+      emit: (workerId, fields) => {
+        this.log?.("worker_event", { workerId, type: fields.type });
+        this.client.emit(workerId, fields);
+      },
     });
 
     this.client = new ConnectorClient({
@@ -51,13 +61,17 @@ export class ConnectorApp {
       handleCommand: (cmd: CmdMessage) => this.runCommand(cmd),
       snapshot: () => this.snapshot(),
       workersSnapshot: () => this.workersSnapshot(),
+      onWelcome: options.onWelcome,
+      onClose: options.onClose,
     });
   }
 
   /**
    * Reconcile first (§9.1: orphan cleanup, stale locks, session-tail checks, resume
    * scheduling), then connect — the first hello's workers snapshot and bootId let the DO
-   * reconcile against post-crash reality instead of stale pre-crash states.
+   * reconcile against post-crash reality instead of stale pre-crash states. Reconciliation
+   * is local disk I/O and process cleanup only, so this returns quickly; callers that don't
+   * care (the daemon) may fire-and-forget, but awaiting keeps startup failures visible.
    */
   async start(): Promise<void> {
     await this.manager.reconcileStartup();
@@ -76,6 +90,7 @@ export class ConnectorApp {
   }
 
   private async runCommand(cmd: CmdMessage): Promise<CommandResult> {
+    this.log?.("command_received", { cmdId: cmd.id, kind: cmd.kind });
     try {
       let data: unknown;
       if (cmd.kind === "reconcile") {
@@ -84,13 +99,16 @@ export class ConnectorApp {
       } else {
         data = await this.manager.handleCommand(cmd.id, cmd.kind, cmd.args ?? {}, cmd.workerId);
       }
+      this.log?.("command_settled", { cmdId: cmd.id, kind: cmd.kind, ok: true });
       return { ok: true, data };
     } catch (err) {
       if (err instanceof CommandError) {
+        this.log?.("command_settled", { cmdId: cmd.id, kind: cmd.kind, ok: false, code: err.code });
         return { ok: false, error: { code: err.code, message: err.message, retriable: err.retriable } };
       }
       const code = (err as { code?: string }).code ?? "internal";
       const message = err instanceof Error ? err.message : String(err);
+      this.log?.("command_settled", { cmdId: cmd.id, kind: cmd.kind, ok: false, code });
       return { ok: false, error: { code, message, retriable: false } };
     }
   }

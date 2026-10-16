@@ -1,25 +1,43 @@
 {
   "name": "@iefnaf/shepherd",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.0",
+  "description": "Shepherd connector: pairs this machine with your steward and runs pi workers as a background service.",
   "type": "module",
   "bin": {
-    "shepherd": "./src/cli.ts"
+    "shepherd": "./bin/shepherd.js"
   },
+  "files": [
+    "bin",
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/iefnaf/shepherd.git",
+    "directory": "apps/connector"
+  },
+  "license": "UNLICENSED",
   "scripts": {
+    "build": "node build.mjs",
+    "prepack": "node build.mjs",
+    "pretest": "node build.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
-  },
-  "dependencies": {
-    "@shepherd/protocol": "workspace:*",
-    "ws": "8.22.0"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "1.2.0",
     "@earendil-works/pi-coding-agent": "1.2.0",
+    "@shepherd/protocol": "workspace:*",
     "@types/node": "26.6.5",
     "@types/ws": "8.18.2",
+    "esbuild": "0.28.2",
     "typescript": "7.0.2",
-    "vitest": "4.1.12"
+    "vitest": "4.1.12",
+    "ws": "8.22.0"
   }
 }

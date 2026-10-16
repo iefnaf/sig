@@ -1,56 +1,339 @@
 #!/usr/bin/env node
-// `npx @iefnaf/shepherd <command>` (ADR-0001 decision 10).
-//   connect <url> <code>  — redeem a pairing code, then hold the connection open
-//                           (reconnecting per protocol §3.3) like a long-running daemon.
-//   add-repo <path>       — register a repository so start_worker may run in it (§8.1).
+// `npx @iefnaf/shepherd <command>` (ADR-0001 decision 10, issue #26).
+//
+//   connect <url> <code>   redeem a pairing code, then install + start the background
+//                          service (launchd agent on macOS, systemd --user unit on Linux);
+//                          --foreground runs the daemon in this terminal instead
+//   status                 service state, pairing, workers, installed assets
+//   logs [-n N] [name]     tail ~/.shepherd/logs/<name> (default connector.log)
+//   start | stop | restart control the background service (stop also disables start-at-login)
+//   uninstall              stop the service and remove its unit (keeps ~/.shepherd data)
+//   upgrade [--version V]  npm-install @iefnaf/shepherd (default @latest) and restart the
+//                          service; the fresh daemon rewrites the versioned pi assets
+//   add-repo <path>        register a repository so start_worker may run in it (§8.1)
+//   daemon                 internal: the background service's entry point
+import { existsSync, readdirSync } from "node:fs";
 import { hostname, homedir } from "node:os";
-import { basename } from "node:path";
-import { join } from "node:path";
-import { ConnectorApp } from "./connector-app.ts";
-import { connect } from "./pairing.ts";
-import { LocalStore } from "./store.ts";
-import { defaultBranch, repoTopLevel } from "./worktree.ts";
+import { basename, dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { runDaemon } from "./daemon.ts";
+import { installAssets } from "./install.ts";
+import { tailFile } from "./logger.ts";
+import { connect } from "./pairing.ts";
+import { getServiceInstaller, SHEPHERD_LABEL, type ServiceInstaller, type ServiceSpec } from "./service.ts";
+import { LocalStore } from "./store.ts";
+import { defaultBranch, repoTopLevel } from "./worktree.ts";
+import { runUpgrade } from "./upgrade.ts";
+import { VERSION } from "./version.ts";
 
 const exec = promisify(execFile);
 
-const STATE_DIR = process.env.SHEPHERD_HOME ?? join(homedir(), ".shepherd");
+const DEFAULT_PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
-function usage(): never {
-  console.error("usage: shepherd connect <url> <code>\n       shepherd add-repo <path>");
-  process.exit(2);
+function stateDir(): string {
+  return process.env.SHEPHERD_HOME ?? join(homedir(), ".shepherd");
+}
+
+/** The bin wrapper this package ships; both src/cli.ts (dev) and dist/cli.js sit one
+ * directory below the package root, so ../bin/shepherd.js is correct in either layout. */
+export function binEntryPath(): string {
+  return join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "shepherd.js");
+}
+
+const USAGE = `shepherd ${VERSION} — the Shepherd connector
+
+usage:
+  shepherd connect <url> <code> [--foreground]   pair and install the background service
+  shepherd status                                 service, pairing, workers, assets
+  shepherd logs [-n <lines>] [name]               tail ~/.shepherd/logs (default connector.log)
+  shepherd start | stop | restart                 control the background service
+  shepherd uninstall                              remove the service (keeps ~/.shepherd data)
+  shepherd upgrade [--version <version>]          replace the package and restart the service
+  shepherd add-repo <path>                        register a repository for start_worker
+  shepherd daemon                                 internal: run the connector daemon
+
+environment:
+  SHEPHERD_HOME         state directory (default ~/.shepherd)
+  SHEPHERD_MACHINE_NAME machine name reported to the steward`;
+
+function usage(code = 2): never {
+  console.error(USAGE);
+  process.exit(code);
+}
+
+function fail(message: string): never {
+  console.error(`shepherd: ${message}`);
+  process.exit(1);
+}
+
+/** Removes one `--flag [value]` pair from argv, returning [value, rest]. */
+function takeFlag(argv: string[], flag: string): { value?: string; rest: string[] } {
+  const index = argv.indexOf(flag);
+  if (index === -1) return { rest: argv };
+  const value = argv[index + 1];
+  const rest = [...argv.slice(0, index), ...(value === undefined ? [] : argv.slice(index + 2))];
+  return { value, rest };
+}
+
+function requireInstaller(): ServiceInstaller {
+  const spec = serviceSpec(binEntryPath());
+  const installer = getServiceInstaller(spec);
+  if (!installer) {
+    fail(
+      `background services are not supported on ${process.platform} (ADR-0001: macOS launchd / Linux systemd only)`,
+    );
+  }
+  return installer;
+}
+
+function serviceSpec(entryPath: string): ServiceSpec {
+  const dir = stateDir();
+  const env: Record<string, string> = { PATH: process.env.PATH ?? DEFAULT_PATH };
+  if (process.env.SHEPHERD_HOME) env.SHEPHERD_HOME = process.env.SHEPHERD_HOME;
+  return {
+    label: SHEPHERD_LABEL,
+    nodePath: process.execPath,
+    entryPath,
+    args: ["daemon"],
+    env,
+    stateDir: dir,
+    logDir: join(dir, "logs"),
+  };
 }
 
 async function main(argv: string[]): Promise<void> {
-  const [command, a, b] = argv;
-  if (!command) usage();
-
-  if (command === "add-repo") {
-    if (!a) usage();
-    await addRepo(a);
+  const [command, ...rest] = argv;
+  if (!command || command === "-h" || command === "--help") usage(command ? 0 : 2);
+  if (command === "-v" || command === "--version") {
+    console.log(VERSION);
     return;
   }
 
-  if (command === "connect") {
-    if (!a || !b) usage();
-    const store = new LocalStore(join(STATE_DIR, "connector.sqlite"));
-    const machineName = process.env.SHEPHERD_MACHINE_NAME ?? hostname();
-    const { deviceId } = await connect(a, b, machineName, { store });
-    console.log(`paired as ${deviceId}; connecting...`);
-
-    const app = new ConnectorApp({ store, stateDir: STATE_DIR, machineName });
-    await app.start();
-    return;
+  switch (command) {
+    case "connect":
+      return connectCommand(rest);
+    case "status":
+      return statusCommand();
+    case "logs":
+      return logsCommand(rest);
+    case "start":
+    case "stop":
+    case "restart":
+      return serviceCommand(command);
+    case "uninstall":
+      return uninstallCommand();
+    case "upgrade":
+      return upgradeCommand(rest);
+    case "add-repo":
+      return addRepo(rest[0]);
+    case "daemon":
+      return daemonCommand();
+    default:
+      usage();
   }
-
-  usage();
 }
+
+// --- connect ---------------------------------------------------------------------------------
+
+async function connectCommand(argv: string[]): Promise<void> {
+  const foreground = argv.includes("--foreground");
+  const [url, code] = argv.filter((a) => a !== "--foreground");
+  if (!url || !code) usage();
+  const dir = stateDir();
+  const machineName = process.env.SHEPHERD_MACHINE_NAME ?? hostname();
+
+  // 1. Pair (protocol §5.2): redeem the code once, persist credentials in the LocalStore.
+  const store = new LocalStore(join(dir, "connector.sqlite"));
+  let deviceId: string;
+  try {
+    ({ deviceId } = await connect(url, code, machineName, { store }));
+  } catch (err) {
+    store.close();
+    fail(err instanceof Error ? err.message : String(err));
+  }
+  store.close();
+
+  // 2. Write this version's pi assets so even a foreground run is ready to start workers.
+  installAssets(dir);
+
+  // 3. Install and start the background service. `--foreground` keeps the old behavior:
+  //    hold the connection in this terminal (dev boxes, containers, unsupported platforms).
+  if (foreground) {
+    console.log(`paired as ${deviceId}; running in foreground (Ctrl-C to stop)`);
+    const handle = await runDaemon({ stateDir: dir, machineName });
+    const shutdown = () => {
+      void handle.stop().finally(() => process.exit(0));
+      setTimeout(() => process.exit(0), 5000).unref();
+    };
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
+    return;
+  }
+
+  const installer = requireInstaller();
+  try {
+    await installer.install();
+  } catch (err) {
+    fail(
+      `${err instanceof Error ? err.message : String(err)}\n` +
+        `  the service could not be installed; pair again with --foreground to run attached instead`,
+    );
+  }
+  const status = await installer.status();
+  console.log(`paired as ${deviceId}`);
+  console.log(
+    `background service ${status.running ? "installed and running" : "installed"} ` +
+      `(${installer.kind}: ${installer.unitPath})`,
+  );
+  for (const note of installer.notes) console.log(`note: ${note}`);
+  console.log(`logs: ${join(dir, "logs", "connector.log")}`);
+  console.log("next: shepherd status · shepherd add-repo <path> · shepherd logs");
+}
+
+// --- status / logs ---------------------------------------------------------------------------
+
+async function statusCommand(): Promise<void> {
+  const dir = stateDir();
+  console.log(`shepherd ${VERSION} (node ${process.version}, ${process.platform})`);
+
+  const installer = getServiceInstaller(serviceSpec(binEntryPath()));
+  if (installer) {
+    const status = await installer.status();
+    const pid = status.pid ? ` pid ${status.pid}` : "";
+    console.log(
+      `service:  ${installer.kind} ${SHEPHERD_LABEL} — ${status.installed ? (status.running ? `running${pid} (${status.detail})` : `not running (${status.detail})`) : "not installed"}`,
+    );
+  } else {
+    console.log(`service:  not supported on ${process.platform}`);
+  }
+
+  const dbPath = join(dir, "connector.sqlite");
+  if (!existsSync(dbPath)) {
+    console.log("paired:   not paired (run `shepherd connect <url> <code>`)");
+    return;
+  }
+  const store = new LocalStore(dbPath);
+  try {
+    const credentials = store.getCredentials();
+    if (credentials) {
+      console.log(`paired:   ${credentials.deviceId} → ${credentials.serverUrl} (connEpoch ${credentials.connEpoch})`);
+    } else {
+      console.log("paired:   no credentials (run `shepherd connect <url> <code>`)");
+    }
+    const workers = store.listWorkers();
+    const byState = new Map<string, number>();
+    for (const worker of workers) byState.set(worker.state, (byState.get(worker.state) ?? 0) + 1);
+    const summary =
+      workers.length === 0
+        ? "none"
+        : [...byState.entries()].map(([state, count]) => `${count} ${state}`).join(", ");
+    console.log(`workers:  ${summary}`);
+  } finally {
+    store.close();
+  }
+
+  const extDir = join(dir, "ext");
+  const promptDir = join(dir, "prompts");
+  const exts = existsSync(extDir) ? readdirSync(extDir).sort() : [];
+  const prompts = existsSync(promptDir) ? readdirSync(promptDir).sort() : [];
+  console.log(`assets:   ${exts.length ? exts.join(", ") : "none installed"}`);
+  if (prompts.length) console.log(`          ${prompts.join(", ")}`);
+  console.log(`logs:     ${join(dir, "logs")}`);
+}
+
+async function logsCommand(argv: string[]): Promise<void> {
+  const { value: count, rest } = takeFlag(argv, "-n");
+  const lines = count && /^\d+$/.test(count) ? Number(count) : 50;
+  const dir = stateDir();
+  const logDir = join(dir, "logs");
+
+  // Only plain file names — never a path — so `logs` cannot read outside the log directory.
+  const name = rest[0] ? basename(rest[0]).replace(/[^\w.-]/g, "_") : "connector.log";
+  const path = join(logDir, name);
+  if (!existsSync(path)) {
+    const available = existsSync(logDir) ? readdirSync(logDir).join(", ") : "none yet";
+    fail(`no log file '${name}' in ${logDir} (available: ${available})`);
+  }
+  const tail = tailFile(path, lines);
+  if (tail) console.log(tail);
+}
+
+// --- service control -------------------------------------------------------------------------
+
+async function serviceCommand(action: "start" | "stop" | "restart"): Promise<void> {
+  const installer = requireInstaller();
+  try {
+    await installer[action]();
+  } catch (err) {
+    fail(err instanceof Error ? err.message : String(err));
+  }
+  const status = await installer.status();
+  console.log(
+    `${SHEPHERD_LABEL}: ${status.running ? `running${status.pid ? ` (pid ${status.pid})` : ""}` : `not running (${status.detail})`}`,
+  );
+}
+
+async function uninstallCommand(): Promise<void> {
+  const installer = requireInstaller();
+  try {
+    await installer.uninstall();
+  } catch (err) {
+    fail(err instanceof Error ? err.message : String(err));
+  }
+  console.log(`removed ${installer.unitPath}`);
+  console.log(`kept ${stateDir()} (credentials, workers, logs); delete it to purge everything`);
+}
+
+// --- upgrade ---------------------------------------------------------------------------------
+
+async function upgradeCommand(argv: string[]): Promise<void> {
+  const { value: version, rest } = takeFlag(argv, "--version");
+  if (rest.length > 0) usage();
+  try {
+    await runUpgrade((line) => console.log(line), {
+      version,
+      currentVersion: VERSION,
+      currentEntry: binEntryPath(),
+      getService: (entryPath) => getServiceInstaller(serviceSpec(entryPath)),
+    });
+  } catch (err) {
+    fail(err instanceof Error ? err.message : String(err));
+  }
+}
+
+// --- daemon ----------------------------------------------------------------------------------
+
+async function daemonCommand(): Promise<void> {
+  const dir = stateDir();
+  let handle;
+  try {
+    handle = await runDaemon({ stateDir: dir, machineName: process.env.SHEPHERD_MACHINE_NAME ?? hostname() });
+  } catch (err) {
+    fail(err instanceof Error ? err.message : String(err));
+  }
+
+  const shutdown = () => {
+    handle!
+      .stop()
+      .catch(() => undefined)
+      .finally(() => process.exit(0));
+    setTimeout(() => process.exit(0), 5000).unref();
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+  // The ConnectorApp's sockets/timers hold the event loop open; nothing else to do.
+  await new Promise<void>(() => {});
+}
+
+// --- add-repo --------------------------------------------------------------------------------
 
 /** `shepherd add-repo <path>`: registers the repository (resolving subdirectories to the
  * repo root) in the local whitelist. Runs entirely on-machine (§8.1/§13): a remote
  * steward can never add entries, only see them. */
-async function addRepo(path: string): Promise<void> {
+async function addRepo(path: string | undefined): Promise<void> {
+  if (!path) usage();
   const topLevel = await repoTopLevel(path);
   const name = basename(topLevel);
   let remote: string | null = null;
@@ -62,7 +345,7 @@ async function addRepo(path: string): Promise<void> {
   }
   const branch = await defaultBranch(topLevel).catch(() => null);
 
-  const store = new LocalStore(join(STATE_DIR, "connector.sqlite"));
+  const store = new LocalStore(join(stateDir(), "connector.sqlite"));
   try {
     store.addRepo({ repoId: topLevel, name, path: topLevel, defaultBranch: branch, remote });
     console.log(`registered ${name} (${topLevel})${branch ? ` default branch: ${branch}` : ""}`);
