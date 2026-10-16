@@ -50,6 +50,8 @@ export interface ScenarioStep {
   emit?: Record<string, unknown>;
   raw?: string;
   shell?: string;
+  /** Append one entry to the session JSONL (pi-shaped) for §9.1 tail-reconciliation tests. */
+  session?: Record<string, unknown>;
   exit?: number;
 }
 
@@ -76,6 +78,58 @@ export function waitFor<T>(predicate: () => T | undefined, timeoutMs = 10_000, w
     };
     check();
   });
+}
+
+// ---- session JSONL entries (pi research “Sessions”: header + tree entries) -----------------
+
+export function sessionUserMessage(text: string): Record<string, unknown> {
+  return {
+    type: "message",
+    message: { role: "user", content: text, timestamp: Date.now() },
+  };
+}
+
+export function sessionAssistantMessage(
+  content: unknown[],
+  extra: { stopReason?: string; errorMessage?: string } = {},
+): Record<string, unknown> {
+  return {
+    type: "message",
+    message: {
+      role: "assistant",
+      content,
+      stopReason: extra.stopReason ?? "stop",
+      ...(extra.errorMessage ? { errorMessage: extra.errorMessage } : {}),
+      timestamp: Date.now(),
+    },
+  };
+}
+
+export function sessionToolResult(toolCallId: string, toolName: string): Record<string, unknown> {
+  return {
+    type: "message",
+    message: { role: "toolResult", toolCallId, toolName, content: [], isError: false, timestamp: Date.now() },
+  };
+}
+
+export function textBlock(text: string) {
+  return { type: "text", text };
+}
+
+export function reportToolCall(toolCallId: string, args: Record<string, unknown>) {
+  return { type: "toolCall", id: toolCallId, name: "report", arguments: args };
+}
+
+/** Writes a complete session JSONL (header + entries) — the tail-inspection fixture. */
+export function writeSessionFile(dir: string, workerId: string, entries: Array<Record<string, unknown>>): string {
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, `${workerId}.jsonl`);
+  const lines = [
+    JSON.stringify({ type: "session", version: 3, id: workerId, timestamp: new Date().toISOString(), cwd: dir }),
+    ...entries.map((entry) => JSON.stringify(entry)),
+  ];
+  writeFileSync(path, lines.join("\n") + "\n");
+  return path;
 }
 
 /** A run whose steps stream a normal assistant turn. */

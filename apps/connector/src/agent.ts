@@ -120,4 +120,10 @@ export interface AgentAdapter {
   resume(id: string, reason: string): Promise<void>; // must
   stopProcess(id: string): Promise<void>; // must; frees memory, the session stays on disk
   on(event: "worker-event", fn: (e: RawAdapterEvent) => void): void;
+  /** Whether the worker's process is alive (idle-hot counts). Used to pick the resume path (§9.2). */
+  isRunning?(id: string): boolean;
+  /** Live worker pids for the descendant-snapshot loop (connector-pi.md §9.3). */
+  workerPids?(): Array<{ workerId: string; pid: number }>;
+  /** Test support: emulate a hard crash of the connector (children SIGKILLed, no cleanup). */
+  simulateCrash?(): void;
 }

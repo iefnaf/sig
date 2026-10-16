@@ -40,7 +40,7 @@ async function main(argv: string[]): Promise<void> {
     console.log(`paired as ${deviceId}; connecting...`);
 
     const app = new ConnectorApp({ store, stateDir: STATE_DIR, machineName });
-    app.start();
+    await app.start();
     return;
   }
 
