@@ -5,6 +5,11 @@
 // the webhook switch). Progress while a scan or the verifying DM is pending comes from a
 // `<meta refresh>`, so polling stays server-side. Copy is Chinese to match the product's
 // user-facing language.
+//
+// Post-deploy reachability self-check (issue #25): the page classifies the host it was opened
+// on — *.workers.dev vs a custom domain — and says what that means for Feishu's webhook
+// delivery (research/feishu-channel.md §3, §9.3). That this page renders at all is the other
+// half of the check: the HTML comes from the Durable Object, so Worker + DO + storage are up.
 import { renderSVG } from "uqr";
 import type { Brand } from "./channel/types.ts";
 
@@ -87,17 +92,45 @@ ${refresh ? `<meta http-equiv="refresh" content="3">\n` : ""}<title>Shepherd 设
 <body><main>
 <h1>Shepherd 设置</h1>
 <p>一次性引导：扫码创建飞书机器人并切换为 webhook 投递，或手动填写凭据。引导完成后，本页面将<b>永久关闭</b>。</p>
-${workersDevWarning(opts.host)}
+${renderReachabilityCheck(opts.host)}
 ${opts.view.formError ? `<p class="error">${escapeHtml(opts.view.formError)}</p>` : ""}
 ${renderPhase(opts)}
 ${renderManualFallback(opts)}
 </main></body></html>`;
 }
 
-function workersDevWarning(host: string): string {
-  if (!/(^|\.)workers\.dev$/i.test(host)) return "";
-  return `<div class="warn">⚠️ 当前地址是 <code>${escapeHtml(host)}</code>：飞书服务器无法访问 <code>*.workers.dev</code>（实测，见部署文档）。
-切换 webhook 前需要先为 Worker 绑定<b>自定义域名</b>，并用新域名重新打开本页面。</div>`;
+const DEPLOY_GUIDE = "https://github.com/iefnaf/shepherd/blob/main/docs/deploy.md";
+
+// Reachability self-check (issue #25, research §3 + §9.3). Shown on every phase: the host you
+// open the page on decides whether Feishu's servers (inside mainland China) can deliver
+// webhooks to this deployment. `*.workers.dev` is blocked there (DNS pollution + SNI reset,
+// verified live); custom domains are usually reachable but not guaranteed — the authoritative
+// test is Feishu's own URL validation during the webhook switch, i.e. the QR flow's step 3.
+function renderReachabilityCheck(host: string): string {
+  const alive = `<p class="ok">✓ 部署自检：本页由你的 Durable Object 渲染——能打开它，说明 Worker、Durable Object 与存储都已正常工作。</p>`;
+  const bare = host.replace(/^\[|\]$/g, "");
+  if (/(^|\.)localhost$/i.test(host) || bare === "::1" || /^\d+\.\d+\.\d+\.\d+$/.test(bare)) {
+    return ""; // local wrangler dev: nothing to check
+  }
+  if (/(^|\.)workers\.dev$/i.test(host)) {
+    return `<div class="warn">${alive}
+⚠️ 网络自检：你正通过 <code>${escapeHtml(host)}</code>（workers.dev）访问。飞书服务器在国内，
+<b>无法访问 <code>*.workers.dev</code></b>（DNS 污染 + SNI 重置，实测）：webhook 事件永远送不到这里，
+大陆用户直接打开本页或运行 connector 也需要代理。继续之前：
+<ol style="margin:8px 0 0">
+<li>为 Worker <b>绑定自定义域名</b>（需要一个托管在 Cloudflare DNS 上的域名）；</li>
+<li>用自定义域名重新打开本页（SETUP_TOKEN 不变），自检变为绿色后再继续扫码。</li>
+</ol>
+<p class="muted" style="margin:8px 0 0">步骤与截图见 <a href="${DEPLOY_GUIDE}#custom-domain" rel="noopener">部署指南 · 自定义域名</a>。大陆网络下 Cloudflare 自定义域名也并非全部可达，最终以第 3 步切换 webhook 时飞书侧的地址校验为准。</p>
+</div>`;
+  }
+  return `<div class="card" style="border-color:#2ea86f">${alive}
+<p class="ok">✓ 网络自检：你正通过<b>自定义域名</b> <code>${escapeHtml(host)}</code> 访问，webhook 地址将以它为准。
+飞书能否真正送达，以「切换到 webhook」（扫码流程第 3 步，或手动在开放平台保存事件订阅地址）时飞书侧的
+地址校验为准——那一步成功即证明可达。</p>
+<p class="muted" style="margin:8px 0 0">大陆网络下部分 Cloudflare 域名同样不可达：若切换失败或收不到验证消息，见
+<a href="${DEPLOY_GUIDE}#custom-domain" rel="noopener">部署指南 · 自定义域名</a>的排查清单。</p>
+</div>`;
 }
 
 function renderPhase(opts: SetupPageOptions): string {

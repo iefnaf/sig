@@ -1269,6 +1269,10 @@ export class Steward extends Agent<Env> {
   // (M2) reads it back through modelConfig(). Not reachable over HTTP — RPC on the stub only,
   // which the routes-audit test pins down.
 
+  // ADR-0001 decision 11: the default provider for keys collected at deploy time (the model
+  // itself is deepseek-flash); M2's setup/chat step can reconfigure via setModelConfig.
+  static readonly DEFAULT_MODEL_PROVIDER = "deepseek";
+
   async setModelConfig(provider: string, apiKey: string): Promise<void> {
     if (!provider.trim() || !apiKey.trim()) throw new Error("provider and apiKey are required");
     const [primary] = await this.serverKeys();
@@ -1280,6 +1284,14 @@ export class Steward extends Agent<Env> {
   }
 
   async modelConfig(): Promise<{ provider: string; apiKey: string } | null> {
+    // One-click-deploy glue (issue #25, spec §12.1 step 1): MODEL_KEY — the secret the
+    // Deploy-to-Cloudflare form collects — seeds the sealed config on first read, so the key
+    // never lives anywhere outside the user's own account. Seeding only fills an empty
+    // sh_model: an explicit setModelConfig (M2's setup/chat step) always wins, and the env
+    // secret is dead weight once the sealed row exists (delete it if you like).
+    if (this.sql`SELECT 1 AS one FROM sh_model WHERE id = 0`.length === 0 && this.env.MODEL_KEY?.trim()) {
+      await this.setModelConfig(Steward.DEFAULT_MODEL_PROVIDER, this.env.MODEL_KEY.trim());
+    }
     const row = this.sql<{ provider: string; apiKeyEnc: string }>`SELECT provider, apiKeyEnc FROM sh_model WHERE id = 0`[0];
     if (!row) return null;
     const opened = await openSecret(await this.serverKeys(), row.apiKeyEnc);
