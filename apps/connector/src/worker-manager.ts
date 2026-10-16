@@ -12,6 +12,8 @@ import { acquireLock, markLocksHeldByDeadProcess, releaseLock, removeStaleLocks 
 import { RESUME_PROMPT, PiAdapter } from "./pi-adapter.ts";
 import { ProgressThrottle } from "./progress.ts";
 import { inspectSessionTail, type SessionTail } from "./session-tail.ts";
+import { readSessionHistory } from "./session-history.ts";
+import type { HistoryPage } from "@shepherd/protocol";
 import type { LocalStore, WorkerRow } from "./store.ts";
 import { WorktreeManager } from "./worktree.ts";
 import { join } from "node:path";
@@ -277,6 +279,23 @@ export class WorkerManager {
     await this.adapter.stopProcess(workerId); // process_exit handler releases the lock
     // §9.3: a stop that had to escalate to SIGKILL may have orphaned tool children.
     await this.cleanupOrphans(workerId);
+  }
+
+  /**
+   * On-demand raw history (connector-pi.md §11.4): while the process is running, increments
+   * come from `get_entries{since}` over RPC; otherwise the session JSONL is parsed directly
+   * along the current branch. Normalized, truncated, capped at maxBytes, cursor-addressed.
+   */
+  async history(workerId: string, since: string | undefined, maxBytes: number): Promise<HistoryPage> {
+    const worker = this.store.getWorker(workerId);
+    if (!worker) throw new CommandError("not_found", `worker ${workerId} is unknown on this machine`);
+    if (typeof this.adapter.history === "function" && this.adapter.isRunning?.(workerId)) {
+      return this.adapter.history(workerId, since, maxBytes);
+    }
+    if (!worker.sessionFile) {
+      throw new CommandError("no_history", `worker ${workerId} has no session file to read`);
+    }
+    return readSessionHistory(worker.sessionFile, { since, maxBytes });
   }
 
   // --- Startup reconciliation (connector-pi.md §9.1) ----------------------------------------

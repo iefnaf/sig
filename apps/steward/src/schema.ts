@@ -307,4 +307,25 @@ export const MIGRATIONS: readonly Migration[] = [
       )`;
     },
   },
+  {
+    // History relay (issue #23, protocol §6.6): bookkeeping only — which browser connection
+    // asked, which worker/machine, the byte meter, and the deadline. Chunk CONTENT never
+    // reaches this table (or any other): it passes through DO memory between sockets.
+    id: "009_history_relay",
+    up: (sql) => {
+      // state lives in SQLite because the DO may sleep between chunks (§6.6).
+      sql`CREATE TABLE IF NOT EXISTS history_relay (
+        reqId TEXT PRIMARY KEY,
+        webConnId TEXT NOT NULL,
+        workerId TEXT NOT NULL,
+        deviceId TEXT NOT NULL,
+        maxBytes INTEGER NOT NULL,
+        sentBytes INTEGER NOT NULL DEFAULT 0,
+        expiresAt INTEGER NOT NULL,
+        createdAt INTEGER NOT NULL
+      )`;
+      sql`CREATE INDEX IF NOT EXISTS history_relay_conn ON history_relay (webConnId)`;
+      sql`CREATE INDEX IF NOT EXISTS history_relay_device ON history_relay (deviceId)`;
+    },
+  },
 ];
