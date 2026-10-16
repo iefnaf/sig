@@ -466,6 +466,8 @@ The `beforeTool` hook (pi-durable's `hook(ToolTask, { beforeTool })`) consults t
 
 The `provenance` rule (spec §8.3): in event-triggered runs, calling `start_worker`/`send_to_worker` requires a `provenance` that is an existing routine, follow-up, or watch ID, or a user message ID; an empty value is always rejected. This makes it impossible for the steward to decide to act "out of thin air".
 
+> **Implemented boundary (issue #6, PR #40 review #4):** in event/routine/follow-up-triggered runs the `start_worker` tool requires an explicit `provenanceRef`; `user:<msgId>` values are verified against `sh_inbound` (a message this deployment actually received), anything else — including the wake's own `evt:` id — is refused at the tool. Routine/follow-up/watch reference checks join when those tables land (#20).
+
 The autonomy switch (cautious / balanced / hands-off) = three settings of this policy table; the MVP implements only "balanced", and the table structure leaves room for swapping in the others.
 
 ## 8. Proactive behavior

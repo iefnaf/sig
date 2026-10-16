@@ -1,6 +1,6 @@
 import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { expect } from "vitest";
-import type { Steward } from "../src/steward.ts";
+import type { ShOutboundRow, Steward } from "../src/steward.ts";
 
 export function ownerStub() {
   const id = env.Steward.idFromName("owner");
@@ -76,6 +76,22 @@ export async function scriptModel(...steps: unknown[]): Promise<void> {
 
 export async function modelRequests(): Promise<Array<{ at: number; userText: string; brief: string | null; lastToolResult: string }>> {
   return ownerStub().fauxRequests();
+}
+
+/**
+ * Polls ONLY the outbound queue until a sent text row equals `text` — deliberately never
+ * touches pollRuns/drainWakes, so alarm-driven paths (review #1's regression) must carry the
+ * run home on their own.
+ */
+export async function waitForSentText(text: string, timeoutMs = 25_000): Promise<ShOutboundRow | null> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const rows = await ownerStub().outboundRows(50);
+    const hit = rows.find((r) => r.kind === "text" && r.status === "sent" && (JSON.parse(r.payload as string) as { text?: string }).text === text);
+    if (hit) return hit;
+    if (Date.now() > deadline) throw new Error(`sent text never arrived: ${text} (rows: ${JSON.stringify(rows.map((r) => [r.kind, r.status]))})`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
 }
 
 /** Polls until every sh_run row is settled and no wake is pending (the alarm paths settle). */

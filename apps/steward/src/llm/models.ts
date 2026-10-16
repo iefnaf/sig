@@ -139,7 +139,7 @@ export function buildStewardModels(config: StewardModelConfig, apiKey: string | 
     const faux: FauxProviderHandle = fauxProvider({ models: [{ id: config.modelId, name: "Faux" }] });
     const steps: AssistantMessage[] = [];
     const requests: FauxRequestRecord[] = [];
-    const factory = (context: TranscriptContext): AssistantMessage => {
+    const factory = async (context: TranscriptContext): Promise<AssistantMessage> => {
       const messages = [...context.messages];
       const lastUser = [...messages].reverse().find((m) => m.role === "user");
       const lastToolResult = [...messages].reverse().find((m) => m.role === "toolResult");
@@ -153,6 +153,22 @@ export function buildStewardModels(config: StewardModelConfig, apiKey: string | 
       });
       if (requests.length > 50) requests.shift();
       const step = steps.shift();
+      // `{ waitForMs, text }` steps delay the reply — the no-nudge alarm tests use them to
+      // keep a run open across several real alarm cycles (review #1's regression coverage).
+      if (step !== undefined && "waitForMs" in (step as unknown as Record<string, unknown>)) {
+        const delayed = step as unknown as { waitForMs: number; text: string };
+        await new Promise((resolve) => setTimeout(resolve, delayed.waitForMs));
+        return {
+          role: "assistant",
+          content: [{ type: "text", text: delayed.text }],
+          api: "faux",
+          provider: "faux",
+          model: config.modelId,
+          usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+          stopReason: "stop",
+          timestamp: Date.now(),
+        } satisfies AssistantMessage;
+      }
       return (
         step ?? {
           role: "assistant",

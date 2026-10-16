@@ -489,9 +489,13 @@ function progressText(lastProgress: string): string {
 /** The timeline body (L2): header + summary events, mobile-first single column (spec §7.4). */
 export function renderTimeline(view: TimelineView, now: number): string {
   const { thread, entries, workers, openQuestion } = view;
+  // Review #40/#2: goal is model-writable (start_worker/update_thread) and machine names are
+  // connector-reported — every meta value goes through esc() like the rest of the page.
   const meta = [
-    thread.goal ? `目标：${thread.goal}` : null,
-    workers.length > 0 ? [...new Set(workers.map((w) => `${w.agent} @ ${w.machineName}`))].join("、") : null,
+    thread.goal ? `目标：${esc(thread.goal)}` : null,
+    workers.length > 0
+      ? [...new Set(workers.map((w) => `${esc(w.agent)} @ ${esc(w.machineName)}`))].join("、")
+      : null,
     `建于 ${relTime(thread.createdAt, now)}`,
   ]
     .filter((p): p is string => p !== null)

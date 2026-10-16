@@ -157,6 +157,9 @@ export interface RunRow {
   resultReason: string | null;
   resultText: string | null;
   replyOutboundId: string | null;
+  /** The run already produced user-facing output (notify_user/ask_user) — an empty final
+   *  text is then legitimate, not a failure (review #9). */
+  notified: boolean;
   createdAt: number;
   settledAt: number | null;
 }
@@ -587,7 +590,18 @@ export function createLedger(deps: LedgerDeps) {
       text?: string;
       card?: unknown;
       urgency?: "push" | "quiet";
+      /** Stable dedupe key (review #6): same id → same row (INSERT OR IGNORE), never a second
+       *  message; the id doubles as the provider-side uuid. Omitted: a fresh one-of message. */
+      id?: string;
     }): string {
+      if (input.id !== undefined) {
+        sql`
+          INSERT OR IGNORE INTO sh_outbound (id, channel, kind, receiveId, threadId, payload, urgency, status, attempts, nextAttemptAt, createdAt)
+          VALUES (${input.id}, 'feishu', ${input.kind}, ${input.to}, ${input.threadId ?? null},
+                  ${JSON.stringify({ text: input.text, card: input.card })}, ${input.urgency ?? "quiet"}, 'queued', 0, ${now()}, ${now()})
+        `;
+        return input.id;
+      }
       const id = ulid(); // stable across retries; doubles as the provider-side uuid
       sql`
         INSERT INTO sh_outbound (id, channel, kind, receiveId, threadId, payload, urgency, status, attempts, nextAttemptAt, createdAt)

@@ -113,6 +113,8 @@ export interface DispatcherDeps {
   ) => Promise<{ cmdId: string }>;
   /** Withdraws a still-queued command; false once it has left the DO. */
   cancelQueuedCommand: (cmdId: string) => boolean;
+  /** Whether a command with this id already exists (replay dedup, protocol §7.1). */
+  commandExists: (cmdId: string) => boolean;
   sendText: (text: string, threadId?: string | null) => Promise<void>;
   sendCard: (card: unknown, threadId: string) => Promise<void>;
   /** Issues a one-time pairing code (protocol §5.2) for `/加机器`. */
@@ -338,6 +340,10 @@ export class Dispatcher {
     provenance: string,
     cmdId?: string,
   ): Promise<void> {
+    // Review (other findings): a replayed call carrying a cmdId that already exists must not
+    // register a second worker row (the outbox dedupes the command, but the ghost `starting`
+    // worker would sit on the Thread forever). Re-entering an existing command is a no-op.
+    if (cmdId !== undefined && this.#deps.commandExists(cmdId)) return;
     const workerId = `w_${ulid()}`;
     // Relay (spec §5.3): a later worker on the same Thread continues from the previous branch.
     const previous = this.ledger.workers.latestOnThread(thread.threadId);

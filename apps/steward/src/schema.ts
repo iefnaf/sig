@@ -313,7 +313,9 @@ export const MIGRATIONS: readonly Migration[] = [
       sql`CREATE INDEX IF NOT EXISTS sh_wake_due ON sh_wake (status, dueAt)`;
       // One row per steward input (§6.3): kind=user runs reply with the settled final text;
       // event/routine/followup runs keep the text for audit and never send it (§6.2).
-      // routedThreadId records the quote-routed Thread (§3.1 signal 1) resolved at submit time.
+      // routedThreadId records the Thread this run belongs to (§3.1 signal 1 at submit time,
+      // or the run's own dispatch backfilled); `notified` marks runs that already produced
+      // user-facing output, so an empty final text is not mistaken for a failure (review #9).
       sql`CREATE TABLE IF NOT EXISTS sh_run (
         operationId TEXT PRIMARY KEY,
         kind TEXT NOT NULL,
@@ -326,6 +328,7 @@ export const MIGRATIONS: readonly Migration[] = [
         resultReason TEXT,
         resultText TEXT,
         replyOutboundId TEXT,
+        notified INTEGER NOT NULL DEFAULT 0,
         createdAt INTEGER NOT NULL,
         settledAt INTEGER
       )`;

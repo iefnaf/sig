@@ -60,6 +60,7 @@ import { RetriableChannelError, type Brand, type InboundEvent } from "./channel/
 import { Dispatcher, parseOwnerCommand } from "./dispatch.ts";
 import { buildSituationBrief } from "./llm/brief.ts";
 import { buildStewardExtension, type StewardExtensionContext } from "./llm/extension.ts";
+import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import {
   buildStewardModels,
   installModel,
@@ -276,6 +277,16 @@ export class Steward extends Agent<Env> {
     const config = sealed && !vars.explicit ? { ...vars, provider: sealed.provider } : vars;
     const apiKey = sealed && sealed.provider === config.provider ? sealed.apiKey : undefined;
     installModel(this.llmModels.models, config, apiKey);
+    // Review #10: a provider/model combination the catalog does not know (e.g. a sealed
+    // provider whose key was collected for another vendor while vars still carry the default
+    // model id) fails visibly as `no_model` — surface it in the channel log too, with the
+    // fix, instead of a silent never-answering bot.
+    if (this.llmModels.models.getModel(config.provider, config.modelId) === undefined) {
+      this.logChannel(
+        "model_config_error",
+        `provider ${config.provider} 没有模型 ${config.modelId}；用 vars.STEWARD_MODEL 指定该 provider 存在的 modelId（或为 ${config.modelId} 配置对应 provider 的 sealed key）`,
+      );
+    }
     const signature = `${config.provider}/${config.modelId}/${apiKey ? "keyed" : "keyless"}`;
     if (this.appliedRootModel === signature) return;
     await this.piHarness.session().setModel({ provider: config.provider, id: config.modelId });
@@ -315,6 +326,7 @@ export class Steward extends Agent<Env> {
         this.sql`UPDATE outbox SET state = 'expired' WHERE cmdId = ${cmdId} AND state = 'queued'`;
         return this.sql<{ changes: number }>`SELECT changes() AS changes`[0]!.changes > 0;
       },
+      commandExists: (cmdId) => this.sql`SELECT 1 AS one FROM outbox WHERE cmdId = ${cmdId}`.length > 0,
       sendText: async (text, threadId) => {
         const owner = this.ownerOpenIdSync();
         if (!owner) return;
@@ -353,14 +365,28 @@ export class Steward extends Agent<Env> {
     return {
       ledger: this.ledger,
       buildBrief: () => buildSituationBrief(this.ledger),
-      currentRun: () => {
-        const run = this.ledger.runs.openRows()[0];
-        if (!run) return null;
-        // §7.1: the provenance of an event run is the wake's operationId; a user run's is
-        // `user:<msgId>` — what start_worker records as createdFromMsg.
-        return { operationId: run.operationId, kind: run.kind, provenance: run.operationId, routedThreadId: run.routedThreadId };
+      currentRun: () => this.currentRunBinding(),
+      checkProvenanceRef: async (ref) => {
+        // §7.2 (review #4): a `user:<msgId>` reference is valid only if this deployment
+        // actually received that message. Routine/followup/watch ids join when #20 lands.
+        if (!ref.startsWith("user:")) return false;
+        const msgId = ref.slice("user:".length);
+        if (msgId.length === 0) return false;
+        return this.sql`SELECT 1 AS one FROM sh_inbound WHERE channel = 'feishu' AND msgId = ${msgId}`.length > 0;
       },
-      startWorker: (input) => this.dispatcher.startWorker(input),
+      startWorker: async (input) => {
+        const outcome = await this.dispatcher.startWorker(input);
+        // Review #8: a dispatch in this run picks/creates the Thread the conversation is now
+        // about — backfill it onto the run so the run's reply (and quote-replies to it)
+        // route to that Thread, exactly like an explicit quote-route does.
+        if (outcome.kind === "dispatched" || outcome.kind === "asked_offline") {
+          const run = await this.currentRunBinding();
+          if (run && run.routedThreadId === null) {
+            this.sql`UPDATE sh_run SET routedThreadId = ${outcome.threadId} WHERE operationId = ${run.operationId} AND routedThreadId IS NULL`;
+          }
+        }
+        return outcome;
+      },
       notifyUser: async (input) => {
         const owner = this.ownerOpenIdSync();
         if (!owner) return;
@@ -369,6 +395,7 @@ export class Steward extends Agent<Env> {
         // fresh one-time link the core-template cards carry (issue #22).
         const detailsUrl = thread ? await this.web.linkUrl(linkTargetForThread(thread.threadId)) : null;
         await this.enqueueOutbound({
+          id: input.dedupeId,
           kind: "card",
           to: owner,
           card: notifyCard({
@@ -382,6 +409,7 @@ export class Steward extends Agent<Env> {
           urgency: input.urgency,
         });
         if (thread) this.sql`UPDATE sh_thread SET unread = 1 WHERE threadId = ${thread.threadId}`;
+        await this.markRunNotified();
       },
       askUser: async (input) => {
         const owner = this.ownerOpenIdSync();
@@ -389,8 +417,10 @@ export class Steward extends Agent<Env> {
         const thread = input.threadId ? this.ledger.threads.get(input.threadId) : null;
         if (thread) {
           // §4.3: ask_user creates the question, flips the Thread to waiting_you, and ends the
-          // turn. Answering later happens as a quote-reply routed back to the Thread.
-          const qid = `q_steward_${this.ledger.runs.openRows()[0]?.operationId ?? ulid()}`;
+          // turn. Answering later happens as a quote-reply routed back to the Thread (which
+          // closes it — see submitUserMessage). One question per call: unique id (review #3 —
+          // a per-run id collided and INSERT OR IGNORE silently swallowed repeats).
+          const qid = `q_steward_${ulid()}`;
           this.sql`
             INSERT OR IGNORE INTO sh_question (qid, threadId, workerId, text, options, status, askedAt)
             VALUES (${qid}, ${thread.threadId}, NULL, ${input.question}, ${JSON.stringify(input.options)}, 'open', ${Date.now()})
@@ -399,17 +429,52 @@ export class Steward extends Agent<Env> {
           this.sql`UPDATE sh_thread SET unread = 1 WHERE threadId = ${thread.threadId}`; // news landed (§5.2)
         }
         await this.enqueueOutbound({
+          id: input.dedupeId,
           kind: "text",
           to: owner,
           text: askUserText(input.question, input.options, thread?.title),
           threadId: thread?.threadId ?? null,
           urgency: "push",
         });
+        await this.markRunNotified();
       },
       audit: (kind, detail) => {
         this.logChannel(kind, detail);
       },
     };
+  }
+
+  /**
+   * The run that is *executing* right now (review #3): pi marks a submission `placed` while
+   * an active run owns it, and PiHarness.pending() surfaces those as `running` — that, not
+   * the oldest unsettled sh_run, is what tools are executing inside (a queued followUp starts
+   * the moment the previous run answers, while sh_run only settles at the next 2s poll).
+   * Falls back to the oldest open run between runs (passive entry writes, wake drains).
+   */
+  private async currentRunBinding(): Promise<{
+    operationId: string;
+    kind: string;
+    provenance: string;
+    routedThreadId: string | null;
+  } | null> {
+    const running = (await this.piHarness.pending()).find((p) => p.status === "running");
+    if (running) {
+      const row = this.ledger.runs.get(running.operationId);
+      if (row) {
+        // §7.1: the provenance of an event run is the wake's operationId; a user run's is
+        // `user:<msgId>` — what start_worker records as createdFromMsg.
+        return { operationId: row.operationId, kind: row.kind, provenance: row.operationId, routedThreadId: row.routedThreadId };
+      }
+    }
+    const open = this.ledger.runs.openRows()[0];
+    if (!open) return null;
+    return { operationId: open.operationId, kind: open.kind, provenance: open.operationId, routedThreadId: open.routedThreadId };
+  }
+
+  /** Records that the *executing* run already produced user-facing output (review #9). */
+  private async markRunNotified(): Promise<void> {
+    const run = await this.currentRunBinding();
+    if (run) this.sql`UPDATE sh_run SET notified = 1 WHERE operationId = ${run.operationId}`;
   }
 
   private ownerOpenIdSync(): string | null {
@@ -1548,6 +1613,9 @@ export class Steward extends Agent<Env> {
     explicitVars: boolean;
     sealedProvider: string | null;
     apiKey: boolean;
+    /** False when the selected provider's catalog has no such model — runs would settle
+     *  `unanswered` with `no_model` (review #10); ensureRootModel logs model_config_error. */
+    modelKnown: boolean;
   }> {
     const sealed = await this.modelConfig();
     // `varsRaw: null` models an unset deploy config; `undefined` (the production call) reads env.
@@ -1560,6 +1628,7 @@ export class Steward extends Agent<Env> {
       explicitVars: vars.explicit,
       sealedProvider: sealed?.provider ?? null,
       apiKey: Boolean(sealed && sealed.provider === config.provider),
+      modelKnown: config.provider === "faux" || builtinProviders().some((p) => p.id === config.provider && p.getModels().some((m) => m.id === config.modelId)),
     };
   }
 
@@ -1655,7 +1724,13 @@ export class Steward extends Agent<Env> {
     // Signal 1 (§3.1): a quote of one of our messages routes to that Thread directly.
     const routed = input.parentId ? this.ledger.outbound.threadIdForProviderMsg(input.parentId) : null;
     const routedThread = routed ? this.ledger.threads.get(routed) : null;
-    if (routedThread) this.ledger.threads.markRead(routedThread.threadId); // a reply means the report was seen (§6.5)
+    if (routedThread) {
+      this.ledger.threads.markRead(routedThread.threadId); // a reply means the report was seen (§6.5)
+      // Review #7: a reply routed to a Thread with an open question IS the answer — close it
+      // (the deterministic path only closed on re-dispatch, leaving waiting_you stuck when
+      // the user e.g. answered "算了"). The steward sees the closed state in the next brief.
+      this.ledger.questions.closeOpen(routedThread.threadId, "用户回复了提问");
+    }
     // Content markers (§4.2): user text is escaped so it can never mimic a ⟦…⟧ system input;
     // the routing note is prefixed as clearly-marked system metadata (never the ⟦ form, so
     // the input still reads as user-originated).
@@ -1682,7 +1757,7 @@ export class Steward extends Agent<Env> {
    * RUN_POLL_S seconds; on settlement a user run's final text is enqueued as the reply, and
    * every other kind's text is discarded — the structural half of "quiet by default" (§6.2).
    */
-  async pollRuns(): Promise<void> {
+  async pollRuns(_payload?: unknown, schedule?: { id: string }): Promise<void> {
     const open = this.ledger.runs.openRows();
     if (open.length === 0) return;
     let stillOpen = false;
@@ -1713,20 +1788,37 @@ export class Steward extends Agent<Env> {
       this.logChannel("poll_runs_failed", errorText(err));
       stillOpen = true;
     }
-    // idempotent: frequent callers (submit, the test poller) dedup onto one pending job.
-    if (stillOpen) void this.schedule(RUN_POLL_S, "pollRuns", undefined, { idempotent: true });
+    if (!stillOpen) return;
+    // Rearm (review #1): an idempotent schedule() called from inside the running job dedups
+    // ONTO that job — which the JobDriver deletes when the handler returns — so the loop
+    // would die after one alarm. The Scheduler hands the callback its own schedule: cancel
+    // it first, then the idempotent insert is the only job left and always creates fresh.
+    // Inline callers (submit, the test poller) have no `schedule` and only dedup onto whatever
+    // is pending, which the job-context pass above keeps correcting.
+    if (schedule !== undefined) await this.cancelSchedule(schedule.id).catch(() => {});
+    await this.schedule(RUN_POLL_S, "pollRuns", undefined, { idempotent: true });
   }
 
   private settleRun(run: RunRow, result: { status: string; reason?: string; text?: string }): void {
     if (run.kind === "user") {
       const owner = this.ownerOpenIdSync();
-      if (owner && result.status === "done" && result.text && result.text.trim().length > 0) {
+      const hasText = Boolean(result.text && result.text.trim().length > 0);
+      // Review #9: a `done` run with no final text is legitimate when the model already
+      // produced user-facing output (ask_user terminates the turn right after its push;
+      // notify_user cards went out mid-run). Only a silent empty answer is treated as a
+      // failure the user must hear about.
+      const alreadyNotified = Boolean(run.notified);
+      if (owner && result.status === "done" && hasText) {
         // §6.2 source 3: the final text of a user-triggered run IS the reply. Carrying the
-        // routed thread keeps quote-reply chains on the same Thread (§3.1).
+        // routed thread keeps quote-reply chains on the same Thread (§3.1) — either the
+        // quote-route resolved at submit time or the run's own dispatch backfilled it.
+        // The outbound id is keyed to the run (review #6): concurrent polls and interrupted
+        // settle windows converge on one message.
         void this.enqueueOutbound({
+          id: `reply:${run.operationId}`,
           kind: "text",
           to: owner,
-          text: result.text,
+          text: result.text!,
           threadId: run.routedThreadId,
           urgency: "push",
         }).then(({ id }) => this.ledger.runs.settle(run.operationId, result, id));
@@ -1736,6 +1828,7 @@ export class Steward extends Agent<Env> {
         // No template exists for user replies; a one-line notice beats silence (the budget
         // cap and its degradation behavior are #28's to refine).
         void this.enqueueOutbound({
+          id: `reply:${run.operationId}`,
           kind: "text",
           to: owner,
           text: "⚠️ 总管这轮没有跑成（模型调用失败或被中断），这条消息我没能处理；稍后再试或重发一次。",
@@ -1744,8 +1837,21 @@ export class Steward extends Agent<Env> {
         }).then(({ id }) => this.ledger.runs.settle(run.operationId, result, id));
         return;
       }
+      if (owner && result.status === "done" && !hasText && !alreadyNotified) {
+        // Review #9: done, empty, and nothing reached the user — say so instead of silence.
+        void this.enqueueOutbound({
+          id: `reply:${run.operationId}`,
+          kind: "text",
+          to: owner,
+          text: "⚠️ 总管这轮没有给出回复（可能只调用了内部工具）；需要的话再说一次。",
+          threadId: run.routedThreadId,
+          urgency: "push",
+        }).then(({ id }) => this.ledger.runs.settle(run.operationId, result, id));
+        return;
+      }
     }
-    // Event/routine/follow-up runs: the text is kept for audit and NOT sent (§6.2).
+    // Event/routine/follow-up runs, and user runs that already reached the user: the text is
+    // kept for audit and nothing more is sent (§6.2).
     this.ledger.runs.settle(run.operationId, result);
   }
 
@@ -1755,7 +1861,7 @@ export class Steward extends Agent<Env> {
    * time and harness.submit deduplicates by it, so replays and crash-restarts never produce a
    * second steward input.
    */
-  async drainWakes(): Promise<void> {
+  async drainWakes(_payload?: unknown, schedule?: { id: string }): Promise<void> {
     let submitted = false;
     try {
       for (const wake of this.ledger.wakes.due(Date.now())) {
@@ -1775,9 +1881,12 @@ export class Steward extends Agent<Env> {
     }
     const next = this.ledger.wakes.earliestDue(Date.now());
     if (next !== null) {
-      // Idempotent on a fixed payload so repeated drains share one pending job; a fresh,
-      // earlier wake first cancels the stale job so the alarm can be pulled in.
+      // Rearm (same reasoning as pollRuns, review #1): cancel the tracked pending job AND
+      // our own running schedule (the tracked id can be stale after an eviction restarted
+      // this isolate), then the idempotent insert always creates fresh — at the earliest
+      // due moment, so a new wake can also pull the alarm in.
       const inS = Math.max(1, Math.ceil((next - Date.now()) / 1000));
+      if (schedule !== undefined) await this.cancelSchedule(schedule.id).catch(() => {});
       if (this.drainWakeScheduleId !== undefined) {
         await this.cancelSchedule(this.drainWakeScheduleId).catch(() => {});
         this.drainWakeScheduleId = undefined;
@@ -1827,6 +1936,10 @@ export class Steward extends Agent<Env> {
     card?: unknown;
     threadId?: string | null;
     urgency?: "push" | "quiet";
+    /** Stable dedupe key (review #6): retries/replays of the same logical message converge on
+     *  one row (INSERT OR IGNORE) — the id doubles as the provider-side uuid, so a repeated
+     *  enqueue can never double-send. Omitted: a fresh one-of message. */
+    id?: string;
   }): Promise<{ id: string }> {
     const id = this.ledger.outbound.enqueue(input);
     void this.deliverOutbound();
