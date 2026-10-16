@@ -202,3 +202,72 @@ export function askUserText(question: string, options: string[], threadTitle?: s
   const body = options.length > 0 ? `${question}\n${options.map((o, i) => `${i + 1}. ${o}`).join("\n")}` : question;
   return `${head}❓ ${body}\n（直接回复这句话即可；回复会带上所属 Thread。）`;
 }
+
+// ---- proactive behavior (issue #20, steward.md §8; spike-conclusions §2 "digest routines") ----
+
+/** What a digest renders from — collected deterministically from the ledger, no LLM. */
+export interface DigestData {
+  running: Array<{ threadId: string; title: string; machineName: string; agent: string }>;
+  waiting: Array<{ threadId: string; title: string; question: string }>;
+  unreadIdle: Array<{ threadId: string; title: string; summary: string | null }>;
+}
+
+export const digestIsEmpty = (d: DigestData): boolean =>
+  d.running.length === 0 && d.waiting.length === 0 && d.unreadIdle.length === 0;
+
+/**
+ * The deterministic digest card (steward.md §8.2 × spike-conclusions §2): running / waiting /
+ * unread become one three-part card; the tone follows whether anything waits on the owner.
+ * Nothing to say → the caller stays silent, this is never called.
+ */
+export function digestCard(data: DigestData, footer: string) {
+  const parts: string[] = [];
+  if (data.running.length > 0) parts.push(`${data.running.length} 个在跑`);
+  if (data.waiting.length > 0) parts.push(`${data.waiting.length} 个等你`);
+  if (data.unreadIdle.length > 0) parts.push(`${data.unreadIdle.length} 个未读汇报`);
+  const lines = [
+    ...data.running.map((r) => `「${r.title}」在 ${r.machineName} 上跑（${r.agent}）`),
+    ...data.waiting.map((w) => `「${w.title}」等你：${w.question}`),
+    ...data.unreadIdle.map((u) => `「${u.title}」有未读汇报${u.summary ? `：${u.summary}` : ""}`),
+  ];
+  // renderReportCard caps did at 4 — so the overflow count rides the FOOTER, never a fifth
+  // did line that the cap would silently swallow (review #47-1): no omission is ever silent.
+  const shown = lines.slice(0, MAX_DID_ITEMS).map((line) => clip(line, MAX_DID_ITEM));
+  const overflow = lines.length - shown.length;
+  return renderReportCard({
+    tone: data.waiting.length > 0 ? "attention" : "success",
+    conclusion: `例行汇总：${parts.join("、")}`,
+    did: shown,
+    threadTitle: "",
+    footer: overflow > 0 ? `${footer}（另有 ${overflow} 件未列出，问我要详情）` : footer,
+  });
+}
+
+/**
+ * The routine-suggestion card (steward.md §8.5): repeats the spec back and offers buttons —
+ * the ONLY thing a suggestion may do. Creation happens on the tap (spec §8.3 consent); the
+ * button value carries just the action, the offer resolves via the card's providerMsgId.
+ */
+export function routineOfferCard(input: { schedule: string; instruction: string }) {
+  return {
+    config: { wide_screen_mode: true },
+    header: {
+      template: "azure",
+      title: { tag: "plain_text", content: "💡 要把这个变成例行任务吗？" },
+    },
+    elements: [
+      {
+        tag: "div",
+        text: { tag: "lark_md", content: `**触发**：${input.schedule}\n**做什么**：${clip(input.instruction, 200)}` },
+      },
+      {
+        tag: "action",
+        actions: [
+          { tag: "button", text: { tag: "plain_text", content: "创建" }, type: "primary", value: { action: "routine_accept" } },
+          { tag: "button", text: { tag: "plain_text", content: "先不用" }, type: "default", value: { action: "routine_decline" } },
+        ],
+      },
+      { tag: "note", elements: [{ tag: "plain_text", content: "点「创建」后才会保存；随时可以让我暂停或取消。" }] },
+    ],
+  };
+}

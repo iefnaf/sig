@@ -88,6 +88,10 @@ export interface StartWorkerInput {
   newTitle?: string;
   goal?: string;
   machineHint?: string;
+  /** §11 (issue #16): research/Q&A/review tasks run readonly in the repo's own checkout;
+   * anything that may change code needs a workspace. The steward decides at dispatch; the
+   * default — also when unsure — is write. */
+  mode?: "write" | "readonly";
   /** The authorizing run: `user:<msgId>` / `evt:…` / `routine:…` (steward.md §7.1). */
   provenance: string;
   /** `tool:<taskId>` — the idempotency key for replays (protocol §7.1). */
@@ -100,6 +104,41 @@ export type StartWorkerOutcome =
   | { kind: "dispatched"; workerId: string; threadId: string; machineName: string; repoId: string; queued: boolean; created: boolean }
   /** The only machine with the repo is offline: the wait/cancel card went out (spec §9). */
   | { kind: "asked_offline"; threadId: string; machineName: string }
+  | { kind: "refused"; reason: string };
+
+/** What the steward's send_to_worker tool asks the service to do (issue #9, §6.1 `send`). */
+export interface SendToWorkerInput {
+  workerId: string;
+  text: string;
+  intent: "now" | "after" | "auto";
+  /** The authorizing run: `user:<msgId>` / `evt:…` (steward.md §7.1). */
+  provenance: string;
+  /** `tool:<taskId>` — the idempotency key for replays (protocol §7.1). */
+  cmdId: string;
+}
+
+export type SendToWorkerOutcome =
+  | {
+      kind: "sent";
+      threadId: string;
+      /** How the connector will deliver it — the §6.2 state table applied to the worker's
+       *  ledger state; `steer` is what makes the reply mention after_current_tools. */
+      delivery: "steer" | "follow_up" | "prompt" | "queued";
+      machineOffline: boolean;
+    }
+  | { kind: "refused"; reason: string };
+
+/** What the steward's interrupt_worker tool asks the service to do (§6.1 `interrupt`). */
+export interface InterruptWorkerInput {
+  workerId: string;
+  /** “停，然后……” — the instruction handed to the worker right after the abort. */
+  then?: string;
+  provenance: string;
+  cmdId: string;
+}
+
+export type InterruptWorkerOutcome =
+  | { kind: "interrupted"; threadId: string; machineOffline: boolean }
   | { kind: "refused"; reason: string };
 
 export interface DispatcherDeps {
@@ -125,6 +164,8 @@ export interface DispatcherDeps {
   deployOrigin: () => string | null;
   /** Mints an absolute one-time web URL, or null when no origin is known yet. */
   webLinkUrl: (target: string) => Promise<string | null>;
+  /** A tap on a routine-suggestion card (`offer:` outbound ids, issue #20). */
+  onOfferTap: (offerId: string, action: string) => Promise<void>;
 }
 
 const AGENT = "pi"; // the only agent the connector drives in the MVP (ADR-0001 decision 3)
@@ -225,7 +266,7 @@ export class Dispatcher {
           this.ledger.timeline.add(thread.threadId, "user_instruction", input.prompt, { provenance: input.provenance });
           created = true;
         }
-        await this.dispatchTo(thread, choice.deviceId, repoId, input.prompt, choice.queued, input.provenance, input.cmdId);
+        await this.dispatchTo(thread, choice.deviceId, repoId, input.prompt, choice.queued, input.provenance, input.cmdId, input.mode);
         return {
           kind: "dispatched",
           workerId: this.ledger.workers.latestOnThread(thread.threadId)!.workerId,
@@ -237,6 +278,97 @@ export class Dispatcher {
         };
       }
     }
+  }
+
+  /**
+   * The steward's `send_to_worker` lands here (issue #9): the deterministic half is the
+   * §6.2 state table applied to the ledger's worker state (which delivery the connector
+   * will pick), the command enqueue with the tool's idempotency key, and the timeline
+   * entry. The tool tells the model what delivery to expect — including the
+   * after_current_tools effect for a running worker.
+   */
+  async sendToWorker(input: SendToWorkerInput): Promise<SendToWorkerOutcome> {
+    if (input.text.trim().length === 0) return { kind: "refused", reason: "text 为空" };
+    const worker = this.ledger.workers.get(input.workerId);
+    if (!worker) {
+      return { kind: "refused", reason: `worker ${input.workerId} 不存在。先 get_thread 拿到最新的 workerId。` };
+    }
+    const machine = this.ledger.machines.get(worker.deviceId);
+    const offline = !(machine?.online ?? false);
+    // PR #45 review #6: the connector rejects a broken worker's sends (broken_worker) —
+    // refuse here, before the enqueue, so the tool reply cannot claim a delivery (「已发送」)
+    // the connector is guaranteed to reject.
+    if (worker.state === "broken") {
+      return {
+        kind: "refused",
+        reason: `worker ${input.workerId} 已损坏（需要人工决定），指令不会被送达。先和用户确认下一步。`,
+      };
+    }
+    const delivery =
+      worker.state === "running" || worker.state === "recovering"
+        ? input.intent === "after"
+          ? "follow_up"
+          : "steer"
+        : worker.state === "starting" || worker.state === "lost"
+          ? "queued"
+          : "prompt"; // idle — broken was refused above
+    // Replay dedup (protocol §7.1): the same tool task re-running after a crash converges on
+    // the existing outbox row instead of writing a second timeline entry.
+    if (this.#deps.commandExists(input.cmdId)) {
+      return { kind: "sent", threadId: worker.threadId, delivery, machineOffline: offline };
+    }
+    const { cmdId } = await this.#deps.enqueueCommand(
+      worker.deviceId,
+      "send",
+      { workerId: worker.workerId, text: input.text, intent: input.intent },
+      { workerId: worker.workerId, cmdId: input.cmdId },
+    );
+    this.ledger.timeline.add(
+      worker.threadId,
+      "intervention",
+      `追加指令（intent=${input.intent}，将按 ${delivery} 送达）：${input.text}`,
+      { workerId: worker.workerId, cmdId, provenance: input.provenance },
+    );
+    return { kind: "sent", threadId: worker.threadId, delivery, machineOffline: offline };
+  }
+
+  /**
+   * The steward's `interrupt_worker` lands here (issue #9): enqueue the `interrupt` command
+   * (§6.1 — clear_queue → abort → optional then) and record it on the Thread's timeline.
+   * The hook in the extension is what gates autonomy (§7.2: user_explicit/user_reply_to
+   * only); this method stays mechanical.
+   */
+  async interruptWorker(input: InterruptWorkerInput): Promise<InterruptWorkerOutcome> {
+    const worker = this.ledger.workers.get(input.workerId);
+    if (!worker) {
+      return { kind: "refused", reason: `worker ${input.workerId} 不存在。先 get_thread 拿到最新的 workerId。` };
+    }
+    const machine = this.ledger.machines.get(worker.deviceId);
+    const offline = !(machine?.online ?? false);
+    // PR #45 review #6: nothing runs on a broken worker — refuse before the enqueue so the
+    // model cannot promise「会尽快停下」for a command the connector will reject.
+    if (worker.state === "broken") {
+      return { kind: "refused", reason: `worker ${input.workerId} 已损坏（需要人工决定），没有运行中的任务可停。` };
+    }
+    if (this.#deps.commandExists(input.cmdId)) {
+      return { kind: "interrupted", threadId: worker.threadId, machineOffline: offline };
+    }
+    const { cmdId } = await this.#deps.enqueueCommand(
+      worker.deviceId,
+      "interrupt",
+      {
+        workerId: worker.workerId,
+        ...(input.then !== undefined ? { then: { text: input.then } } : {}),
+      },
+      { workerId: worker.workerId, cmdId: input.cmdId },
+    );
+    this.ledger.timeline.add(
+      worker.threadId,
+      "intervention",
+      input.then !== undefined ? `中断指令（停后继续）：${input.then}` : "中断指令（停止运行）",
+      { workerId: worker.workerId, cmdId, provenance: input.provenance },
+    );
+    return { kind: "interrupted", threadId: worker.threadId, machineOffline: offline };
   }
 
   /**
@@ -277,6 +409,13 @@ export class Dispatcher {
 
   /** A card button callback (already deduped); the Thread comes from the card's message id. */
   async handleCardAction(input: { operatorId: string; action: string; cardMsgId: string }): Promise<void> {
+    // Routine suggestion cards (steward.md §8.5): resolved via the outbound row's `offer:` id —
+    // the tap is the consent that creates the routine; no Thread is required.
+    const outboundRow = this.ledger.outbound.rowForProviderMsg(input.cardMsgId);
+    if (outboundRow && outboundRow.id.startsWith("offer:")) {
+      await this.#deps.onOfferTap(outboundRow.id.slice("offer:".length), input.action);
+      return;
+    }
     const threadId = this.ledger.outbound.threadIdForProviderMsg(input.cardMsgId);
     const thread = threadId ? this.ledger.threads.get(threadId) : null;
     if (!thread) {
@@ -329,7 +468,7 @@ export class Dispatcher {
     return (
       this.ledger.workers
         .listByThread(threadId)
-        .some((w) => w.state === "starting" || w.state === "running" || w.state === "recovering") ||
+        .some((w) => w.state === "queued" || w.state === "starting" || w.state === "running" || w.state === "recovering") ||
       // A start_worker still in flight (queued for an offline machine, or sent and un-acked)
       // is just as live — the run exists and has merely not reached the worker yet. Keying
       // the guard on the pending command too keeps a reap from opening duplicate dispatches
@@ -351,6 +490,7 @@ export class Dispatcher {
     queued: boolean,
     provenance: string,
     cmdId?: string,
+    mode: "write" | "readonly" = "write",
   ): Promise<void> {
     // Review (other findings): a replayed call carrying a cmdId that already exists must not
     // register a second worker row (the outbox dedupes the command, but the ghost `starting`
@@ -361,7 +501,7 @@ export class Dispatcher {
     const previous = this.ledger.workers.latestOnThread(thread.threadId);
     const base = previous?.branch ?? undefined;
     this.ledger.questions.closeOpen(thread.threadId, "用户重新派发");
-    this.ledger.workers.register({ workerId, threadId: thread.threadId, deviceId, repoId, agent: AGENT, mode: "write" });
+    this.ledger.workers.register({ workerId, threadId: thread.threadId, deviceId, repoId, agent: AGENT, mode });
     this.ledger.threads.setLastMachine(thread.threadId, deviceId);
     this.ledger.recomputeThreadState(thread.threadId);
     const machineName = this.ledger.machines.get(deviceId)?.name ?? deviceId;
@@ -372,9 +512,9 @@ export class Dispatcher {
         workerId,
         threadId: thread.threadId,
         repoId,
-        mode: "write",
+        mode,
         prompt,
-        ...(base ? { base } : {}),
+        ...(mode === "write" && base ? { base } : {}),
       },
       // Offline queueing is exactly `notAfter: null` (protocol §4.2): no expiry, delivered at
       // the next hello; the idle sweep still fails it after ~30 min of the machine not returning.

@@ -18,7 +18,16 @@ import {
   type Extension,
 } from "@earendil-works/pi-durable";
 import { MAX_THREAD_SUMMARY, type Ledger } from "../ledger.ts";
-import { titleOf, type StartWorkerInput, type StartWorkerOutcome } from "../dispatch.ts";
+import {
+  titleOf,
+  type InterruptWorkerInput,
+  type InterruptWorkerOutcome,
+  type SendToWorkerInput,
+  type SendToWorkerOutcome,
+  type StartWorkerInput,
+  type StartWorkerOutcome,
+} from "../dispatch.ts";
+import { describeSchedule, parseAtIso, type RoutineService, type RoutineSpecInput } from "../routines.ts";
 import { MAX_CONCLUSION, MAX_DID_ITEM, MAX_DID_ITEMS, MAX_NEEDS_YOU, type Tone } from "../report-template.ts";
 
 /** What the tools may reach. Implemented by the Steward DO; faked nowhere else. */
@@ -32,8 +41,12 @@ export interface StewardExtensionContext {
   currentRun(): Promise<{ operationId: string; kind: string; provenance: string; routedThreadId: string | null } | null>;
   /** The deterministic dispatch service (ADR-0001 decision 6). */
   startWorker(input: StartWorkerInput): Promise<StartWorkerOutcome>;
+  /** In-chat intervention (issue #9, connector-pi.md §6.1): send/interrupt land in the same
+   *  deterministic service — the outcomes tell the model how the message will be delivered. */
+  sendToWorker(input: SendToWorkerInput): Promise<SendToWorkerOutcome>;
+  interruptWorker(input: InterruptWorkerInput): Promise<InterruptWorkerOutcome>;
   /** Verify a model-claimed provenance reference (§7.2): `user:<msgId>` must be a message
-   *  this deployment actually received. Routine/followup/watch ids land with #20. */
+   *  this deployment actually received; `routine:`/`followup:` ids must exist (issue #20). */
   checkProvenanceRef(ref: string): Promise<boolean>;
   /** notify_user / ask_user land in the outbound queue; only these reach the user.
    *  `dedupeId` (from the tool taskId) makes replayed calls converge on one message. */
@@ -49,6 +62,10 @@ export interface StewardExtensionContext {
   askUser(input: { question: string; options: string[]; threadId?: string; dedupeId?: string }): Promise<void>;
   /** Audit trail for no_action and other quiet outcomes (§8.6). */
   audit(kind: string, detail: string): void;
+  /** The proactive-behavior service (issue #20, steward.md §8): routines and follow-ups. */
+  routines: RoutineService;
+  /** Records an explicit in-run outcome (no_action) on the firing routine/follow-up (§8.6). */
+  recordProactiveOutcome(operationId: string, outcome: string): void;
 }
 
 const SITUATION_SECTION = "shepherd-situation";
@@ -100,12 +117,16 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
           state: thread.state,
           unread: thread.unread,
           repos: ctx.ledger.threads.repoIds(thread.threadId),
+          createdFromMsg: thread.createdFromMsg,
           workers: workers.map((w) => ({
             workerId: w.workerId, state: w.state, agent: w.agent, mode: w.mode,
             branch: w.branch, lastOutcome: w.lastOutcome,
           })),
           latestReport: report && { status: report.status, summary: report.summary, question: report.question, git: report.git },
           openQuestion: question?.text ?? null,
+          followups: ctx.ledger.followups.listByThread(thread.threadId).map((f) => ({
+            followupId: f.followupId, status: f.status, dueAt: f.dueAt, reason: f.reason,
+          })),
           timeline: timeline.map((e) => `${e.kind}: ${e.text}`),
         }),
       );
@@ -140,7 +161,9 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
     description:
       "派发一个编码任务到用户的机器。要么接续（threadId，来自 get_thread /态势简报），要么新开（newTitle + 可选 goal）。" +
       "机器由确定性规则挑选；工具会让你知道结果（已派发 / 已用按钮问用户 / 需要你转问用户）。basis 是你派发的依据。" +
-      "事件触发的运行里（⟦…⟧ 输入）必须另外给 provenanceRef：一条真实存在的用户消息 id（user:<om_…>，来自时间线/汇报的 refs），" +
+      "mode 按任务性质选：纯研究/答疑/代码评审不改代码的用 readonly（在原仓库只读运行，无 worktree）；" +
+      "会改代码的、或不确定的，用 write（默认，独享 worktree）。事件触发的运行里（⟦…⟧ 输入）必须另外给 " +
+      "provenanceRef：一条真实存在的用户消息 id（user:<om_…>，来自时间线/汇报的 refs），" +
       "否则会被拒绝——系统输入自身不构成派发授权（设计 §7.2）。",
     parameters: Type.Object({
       prompt: Type.String({ description: "自包含的任务描述：worker 只看这段话" }),
@@ -149,6 +172,13 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
       newTitle: Type.Optional(Type.String({ description: "新 Thread 的标题（用户原话短语，≤24 字）" })),
       goal: Type.Optional(Type.String()),
       machineHint: Type.Optional(Type.String({ description: "用户点名的机器名（没点名就别填）" })),
+      /** §11 (issue #16): the steward tells read-only and change-making tasks apart at
+       * dispatch; when unsure it must treat the task as "will make changes" → write. */
+      mode: Type.Optional(
+        Type.Union([Type.Literal("write"), Type.Literal("readonly")], {
+          description: "readonly=只读运行（研究/答疑/评审，无 worktree）；write=会改代码（默认；拿不准就 write）",
+        }),
+      ),
       /** §7.2 (review #4): in event/routine/follow-up runs the system input itself is not
        * authorization — the model must point at the user message (later also routine/
        * followup/watch id) that asked for this. */
@@ -186,6 +216,7 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
         ...(args.newTitle !== undefined ? { newTitle: titleOf(args.newTitle) } : {}),
         ...(args.goal !== undefined ? { goal: args.goal } : {}),
         ...(args.machineHint !== undefined ? { machineHint: args.machineHint } : {}),
+        ...(args.mode !== undefined ? { mode: args.mode } : {}),
         provenance,
         cmdId: `tool:${api.taskId}`,
         createdFromMsg: provenance.startsWith("user:") ? provenance.slice("user:".length) : null,
@@ -198,6 +229,118 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
         ? `${outcome.machineName} 当前不在线，已排队，上线后自动开始。`
         : `已派给 ${outcome.machineName}，完成后我会汇报。`;
       return ok(`${outcome.created ? `已创建「${outcome.threadId}」并派发` : `已续派到 ${outcome.threadId}`}：${tail}`);
+    },
+  });
+
+  const sendToWorker = defineTool({
+    name: "send_to_worker",
+    description:
+      "给一个正在运行/空闲的 worker 追加或转向指令（「改用 pnpm」「做完后顺便补测试」）。" +
+      "workerId 从 get_thread /态势简报对应 Thread 的 workers 里拿。intent：now=立即转向（不打断当前工具，当前批次结束后生效）；" +
+      "after=本轮跑完再处理；auto=按 worker 状态决定。事件触发的运行里必须另外给 provenanceRef（user:<msgId>）。",
+    parameters: Type.Object({
+      workerId: Type.String({ description: "如 w_01J…" }),
+      text: Type.String({ description: "自包含的追加/转向指令：worker 只看这段话" }),
+      intent: Type.Optional(
+        Type.Union([Type.Literal("now"), Type.Literal("after"), Type.Literal("auto")], {
+          description: "默认 auto",
+        }),
+      ),
+      provenanceRef: Type.Optional(Type.String({ description: "授权来源：user:<msgId>（仅事件触发的运行里必填）" })),
+      basis: Type.Union([
+        Type.Literal("user_explicit"),
+        Type.Literal("user_reply_to"),
+        Type.Literal("memory"),
+        Type.Literal("routine"),
+        Type.Literal("followup"),
+        Type.Literal("watch"),
+      ]),
+    }),
+    // §4.3: a replay after a crash must not re-send; cmdId = "tool:" + api.taskId (§7.1).
+    replay: "unsafe",
+    execute: async (args, api) => {
+      const run = await ctx.currentRun();
+      let provenance = run?.provenance ?? "unknown";
+      if (run && run.kind !== "user") {
+        if (args.provenanceRef === undefined) {
+          return err("refused: 事件触发的运行不能自行向 worker 发送（设计 §7.2）。给出 provenanceRef=user:<msgId>，或改用 ask_user。");
+        }
+        if (!(await ctx.checkProvenanceRef(args.provenanceRef))) {
+          return err(`refused: provenanceRef ${args.provenanceRef} 不存在（必须是本部署真实收到的用户消息 id）。`);
+        }
+        provenance = args.provenanceRef;
+      }
+      const outcome = await ctx.sendToWorker({
+        workerId: args.workerId,
+        text: args.text,
+        intent: args.intent ?? "auto",
+        provenance,
+        cmdId: `tool:${api.taskId}`,
+      });
+      if (outcome.kind === "refused") return err(`refused: ${outcome.reason}`);
+      // §6.2: steer takes effect after the current tool batch — say so in the reply so the
+      // model can tell the user exactly when the redirect lands.
+      const tail =
+        outcome.delivery === "steer"
+          ? "已进入转向队列，after_current_tools：不打断正在执行的工具，当前工具批次结束后生效。"
+          : outcome.delivery === "follow_up"
+            ? "已排队，本轮运行结束后生效。"
+            : outcome.delivery === "queued"
+              ? "worker 正在启动/恢复中，指令已排队，就绪后送达。"
+              : "worker 当前空闲，指令已送达，会立即开始处理。";
+      const offline = outcome.machineOffline ? "（机器当前离线，上线后会送达。）" : "";
+      return ok(`已发送给 ${args.workerId}：${tail}${offline}`);
+    },
+  });
+
+  const interruptWorker = defineTool({
+    name: "interrupt_worker",
+    description:
+      "中断一个正在运行的 worker（停下它手头的事）。仅当用户明确要求停下时才用（basis 必须是 user_explicit 或 user_reply_to，" +
+      "否则用 ask_user 先问）。事件触发的运行里（⟦…⟧ 输入）必须另外给 provenanceRef：一条真实存在的用户消息 id（user:<om_…>，来自时间线/汇报的 refs），" +
+      "否则会被拒绝——停下运行中的任务必须用户明示，系统输入自身不构成授权（设计 §7.2）。" +
+      "可选 then：「停，然后改用 pnpm」这类停后跟进的新指令。转向（不停下）用 send_to_worker。",
+    parameters: Type.Object({
+      workerId: Type.String({ description: "如 w_01J…" }),
+      then: Type.Optional(Type.String({ description: "停下后紧接着交给 worker 的新指令（可省）" })),
+      provenanceRef: Type.Optional(Type.String({ description: "授权来源：user:<msgId>（仅事件触发的运行里必填）" })),
+      basis: Type.Union([
+        Type.Literal("user_explicit"),
+        Type.Literal("user_reply_to"),
+        Type.Literal("memory"),
+        Type.Literal("routine"),
+        Type.Literal("followup"),
+        Type.Literal("watch"),
+      ]),
+    }),
+    replay: "unsafe",
+    execute: async (args, api) => {
+      const run = await ctx.currentRun();
+      // PR #45 review #4: an abort is at least as destructive as a steer, and `basis` labels
+      // are model-claimed — event-triggered runs need a verifiable reference to the user
+      // message that said stop, exactly like send_to_worker (§7.2).
+      let provenance = run?.provenance ?? "unknown";
+      if (run && run.kind !== "user") {
+        if (args.provenanceRef === undefined) {
+          return err("refused: 事件触发的运行不能自行中断 worker（设计 §7.2）。停下运行中的任务必须用户明示：给出 provenanceRef=user:<msgId>（用户真正说过这条话的消息 id），或改用 ask_user。");
+        }
+        if (!(await ctx.checkProvenanceRef(args.provenanceRef))) {
+          return err(`refused: provenanceRef ${args.provenanceRef} 不存在（必须是本部署真实收到的用户消息 id）。`);
+        }
+        provenance = args.provenanceRef;
+      }
+      const outcome = await ctx.interruptWorker({
+        workerId: args.workerId,
+        ...(args.then !== undefined ? { then: args.then } : {}),
+        provenance,
+        cmdId: `tool:${api.taskId}`,
+      });
+      if (outcome.kind === "refused") return err(`refused: ${outcome.reason}`);
+      const offline = outcome.machineOffline ? "（机器当前离线，中断指令在它上线后送达。）" : "";
+      return ok(
+        `已发出中断${args.then !== undefined ? "（停后会带上你的后续指令）" : ""}：worker 会尽快停下；` +
+          `它队列里未送达的排队消息会被取回并记录，需要的话我会告诉你取回了什么。${offline}`,
+      );
     },
   });
 
@@ -262,14 +405,216 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
     replay: "safe",
     execute: async (args) => {
       ctx.audit("no_action", args.reason);
+      // §8.6: a routine/follow-up fire's default outcome — visible in lastResult, not just the log.
+      const run = await ctx.currentRun();
+      if (run && (run.kind === "routine" || run.kind === "followup")) {
+        ctx.recordProactiveOutcome(run.operationId, `no_action: ${args.reason}`);
+      }
       return { output: [{ type: "text" as const, text: "ok" }], control: { terminate: true } };
+    },
+  });
+
+  // ---- proactive behavior (issue #20, steward.md §8) ------------------------------------------------
+
+  /** Shared spec parameters for create_routine / suggest_routine. */
+  const routineSpecParams = {
+    instruction: Type.String({ description: "自包含的做什么（digest 类可写「汇总当前进展」）" }),
+    kind: Type.Union([Type.Literal("digest"), Type.Literal("instruction")], {
+      description: "digest=系统确定性汇总（不耗模型）；instruction=按指令执行（以 ⟦routine⟧ 唤醒你）",
+    }),
+    cron: Type.Optional(Type.String({ description: '5 段 cron（UTC），如 "0 9 * * 1-5"＝每个工作日 09:00' })),
+    atIso: Type.Optional(Type.String({ description: "一次性任务的触发时刻（ISO 8601，未来时间）" })),
+    threadId: Type.Optional(Type.String({ description: "归属的 Thread（回看/派发类建议带上）" })),
+    repoRef: Type.Optional(Type.String({ description: "涉及的仓库（可选）" })),
+  };
+
+  /** Resolves the spec args into the service input; null error text on bad input. */
+  const specInput = (args: { instruction: string; kind: "digest" | "instruction"; cron?: string; atIso?: string; threadId?: string; repoRef?: string }): { ok: true; input: RoutineSpecInput } | { ok: false; error: string } => {
+    let onceAt: number | undefined;
+    if (args.atIso !== undefined) {
+      const parsed = parseAtIso(args.atIso);
+      if (!parsed.ok) return { ok: false, error: parsed.error };
+      onceAt = parsed.onceAt;
+    }
+    return {
+      ok: true,
+      input: {
+        instruction: args.instruction,
+        kind: args.kind,
+        ...(args.cron !== undefined && args.cron.length > 0 ? { cron: args.cron.trim() } : {}),
+        ...(onceAt !== undefined ? { onceAt } : {}),
+        ...(args.threadId !== undefined ? { threadId: args.threadId } : {}),
+        ...(args.repoRef !== undefined ? { repoId: args.repoRef } : {}),
+      },
+    };
+  };
+
+  const createRoutine = defineTool({
+    name: "create_routine",
+    description:
+      "创建例行任务（spec §8.3）。只能在你和用户的对话运行里调用：先把触发条件和要做的事复述给用户确认，确认后立即调用（当前这条用户消息就是授权来源）。" +
+      "绝对不要用它在用户没答应时建任务——那种情况用 suggest_routine 发按钮。",
+    parameters: Type.Object({
+      ...routineSpecParams,
+      basis: Type.Literal("user_explicit", { description: "创建例行任务必须来自用户的明确要求（§7.2）" }),
+    }),
+    replay: "safe",
+    execute: async (args, api) => {
+      const run = await ctx.currentRun();
+      if (!run || run.kind !== "user" || !run.provenance.startsWith("user:")) {
+        return err("refused: create_routine 只能在用户消息的运行里、用户明确要求后调用（§7.2/§8.3）。要主动提议请用 suggest_routine。 ");
+      }
+      const spec = specInput(args);
+      if (!spec.ok) return err(`refused: ${spec.error}`);
+      const outcome = await ctx.routines.create({
+        ...spec.input,
+        routineId: `r_${api.taskId}`,
+        createdFromMsg: run.provenance.slice("user:".length),
+      });
+      if (!outcome.ok) return err(`refused: ${outcome.reason}`);
+      return ok(`已创建例行任务 ${outcome.routine.routineId}（${describeSchedule(outcome.routine)}），会按计划触发。`);
+    },
+  });
+
+  const suggestRoutine = defineTool({
+    name: "suggest_routine",
+    description:
+      "建议用户把某件事变成例行任务：只发送一张带「创建/先不用」按钮的卡片，绝不直接创建（spec §8.3：创建需要用户同意）。" +
+      "用户点「创建」后系统才会保存。用户已经明说要时不要用这个，直接复述确认后 create_routine。",
+    parameters: Type.Object(routineSpecParams),
+    replay: "safe",
+    execute: async (args, api) => {
+      const run = await ctx.currentRun();
+      if (!run || run.kind !== "user" || !run.provenance.startsWith("user:")) {
+        return err("refused: suggest_routine 只能在用户消息的运行里调用。");
+      }
+      const spec = specInput(args);
+      if (!spec.ok) return err(`refused: ${spec.error}`);
+      const outcome = await ctx.routines.suggest({
+        ...spec.input,
+        offerId: String(api.taskId),
+        sourceMsg: run.provenance.slice("user:".length),
+      });
+      if (!outcome.ok) return err(`refused: ${outcome.reason}`);
+      return ok("已发送建议卡片（带按钮）。用户点「创建」后才会真正保存；本轮不要再调用 create_routine。");
+    },
+  });
+
+  const setFollowup = defineTool({
+    name: "set_followup",
+    description:
+      "给一个 Thread 设定时回看（「两小时后再看一眼那个任务」）。用户运行里直接设；在事件/例行运行里你自己发起的回看必须给 sourceRef" +
+      "（该 Thread 的来源用户消息 user:<om_…>，get_thread 的 createdFromMsg 可查；或 routine:<r_…>），否则拒绝（§8.3）。",
+    parameters: Type.Object({
+      threadId: Type.String(),
+      afterMinutes: Type.Number({ description: "多少分钟后回看（>0）" }),
+      reason: Type.String({ description: "到时候为什么要看（自包含）" }),
+      sourceRef: Type.Optional(Type.String({ description: "事件/例行运行里必填：user:<msgId> 或 routine:<id>" })),
+    }),
+    replay: "safe",
+    execute: async (args, api) => {
+      const thread = ctx.ledger.threads.get(args.threadId);
+      if (!thread) return err(`Thread ${args.threadId} 不存在。`);
+      const run = await ctx.currentRun();
+      // An EXPLICIT sourceRef is the model claiming a specific authorization — a false claim
+      // is refused outright (§7.2), never silently substituted with the fallback.
+      if (args.sourceRef !== undefined && !(await ctx.checkProvenanceRef(args.sourceRef))) {
+        return err(`refused: sourceRef ${args.sourceRef} 无法验证（必须是真实收到的 user:<msgId> 或 routine:<id>）。`);
+      }
+      // The source ref: explicit > the user run's own message > the Thread's origin message —
+      // every path resolves to something the owner actually said/authorized (§8.3).
+      const candidates = [
+        args.sourceRef,
+        run && run.kind === "user" && run.provenance.startsWith("user:") ? run.provenance : undefined,
+        thread.createdFromMsg ? `user:${thread.createdFromMsg}` : undefined,
+      ].filter((v): v is string => v !== undefined);
+      let sourceRef: string | undefined;
+      for (const candidate of candidates) {
+        if (await ctx.checkProvenanceRef(candidate)) {
+          sourceRef = candidate;
+          break;
+        }
+      }
+      if (sourceRef === undefined) {
+        return err("refused: 找不到可验证的来源（sourceRef 必须是真实收到的 user:<msgId> 或 routine:<id>；该 Thread 的 createdFromMsg 也可）。 ");
+      }
+      const outcome = await ctx.routines.setFollowup({
+        followupId: `f_${api.taskId}`,
+        threadId: args.threadId,
+        afterMinutes: args.afterMinutes,
+        reason: args.reason,
+        createdBy: run?.kind === "user" ? "user" : "steward",
+        sourceRef,
+      });
+      if (!outcome.ok) return err(`refused: ${outcome.reason}`);
+      const when = new Date(outcome.followup.dueAt).toISOString().slice(0, 16).replace("T", " ");
+      return ok(`已设定回看 ${outcome.followup.followupId}：${when} UTC 时以 ⟦followup⟧ 唤醒。`);
+    },
+  });
+
+  const listSchedules = defineTool({
+    name: "list_schedules",
+    description: "列出所有例行任务与未触发的定时回看（编号、触发条件、状态、上次结果）。用户问「我有哪些例行任务」或你要取消/暂停前先查它。",
+    parameters: Type.Object({}),
+    replay: "safe",
+    execute: async () => {
+      const routines = ctx.ledger.routines.list();
+      const followups = ctx.ledger.followups.list();
+      if (routines.length === 0 && followups.length === 0) return ok("还没有任何例行任务或定时回看。 ");
+      return ok(
+        JSON.stringify({
+          routines: routines.map((r) => ({
+            id: r.routineId,
+            kind: r.kind,
+            status: r.status,
+            schedule: describeSchedule(r),
+            instruction: r.instruction,
+            threadId: r.threadId,
+            lastRunAt: r.lastRunAt,
+            lastResult: r.lastResult,
+          })),
+          followups: followups
+            .filter((f) => f.status !== "cancelled")
+            .map((f) => ({ id: f.followupId, status: f.status, threadId: f.threadId, dueAt: f.dueAt, reason: f.reason, lastResult: f.lastResult })),
+        }),
+      );
+    },
+  });
+
+  const cancelSchedule = defineTool({
+    name: "cancel_schedule",
+    description: "取消一个例行任务或定时回看（传 list_schedules 里的编号）。用户说「取消那个每天九点的」时用；管理动作只在用户运行里可调。",
+    parameters: Type.Object({ scheduleId: Type.String() }),
+    replay: "safe",
+    execute: async (args) => {
+      const run = await ctx.currentRun();
+      if (!run || run.kind !== "user") return err("refused: 取消只能由用户发起（对话里说取消）。 ");
+      const outcome = await ctx.routines.cancel(args.scheduleId);
+      return outcome.ok ? ok(outcome.what) : err(`refused: ${outcome.reason}`);
+    },
+  });
+
+  const pauseSchedule = defineTool({
+    name: "pause_schedule",
+    description: "暂停/恢复一个例行任务（paused=true 暂停，false 恢复）。定时回看是一次性的，直接 cancel_schedule。",
+    parameters: Type.Object({
+      scheduleId: Type.String(),
+      paused: Type.Boolean(),
+    }),
+    replay: "safe",
+    execute: async (args) => {
+      const run = await ctx.currentRun();
+      if (!run || run.kind !== "user") return err("refused: 暂停/恢复只能由用户发起（对话里说暂停）。 ");
+      const outcome = await ctx.routines.pause(args.scheduleId, args.paused);
+      return outcome.ok ? ok(outcome.what) : err(`refused: ${outcome.reason}`);
     },
   });
 
   // Policy hook (§7.2, the M2 subset): dispatches need a real basis — never `inferred` — and
   // exactly one per run (a second start_worker for another target means the model is
   // second-guessing itself; observed live in the spike). The guard resets when the run's
-  // provenance changes, never mid-run.
+  // provenance changes, never mid-run. An interrupt additionally requires the user's own
+  // hand (spec §6: interrupting a running task must follow an explicit user instruction).
   let dispatchedTarget: string | undefined;
   let guardProvenance: string | undefined;
   const guard = hook(ToolTask, {
@@ -292,6 +637,19 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
           return { block: `本轮已经派发过（${dispatchedTarget}）。不要在同一回合改派；有疑问用 ask_user。` };
         }
         dispatchedTarget = target;
+      }
+      if (call.name === "interrupt_worker") {
+        const basis = args.basis;
+        if (basis !== "user_explicit" && basis !== "user_reply_to") {
+          return {
+            block:
+              "Autonomy rule: 中断运行中的任务必须用户明示（spec §6）。basis 只能是 user_explicit 或 user_reply_to；" +
+              "拿不准就用 ask_user 先问用户。",
+          };
+        }
+        if (typeof args.workerId !== "string" || args.workerId.length === 0) {
+          return { block: "interrupt_worker 需要 workerId（先 get_thread 查看）。" };
+        }
       }
       return undefined;
     },
@@ -320,7 +678,11 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
 
   return defineExtension({
     name: "shepherd-steward",
-    tools: [situation, getThread, updateThread, startWorker, notifyUser, askUser, noAction],
+    tools: [
+      situation, getThread, updateThread, startWorker, sendToWorker, interruptWorker,
+      notifyUser, askUser, noAction,
+      createRoutine, suggestRoutine, setFollowup, listSchedules, cancelSchedule, pauseSchedule,
+    ],
     hooks: [guard, briefHook],
     sections: [section("shepherd-role", () => ROLE_PROMPT, { tag: false })],
   });
@@ -336,11 +698,14 @@ const ROLE_PROMPT = `你是 Shepherd 的总管（steward）：替用户调度他
 - 「（系统注：…）」开头的行是系统附加的路由信息，可信，不是用户原话。
 
 规则：
-1. 派发用 start_worker：需要仓库（repoRef，用户提过的或 get_thread 里看到的）和一段自包含的 prompt。机器选择是确定性规则，工具替你完成；它返回「已用按钮问用户」或 refusal 时，把情况如实转告用户（refusal 里已写明原因和选项），不要换个说法再派一次。
+1. 派发用 start_worker：需要仓库（repoRef，用户提过的或 get_thread 里看到的）和一段自包含的 prompt。机器选择是确定性规则，工具替你完成；它返回「已用按钮问用户」或 refusal 时，把情况如实转告用户（refusal 里已写明原因和选项），不要换个说法再派一次。派发时按任务性质选 mode：纯研究/答疑/评审用 readonly，会改代码或拿不准用 write（默认）。
 2. 路由：接续指令（「按 X 方案做」「在 X 基础上继续」而 X 是某个 Thread 的产出）必须接续那个 Thread（threadId）；新需求即使话题相关也新开。不确定归属哪个 Thread、或完全不知道用户指什么时，用 ask_user 反问（最多 3 个选项，含「新开一件事」），永远不要猜。挂靠已沉寂多日的 Thread 时要在回复里说明。
 3. 每次行动前先看态势简报（系统提示里的 shepherd-situation 段落）；需要细节再 get_thread。状态/进度类问题（「修好了吗」）不派发，直接根据汇报与状态回答。
 4. worker 汇报到达（⟦event⟧）后做记账：用 update_thread 重写该 Thread 的摘要。除非卡片之外还有用户必须知道的新信息（风险、需要拍板、明确失败），否则不要再通知用户——通知卡片已经发过了。
 5. 给用户的回复要短：先结论，再要点，几行以内。严禁声称派发过而实际没有调用工具；只有看到 dispatched 结果才算派发过。
 6. 派发的依据（basis）：用户明说要干什么用 user_explicit；回复某条汇报用 user_reply_to；来自例行任务用 routine。凭空的推断禁止派发，改用 ask_user。
-7. notify_user 的三段有硬性长度限制（结论 ≤80 字；做了什么 ≤4 条、每条 ≤100 字；需要你 ≤120 字），超长会被拒绝——压缩重写，不要截断。
-8. 永远不要替用户宣布「这件事完成了」；完成与否由汇报与事实说话。`;
+7. 运行中的任务可以干预（workerId 从 get_thread 拿）：转向/追加用 send_to_worker —— 用户要「立刻改」用 intent=now（不打断当前工具，当前批次结束就转向，回复里说明 after_current_tools），「做完这个再顺便…」用 intent=after；停下/停止用 interrupt_worker，且仅限用户明示（basis=user_explicit 或 user_reply_to），「停，然后改用 X」把 X 放进 then。转向不是停下：想停就说停。
+8. notify_user 的三段有硬性长度限制（结论 ≤80 字；做了什么 ≤4 条、每条 ≤100 字；需要你 ≤120 字），超长会被拒绝——压缩重写，不要截断。
+9. 永远不要替用户宣布「这件事完成了」；完成与否由汇报与事实说话。
+10. 例行任务与定时回看（spec §8）：用户表达周期性需求（「每个工作日 9 点汇总昨晚进展」）时，先把触发条件和要做的事复述给他确认，确认后用 create_routine（basis=user_explicit；digest=确定性汇总，instruction=按指令执行；cron 用 UTC）。你只是「察觉到重复模式」时，用 suggest_routine 发一张带按钮的建议卡——点按钮才会创建，绝不绕过按钮。给某个 Thread 设闹钟用 set_followup；管理用 list_schedules / pause_schedule / cancel_schedule（「暂停那个每天九点的」）。
+11. ⟦routine R⟧ 输入到达时按指令执行：要派发必须带 provenanceRef=routine:R（或指令里引用的真实用户消息），无事可做用 no_action 收尾——那是默认结局，不要为了「显得有用」而制造通知。⟦followup F⟧ 到期时同理：先看那个 Thread 的现状再决定。`;

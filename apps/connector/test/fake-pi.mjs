@@ -1,14 +1,16 @@
 #!/usr/bin/env node
 // fake-pi: a deterministic `pi --mode rpc` stand-in for connector tests (connector-pi.md §14).
 // Implements the RPC subset the connector uses — get_state, prompt, steer, follow_up, abort,
-// clear_queue, get_session_stats — and plays a scripted event sequence per prompt, with
-// deliberate delays, shells, raw lines, and deliberate crashes.
+// clear_queue, get_session_stats, get_entries — and plays a scripted event sequence per
+// prompt, with deliberate delays, shells, raw lines, and deliberate crashes.
 //
 // Env:
 //   FAKE_PI_SCRIPT       path to the JSON scenario file (required)
 //   FAKE_PI_LOG          path to append delivered prompts as JSON lines (assertions)
 //   FAKE_PI_ENV_LOG       path to append one JSON snapshot of the child env at startup
 //                       (issue #27: the connector must not pass its credentials through)
+//   FAKE_PI_ARGV_LOG      path to append the child argv at startup (issue #16: --tools
+//                       read-only whitelist and --approve/--no-approve assertions)
 //   FAKE_PI_SESSIONS_DIR directory for session JSONL files (default /tmp/fake-sessions);
 //                       `session` steps append real entries so the connector's §9.1
 //                       session-tail reconciliation has true pi-shaped files to read
@@ -20,7 +22,11 @@
 //
 // Scenario file:
 //   {
-//     "startup": { "exit": 9 },            // optional: exit before answering get_state
+//     "startup": { "exit": 9, "delayMs": 300 },  // optional: exit before answering get_state,
+//                                               // or hold the get_state answer (a `starting` window)
+//     "statsDelayMs": 1500,                 // optional: hold get_session_stats back — models the
+//                                             // settle lag where pi's run window is closed but the
+//                                             // connector still says running
 //     "runs": [ [ <step>, ... ], ... ]     // runs[k] plays on the k-th prompt
 //   }
 // Step:
@@ -29,7 +35,13 @@
 //   { "raw": "..." }                       // verbatim stdout chunk (framing tests)
 //   { "shell": "git add -A" }              // run in cwd, ignore failures
 //   { "session": { ... } }                 // append one entry to the session JSONL
+//   { "fail": "reason" }                   // fail that prompt's RPC with `reason` (no run plays)
 //   { "exit": 7 }                          // crash the fake pi process
+//
+// steer/follow_up messages queue like real pi ( disposition "queued"); clear_queue hands
+// them back; abort stops the scripted run and emits agent_settled{aborted:true} — the
+// §6.2 intervention surface the connector drives. An abort with no run in flight is a
+// no-op (real pi has nothing to abort on an idle process); the next prompt runs normally.
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { exec } from "node:child_process";
 import { join } from "node:path";
@@ -43,6 +55,9 @@ const scenario = JSON.parse(readFileSync(scriptPath, "utf8"));
 
 if (process.env.FAKE_PI_ENV_LOG) {
   appendFileSync(process.env.FAKE_PI_ENV_LOG, JSON.stringify(process.env) + "\n");
+}
+if (process.env.FAKE_PI_ARGV_LOG) {
+  appendFileSync(process.env.FAKE_PI_ARGV_LOG, JSON.stringify(process.argv) + "\n");
 }
 
 // Pull --session-id <id> from argv so get_state echoes what the connector expects.
@@ -66,6 +81,16 @@ function appendSessionEntry(entry) {
   }
   const id = typeof entry.id === "string" ? entry.id : `e${++entrySeq}`;
   appendFileSync(sessionFile, JSON.stringify({ id, parentId: null, timestamp: new Date().toISOString(), ...entry }) + "\n");
+  return id;
+}
+
+/** Reads the session file's entries (header included) in file order — real get_entries shape. */
+function readSessionEntries() {
+  if (!existsSync(sessionFile)) return [];
+  return readFileSync(sessionFile, "utf8")
+    .split("\n")
+    .filter((line) => line.trim())
+    .map((line) => JSON.parse(line));
 }
 
 function writeLine(record) {
@@ -96,19 +121,44 @@ function nextRunIndex() {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** True while a scripted run is playing — aborts only take effect inside a run (PR #45
+ *  review #7: an abort on an idle process must not derail the next prompt's run). */
+let runInFlight = false;
+
 async function playRun(steps) {
-  for (const step of steps ?? []) {
-    if (step.delayMs) await sleep(step.delayMs);
-    if (step.emit) writeLine(step.emit);
-    if (step.raw) process.stdout.write(step.raw);
-    if (step.session) appendSessionEntry(step.session);
-    if (step.shell) await new Promise((r) => exec(step.shell, () => r(undefined)));
-    if (step.exit !== undefined) process.exit(step.exit);
+  runInFlight = true;
+  try {
+    for (const step of steps ?? []) {
+      if (step.delayMs) await sleep(step.delayMs);
+      // abort() takes effect between steps: the run ends and agent_settled{aborted:true}
+      // fires (research #3: abort responds in ~3 ms and the process accepts new commands).
+      if (aborting) break;
+      if (step.emit) {
+        writeLine(step.emit);
+        // Tests synchronize on pi-side settles (the settle-lag window): log it like the
+        // intervention commands so a test can wait for exactly this moment.
+        if (step.emit.type === "agent_settled") logPrompt({ type: "agent_settled", aborted: step.emit.aborted === true, at: Date.now() });
+      }
+      if (step.raw) process.stdout.write(step.raw);
+      if (step.session) appendSessionEntry(step.session);
+      if (step.shell) await new Promise((r) => exec(step.shell, () => r(undefined)));
+      if (step.exit !== undefined) process.exit(step.exit);
+    }
+    if (aborting) {
+      aborting = false;
+      writeLine({ type: "agent_settled", aborted: true });
+    }
+  } finally {
+    runInFlight = false;
   }
 }
 
 let buffer = "";
 let promptCount = 0;
+let aborting = false;
+/** Queued steer/follow_up texts — what clear_queue hands back (real pi queues strings). */
+let steeringQueue = [];
+let followUpQueue = [];
 
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
@@ -131,9 +181,11 @@ process.stdin.on("end", () => {
 
 async function handle(command) {
   const id = command.id;
+  const messageText = () => (typeof command.message === "string" ? command.message : "");
   switch (command.type) {
     case "get_state": {
       if (scenario.startup?.exit !== undefined) process.exit(scenario.startup.exit);
+      if (scenario.startup?.delayMs) await sleep(scenario.startup.delayMs);
       respond(id, "get_state", {
         sessionId,
         sessionFile,
@@ -152,31 +204,57 @@ async function handle(command) {
         text = text.slice(nl + 1);
       }
       logPrompt({ commandId, text, cwd: process.cwd(), sessionId, pid: process.pid, at: Date.now() });
-      respond(id, "prompt", { disposition: commandId !== null ? "handled" : "started" });
       const run = scenario.runs?.[nextRunIndex()] ?? [];
+      const failure = run.find((step) => typeof step.fail === "string");
+      if (failure) {
+        // The prompt RPC fails at the pi boundary (a wedged/broken pi): no run plays.
+        respondError(id, "prompt", failure.fail);
+        return;
+      }
+      respond(id, "prompt", { disposition: commandId !== null ? "handled" : "started" });
       await playRun(run);
       return;
     }
     case "steer":
     case "follow_up": {
+      const text = messageText();
+      (command.type === "steer" ? steeringQueue : followUpQueue).push(text);
+      logPrompt({ type: command.type, text, at: Date.now() });
       respond(id, command.type, { disposition: "queued" });
       return;
     }
     case "abort": {
+      // Real pi only aborts an in-flight run; on an idle process the RPC succeeds as a
+      // no-op and a later prompt runs normally (review #7) — the dangling-abort model.
+      if (runInFlight) aborting = true;
+      logPrompt({ type: "abort", at: Date.now() });
       respond(id, "abort", {});
       return;
     }
     case "clear_queue": {
-      respond(id, "clear_queue", { steering: [], followUp: [] });
+      const returned = { steering: steeringQueue, followUp: followUpQueue };
+      steeringQueue = [];
+      followUpQueue = [];
+      logPrompt({ type: "clear_queue", returned, at: Date.now() });
+      respond(id, "clear_queue", returned);
       return;
     }
     case "get_session_stats": {
+      if (scenario.statsDelayMs) await sleep(scenario.statsDelayMs);
       respond(id, "get_session_stats", {
         sessionId,
         tokens: { input: 1200, output: 300, totalTokens: 1500 },
         cost: 0.0042,
         contextUsage: { tokens: 4000, contextWindow: 200000, percent: 2 },
       });
+      return;
+    }
+    case "get_entries": {
+      // Research §3: `since` = "everything after a given entry"; the response is the session's
+      // entries in file order. Like real pi, `limit` is ignored.
+      const entries = readSessionEntries();
+      const sinceIdx = typeof command.since === "string" ? entries.findIndex((e) => e.id === command.since) : -1;
+      respond(id, "get_entries", { sessionId, sessionFile, entries: sinceIdx === -1 ? entries : entries.slice(sinceIdx + 1) });
       return;
     }
     default: {

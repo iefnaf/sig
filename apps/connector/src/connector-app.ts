@@ -75,6 +75,13 @@ export class ConnectorApp {
       handleCommand: (cmd: CmdMessage) => this.runCommand(cmd),
       snapshot: () => this.snapshot(),
       workersSnapshot: () => this.workersSnapshot(),
+      // L3 raw-history reads (§11.4): live get_entries while the process runs, the session
+      // JSONL along the current branch otherwise. Logged at lifecycle level only — the
+      // transcript itself never reaches the log.
+      loadHistory: (workerId, since, maxBytes) => {
+        this.log?.("history_requested", { workerId, since: since ?? null, maxBytes });
+        return this.manager.history(workerId, since, maxBytes);
+      },
       onWelcome: options.onWelcome,
       onClose: options.onClose,
     });

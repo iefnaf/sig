@@ -620,6 +620,30 @@ describe("terminal start_worker verdicts close wedged starting workers (PR #41 r
     void (await mockCalls());
   }, 30_000);
 
+  it("a serial-queued worker is reaped only when its machine measurably disappears, never by silence (merge with #16)", async () => {
+    const { fake, workerId } = await dispatchRunningWorker("排队任务");
+    // The connector parks the write worker behind a serial slot (issue #16).
+    await fake.emit("queued", workerId, { behind: "w-other" });
+    await waitForWorkerState(workerId, "queued");
+
+    // Two hours "waiting" on an ONLINE machine: legitimate (a long task holds the slot) —
+    // no reap, no stall notice, nothing.
+    await backdate(workerId, 120);
+    expect(await sweep()).toEqual({ stalled: 0, reaped: 0 });
+    expect((await workerRow(workerId))!.worker.state).toBe("queued");
+
+    // The machine measurably disappears: quiet lost{reaped}, same 10-min clock as running.
+    fake.close();
+    await setMachineOffline(11);
+    expect(await sweep()).toEqual({ stalled: 0, reaped: 1 });
+    const row = await waitForWorkerState(workerId, "lost");
+    expect(row!.worker.lastOutcome).toBe("reaped");
+    expect(row!.thread.state).toBe("idle");
+    await waitWhileOutboundPending();
+    expect((await sentCards()).length).toBe(0);
+    void (await mockCalls());
+  }, 30_000);
+
   it("a done start on a machine offline for a measured 11 minutes reaps at the offline clock, not 45 (PR #46 review finding 4)", async () => {
     const { fake, workerId } = await dispatchCmdWithoutStart();
     fake.close(); // the connector died right after the successful start
