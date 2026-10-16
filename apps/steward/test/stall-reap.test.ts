@@ -174,6 +174,9 @@ describe("the §8.4 stall alarm (online machine, lastEventAt + 20 min)", () => {
     // The worker emits: the timer restarts (this is also what a connector watchdog respawn's
     // progress/resumed events do — they push the DO alarm out by a full window).
     await fake.emit("progress", workerId, { phase: "tool", tool: "edit", target: "src/a.ts", turn: 2 });
+    // The apply (not the WS send) restarts the clock; wait for it, or a lagging apply lets
+    // the sweep still see the backdated silence and notify a second time.
+    await waitForRow(workerId, (r) => (r.worker.lastProgress ?? "").includes("src/a.ts"));
     expect(await sweep()).toEqual({ stalled: 0, reaped: 0 }); // fresh clock, nothing due
 
     await backdate(workerId, 21);
