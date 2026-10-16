@@ -67,6 +67,8 @@ This pairs the machine (redeeming the pairing code from the steward's `/pair` en
 
 ```sh
 shepherd add-repo ~/code/my-repo   # allow start_worker in this repository (§8.1)
+shepherd repo-config ~/code/my-repo --workspace serial   # worktree (default) | serial | main checkout
+shepherd repo-config ~/code/my-repo --approve            # trust the repo's local pi extensions (machine-local only)
 shepherd status                    # service, pairing, workers, installed assets
 shepherd logs                      # tail ~/.shepherd/logs/connector.log
 shepherd stop | start | restart    # control the service
@@ -79,6 +81,8 @@ State lives under `~/.shepherd/` (set `SHEPHERD_HOME` to move it): credentials i
 ## Talking to it (M2)
 
 The Feishu bot is the steward LLM: a pi conversation hosted in the Durable Object, talking to the model configured above. Natural language in, natural language out — the model dispatches through its `start_worker` tool (machine choice, branch relay, and the three-part done-report card stay deterministic), keeps Thread summaries current when workers report back, and only ever disturbs you on its own initiative through `notify_user`/`ask_user`. In event-triggered runs its plain text output is discarded by structure — quiet by default is guaranteed by the code, not the prompt.
+
+You can also reach a worker mid-run: 「改用 pnpm」 goes out as a steer (applied after the current tool batch, never interrupting it), 「做完后顺便补测试」 queues as a follow-up, and 「停下那个」 aborts the run — stopping only ever follows your explicit instruction. Anything the worker hadn't received when it stopped is reported back and kept on the Thread.
 
 Two exact phrases stay deterministic and never reach the model — they mint credentials, so they must work without one:
 
@@ -96,3 +100,5 @@ Routing quality has a measurable bar: a fixed 106-case set (ported from the spik
 ## The companion web
 
 Report cards carry a **查看详情** button: a one-time signed link (15 min, single use) that logs the owner in and opens the Thread timeline (L2: instructions, dispatches, reports, questions — mobile-friendly, server-rendered, no JS). While logged in (`/网页` for a fresh link), `/app` lists all Threads and `/app/machines` lists paired machines with live online state; the 撤销 button bumps a machine's device epoch and closes its connection (4403), so a stolen token dies instantly (protocol §5.1). The chat-issued `/加机器` command is the only pairing path.
+
+Each worker on a timeline links to its **原始过程** (L3 raw process, spec §7.4): the full conversation and tool calls, streamed from the machine through the Durable Object over a browser WebSocket — never stored or logged server-side (protocol doc §6.6). The connector serves it from the live pi process (`get_entries`) or, once the process is gone, by parsing the session JSONL along the current branch; entries are normalized and truncated with a 2 MB per-stream cap and a cursor for paging. Offline machines answer `machine_offline` with an explanation instead of a stream: the transcript lives on that machine only.

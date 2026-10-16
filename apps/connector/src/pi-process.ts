@@ -39,6 +39,12 @@ export interface PiProcessOptions {
   stderrFileMaxBytes?: number;
   /** Grace period between closing stdin and SIGKILL on stop (§4.4: 3s measured). */
   stopGraceMs?: number;
+  /** Fallback rpc budget when a call passes none (PR #45 review #8): control RPCs —
+   *  steer/follow_up/clear_queue/abort and prompt deliveries — are acceptance round-trips
+   *  pi answers in milliseconds (research #3 measured abort at ~3 ms), so a response that
+   *  never comes means a wedged process; failing the command beats parking it (and the
+   *  steward's outbox row) forever. Defaults to 15 s. */
+  defaultRpcTimeoutMs?: number;
 }
 
 interface Pending {
@@ -55,6 +61,7 @@ export class PiProcess {
   private readonly decoder = new StringDecoder("utf8");
   private stderrTail = "";
   private readonly stderrLimit: number;
+  private readonly defaultRpcTimeoutMs: number;
   private exited = false;
   private exitInfo: { code: number | null; signal: NodeJS.Signals | null } | null = null;
   private exitWaiters: (() => void)[] = [];
@@ -62,6 +69,7 @@ export class PiProcess {
   constructor(options: PiProcessOptions) {
     this.options = options;
     this.stderrLimit = options.stderrTailBytes ?? 64 * 1024;
+    this.defaultRpcTimeoutMs = options.defaultRpcTimeoutMs ?? 15_000;
   }
 
   spawn(): void {
@@ -97,32 +105,30 @@ export class PiProcess {
   }
 
   /** Sends one command and resolves with the response `data`. Rejects on `success === false`,
-   * an `error` field, timeout, or process exit (spike-conclusions §2: `success`, not `ok`). */
-  rpc(command: Record<string, unknown>, timeoutMs?: number): Promise<Record<string, unknown>> {
+   * an `error` field, timeout (explicit, or the default budget when none is passed), or
+   * process exit (spike-conclusions §2: `success`, not `ok`). */
+  rpc(command: Record<string, unknown>, timeoutMs: number = this.defaultRpcTimeoutMs): Promise<Record<string, unknown>> {
     const id = typeof command.id === "string" ? command.id : randomUUID();
     return new Promise((resolve, reject) => {
       if (this.exited || !this.child) {
         reject(new RpcError("pi process is not running"));
         return;
       }
-      const timer =
-        timeoutMs === undefined
-          ? undefined
-          : setTimeout(() => {
-              this.pending.delete(id);
-              reject(new RpcError(`rpc timed out after ${timeoutMs}ms`, String(command.type ?? "")));
-            }, timeoutMs);
-      if (timer) timer.unref?.();
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new RpcError(`rpc timed out after ${timeoutMs}ms`, String(command.type ?? "")));
+      }, timeoutMs);
+      timer.unref?.();
       this.pending.set(id, {
         resolve: (value) => {
-          if (timer) clearTimeout(timer);
+          clearTimeout(timer);
           resolve(value);
         },
         reject: (err) => {
-          if (timer) clearTimeout(timer);
+          clearTimeout(timer);
           reject(err);
         },
-        timer: timer as NodeJS.Timeout,
+        timer,
       });
       this.writeLine({ ...command, id });
     });

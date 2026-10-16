@@ -34,6 +34,9 @@ export async function resetChannelState(): Promise<void> {
 export async function resetLedgerState(): Promise<void> {
   await resetChannelState();
   await runInDurableObject(ownerStub(), async (instance: Steward) => {
+    // Routines/follow-ups own SDK schedules that outlive table rows — cancel them first
+    // (issue #20), or a stray fire lands in whichever test runs next.
+    await instance.resetRoutineStateForTests();
     // The steward conversation must not leak between tests: dispose pi, drop its tables,
     // and clear the run/wake bookkeeping (sh_run/sh_wake are ledger-owned but reset here as
     // part of the LLM state, together with the pi tables they mirror).
@@ -55,7 +58,7 @@ export async function resetLedgerState(): Promise<void> {
 /** llmState's shape, declared locally: through the RPC stub's inferred type the class method's
  *  return collapses to `never`, so tests read it through this view instead. */
 export interface LlmStateView {
-  runs: Array<{ operationId: string; kind: string; status: string; resultStatus: string | null; resultReason: string | null; resultText: string | null; replyOutboundId: string | null; replyTo: string | null; routedThreadId: string | null; dispatchCount: number }>;
+  runs: Array<{ operationId: string; kind: string; status: string; text: string; resultStatus: string | null; resultReason: string | null; resultText: string | null; replyOutboundId: string | null; replyTo: string | null; routedThreadId: string | null; dispatchCount: number }>;
   inputs: Array<{ operationId: string; kind: string; text: string }>;
   assistantTexts: string[];
   raw: unknown[];
@@ -433,14 +436,28 @@ export class FakeConnector {
   bootId = "boot-1";
   /** Full workers snapshot for hello.workers (reconciliation input, issue #12). */
   workers: Array<Record<string, unknown>> = [];
+  /** Scripted L3 history (issue #23): entries replayed as windowed chunks on history_req. */
+  historyEntries: Array<Record<string, unknown>> = [];
+  /** Entries per chunk — lets tests force multi-chunk streams. */
+  historyChunkEntries = 2;
+  /** When set, history_req is answered with this error instead of chunks. */
+  historyError: { code: string; message: string } | null = null;
+  /** When true, history_req is swallowed entirely (a machine that never answers). */
+  historySilent = false;
+  /** When set, the connector drops its connection after sending this many chunks. */
+  historyCloseAfterChunks: number | undefined;
   ws: WebSocket | null = null;
   reader: MessageReader | null = null;
   /** Every `cmd` frame received so far; assert with `waitForCmds`. */
   readonly cmds: Array<Record<string, unknown>> = [];
+  /** Every `error` frame received so far (e.g. §5.3 role-fence refusals). */
+  readonly errors: Array<Record<string, unknown>> = [];
   private readonly seqs = new Map<string, number>();
   private readonly connEpochs = new Map<string, number>();
   private readonly runs: FakeWorkerRun[] = [];
   private readonly autorun: boolean;
+  /** §6.6 window state for the stream in flight (one at a time, like a browser page). */
+  private historyStream: { reqId: string; chunks: Array<Record<string, unknown>>; next: number; acked: number; closeAfter?: number } | null = null;
 
   constructor(options: {
     deviceId: string;
@@ -508,6 +525,18 @@ export class FakeConnector {
       } catch {
         continue; // poll timeout: re-check liveness so close() ends the loop
       }
+      if (message.t === "history_req") {
+        this.startHistory(message);
+        continue;
+      }
+      if (message.t === "error") {
+        this.errors.push(message);
+        continue;
+      }
+      if (message.t === "history_ack") {
+        this.onHistoryAck(message);
+        continue;
+      }
       if (message.t !== "cmd") continue;
       this.cmds.push(message);
       if (this.autorun && message.kind === "start_worker") {
@@ -529,6 +558,64 @@ export class FakeConnector {
       if (Date.now() - startedAt > timeoutMs) throw new Error(`only ${this.cmds.length}/${count} cmds arrived`);
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
+  }
+
+  /** §6.6: splits the scripted entries into chunks and sends the first window. */
+  private startHistory(req: Record<string, unknown>): void {
+    if (this.historySilent) return;
+    if (this.historyError) {
+      this.send({
+        t: "error",
+        re: String(req.id),
+        code: this.historyError.code,
+        message: this.historyError.message,
+        retriable: false,
+      });
+      return;
+    }
+    const per = Math.max(1, this.historyChunkEntries);
+    const entries = this.historyEntries;
+    const chunks: Array<Record<string, unknown>> = [];
+    for (let i = 0; i < entries.length; i += per) {
+      const slice = entries.slice(i, i + per) as Array<{ id: string }>;
+      chunks.push({
+        t: "history_chunk",
+        re: String(req.id),
+        n: chunks.length,
+        entries: slice,
+        cursor: slice.length > 0 ? slice[slice.length - 1]!.id : null,
+        done: false,
+      });
+    }
+    if (chunks.length === 0) chunks.push({ t: "history_chunk", re: String(req.id), n: 0, entries: [], cursor: null, done: true });
+    const last = chunks[chunks.length - 1]!;
+    last.done = true;
+    last.cursor = entries.length > 0 ? (entries[entries.length - 1] as { id: string }).id : null;
+    this.historyStream = { reqId: String(req.id), chunks, next: 0, acked: -1, closeAfter: this.historyCloseAfterChunks };
+    this.pumpHistory();
+  }
+
+  private onHistoryAck(message: Record<string, unknown>): void {
+    const stream = this.historyStream;
+    if (!stream || stream.reqId !== String(message.re)) return;
+    const n = Number(message.n);
+    if (n === stream.acked + 1) stream.acked = n;
+    this.pumpHistory();
+  }
+
+  private pumpHistory(): void {
+    const stream = this.historyStream;
+    if (!stream) return;
+    while (stream.next < stream.chunks.length && stream.next <= stream.acked + 2) {
+      this.send(stream.chunks[stream.next]!);
+      stream.next += 1;
+      if (stream.closeAfter !== undefined && stream.next >= stream.closeAfter) {
+        this.historyStream = null;
+        this.close(); // the machine dropped offline mid-stream
+        return;
+      }
+    }
+    if (stream.next >= stream.chunks.length) this.historyStream = null;
   }
 
   /** Scripted worker behavior: ack → result → started → progress → report(+git) → settled. */
@@ -566,7 +653,7 @@ export class FakeConnector {
 
   /** Sends one worker event with the next seq for that worker (connector-persisted seqs). */
   async emit(
-    kind: "started" | "progress" | "report" | "settled" | "lost" | "resumed",
+    kind: "started" | "progress" | "report" | "settled" | "lost" | "resumed" | "queue_returned",
     workerId: string,
     fields: Record<string, unknown>,
   ): Promise<void> {
@@ -605,4 +692,50 @@ export async function pairFakeConnector(
     run: options.run,
     ...(options.autorun === undefined ? {} : { autorun: options.autorun }),
   });
+}
+
+// ---- The owner's web session (issue #22 login, reused by the L3 stream tests) -------------------
+
+/** Sends the owner's DM (fixed-phrase dispatch etc.) and waits for the replies to settle. */
+export async function ownerDm(text: string): Promise<void> {
+  const res = await postEvent(messageEvent({ msgId: `om_${crypto.randomUUID().slice(0, 8)}`, text }));
+  if (res.status !== 200) throw new Error(`owner DM failed: ${res.status}`);
+  await waitWhileOutboundPending();
+}
+
+/** Logs in via /网页 and returns the session cookie header value. */
+export async function webLogin(): Promise<string> {
+  await ownerDm("/网页");
+  const rows = await ownerStub().outboundRows(20);
+  const texts = rows
+    .filter((r) => r.kind === "text" && r.status === "sent")
+    .map((r) => JSON.parse(r.payload as string).text as string);
+  const linkUrl = texts.join(" ").match(/https:\/\/example\.com\/link\/\S+/)![0]!;
+  const res = await SELF.fetch(linkUrl, { redirect: "manual" });
+  if (res.status !== 303) throw new Error(`link did not log in: ${res.status}`);
+  return res.headers.get("set-cookie")!.split(";")[0]!;
+}
+
+/** Opens a web-role WebSocket (protocol §5.3): the L3 stream's browser connection. */
+export async function connectWeb(cookie: string): Promise<{ ws: WebSocket; reader: MessageReader }> {
+  const res = await SELF.fetch("https://example.com/agents/steward/owner?role=web", {
+    headers: { Upgrade: "websocket", cookie },
+  });
+  if (res.status !== 101 || !res.webSocket) throw new Error(`web role connect failed: ${res.status}`);
+  const ws = res.webSocket;
+  ws.accept();
+  return { ws, reader: new MessageReader(ws) };
+}
+
+/** Waits until the first thread's first worker reaches `state`. */
+export async function waitForWorkerState(state: string, timeoutMs = 8000): Promise<{ threadId: string; workerId: string }> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const snap = await ownerStub().debugSnapshot();
+    const thread = snap.threads[0];
+    const worker = thread?.workers[0];
+    if (thread && worker && worker.state === state) return { threadId: thread.threadId, workerId: worker.workerId };
+    if (Date.now() > deadline) throw new Error(`worker never reached ${state}: ${JSON.stringify(snap.threads)}`);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
 }

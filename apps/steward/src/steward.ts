@@ -16,6 +16,11 @@
 // poll, §6.3), worker events wake it for bookkeeping through the durable wake queue (§5.1/
 // §5.4), and in event-triggered runs its plain text is discarded by structure (§6.2): only
 // notify_user / ask_user reach the user.
+//
+// Proactive behavior (issue #20, steward.md §8): routines and follow-ups schedule through
+// the Agents SDK (`fireRoutine`/`fireFollowup`); digest routines render deterministically
+// with no LLM, instruction fires submit ⟦routine⟧ inputs whose operationId
+// (routine:<id>:<fireTime>) dedups duplicate fires; every row traces back to a user message.
 import { Agent, type Connection, type ConnectionContext, type WSMessage } from "agents";
 import { PiHarness } from "agents/harness/pi";
 import { Harness, createRegistry, type Extension, type Registry } from "@earendil-works/pi-durable";
@@ -27,6 +32,11 @@ import {
   EventsGapMessageSchema,
   EventsMessageSchema,
   HelloMessageSchema,
+  HISTORY_MAX_BYTES,
+  HISTORY_RELAY_TTL_MS,
+  HistoryAckMessageSchema,
+  HistoryChunkMessageSchema,
+  HistoryOpenMessageSchema,
   PingMessageSchema,
   PROTOCOL_VERSION,
   generatePairingCode,
@@ -36,6 +46,8 @@ import {
   type CmdMessage,
   type ErrorMessage,
   type EventsAckMessage,
+  type HistoryReqMessage,
+  type MachineOfflineMessage,
   type PongMessage,
   type ResyncMessage,
   type ServerKey,
@@ -69,14 +81,17 @@ import {
   type StewardModels,
 } from "./llm/models.ts";
 import { createLedger, type Ledger, type LedgerSql, type NotifyRow, type RunRow } from "./ledger.ts";
+import { RoutineService } from "./routines.ts";
 import { failureCard, notifyCard, askUserCard, reportCardFor, type AskCardButton } from "./report-template.ts";
 import { MIGRATIONS, runMigrations } from "./schema.ts";
 import { openSecret, sealSecret } from "./secretbox.ts";
 import { renderSetupPage, type SetupView } from "./setup-page.ts";
 import { escapeMarkers, verifyWakeText } from "./wake-text.ts";
-import { WebApp, linkTargetForThread } from "./web.ts";
+import { WebApp, linkTargetForThread, parseSessionCookie } from "./web.ts";
 
 interface ConnState {
+  /** Set on browser connections (the L3 stream consumers); connector connections carry deviceId. */
+  role?: "web";
   deviceId: string;
   epoch: number;
   /** Key that authenticated the connection (issue #27): ≠ primary ⇒ welcome rekeys. */
@@ -112,6 +127,10 @@ const IDLE_SWEEP_INTERVAL_S = 60;
 // to come online" pass `notAfter: null` explicitly.
 const DEFAULT_NOTAFTER_MS = 10 * 60_000;
 
+// History relay (protocol §6.6, issue #23): a relay row older than this is dropped; the
+// browser's stream JS treats silence past its own deadline as the end. Shrunk in tests.
+const HISTORY_RELAY_TTL_DEFAULT_MS = HISTORY_RELAY_TTL_MS;
+
 // ---- Channel: Feishu webhook inbound + outbound queue (steward.md §6.1, §9; spike bugs 1, 3) ----
 // A claim is the double-send guard (bug 1): the conditional UPDATE hands a row to exactly one
 // delivery pass; it outlives the 10s send timeout so a merely-slow send keeps its owner.
@@ -133,6 +152,10 @@ const RUN_POLL_S = 2;
  *  over-broad pattern would spam corrective runs. */
 const DISPATCH_CLAIM_RE = /已派活|已重派|已派出|已派发|派给了|已经派出|新 worker|worker 会|worker 将/;
 export const claimsDispatch = (text: string): boolean => DISPATCH_CLAIM_RE.test(text);
+// §7.2 (review #47-5): a fired once-routine / follow-up authorizes the run its fire spawned
+// — bounded in time, so a long-dead fire is not a standing authorization. Generous enough
+// for a wake queued behind a busy harness (whenBusy: followUp), short enough to revoke.
+const PROVENANCE_FIRE_FRESHNESS_MS = 10 * 60_000;
 // Sent when the first event lands on the webhook after the QR switch: only a delivered event
 // proves the transport actually moved (research §8.2 — the API's callback_type report stays
 // out of sync with real delivery until the console republish lands).
@@ -183,6 +206,11 @@ export interface ShOutboundRow {
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+/** UTF-8 size of a serialized relay message — the byte meter is numbers only, never content. */
+function jsonByteLength(value: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(value)).length;
+}
+
 function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -201,12 +229,16 @@ export type PairResult =
 // cast at the read/write sites instead (same tradeoff the do-protocol spike made).
 export class Steward extends Agent<Env> {
   onStart(): void {
-    // Each migration commits atomically with its ledger row (review #48 finding 3): a crash
-    // mid-migration rolls back instead of stranding the schema half-applied.
+    // Each migration commits atomically WITH its ledger row (reviews #47-2 + #48 finding 3):
+    // a multi-statement rebuild can never persist half of itself, and the ledger write
+    // cannot lag the commit (the copy-drop-rename migrations are not re-runnable).
     runMigrations(this.sql.bind(this), MIGRATIONS, (fn) => this.ctx.storage.transactionSync(fn));
     // Wakes queued by past reducers (crash between queue and submit, §11) drain now.
     void this.drainWakes();
     void this.pollRuns();
+    // Routine/follow-up rows and their SDK schedules live in different stores — a crash
+    // between INSERT and schedule() must not silently kill a routine (issue #20, §11).
+    void this.reconcileRoutineSchedules();
   }
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -311,6 +343,8 @@ export class Steward extends Agent<Env> {
   // Tests shrink the /pair lockout (see feishuSendTimeoutMs for the same pattern).
   protected pairLockMs = PAIR_LOCK_MS;
 
+  // Tests shrink the history relay TTL to exercise the alarm-driven sweep quickly.
+  protected historyRelayTtlMs = HISTORY_RELAY_TTL_DEFAULT_MS;
 
   // The memory module (steward.md §2): all sh_* ledger SQL lives behind this handle. Bound
   // lazily because `sql`/`ctx` only mean something once the DO is live.
@@ -347,7 +381,59 @@ export class Steward extends Agent<Env> {
       createPairing: () => this.createPairing(),
       deployOrigin: () => this.web.origin(),
       webLinkUrl: (target) => this.web.linkUrl(target),
+      // Routine suggestion cards (`offer:` outbound ids) route their taps here (§8.5).
+      onOfferTap: (offerId, action) => this.routineService.handleOfferTap(offerId, action),
     }));
+  }
+
+  // The proactive-behavior service (issue #20, steward.md §8): routines, follow-ups, offers.
+  // Same lazy-bind pattern as the ledger/dispatcher.
+  private routineService_?: RoutineService;
+  protected get routineService(): RoutineService {
+    return (this.routineService_ ??= new RoutineService({
+      ledger: this.ledger,
+      schedule: (when, callback, payload, opts) => this.schedule(when, callback, payload, opts),
+      cancelSchedule: (id) => this.cancelSchedule(id),
+      enqueueOutbound: (input) => this.enqueueOutbound(input),
+      ownerOpenId: () => this.ownerOpenIdSync(),
+      onWakeQueued: () => {
+        void this.drainWakes();
+        void this.pollRuns();
+      },
+      audit: (kind, detail) => this.logChannel(kind, detail),
+    }));
+  }
+
+  /** Agents SDK callback (this.schedule(cron, "fireRoutine", { routineId }), §8.2). */
+  async fireRoutine(payload?: { routineId?: string }, schedule?: { id?: string; time?: number }): Promise<void> {
+    if (!payload?.routineId) return;
+    try {
+      await this.routineService.fire(payload.routineId, schedule);
+    } catch (err) {
+      this.logChannel("routine_fire_failed", `${payload.routineId} ${errorText(err)}`);
+    }
+  }
+
+  /** Agents SDK callback for a due follow-up (§8.3): submits ⟦followup F⟧. */
+  async fireFollowup(payload?: { followupId?: string }): Promise<void> {
+    if (!payload?.followupId) return;
+    try {
+      await this.routineService.fireFollowup(payload.followupId);
+    } catch (err) {
+      this.logChannel("followup_fire_failed", `${payload.followupId} ${errorText(err)}`);
+    }
+  }
+
+  /** onStart reconciliation driver (§11): rows ↔ SDK schedules must agree after any crash. */
+  async reconcileRoutineSchedules(): Promise<void> {
+    try {
+      const schedules = await this.listSchedules();
+      await this.routineService.reconcile(
+        schedules.map((s) => ({ id: s.id, callback: s.callback, type: s.type, time: s.time, payload: s.payload })),
+      );
+    } catch (err) {
+      this.logChannel("routine_reconcile_failed", errorText(err));
+    }
   }
 
   // The signed-link web app (issue #22, steward.md §10): login exchange, Thread timeline,
@@ -363,6 +449,7 @@ export class Steward extends Agent<Env> {
           SELECT deviceId, name, revoked FROM device ORDER BY createdAt, deviceId
         `.map((d) => ({ deviceId: d.deviceId, name: d.name, revoked: !!d.revoked })),
       revokeDevice: (deviceId) => void this.revoke(deviceId),
+      machineConnected: (deviceId) => this.connFor(deviceId) !== undefined,
       audit: (reason, detail) => this.logChannel(reason, detail),
     }));
   }
@@ -374,12 +461,32 @@ export class Steward extends Agent<Env> {
       buildBrief: () => buildSituationBrief(this.ledger),
       currentRun: () => this.currentRunBinding(),
       checkProvenanceRef: async (ref) => {
-        // §7.2 (review #4): a `user:<msgId>` reference is valid only if this deployment
-        // actually received that message. Routine/followup/watch ids join when #20 lands.
-        if (!ref.startsWith("user:")) return false;
-        const msgId = ref.slice("user:".length);
-        if (msgId.length === 0) return false;
-        return this.sql`SELECT 1 AS one FROM sh_inbound WHERE channel = 'feishu' AND msgId = ${msgId}`.length > 0;
+        // §7.2 (review #4 + #47-5): a provenance reference is valid only if this deployment
+        // actually holds — and has not revoked — what it points at. Routine/follow-up ids
+        // authorize while their fire is live: an `active` routine, a `done` once-routine
+        // whose fire may still be executing (bounded by PROVENANCE_FIRE_FRESHNESS), a
+        // freshly `fired` follow-up. Paused/cancelled are the owner's revocation.
+        if (ref.startsWith("user:")) {
+          const msgId = ref.slice("user:".length);
+          if (msgId.length === 0) return false;
+          return this.sql`SELECT 1 AS one FROM sh_inbound WHERE channel = 'feishu' AND msgId = ${msgId}`.length > 0;
+        }
+        if (ref.startsWith("routine:")) {
+          const routineId = ref.slice("routine:".length);
+          if (routineId.length === 0) return false;
+          const routine = this.ledger.routines.get(routineId);
+          if (!routine) return false;
+          if (routine.status === "active") return true;
+          return routine.status === "done" && (routine.lastRunAt ?? 0) > Date.now() - PROVENANCE_FIRE_FRESHNESS_MS;
+        }
+        if (ref.startsWith("followup:")) {
+          const followupId = ref.slice("followup:".length);
+          if (followupId.length === 0) return false;
+          const followup = this.ledger.followups.get(followupId);
+          // `open` has not happened yet and authorizes nothing; `fired` is live only while fresh.
+          return followup?.status === "fired" && (followup.firedAt ?? 0) > Date.now() - PROVENANCE_FIRE_FRESHNESS_MS;
+        }
+        return false;
       },
       startWorker: async (input) => {
         const run = await this.currentRunBinding();
@@ -395,6 +502,16 @@ export class Steward extends Agent<Env> {
           // claiming "dispatched" with dispatchCount 0 gets the corrective follow-up.
           if (run) this.ledger.runs.countDispatch(run.operationId);
         }
+        return outcome;
+      },
+      sendToWorker: async (input) => {
+        const outcome = await this.dispatcher.sendToWorker(input);
+        if (outcome.kind === "sent") await this.backfillRunThread(outcome.threadId);
+        return outcome;
+      },
+      interruptWorker: async (input) => {
+        const outcome = await this.dispatcher.interruptWorker(input);
+        if (outcome.kind === "interrupted") await this.backfillRunThread(outcome.threadId);
         return outcome;
       },
       notifyUser: async (input) => {
@@ -474,6 +591,17 @@ export class Steward extends Agent<Env> {
       audit: (kind, detail) => {
         this.logChannel(kind, detail);
       },
+      routines: this.routineService,
+      // §8.6 (audit trail): an explicit in-run outcome (no_action) beats the settle fallback.
+      recordProactiveOutcome: (operationId, outcome) => {
+        const followup = /^followup:(f_.+)$/.exec(operationId);
+        if (followup) {
+          this.ledger.followups.recordOutcome(followup[1]!, outcome);
+          return;
+        }
+        const routine = /^routine:(r_.+):\d+$/.exec(operationId);
+        if (routine) this.ledger.routines.recordOutcome(routine[1]!, outcome);
+      },
     };
   }
 
@@ -519,6 +647,16 @@ export class Steward extends Agent<Env> {
     if (run) this.sql`UPDATE sh_run SET notified = 1 WHERE operationId = ${run.operationId}`;
   }
 
+  /** Issue #9: an intervention resolves the Thread this run's reply belongs to (same
+   *  rationale as a dispatch, review #8) — the tool resolved the worker; the routing
+   *  backfill never passes through model judgment (§3.1). */
+  private async backfillRunThread(threadId: string): Promise<void> {
+    const run = await this.currentRunBinding();
+    if (run && run.routedThreadId === null) {
+      this.sql`UPDATE sh_run SET routedThreadId = ${threadId} WHERE operationId = ${run.operationId} AND routedThreadId IS NULL`;
+    }
+  }
+
   private ownerOpenIdSync(): string | null {
     return this.sql<{ ownerOpenId: string | null }>`
       SELECT ownerOpenId FROM sh_channel WHERE channel = 'feishu'
@@ -556,6 +694,9 @@ export class Steward extends Agent<Env> {
   }
 
   async getConnectionTags(_connection: Connection, ctx: ConnectionContext): Promise<string[]> {
+    // §5.3: the role query param routes/tags the connection; legitimacy is decided by the
+    // credential — device token for connectors (onConnect), session cookie for browsers.
+    if (new URL(ctx.request.url).searchParams.get("role") === "web") return ["web"];
     const parsed = await parseToken(await this.serverKeys(), bearer(ctx.request));
     return parsed ? [`dev:${parsed.deviceId}`] : [];
   }
@@ -565,6 +706,24 @@ export class Steward extends Agent<Env> {
   }
 
   async onConnect(connection: Connection, ctx: ConnectionContext): Promise<void> {
+    // Browser connections (§5.3 `web` role): authenticated by the session cookie the Worker
+    // layer already HMAC-verified (index.ts onBeforeConnect); liveness stays a DB fact here.
+    if (new URL(ctx.request.url).searchParams.get("role") === "web") {
+      const raw = (ctx.request.headers.get("cookie") ?? "")
+        .split(/;\s*/)
+        .find((part) => part.startsWith("shepherd_session="))
+        ?.slice("shepherd_session=".length) ?? null;
+      const sid = await parseSessionCookie(
+        [this.env.SERVER_KEY, this.env.SERVER_KEY_PREVIOUS].filter((k): k is string => typeof k === "string" && k.length > 0),
+        raw,
+      );
+      if (!sid || !this.web.sessionAlive(sid)) {
+        connection.close(CloseCode.UNAUTHORIZED, "unauthorized");
+        return;
+      }
+      connection.setState({ role: "web", deviceId: "", epoch: 0, keyId: "" } satisfies ConnState);
+      return;
+    }
     const parsed = await parseToken(await this.serverKeys(), bearer(ctx.request));
     if (!parsed) {
       connection.close(CloseCode.UNAUTHORIZED, "unauthorized");
@@ -589,11 +748,28 @@ export class Steward extends Agent<Env> {
 
   onClose(connection: Connection): void {
     const state = connection.state as unknown as ConnState | null;
-    if (!state?.deviceId) return;
+    if (!state) return;
+    if (state.role === "web") {
+      // §6.6 termination: the browser closing its connection ends every stream it opened.
+      this.sql`DELETE FROM history_relay WHERE webConnId = ${connection.id}`;
+      return;
+    }
+    if (!state.deviceId) return;
     // A superseded old connection closes after its replacement is live: only the last
     // connection for the device takes the machine offline.
     const remaining = [...this.getConnections<ConnState>(`dev:${state.deviceId}`)].filter((c) => c.id !== connection.id);
-    if (remaining.length === 0) this.ledger.machines.setOnline(state.deviceId, false);
+    if (remaining.length > 0) return; // superseded, not offline — its relays die with the
+    // connector-side reset; the browser's silence watchdog ends the view.
+    // The machine really went offline: every relay through it dies with the connection, and
+    // each browser hears why (§6.6 machine_offline) instead of waiting out its own timeout.
+    const orphaned = this.sql<{ reqId: string; webConnId: string }>`
+      SELECT reqId, webConnId FROM history_relay WHERE deviceId = ${state.deviceId}
+    `;
+    for (const relay of orphaned) {
+      this.sql`DELETE FROM history_relay WHERE reqId = ${relay.reqId}`;
+      this.getConnection(relay.webConnId)?.send(JSON.stringify({ t: "machine_offline", re: relay.reqId } satisfies MachineOfflineMessage));
+    }
+    this.ledger.machines.setOnline(state.deviceId, false);
   }
 
   async onMessage(connection: Connection, raw: WSMessage): Promise<void> {
@@ -605,7 +781,34 @@ export class Steward extends Agent<Env> {
       this.sendError(connection, "bad_request", "invalid JSON");
       return;
     }
+    // §5.3 role fence: browsers only stream history; connectors do everything else. A
+    // cross-role message is answered with forbidden and never reaches a handler.
+    const state = connection.state as unknown as ConnState | null;
     const t = (message as { t?: unknown }).t;
+    if (state?.role === "web") {
+      switch (t) {
+        case "history_open":
+          this.handleHistoryOpen(connection, message);
+          return;
+        case "history_ack":
+          this.handleHistoryAck(connection, message);
+          return;
+        default:
+          this.sendError(connection, "forbidden", `message type ${JSON.stringify(t)} is not allowed on a web connection`);
+          return;
+      }
+    }
+    if (t === "history_open" || t === "history_ack") {
+      // §5.3: browser-type messages on a connector connection.
+      const id = (message as { id?: unknown }).id;
+      this.sendError(
+        connection,
+        "forbidden",
+        `message type ${JSON.stringify(t)} is not allowed on a connector connection`,
+        typeof id === "string" ? id : undefined,
+      );
+      return;
+    }
     switch (t) {
       case "hello":
         this.handleHello(connection, message);
@@ -628,6 +831,14 @@ export class Steward extends Agent<Env> {
         // the DO just accepts the report instead of answering "unsupported".
         EventsGapMessageSchema.safeParse(message);
         return;
+      case "history_chunk":
+        this.handleHistoryChunk(connection, message);
+        return;
+      case "error":
+        // A connector reply to something the DO itself sent. The only DO-originated requests
+        // are history pulls (§6.6): relay a failure to the waiting browser and end its stream.
+        this.relayHistoryError(connection, message);
+        return;
       default:
         break;
     }
@@ -641,6 +852,126 @@ export class Steward extends Agent<Env> {
     const parsed = PingMessageSchema.safeParse(raw);
     if (!parsed.success) return;
     connection.send(JSON.stringify({ t: "pong", re: parsed.data.id } satisfies PongMessage));
+  }
+
+  // ---- History relay (protocol §6.6, issue #23) ---------------------------------------------------
+  // The DO is a pure pipe: ids and byte meters in SQLite, content only ever in memory
+  // between the two sockets. Nothing here logs or persists entry text.
+
+  /** browser → DO: resolve the worker, refuse offline machines, then ask the connector. */
+  private handleHistoryOpen(connection: Connection, raw: unknown): void {
+    const parsed = HistoryOpenMessageSchema.safeParse(raw);
+    if (!parsed.success) {
+      this.sendError(connection, "bad_request", "invalid history_open");
+      return;
+    }
+    const open = parsed.data;
+    const worker = this.ledger.workers.get(open.workerId);
+    if (!worker) {
+      this.sendError(connection, "not_found", `worker ${open.workerId} is unknown`, open.id);
+      return;
+    }
+    const deviceConn = this.connFor(worker.deviceId);
+    if (!deviceConn) {
+      // §6.6: offline is answered directly — the transcript lives on that machine only.
+      connection.send(JSON.stringify({ t: "machine_offline", re: open.id } satisfies MachineOfflineMessage));
+      return;
+    }
+    const reqId = ulid();
+    const maxBytes = Math.min(open.maxBytes ?? HISTORY_MAX_BYTES, HISTORY_MAX_BYTES);
+    const now = Date.now();
+    // One live stream per browser connection — a re-open supersedes the previous one.
+    this.sql`DELETE FROM history_relay WHERE webConnId = ${connection.id}`;
+    this.sql`
+      INSERT INTO history_relay (reqId, webConnId, workerId, deviceId, maxBytes, sentBytes, expiresAt, createdAt)
+      VALUES (${reqId}, ${connection.id}, ${open.workerId}, ${worker.deviceId}, ${maxBytes}, 0, ${now + this.historyRelayTtlMs}, ${now})
+    `;
+    void this.schedule(Math.max(1, Math.ceil(this.historyRelayTtlMs / 1000)), "sweepHistoryRelays");
+    const req: HistoryReqMessage = {
+      t: "history_req",
+      id: reqId,
+      workerId: open.workerId,
+      maxBytes,
+      ...(open.since ? { since: open.since } : {}),
+    };
+    deviceConn.send(JSON.stringify(req));
+  }
+
+  /** browser → DO → connector: the ack that slides the connector's window (§6.6 step 4). */
+  private handleHistoryAck(connection: Connection, raw: unknown): void {
+    const parsed = HistoryAckMessageSchema.safeParse(raw);
+    if (!parsed.success) return;
+    const relay = this.sql<{ webConnId: string; deviceId: string }>`
+      SELECT webConnId, deviceId FROM history_relay WHERE reqId = ${parsed.data.re}
+    `[0];
+    // Unknown reqId (stream already finished) or another connection's stream: drop.
+    if (!relay || relay.webConnId !== connection.id) return;
+    this.connFor(relay.deviceId)?.send(JSON.stringify(parsed.data));
+  }
+
+  /** connector → DO → browser: forward one chunk, meter the bytes, end finished streams. */
+  private handleHistoryChunk(connection: Connection, raw: unknown): void {
+    const parsed = HistoryChunkMessageSchema.safeParse(raw);
+    if (!parsed.success) return;
+    const chunk = parsed.data;
+    const relay = this.sql<{ webConnId: string; deviceId: string; maxBytes: number; sentBytes: number; cursor: string | null; expiresAt: number }>`
+      SELECT webConnId, deviceId, maxBytes, sentBytes, cursor, expiresAt FROM history_relay WHERE reqId = ${chunk.re}
+    `[0];
+    if (!relay) return; // swept/timed out/done: nothing is waiting for this chunk
+    // The relay belongs to one machine: only its connection's chunks travel on. reqIds are
+    // unguessable ULIDs, so this is defense in depth against a confused connector, not auth.
+    if ((connection.state as unknown as ConnState | null)?.deviceId !== relay.deviceId) return;
+    if (relay.expiresAt <= Date.now()) {
+      this.sql`DELETE FROM history_relay WHERE reqId = ${chunk.re}`;
+      return;
+    }
+    const webConn = this.getConnection(relay.webConnId);
+    if (!webConn) {
+      this.sql`DELETE FROM history_relay WHERE reqId = ${chunk.re}`;
+      return;
+    }
+    const bytes = jsonByteLength(raw);
+    if (relay.sentBytes + bytes > relay.maxBytes) {
+      // Defense in depth (the connector budgets maxBytes first): cut the stream here rather
+      // than forward past the cap, and tell the browser it ended — continuing from the last
+      // FORWARDED cursor, never the dropped chunk's (the browser never saw its entries).
+      webConn.send(
+        JSON.stringify({ t: "history_chunk", re: chunk.re, n: chunk.n, entries: [], cursor: relay.cursor, done: true, truncated: true }),
+      );
+      this.sql`DELETE FROM history_relay WHERE reqId = ${chunk.re}`;
+      return;
+    }
+    webConn.send(JSON.stringify(chunk));
+    if (chunk.done) {
+      this.sql`DELETE FROM history_relay WHERE reqId = ${chunk.re}`;
+    } else {
+      this.sql`
+        UPDATE history_relay SET sentBytes = ${relay.sentBytes + bytes}, cursor = ${chunk.cursor ?? null}
+        WHERE reqId = ${chunk.re}
+      `;
+    }
+  }
+
+  /** A connector `error` replying to a history_req: forward the reason, end the stream. */
+  private relayHistoryError(connection: Connection, raw: unknown): void {
+    const re = (raw as { re?: unknown }).re;
+    if (typeof re !== "string") return;
+    const relay = this.sql<{ webConnId: string; deviceId: string }>`
+      SELECT webConnId, deviceId FROM history_relay WHERE reqId = ${re}
+    `[0];
+    if (!relay) return; // not a history reply; nothing else to do with connector errors today
+    if ((connection.state as unknown as ConnState | null)?.deviceId !== relay.deviceId) return;
+    this.sql`DELETE FROM history_relay WHERE reqId = ${re}`;
+    this.getConnection(relay.webConnId)?.send(JSON.stringify(raw));
+  }
+
+  /** Alarm-driven §6.6 termination: relays older than the TTL disappear, browser or not. */
+  async sweepHistoryRelays(): Promise<void> {
+    this.sql`DELETE FROM history_relay WHERE expiresAt <= ${Date.now()}`;
+    const next = this.sql<{ m: number | null }>`SELECT MIN(expiresAt) AS m FROM history_relay`[0]?.m;
+    if (typeof next === "number") {
+      void this.schedule(Math.max(1, Math.ceil((next - Date.now()) / 1000)), "sweepHistoryRelays");
+    }
   }
 
   private async handleHello(connection: Connection, raw: unknown): Promise<void> {
@@ -1850,6 +2181,9 @@ export class Steward extends Agent<Env> {
   }
 
   private settleRun(run: RunRow, result: { status: string; reason?: string; text?: string }): void {
+    // §8.6: every fire leaves a result. An explicit in-run outcome (no_action) was recorded
+    // during the run; the settle summary is the fallback for everything else.
+    this.recordSettledProactiveOutcome(run, result);
     if (run.kind === "user") {
       const owner = this.ownerOpenIdSync();
       const hasText = Boolean(result.text && result.text.trim().length > 0);
@@ -1910,6 +2244,20 @@ export class Steward extends Agent<Env> {
     // Event/routine/follow-up runs, and user runs that already reached the user: the text is
     // kept for audit and nothing more is sent (§6.2).
     this.ledger.runs.settle(run.operationId, result);
+  }
+
+  /** The settle-time lastResult for routine/follow-up runs (§8.6), when none was recorded. */
+  private recordSettledProactiveOutcome(run: RunRow, result: { status: string; reason?: string; text?: string }): void {
+    const summary =
+      `${result.status}${result.reason !== undefined && result.reason !== null ? `:${result.reason}` : ""}` +
+      (result.text && result.text.trim().length > 0 ? ` — ${result.text.trim().slice(0, 140)}` : "");
+    const followup = /^followup:(f_.+)$/.exec(run.operationId);
+    if (followup) {
+      this.ledger.followups.recordOutcome(followup[1]!, summary);
+      return;
+    }
+    const routine = /^routine:(r_.+):\d+$/.exec(run.operationId);
+    if (routine) this.ledger.routines.recordOutcome(routine[1]!, summary);
   }
 
   /**
@@ -2132,6 +2480,39 @@ export class Steward extends Agent<Env> {
   /** Test-only: pushes a thread's lastActivityAt back `days` — the idle-attach band (#7). */
   async ageThreadForTest(threadId: string, days: number): Promise<void> {
     this.sql`UPDATE sh_thread SET lastActivityAt = ${Date.now() - days * 86_400_000} WHERE threadId = ${threadId}`;
+}
+
+  /** Test entry into the intervention half of the dispatch service (send/interrupt). */
+  async sendForTest(
+    input: Omit<import("./dispatch.ts").SendToWorkerInput, "provenance" | "cmdId"> & { cmdId?: string },
+  ): Promise<import("./dispatch.ts").SendToWorkerOutcome> {
+    return this.dispatcher.sendToWorker({ ...input, provenance: "test", cmdId: input.cmdId ?? `test:${ulid()}` });
+  }
+
+  /** Test entry into the intervention half of the dispatch service (send/interrupt). */
+  async interruptForTest(
+    input: Omit<import("./dispatch.ts").InterruptWorkerInput, "provenance" | "cmdId"> & { cmdId?: string },
+  ): Promise<import("./dispatch.ts").InterruptWorkerOutcome> {
+    return this.dispatcher.interruptWorker({ ...input, provenance: "test", cmdId: input.cmdId ?? `test:${ulid()}` });
+  }
+
+  /** Test entry into the proactive-behavior service (issue #20): create + arm a routine. */
+  async createRoutineForTest(
+    input: import("./routines.ts").RoutineSpecInput & { routineId?: string; createdFromMsg?: string },
+  ): Promise<{ ok: true; routineId: string } | { ok: false; reason: string }> {
+    const outcome = await this.routineService.create({
+      ...input,
+      routineId: input.routineId ?? `r_test_${ulid()}`,
+      createdFromMsg: input.createdFromMsg ?? "om_test_source",
+    });
+    return outcome.ok ? { ok: true, routineId: outcome.routine.routineId } : { ok: false, reason: outcome.reason };
+  }
+
+  /** Test read: the fireRoutine/fireFollowup schedule rows the Agents SDK currently holds. */
+  async routineSchedulesForTest(): Promise<Array<{ id: string; callback: string; type: string; time: number; payload: unknown }>> {
+    return (await this.listSchedules())
+      .filter((s) => s.callback === "fireRoutine" || s.callback === "fireFollowup")
+      .map((s) => ({ id: s.id, callback: s.callback, type: s.type, time: s.time, payload: s.payload }));
   }
 
   // ---- Steward-LLM test surface (the `faux` provider is configured via STEWARD_MODEL) ----
@@ -2183,6 +2564,17 @@ export class Steward extends Agent<Env> {
     this.ctx.storage.sql.exec("DELETE FROM sh_run");
     this.ctx.storage.sql.exec("DELETE FROM sh_wake");
     if (this.llmModels.faux) this.llmModels.faux.reset();
+  }
+
+  /** Test-only: cancels every routine/follow-up schedule and clears the proactive tables. */
+  async resetRoutineStateForTests(): Promise<void> {
+    for (const s of await this.listSchedules()) {
+      if (s.callback === "fireRoutine" || s.callback === "fireFollowup") await this.cancelSchedule(s.id).catch(() => {});
+    }
+    this.ctx.storage.sql.exec("DELETE FROM sh_routine");
+    this.ctx.storage.sql.exec("DELETE FROM sh_followup");
+    this.ctx.storage.sql.exec("DELETE FROM sh_routine_offer");
+    this.routineService_ = undefined;
   }
 
   // Scheduled callback (also fired inline after each enqueue): claims due rows, sends them

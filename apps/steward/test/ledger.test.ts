@@ -223,6 +223,22 @@ describe("the reducer: derived state, unread, notification intents (steward.md �
     expect(snap.threads[0]!.workers[0]!.state).toBe("running"); // started applied before the report
   });
 
+  it("a queued event (§8.2 serial repos) parks the worker without ending the run", async () => {
+    const { ws, reader } = await connectMachine();
+    const workerId = await dispatchAndAwaitWorker(reader, "改点东西");
+
+    await sendEvents(ws, [event(workerId, 1, { type: "queued", behind: "w-other-write" })]);
+    const snap = await snapshotWhere((s) => s.threads[0]?.workers[0]?.state === "queued", "worker queued");
+    // Queued is an active state (issue #16): the Thread stays running-shaped — this is a
+    // parking notice, not an outcome.
+    expect(snap.threads[0]!.state).toBe("running");
+    expect(snap.threads[0]!.timeline.some((e) => e.kind === "note" && JSON.stringify(e).includes("排队"))).toBe(true);
+
+    // And it resolves like any start: the later `started` event flips it to running.
+    await sendEvents(ws, [event(workerId, 2, { type: "started", sessionId: workerId, branch: "shepherd/q-1" })]);
+    await snapshotWhere((s) => s.threads[0]?.workers[0]?.state === "running", "worker running after queue");
+  });
+
   it("a rejected start_worker marks the worker broken and pushes a red failure card", async () => {
     const { ws, reader } = await connectMachine();
     const outcome = await ownerStub().dispatchForTest({ prompt: "修一下部署脚本", repoRef: "repo-a", newTitle: "修一下部署脚本" });
