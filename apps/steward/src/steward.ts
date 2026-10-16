@@ -5,6 +5,11 @@
 //
 // Channel layer (issue #4, steward.md §6.1 / §9): the SETUP_TOKEN-guarded setup page, manual
 // Feishu credentials, the webhook inbound path, and the alarm-driven outbound queue.
+//
+// Ledger core (issue #5, steward.md §2/§5/§6): machines/repositories from hello, online state
+// from connections, the deterministic event reducer (one transaction, derived Thread state),
+// core-template done reports with no LLM, and fixed-phrase dispatch. Every sh_ledger table is
+// reached through the memory module (ledger.ts); this class only wires it to the transports.
 import { Agent, type Connection, type ConnectionContext, type WSMessage } from "agents";
 import {
   CloseCode,
@@ -34,6 +39,9 @@ import {
   type FeishuCredentials,
 } from "./channel/feishu.ts";
 import { RetriableChannelError, type InboundEvent } from "./channel/types.ts";
+import { Dispatcher } from "./dispatch.ts";
+import { createLedger, type Ledger, type LedgerSql, type NotifyRow } from "./ledger.ts";
+import { failureCard, reportCardFor } from "./report-template.ts";
 import { MIGRATIONS, runMigrations } from "./schema.ts";
 import { openSecret, sealSecret } from "./secretbox.ts";
 import { renderSetupPage } from "./setup-page.ts";
@@ -122,6 +130,46 @@ export class Steward extends Agent<Env> {
     runMigrations(this.sql.bind(this), MIGRATIONS);
   }
 
+  // The memory module (steward.md §2): all sh_* ledger SQL lives behind this handle. Bound
+  // lazily because `sql`/`ctx` only mean something once the DO is live.
+  private ledger_?: Ledger;
+  private get ledger(): Ledger {
+    return (this.ledger_ ??= createLedger({
+      sql: this.sql.bind(this) as unknown as LedgerSql,
+      tx: (fn) => this.ctx.storage.transactionSync(fn),
+    }));
+  }
+
+  private dispatcher_?: Dispatcher;
+  private get dispatcher(): Dispatcher {
+    return (this.dispatcher_ ??= new Dispatcher({
+      ledger: this.ledger,
+      enqueueCommand: (deviceId, kind, args, opts) => this.enqueue(deviceId, kind, args, opts),
+      // Withdraw only what never left the DO (still `queued`); a sent command may already be
+      // persisted connector-side, and at-most-once beats a maybe-duplicate cancel (§4.2).
+      cancelQueuedCommand: (cmdId) => {
+        this.sql`UPDATE outbox SET state = 'expired' WHERE cmdId = ${cmdId} AND state = 'queued'`;
+        return this.sql<{ changes: number }>`SELECT changes() AS changes`[0]!.changes > 0;
+      },
+      sendText: async (text, threadId) => {
+        const owner = this.ownerOpenIdSync();
+        if (!owner) return;
+        await this.enqueueOutbound({ kind: "text", to: owner, text, threadId: threadId ?? null, urgency: "push" });
+      },
+      sendCard: async (card, threadId) => {
+        const owner = this.ownerOpenIdSync();
+        if (!owner) return;
+        await this.enqueueOutbound({ kind: "card", to: owner, card, threadId, urgency: "push" });
+      },
+    }));
+  }
+
+  private ownerOpenIdSync(): string | null {
+    return this.sql<{ ownerOpenId: string | null }>`
+      SELECT ownerOpenId FROM sh_channel WHERE channel = 'feishu'
+    `[0]?.ownerOpenId ?? null;
+  }
+
   // Plain-HTTP surface reached via the Worker's stub.fetch forwards (index.ts): the Feishu
   // webhook (unauthenticated — the adapter validates Feishu's own token) and the setup page
   // (the Worker has already checked SETUP_TOKEN before forwarding).
@@ -155,8 +203,8 @@ export class Steward extends Agent<Env> {
       connection.close(CloseCode.UNAUTHORIZED, "unauthorized");
       return;
     }
-    const row = this.sql<{ epoch: number; revoked: number }>`
-      SELECT epoch, revoked FROM device WHERE deviceId = ${parsed.deviceId}
+    const row = this.sql<{ name: string | null; epoch: number; revoked: number }>`
+      SELECT name, epoch, revoked FROM device WHERE deviceId = ${parsed.deviceId}
     `[0];
     if (!row) {
       connection.close(CloseCode.UNAUTHORIZED, "unknown device");
@@ -167,6 +215,18 @@ export class Steward extends Agent<Env> {
       return;
     }
     connection.setState({ deviceId: parsed.deviceId } satisfies ConnState);
+    // Machine online state derives from live connections (issue #5): this and onClose are the
+    // only writers. hello fills in the machine's real name and facts moments later.
+    this.ledger.machines.setOnline(parsed.deviceId, true, row.name ?? undefined);
+  }
+
+  onClose(connection: Connection): void {
+    const state = connection.state as unknown as ConnState | null;
+    if (!state?.deviceId) return;
+    // A superseded old connection closes after its replacement is live: only the last
+    // connection for the device takes the machine offline.
+    const remaining = [...this.getConnections<ConnState>(`dev:${state.deviceId}`)].filter((c) => c.id !== connection.id);
+    if (remaining.length === 0) this.ledger.machines.setOnline(state.deviceId, false);
   }
 
   async onMessage(connection: Connection, raw: WSMessage): Promise<void> {
@@ -242,6 +302,9 @@ export class Steward extends Agent<Env> {
       other.close(CloseCode.SUPERSEDED, "superseded by a newer connection");
     }
     connection.setState({ deviceId: auth.deviceId, connEpoch: hello.connEpoch } satisfies ConnState);
+    // hello is the machine/repo snapshot's source of truth (protocol §6.1, steward.md §2.2):
+    // name, agents, limits, and the full repo list — removals included — land in the ledger.
+    this.ledger.machines.upsertFromHello(hello);
     const acks = Object.fromEntries(
       this.sql<{ workerId: string; upTo: number }>`SELECT workerId, upTo FROM worker_ack`.map((row) => [row.workerId, row.upTo]),
     );
@@ -269,6 +332,9 @@ export class Steward extends Agent<Env> {
       }
     }
     this.redeliverOutbox(auth.deviceId);
+    // A reconnect is also the natural catch-up point for events persisted but not yet reduced
+    // (crash between the events_ack and the reducer, protocol §4.3): drain, then notify.
+    this.applyLedgerEvents();
   }
 
   // protocol §4.2 + ADR-0001 (spike bug 10): hello redelivers queued, sent, AND
@@ -305,6 +371,7 @@ export class Steward extends Agent<Env> {
         UPDATE outbox SET state = 'failed', failReason = 'rejected', result = ${JSON.stringify({ code: ack.code ?? null })}
         WHERE cmdId = ${ack.re}
       `;
+      this.noteCommandFailure(ack.re, `连接器拒绝（${ack.code ?? "未知原因"}）`);
     } else if (ack.status === "ambiguous") {
       // protocol §4.2: a crash during `sending`, undecidable — no automatic re-send.
       this.sql`UPDATE outbox SET state = 'ambiguous' WHERE cmdId = ${ack.re}`;
@@ -319,6 +386,26 @@ export class Steward extends Agent<Env> {
       UPDATE outbox SET state = ${result.ok ? "done" : "failed"}, result = ${JSON.stringify(result.ok ? result.data ?? null : result.error ?? null)}
       WHERE cmdId = ${result.re}
     `;
+    if (!result.ok) {
+      const error = (result.error ?? {}) as { code?: unknown; message?: unknown };
+      const reason = [typeof error.code === "string" ? error.code : null, typeof error.message === "string" ? error.message : null]
+        .filter((part): part is string => part !== null)
+        .join("：") || "未知原因";
+      this.noteCommandFailure(result.re, reason);
+    }
+  }
+
+  // A start_worker the connector could not run: the worker lands `broken`, the failure reaches
+  // the timeline + the user deterministically (there is no LLM to relay it in M1). Idempotent
+  // on the cmdId — cmd_result redeliveries re-run this handler.
+  private noteCommandFailure(cmdId: string, reason: string): void {
+    const row = this.sql<{ workerId: string | null; kind: string }>`
+      SELECT workerId, kind FROM outbox WHERE cmdId = ${cmdId}
+    `[0];
+    if (!row || row.kind !== "start_worker" || !row.workerId) return;
+    if (this.ledger.workers.markStartFailed(row.workerId, cmdId, reason)) {
+      void this.drainNotifications();
+    }
   }
 
   private handleEvents(connection: Connection, raw: unknown): void {
@@ -359,6 +446,78 @@ export class Steward extends Agent<Env> {
         connection.send(JSON.stringify({ t: "resync", workerId, from: upTo + 1 } satisfies ResyncMessage));
       }
     }
+    // Persisted and acked above; now reduce into the ledger (protocol §4.3 keeps the two
+    // decoupled — a crash here leaves the rows pending for the next wake's catch-up).
+    this.applyLedgerEvents();
+  }
+
+  /** Reduces everything pending, then turns notification intents into outbound cards (§5.1). */
+  private applyLedgerEvents(): void {
+    try {
+      const { applied } = this.ledger.applyPendingEvents();
+      if (applied > 0) void this.drainNotifications();
+    } catch (err) {
+      this.logChannel("ledger_apply_failed", errorText(err));
+    }
+  }
+
+  // Single-flight drain, same pattern as deliverOutbound: concurrent wake sources (events,
+  // hello, cmd failures) chain instead of racing, so an intent is enqueued exactly once.
+  private notifyChain: Promise<void> = Promise.resolve();
+
+  drainNotifications(): Promise<void> {
+    const run = this.notifyChain.then(() => this.drainNotifyPass());
+    this.notifyChain = run.catch(() => {});
+    return run;
+  }
+
+  private async drainNotifyPass(): Promise<void> {
+    const cfg = await this.loadFeishuConfig();
+    for (const intent of this.ledger.notifications.pending()) {
+      try {
+        if (!cfg?.ownerOpenId) continue; // no owner yet: the intent stays pending, not lost
+        const card = this.renderNotification(intent);
+        if (card === null) {
+          // Its data is gone (thread archived / worker pruned); drop the intent rather than
+          // retry forever.
+          this.ledger.notifications.markSent(intent.id);
+          continue;
+        }
+        await this.enqueueOutbound({ kind: "card", to: cfg.ownerOpenId, threadId: intent.threadId, card, urgency: "push" });
+        this.ledger.notifications.markSent(intent.id);
+      } catch (err) {
+        this.logChannel("notify_drain_failed", `${intent.id} ${errorText(err)}`);
+      }
+    }
+  }
+
+  /** Deterministic core templates (steward.md §6.2 source 1): data in, card out, no LLM. */
+  private renderNotification(intent: NotifyRow): unknown | null {
+    const worker = intent.workerId ? this.ledger.workers.get(intent.workerId) : null;
+    const thread = this.ledger.threads.get(intent.threadId);
+    if (!worker || !thread) return null;
+    const machine = this.ledger.machines.get(worker.deviceId);
+    const machineName = machine?.name ?? worker.deviceId;
+    const footer = `Thread「${thread.title}」 · ${worker.agent} @ ${machineName} · 引用回复可继续这个 Thread`;
+
+    if (intent.kind === "done_report" || intent.kind === "attention_report") {
+      const report = this.ledger.workers.reportsForWorker(worker.workerId).at(-1);
+      if (!report) return null;
+      return reportCardFor(report, worker, machineName, thread.title);
+    }
+
+    // failure_push: either the start never happened or the run ended in a failure class that
+    // needs a human (steward.md §5.3); the matching open question carries the specifics.
+    if (worker.lastOutcome?.startsWith("start_failed:")) {
+      return failureCard(
+        `派发失败：任务没有开始`,
+        `${worker.lastOutcome.slice("start_failed:".length)}。重新 /派发 一次即可。`,
+        thread.title,
+        footer,
+      );
+    }
+    const question = this.ledger.questions.openForThread(thread.threadId);
+    return failureCard("运行出错，需要你决定下一步", question?.text ?? "查看 Thread 时间线了解详情。", thread.title, footer);
   }
 
   // Not wired to any HTTP route yet (the setup page / chat command that triggers this is a
@@ -645,6 +804,8 @@ export class Steward extends Agent<Env> {
 
     if (parsed.kind === "message") {
       await this.dispatchInboundMessage(parsed, cfg.ownerOpenId);
+    } else if (parsed.kind === "card_action") {
+      await this.dispatchCardAction(parsed, cfg.ownerOpenId);
     } else {
       this.logChannel("event_ignored_other", `${parsed.eventType} ${parsed.eventId}`);
     }
@@ -675,9 +836,24 @@ export class Steward extends Agent<Env> {
       this.logChannel("ignored_message_type", `${ev.messageType} ${ev.msgId}`);
       return;
     }
-    // The DM is durably recorded (sh_inbound) and logged; handing it to the steward
-    // conversation (harness.submit, sh_run) is the M2 ticket — nothing here decides routing yet.
+    // The owner's text: fixed-phrase dispatch and quote-reply routing (issue #5). Natural
+    // language understanding is the M2 steward's job; here everything is deterministic.
     this.logChannel("owner_message", `${ev.msgId} parent=${ev.parentId ?? "-"} ${ev.text ?? ""}`.slice(0, 500));
+    await this.dispatcher.handleOwnerText({ text: ev.text ?? "", parentId: ev.parentId, msgId: ev.msgId });
+  }
+
+  // Card button callbacks (issue #5): the Thread is resolved from the card's providerMsgId —
+  // never from data stuffed into the button (steward.md §3.1, spike bug list).
+  private async dispatchCardAction(ev: InboundEvent, ownerOpenId: string | null): Promise<void> {
+    if (ownerOpenId === null || !ev.operatorId || !ev.cardMsgId) {
+      this.logChannel("ignored_card_no_owner", `${ev.eventId}`);
+      return;
+    }
+    if (ev.operatorId !== ownerOpenId) {
+      this.logChannel("ignored_card_not_owner", `${ev.operatorId} ${ev.eventId}`);
+      return;
+    }
+    await this.dispatcher.handleCardAction({ operatorId: ev.operatorId, action: ev.action ?? "", cardMsgId: ev.cardMsgId });
   }
 
   private logChannel(reason: string, detail: string): void {
@@ -695,6 +871,8 @@ export class Steward extends Agent<Env> {
   }
 
   // ---- Outbound queue (steward.md §6.1) ----------------------------------------------------------
+  // Row writes go through the memory module (ledger.outbound owns the sh_outbound table);
+  // what stays here is delivery mechanics only: claims, pacing, backoff, the adapter call.
 
   async enqueueOutbound(input: {
     kind: "text" | "card";
@@ -704,22 +882,22 @@ export class Steward extends Agent<Env> {
     threadId?: string | null;
     urgency?: "push" | "quiet";
   }): Promise<{ id: string }> {
-    const id = ulid(); // stable across retries; doubles as the provider-side uuid
-    this.sql`
-      INSERT INTO sh_outbound (id, channel, kind, receiveId, threadId, payload, urgency, status, attempts, nextAttemptAt, createdAt)
-      VALUES (${id}, 'feishu', ${input.kind}, ${input.to}, ${input.threadId ?? null},
-              ${JSON.stringify({ text: input.text, card: input.card })}, ${input.urgency ?? "quiet"}, 'queued', 0, ${Date.now()}, ${Date.now()})
-    `;
+    const id = this.ledger.outbound.enqueue(input);
     void this.deliverOutbound();
     return { id };
   }
 
   async outboundRow(id: string): Promise<ShOutboundRow | null> {
-    return (this.sql`SELECT * FROM sh_outbound WHERE id = ${id}`[0] as ShOutboundRow | undefined) ?? null;
+    return (this.ledger.outbound.row(id) as unknown as ShOutboundRow | undefined) ?? null;
   }
 
   async outboundRows(limit = 10): Promise<ShOutboundRow[]> {
-    return this.sql`SELECT * FROM sh_outbound ORDER BY createdAt, id LIMIT ${limit}` as ShOutboundRow[];
+    return this.ledger.outbound.rows(limit) as unknown as ShOutboundRow[];
+  }
+
+  /** Read-only ledger view for tests: threads, workers, reports, questions, timeline. */
+  async debugSnapshot(): Promise<ReturnType<Steward["ledger"]["debug"]["snapshot"]>> {
+    return this.ledger.debug.snapshot();
   }
 
   // Scheduled callback (also fired inline after each enqueue): claims due rows, sends them
@@ -733,31 +911,22 @@ export class Steward extends Agent<Env> {
 
   private async deliverOutboundPass(): Promise<void> {
     // Reclaim rows whose delivery pass died mid-send (claim expired): back to queued.
-    this.sql`UPDATE sh_outbound SET status = 'queued' WHERE status = 'sending' AND claimExpiresAt <= ${Date.now()}`;
-    const due = this.sql<{ id: string }>`
-      SELECT id FROM sh_outbound WHERE status = 'queued' AND nextAttemptAt <= ${Date.now()}
-      ORDER BY createdAt, id LIMIT ${OUTBOUND_BATCH}
-    `;
-    for (const row of due) await this.deliverOneOutbound(row.id);
+    this.ledger.outbound.reclaimExpiredClaims(Date.now());
+    for (const id of this.ledger.outbound.dueIds(Date.now(), OUTBOUND_BATCH)) {
+      await this.deliverOneOutbound(id);
+    }
     this.rearmDeliveryAlarm();
   }
 
   private async deliverOneOutbound(id: string): Promise<void> {
-    const claim = crypto.randomUUID();
-    // The claim (spike bug 1): one conditional, synchronous UPDATE — only a queued row (or one
-    // whose claim has expired) can be taken, so two concurrent passes never both send it.
-    this.sql`
-      UPDATE sh_outbound SET status = 'sending', claimToken = ${claim}, claimExpiresAt = ${Date.now() + OUTBOUND_CLAIM_MS}
-      WHERE id = ${id} AND (status = 'queued' OR (status = 'sending' AND claimExpiresAt <= ${Date.now()}))
-    `;
-    const row = this.sql<{ kind: string; receiveId: string; channel: string; attempts: number; payload: string; threadId: string | null }>`
-      SELECT kind, receiveId, channel, attempts, payload, threadId FROM sh_outbound WHERE id = ${id} AND claimToken = ${claim}
-    `[0];
+    // The claim (spike bug 1): only a queued row (or one whose claim has expired) can be
+    // taken, so two concurrent passes never both send it.
+    const row = this.ledger.outbound.claimForDelivery(id, Date.now(), OUTBOUND_CLAIM_MS);
     if (!row) return; // another pass owns this row
 
     const cfg = await this.loadFeishuConfig();
-    if (!cfg || !this.stillOwnsClaim(id, claim)) {
-      this.settleOutboundFailure(id, claim, row.attempts + 1, "channel_not_configured", true);
+    if (!cfg) {
+      this.ledger.outbound.settleFailure(id, row.claim, row.attempts + 1, "channel_not_configured", null, Date.now());
       return;
     }
 
@@ -779,44 +948,27 @@ export class Steward extends Agent<Env> {
         threadId: row.threadId,
       });
       this.touchPace(row.channel, row.receiveId);
-      if (!this.stillOwnsClaim(id, claim)) return; // a reclaim took over mid-send; its send settles
-      this.sql`
-        UPDATE sh_outbound SET status = 'sent', providerMsgId = ${providerMsgId}, sentAt = ${Date.now()},
-                               attempts = attempts + 1, claimToken = NULL, claimExpiresAt = NULL, lastError = NULL
-        WHERE id = ${id}
-      `;
+      this.ledger.outbound.settleSent(id, row.claim, providerMsgId, Date.now());
     } catch (err) {
       // The attempt hit the wire (or timed out at 10s — spike bug 3), so it counts against
       // the receiver's rate budget either way.
       this.touchPace(row.channel, row.receiveId);
-      if (!this.stillOwnsClaim(id, claim)) return;
+      if (!this.ledger.outbound.stillOwns(id, row.claim)) return; // a reclaim took over mid-send; its send settles
       const attempts = row.attempts + 1;
       const retriable = err instanceof RetriableChannelError;
-      this.settleOutboundFailure(id, claim, attempts, errorText(err), !retriable || attempts >= OUTBOUND_MAX_ATTEMPTS);
+      const permanent = !retriable || attempts >= OUTBOUND_MAX_ATTEMPTS;
+      const delay = permanent
+        ? null
+        : Math.min(OUTBOUND_BACKOFF_BASE_MS * 2 ** Math.max(0, attempts - 1), OUTBOUND_BACKOFF_CAP_MS);
+      this.ledger.outbound.settleFailure(
+        id,
+        row.claim,
+        attempts,
+        errorText(err),
+        permanent ? null : Date.now() + (delay ?? 0),
+        Date.now(),
+      );
     }
-  }
-
-  private settleOutboundFailure(id: string, claim: string, attempts: number, error: string, permanent: boolean): void {
-    if (!this.stillOwnsClaim(id, claim)) return;
-    if (permanent) {
-      this.sql`
-        UPDATE sh_outbound SET status = 'failed', attempts = ${attempts}, lastError = ${error},
-                               claimToken = NULL, claimExpiresAt = NULL
-        WHERE id = ${id}
-      `;
-      return;
-    }
-    const delay = Math.min(OUTBOUND_BACKOFF_BASE_MS * 2 ** Math.max(0, attempts - 1), OUTBOUND_BACKOFF_CAP_MS);
-    this.sql`
-      UPDATE sh_outbound SET status = 'queued', attempts = ${attempts}, nextAttemptAt = ${Date.now() + delay},
-                             lastError = ${error}, claimToken = NULL, claimExpiresAt = NULL
-      WHERE id = ${id}
-    `;
-  }
-
-  private stillOwnsClaim(id: string, claim: string): boolean {
-    const row = this.sql<{ claimToken: string | null }>`SELECT claimToken FROM sh_outbound WHERE id = ${id}`[0];
-    return row?.claimToken === claim;
   }
 
   private touchPace(channel: string, receiveId: string): void {
@@ -827,15 +979,8 @@ export class Steward extends Agent<Env> {
   }
 
   private rearmDeliveryAlarm(): void {
-    const nextDue = this.sql<{ at: number | null }>`
-      SELECT MIN(nextAttemptAt) AS at FROM sh_outbound WHERE status = 'queued'
-    `[0]?.at ?? null;
-    const nextReclaim = this.sql<{ at: number | null }>`
-      SELECT MIN(claimExpiresAt) AS at FROM sh_outbound WHERE status = 'sending'
-    `[0]?.at ?? null;
-    const candidates = [nextDue, nextReclaim].filter((v): v is number => v !== null);
-    if (candidates.length === 0) return;
-    const at = Math.min(...candidates);
+    const at = this.ledger.outbound.nextWake(Date.now());
+    if (at === null) return;
     void this.schedule(Math.max(1, Math.ceil((at - Date.now()) / 1000)), "deliverOutbound");
   }
 }
