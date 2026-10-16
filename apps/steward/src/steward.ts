@@ -36,15 +36,23 @@ import {
   FeishuAdapter,
   SEND_TIMEOUT_MS,
   TOKEN_REFRESH_MARGIN_MS,
+  apiBaseFor,
+  type ApplicationConfigPatch,
   type FeishuCredentials,
 } from "./channel/feishu.ts";
-import { RetriableChannelError, type InboundEvent } from "./channel/types.ts";
+import {
+  APP_CONFIG_PATCH_SCOPE,
+  SLOW_DOWN_EXTRA_S,
+  beginDeviceFlow,
+  pollDeviceFlow as pollDeviceFlowOnce,
+} from "./channel/registration.ts";
+import { RetriableChannelError, type Brand, type InboundEvent } from "./channel/types.ts";
 import { Dispatcher } from "./dispatch.ts";
 import { createLedger, type Ledger, type LedgerSql, type NotifyRow } from "./ledger.ts";
 import { failureCard, reportCardFor } from "./report-template.ts";
 import { MIGRATIONS, runMigrations } from "./schema.ts";
 import { openSecret, sealSecret } from "./secretbox.ts";
-import { renderSetupPage } from "./setup-page.ts";
+import { renderSetupPage, type SetupView } from "./setup-page.ts";
 
 interface ConnState {
   deviceId: string;
@@ -92,6 +100,29 @@ const OUTBOUND_BACKOFF_CAP_MS = 15 * 60_000;
 const OUTBOUND_MAX_ATTEMPTS = 8;
 const OUTBOUND_BATCH = 20;
 const OWNER_BOUND_REPLY = "✅ 已绑定，设置完成。此后直接在这里与 Shepherd 对话即可；设置页面已永久关闭。";
+// Sent when the first event lands on the webhook after the QR switch: only a delivered event
+// proves the transport actually moved (research §8.2 — the API's callback_type report stays
+// out of sync with real delivery until the console republish lands).
+const QR_SETUP_DONE_REPLY = "✅ 事件已切换为 webhook 投递，设置全部完成。此后直接在这里与 Shepherd 对话即可；设置页面已永久关闭。";
+// The events/callbacks the config PATCH subscribes explicitly (additive; the QR template
+// already has them — restating keeps the switch robust when it does not).
+const WEBHOOK_EVENTS = ["im.message.receive_v1"];
+const WEBHOOK_CALLBACKS = ["card.action.trigger"];
+
+export interface ShQrSetupRow {
+  id: number;
+  phase: string;
+  flow: string;
+  deviceCode: string;
+  brand: string;
+  intervalS: number;
+  expiresAt: number;
+  qrUrl: string;
+  userCode: string | null;
+  origin: string | null;
+  lastError: string | null;
+  updatedAt: number;
+}
 
 export interface ShOutboundRow {
   id: string;
@@ -672,9 +703,25 @@ export class Steward extends Agent<Env> {
   // row itself, this keeps the *wire* quiet too.
   private deliveryChain: Promise<void> = Promise.resolve();
 
-  private async loadFeishuConfig(): Promise<(FeishuCredentials & { ownerOpenId: string | null }) | null> {
-    const row = this.sql<{ appId: string; appSecretEnc: string; verificationTokenEnc: string; ownerOpenId: string | null }>`
-      SELECT appId, appSecretEnc, verificationTokenEnc, ownerOpenId FROM sh_channel WHERE channel = 'feishu'
+  private async loadFeishuConfig(): Promise<
+    (FeishuCredentials & {
+      ownerOpenId: string | null;
+      brand: Brand;
+      source: "manual" | "qr";
+      webhookStatus: string | null;
+    }) | null
+  > {
+    const row = this.sql<{
+      appId: string;
+      appSecretEnc: string;
+      verificationTokenEnc: string;
+      ownerOpenId: string | null;
+      brand: string | null;
+      source: string | null;
+      webhookStatus: string | null;
+    }>`
+      SELECT appId, appSecretEnc, verificationTokenEnc, ownerOpenId, brand, source, webhookStatus
+      FROM sh_channel WHERE channel = 'feishu'
     `[0];
     if (!row) return null;
     // A failed open means SERVER_KEY was rotated (secretbox.ts): read back as unconfigured so
@@ -682,10 +729,27 @@ export class Steward extends Agent<Env> {
     const appSecret = await openSecret(this.env.SERVER_KEY, row.appSecretEnc);
     const verificationToken = await openSecret(this.env.SERVER_KEY, row.verificationTokenEnc);
     if (appSecret === null || verificationToken === null) return null;
-    return { appId: row.appId, appSecret, verificationToken, ownerOpenId: row.ownerOpenId };
+    return {
+      appId: row.appId,
+      appSecret,
+      verificationToken,
+      ownerOpenId: row.ownerOpenId,
+      brand: row.brand === "lark" ? "lark" : "feishu",
+      source: row.source === "qr" ? "qr" : "manual",
+      webhookStatus: row.webhookStatus,
+    };
   }
 
-  protected newFeishuAdapter(credentials: FeishuCredentials): FeishuAdapter {
+  // FEISHU_API exists only in tests (a service binding that mocks Feishu); production calls
+  // the real endpoints via global fetch. Covers both the open API and the accounts device flow.
+  private feishuFetcher(): typeof fetch {
+    return this.env.FEISHU_API ? (this.env.FEISHU_API.fetch.bind(this.env.FEISHU_API) as typeof fetch) : fetch;
+  }
+
+  protected newFeishuAdapter(
+    credentials: FeishuCredentials & { brand?: Brand },
+    opts: { looseHandshake?: boolean } = {},
+  ): FeishuAdapter {
     return new FeishuAdapter({
       credentials,
       tokenStore: {
@@ -705,10 +769,10 @@ export class Steward extends Agent<Env> {
           );
         },
       },
-      // FEISHU_API exists only in tests (a service binding that mocks Feishu); production
-      // calls the real endpoint via global fetch.
-      fetcher: this.env.FEISHU_API ? (this.env.FEISHU_API.fetch.bind(this.env.FEISHU_API) as typeof fetch) : undefined,
+      fetcher: this.feishuFetcher(),
       sendTimeoutMs: this.feishuSendTimeoutMs,
+      apiBase: apiBaseFor(credentials.brand ?? "feishu"),
+      looseHandshake: opts.looseHandshake,
     });
   }
 
@@ -728,32 +792,85 @@ export class Steward extends Agent<Env> {
     }
   }
 
+  // ADR-0001 decision 8: the setup page closes permanently once onboarding is complete. For
+  // the manual flow that is the owner's first DM (issue #4); for the QR flow the owner is
+  // bound at scan time, so completeness additionally requires verified webhook delivery —
+  // until then the page must keep guiding the switch (issue #24, research §8.2).
+  private setupClosed(cfg: Awaited<ReturnType<Steward["loadFeishuConfig"]>>): boolean {
+    if (!cfg?.ownerOpenId) return false;
+    return cfg.source !== "qr" || cfg.webhookStatus === "verified";
+  }
+
+  private qrRow(): ShQrSetupRow | null {
+    return (this.sql`SELECT * FROM sh_qr_setup WHERE id = 1`[0] as ShQrSetupRow | undefined) ?? null;
+  }
+
+  async qrSetupState(): Promise<ShQrSetupRow | null> {
+    return this.qrRow();
+  }
+
   private async handleSetup(request: Request): Promise<Response> {
     const cfg = await this.loadFeishuConfig();
-    // ADR-0001 decision 8: once the owner is bound the setup page is closed permanently.
-    if (cfg?.ownerOpenId) return new Response("not found", { status: 404 });
+    if (cfg && this.setupClosed(cfg)) return new Response("not found", { status: 404 });
     const url = new URL(request.url);
-    const webhookUrl = `${url.origin}/channels/feishu/events`;
-    const page = (opts: { state: "form" | "awaiting_owner"; error?: string; appIdValue?: string }) =>
-      new Response(renderSetupPage({ ...opts, actionUrl: `${url.pathname}${url.search}`, webhookUrl }), {
+    const origin = url.origin;
+    // The page's origin is the deployment's public address: the PATCH's request_url and the
+    // prefilled bot name derive from it. Refreshed on every hit so a domain added mid-setup
+    // is picked up without restarting the flow.
+    if (this.qrRow()) {
+      this.sql`UPDATE sh_qr_setup SET origin = ${origin}, updatedAt = ${Date.now()} WHERE id = 1`;
+    }
+
+    const respond = async (formError?: string, appIdValue?: string) => {
+      const fresh = await this.loadFeishuConfig();
+      return new Response(renderSetupPage({ view: this.setupView(fresh, formError, appIdValue), actionUrl: `${url.pathname}${url.search}`, webhookUrl: `${origin}/channels/feishu/events`, host: url.hostname }), {
         headers: { "content-type": "text/html; charset=utf-8" },
       });
+    };
 
-    if (request.method === "GET") {
-      return page({ state: cfg ? "awaiting_owner" : "form" });
-    }
+    if (request.method === "GET") return respond();
 
     let form: FormData;
     try {
       form = await request.formData();
     } catch {
-      return page({ state: "form", error: "表单解析失败，请重试。" });
+      return respond("表单解析失败，请重试。");
     }
+    const action = String(form.get("action") ?? "manual");
+
+    if (action === "start_qr" || action === "restart_qr") {
+      if (cfg) return respond("已存在应用凭据，无法重新发起扫码创建；如需换应用请提交手动凭据。");
+      try {
+        await this.beginQrFlow("create", origin);
+      } catch (err) {
+        return respond(`发起扫码创建失败：${errorText(err)}`);
+      }
+      return respond();
+    }
+
+    if (action === "start_scope_scan") {
+      if (!cfg || cfg.source !== "qr") return respond("尚未通过扫码创建机器人，无法发起第二步。");
+      try {
+        await this.beginQrFlow("addons", origin);
+      } catch (err) {
+        return respond(`发起第二步扫码失败：${errorText(err)}`);
+      }
+      return respond();
+    }
+
+    if (action === "patch_webhook") {
+      const res = await this.patchWebhookConfig();
+      if (!res.ok) return respond(`切换 webhook 失败：${res.error}`);
+      return respond();
+    }
+
+    // Manual credential submission (issue #4) — the permanent fallback (issue #24). Cancels
+    // any active QR flow; a different appId resets the owner binding (open_id is app-scoped).
     const appId = String(form.get("appId") ?? "").trim();
     const appSecret = String(form.get("appSecret") ?? "").trim();
     const verificationToken = String(form.get("verificationToken") ?? "").trim();
     if (!appId || !appSecret || !verificationToken) {
-      return page({ state: "form", error: "三个字段都必填。", appIdValue: appId });
+      return respond("三个字段都必填。", appId);
     }
 
     // Validate live: a tenant_access_token must actually be obtainable with these credentials
@@ -762,33 +879,292 @@ export class Steward extends Agent<Env> {
     try {
       await this.newFeishuAdapter({ appId, appSecret, verificationToken }).getTenantAccessToken();
     } catch (err) {
-      return page({ state: "form", error: `凭据校验失败：${errorText(err)}`, appIdValue: appId });
+      return respond(`凭据校验失败：${errorText(err)}`, appId);
     }
 
     const [appSecretEnc, verificationTokenEnc] = await Promise.all([
       sealSecret(this.env.SERVER_KEY, appSecret),
       sealSecret(this.env.SERVER_KEY, verificationToken),
     ]);
-    this.sql`
-      INSERT INTO sh_channel (channel, appId, appSecretEnc, verificationTokenEnc, ownerOpenId, configuredAt, boundAt)
-      VALUES ('feishu', ${appId}, ${appSecretEnc}, ${verificationTokenEnc}, NULL, ${Date.now()}, NULL)
-      ON CONFLICT (channel) DO UPDATE SET
-        appId = excluded.appId, appSecretEnc = excluded.appSecretEnc,
-        verificationTokenEnc = excluded.verificationTokenEnc, configuredAt = excluded.configuredAt
-    `;
-    return page({ state: "awaiting_owner" });
+    const existing = this.sql<{ appId: string | null }>`SELECT appId FROM sh_channel WHERE channel = 'feishu'`[0];
+    const sameApp = existing?.appId === appId;
+    if (sameApp) {
+      this.sql`
+        INSERT INTO sh_channel (channel, appId, appSecretEnc, verificationTokenEnc, ownerOpenId, configuredAt, boundAt, source, brand)
+        VALUES ('feishu', ${appId}, ${appSecretEnc}, ${verificationTokenEnc}, NULL, ${Date.now()}, NULL, 'manual', 'feishu')
+        ON CONFLICT (channel) DO UPDATE SET
+          appId = excluded.appId, appSecretEnc = excluded.appSecretEnc,
+          verificationTokenEnc = excluded.verificationTokenEnc, configuredAt = excluded.configuredAt, source = 'manual'
+      `;
+    } else {
+      this.sql`
+        INSERT INTO sh_channel (channel, appId, appSecretEnc, verificationTokenEnc, ownerOpenId, configuredAt, boundAt, source, brand)
+        VALUES ('feishu', ${appId}, ${appSecretEnc}, ${verificationTokenEnc}, NULL, ${Date.now()}, NULL, 'manual', 'feishu')
+        ON CONFLICT (channel) DO UPDATE SET
+          appId = excluded.appId, appSecretEnc = excluded.appSecretEnc,
+          verificationTokenEnc = excluded.verificationTokenEnc, configuredAt = excluded.configuredAt, source = 'manual',
+          ownerOpenId = NULL, boundAt = NULL, brand = 'feishu',
+          webhookStatus = NULL, webhookPatchedAt = NULL, webhookVerifiedAt = NULL
+      `;
+      // The cached token belongs to the previous app; never reuse it.
+      this.sql`DELETE FROM sh_channel_token WHERE channel = 'feishu'`;
+    }
+    this.sql`DELETE FROM sh_qr_setup`;
+    this.logChannel("manual_credentials_saved", appId);
+    return respond();
   }
 
-  async setupState(): Promise<{ state: "unconfigured" | "awaiting_owner" | "bound"; appId: string | null; ownerOpenId: string | null }> {
+  private setupView(
+    cfg: Awaited<ReturnType<Steward["loadFeishuConfig"]>>,
+    formError?: string,
+    appIdValue?: string,
+  ): SetupView {
+    const qr = this.qrRow();
+    const base = { appId: cfg?.appId, brand: cfg?.brand, formError, appIdValue };
+    if (!cfg) {
+      if (!qr) return { phase: "start", ...base };
+      if (qr.phase === "awaiting_scan") return { phase: "scan1", qrUrl: qr.qrUrl, userCode: qr.userCode ?? "", expiresAt: qr.expiresAt, phaseError: qr.lastError ?? undefined, ...base };
+      // No credentials + any other phase means the create scan failed terminally.
+      return { phase: "failed", phaseError: qr.lastError ?? "扫码创建未完成。", ...base };
+    }
+    if (cfg.source === "manual") {
+      return { phase: "awaiting_owner", ...base };
+    }
+    // QR source: closed is handled before rendering; the remaining phases guide the switch.
+    if (qr?.phase === "awaiting_scope_scan") {
+      return { phase: "scan2", qrUrl: qr.qrUrl, userCode: qr.userCode ?? "", expiresAt: qr.expiresAt, phaseError: qr.lastError ?? undefined, ...base };
+    }
+    if (qr?.phase === "scope_added") {
+      return { phase: "scope_added", phaseError: qr.lastError ?? undefined, ...base };
+    }
+    if (qr?.phase === "webhook_patched" || cfg.webhookStatus === "patched") {
+      return { phase: "patched", phaseError: qr?.lastError ?? undefined, ...base };
+    }
+    return { phase: "created", phaseError: qr?.lastError ?? undefined, ...base };
+  }
+
+  async setupState(): Promise<{
+    state: "unconfigured" | "awaiting_owner" | "awaiting_webhook" | "bound";
+    appId: string | null;
+    ownerOpenId: string | null;
+    source: "manual" | "qr" | null;
+    brand: Brand | null;
+    webhookStatus: string | null;
+  }> {
     const cfg = await this.loadFeishuConfig();
-    if (!cfg) return { state: "unconfigured", appId: null, ownerOpenId: null };
-    return { state: cfg.ownerOpenId ? "bound" : "awaiting_owner", appId: cfg.appId, ownerOpenId: cfg.ownerOpenId };
+    if (!cfg) return { state: "unconfigured", appId: null, ownerOpenId: null, source: null, brand: null, webhookStatus: null };
+    const state = this.setupClosed(cfg) ? "bound" : cfg.source === "qr" ? "awaiting_webhook" : "awaiting_owner";
+    return { state, appId: cfg.appId, ownerOpenId: cfg.ownerOpenId, source: cfg.source, brand: cfg.brand, webhookStatus: cfg.webhookStatus };
+  }
+
+  // ---- QR onboarding state machine (issue #24, steward.md §9.0, research §1/§8.1–§8.2) ----
+
+  /**
+   * Starts (or restarts — links are single-use) a device-flow scan. `create` prefills a
+   * deployment-distinguishing name and locks the flow to a fresh app; `addons` targets the
+   * created app (`clientID`) and carries the `application:application:patch` scope top-up.
+   */
+  private async beginQrFlow(kind: "create" | "addons", origin: string): Promise<void> {
+    const host = new URL(origin).hostname;
+    // The name leads with the deployment label: app names get truncated (research §8.3 — a
+    // prefilled "Shepherd Spike ({user})" landed as "Spike"), and the label is what tells
+    // same-named bots apart across deployments.
+    const hostLabel = (host.split(".")[0] ?? host).slice(0, 16);
+    let clientId: string | undefined;
+    let brand: Brand = "feishu";
+    if (kind === "addons") {
+      const cfg = await this.loadFeishuConfig();
+      if (!cfg) throw new Error("应用凭据缺失");
+      clientId = cfg.appId;
+      brand = cfg.brand; // a lark-created app scans its second code on the lark domain too
+    }
+    const res = await beginDeviceFlow({
+      fetcher: this.feishuFetcher(),
+      brand,
+      preset: kind === "create" ? { name: `${hostLabel}·Shepherd`, desc: `Shepherd 部署：${origin}` } : undefined,
+      createOnly: kind === "create",
+      clientId,
+      addons: kind === "addons" ? { scopes: { tenant: [APP_CONFIG_PATCH_SCOPE] } } : undefined,
+    });
+    const phase = kind === "create" ? "awaiting_scan" : "awaiting_scope_scan";
+    this.sql`
+      INSERT INTO sh_qr_setup (id, phase, flow, deviceCode, brand, intervalS, expiresAt, qrUrl, userCode, origin, lastError, updatedAt)
+      VALUES (1, ${phase}, ${kind}, ${res.deviceCode}, ${brand}, ${res.intervalS}, ${res.expiresAt}, ${res.qrUrl}, ${res.userCode}, ${origin}, NULL, ${Date.now()})
+      ON CONFLICT (id) DO UPDATE SET
+        phase = excluded.phase, flow = excluded.flow, deviceCode = excluded.deviceCode, brand = excluded.brand,
+        intervalS = excluded.intervalS, expiresAt = excluded.expiresAt, qrUrl = excluded.qrUrl,
+        userCode = excluded.userCode, origin = excluded.origin, lastError = NULL, updatedAt = excluded.updatedAt
+    `;
+    void this.schedule(Math.max(1, res.intervalS), "pollDeviceFlow");
+  }
+
+  private armQrPoll(intervalS: number): void {
+    void this.schedule(Math.max(1, intervalS), "pollDeviceFlow");
+  }
+
+  private qrFail(message: string): void {
+    // A create-flow failure leaves nothing configured (restart offered); an addons-flow
+    // failure keeps the created app and offers the scan-2 retry.
+    const row = this.qrRow();
+    const phase = row?.flow === "create" ? "failed" : "created";
+    this.sql`UPDATE sh_qr_setup SET phase = ${phase}, lastError = ${message}, updatedAt = ${Date.now()} WHERE id = 1`;
+    this.logChannel("qr_error", message);
+  }
+
+  /**
+   * Alarm-driven device-flow poll (the DO hibernates between polls). Respects the returned
+   * `interval` (backing off +5s on `slow_down`, RFC 8628) and switches to the Lark accounts
+   * domain the moment a poll reveals `tenant_brand: lark` (research §1). Stale polls (a flow
+   * was restarted, or the phase moved on) no-op via the deviceCode+phase re-checks.
+   */
+  async pollDeviceFlow(): Promise<void> {
+    for (let hop = 0; hop < 3; hop++) {
+      const row = this.qrRow();
+      if (!row || (row.phase !== "awaiting_scan" && row.phase !== "awaiting_scope_scan")) return;
+      if (row.expiresAt <= Date.now()) {
+        this.qrFail("二维码已过期（expired_token），请重新生成。");
+        return;
+      }
+      let outcome: Awaited<ReturnType<typeof pollDeviceFlowOnce>>;
+      try {
+        outcome = await pollDeviceFlowOnce({ fetcher: this.feishuFetcher(), deviceCode: row.deviceCode, brand: row.brand === "lark" ? "lark" : "feishu" });
+      } catch (err) {
+        // Transient network error: keep polling at the current interval (OpenClaw parity).
+        this.logChannel("qr_poll_error", errorText(err));
+        this.armQrPoll(row.intervalS);
+        return;
+      }
+      // Lark switch (SDK parity): the moment any poll reveals tenant_brand=lark — even one
+      // that also carries success or slow_down — persist the brand and immediately re-poll
+      // on the lark domain; only the re-polled response is processed. `hop` bounds the loop.
+      if (outcome.brand === "lark" && row.brand !== "lark") {
+        this.sql`UPDATE sh_qr_setup SET brand = 'lark', updatedAt = ${Date.now()} WHERE id = 1 AND deviceCode = ${row.deviceCode}`;
+        continue;
+      }
+      switch (outcome.status) {
+        case "pending":
+          this.armQrPoll(row.intervalS);
+          return;
+        case "slow_down":
+          this.sql`UPDATE sh_qr_setup SET intervalS = intervalS + ${SLOW_DOWN_EXTRA_S} WHERE id = 1 AND deviceCode = ${row.deviceCode}`;
+          this.armQrPoll(row.intervalS + SLOW_DOWN_EXTRA_S);
+          return;
+        case "denied":
+          this.qrFail("扫码被拒绝（access_denied），请重新生成二维码再试。");
+          return;
+        case "expired":
+          this.qrFail("二维码已过期（expired_token），请重新生成。");
+          return;
+        case "failed":
+          this.qrFail(`扫码流程失败：${outcome.message}`);
+          return;
+        case "success":
+          await this.onQrSuccess(row, outcome);
+          return;
+      }
+    }
+  }
+
+  private async onQrSuccess(
+    row: ShQrSetupRow,
+    outcome: Extract<Awaited<ReturnType<typeof pollDeviceFlowOnce>>, { status: "success" }>,
+  ): Promise<void> {
+    if (row.flow === "create") {
+      if (!outcome.appSecret) {
+        this.qrFail("创建成功但飞书未返回 App Secret；请改用下方手动凭据完成配置。");
+        return;
+      }
+      // The verification token is ours from the start: generated now, sealed, and PATCHed
+      // into the app's encrypt strategy during the switch (a QR-created app's console token
+      // is unknowable via API — research §1: sensitive config goes through the config PATCH).
+      const verificationToken = crypto.randomUUID().replace(/-/g, "");
+      const [appSecretEnc, verificationTokenEnc] = await Promise.all([
+        sealSecret(this.env.SERVER_KEY, outcome.appSecret),
+        sealSecret(this.env.SERVER_KEY, verificationToken),
+      ]);
+      if (!this.qrFlowStillLive(row, "awaiting_scan")) return;
+      this.sql`
+        INSERT INTO sh_channel (channel, appId, appSecretEnc, verificationTokenEnc, ownerOpenId, configuredAt, boundAt, source, brand)
+        VALUES ('feishu', ${outcome.appId}, ${appSecretEnc}, ${verificationTokenEnc}, ${outcome.openId ?? null}, ${Date.now()}, ${outcome.openId ? Date.now() : null}, 'qr', ${outcome.brand ?? "feishu"})
+        ON CONFLICT (channel) DO UPDATE SET
+          appId = excluded.appId, appSecretEnc = excluded.appSecretEnc,
+          verificationTokenEnc = excluded.verificationTokenEnc, configuredAt = excluded.configuredAt,
+          ownerOpenId = excluded.ownerOpenId, boundAt = excluded.boundAt, source = 'qr', brand = excluded.brand
+      `;
+      // The cached token (if any) belongs to a previous app; never reuse it.
+      this.sql`DELETE FROM sh_channel_token WHERE channel = 'feishu'`;
+      this.logChannel("qr_created", `${outcome.appId} brand=${outcome.brand} owner=${outcome.openId ?? "?"}`);
+      // Park on `created` before chaining scan #2, so a failed begin lands in the right state.
+      this.sql`UPDATE sh_qr_setup SET phase = 'created', updatedAt = ${Date.now()} WHERE id = 1`;
+      // Chain scan #2: the scope top-up (research §8.1 — the addons update flow).
+      try {
+        await this.beginQrFlow("addons", row.origin ?? "https://example.com");
+      } catch (err) {
+        const message = `第二步扫码发起失败：${errorText(err)}`;
+        this.sql`UPDATE sh_qr_setup SET lastError = ${message}, updatedAt = ${Date.now()} WHERE id = 1`;
+        this.logChannel("qr_error", message);
+      }
+      return;
+    }
+
+    // Addons flow: the secret is normally NOT rotated (research §8.1); store a rotation only
+    // if Feishu actually returned a different one for the same app.
+    const cfg = await this.loadFeishuConfig();
+    if (cfg && outcome.appId === cfg.appId && outcome.appSecret && outcome.appSecret !== cfg.appSecret) {
+      const appSecretEnc = await sealSecret(this.env.SERVER_KEY, outcome.appSecret);
+      this.sql`UPDATE sh_channel SET appSecretEnc = ${appSecretEnc} WHERE channel = 'feishu'`;
+      this.sql`DELETE FROM sh_channel_token WHERE channel = 'feishu'`;
+      this.logChannel("qr_secret_rotated", outcome.appId);
+    }
+    if (!this.qrFlowStillLive(row, "awaiting_scope_scan")) return;
+    this.sql`UPDATE sh_qr_setup SET phase = 'scope_added', lastError = NULL, updatedAt = ${Date.now()} WHERE id = 1`;
+    this.logChannel("qr_scope_added", `${outcome.appId} (+${APP_CONFIG_PATCH_SCOPE})`);
+    // Auto-attempt the switch; a failure parks the flow on scope_added with the error shown.
+    await this.patchWebhookConfig();
+  }
+
+  /** True when the row still describes the same in-flight flow (guards stale concurrent polls). */
+  private qrFlowStillLive(row: ShQrSetupRow, phase: string): boolean {
+    const fresh = this.qrRow();
+    return fresh !== null && fresh.deviceCode === row.deviceCode && fresh.flow === row.flow && fresh.phase === phase;
+  }
+
+  /**
+   * The config PATCH (research §2.1/§8.2): events + callbacks to the webhook URL, encrypt
+   * strategy pinned to our stored verification token. Accepting the PATCH does NOT mean
+   * delivery switched — that takes the console republish and is proven by event arrival.
+   */
+  private async patchWebhookConfig(): Promise<{ ok: true } | { ok: false; error: string }> {
+    const cfg = await this.loadFeishuConfig();
+    if (!cfg || !cfg.verificationToken) return { ok: false, error: "尚未配置应用凭据。" };
+    const origin = this.qrRow()?.origin;
+    if (!origin) return { ok: false, error: "缺少部署地址，请先打开一次设置页面。" };
+    const webhookUrl = `${origin}/channels/feishu/events`;
+    const body: ApplicationConfigPatch = {
+      event: { subscription_type: "webhook", request_url: webhookUrl, add_events: WEBHOOK_EVENTS },
+      callback: { callback_type: "webhook", add_callbacks: WEBHOOK_CALLBACKS },
+      event_and_callback_encrypt_strategy: { verification_token: cfg.verificationToken },
+    };
+    try {
+      await this.newFeishuAdapter(cfg).applicationConfigPatch(cfg.appId, body);
+    } catch (err) {
+      const error = errorText(err);
+      this.sql`UPDATE sh_qr_setup SET lastError = ${`切换失败：${error}`}, updatedAt = ${Date.now()} WHERE id = 1`;
+      this.logChannel("webhook_patch_failed", error);
+      return { ok: false, error };
+    }
+    this.sql`UPDATE sh_channel SET webhookStatus = 'patched', webhookPatchedAt = ${Date.now()} WHERE channel = 'feishu'`;
+    this.sql`UPDATE sh_qr_setup SET phase = 'webhook_patched', lastError = NULL, updatedAt = ${Date.now()} WHERE id = 1`;
+    this.logChannel("webhook_patched", webhookUrl);
+    return { ok: true };
   }
 
   private async handleFeishuWebhook(request: Request): Promise<Response> {
     const cfg = await this.loadFeishuConfig();
     if (!cfg) return new Response("not found", { status: 404 });
-    const parsed = await this.newFeishuAdapter(cfg).verifyAndParse(request);
+    // Loose handshake inside the QR-switch window (see FeishuAdapterOptions.looseHandshake):
+    // the PATCH's URL check may be signed with the app's previous console token.
+    const parsed = await this.newFeishuAdapter(cfg, { looseHandshake: cfg.source === "qr" && cfg.webhookStatus !== "verified" }).verifyAndParse(request);
     if (parsed instanceof Response) return parsed;
 
     // Persist before 200 (steward.md §9.1): the dedup insert below is the durable record, and
@@ -801,6 +1177,22 @@ export class Steward extends Agent<Env> {
       INSERT INTO sh_inbound (channel, msgId, eventId, eventType, receivedAt)
       VALUES ('feishu', ${parsed.msgId}, ${parsed.eventId}, ${parsed.eventType}, ${Date.now()})
     `;
+
+    // Delivery verification (issue #24): a QR-created app keeps delivering over its websocket
+    // transport until the console republish lands, no matter what the config PATCH reported —
+    // so the first event that actually reaches this endpoint is the only real proof the
+    // switch happened (research §8.2). Sync check-then-set: atomic within the DO.
+    if (cfg.source === "qr" && cfg.webhookStatus !== "verified") {
+      const prior = this.sql<{ ws: string | null }>`SELECT webhookStatus AS ws FROM sh_channel WHERE channel = 'feishu'`[0]!.ws;
+      if (prior !== "verified") {
+        this.sql`UPDATE sh_channel SET webhookStatus = 'verified', webhookVerifiedAt = ${Date.now()} WHERE channel = 'feishu'`;
+        this.sql`UPDATE sh_qr_setup SET phase = 'done', updatedAt = ${Date.now()} WHERE id = 1`;
+        this.logChannel("webhook_verified", `${parsed.eventType} ${parsed.eventId}`);
+        if (cfg.ownerOpenId) {
+          await this.enqueueOutbound({ kind: "text", to: cfg.ownerOpenId, text: QR_SETUP_DONE_REPLY, urgency: "push" });
+        }
+      }
+    }
 
     if (parsed.kind === "message") {
       await this.dispatchInboundMessage(parsed, cfg.ownerOpenId);
