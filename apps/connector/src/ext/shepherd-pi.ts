@@ -12,7 +12,9 @@
 // 3. Write the steward `commandId` into a `custom` session entry (ADR-0001), replacing the
 //    old "last user message text matches" ambiguity heuristic (connector-pi.md §15.2).
 //    The connector delivers prompts as `/shepherd <commandId>\n<text>`; this command records
-//    the marker and re-sends the clean text as a normal user message.
+//    the marker and re-sends the clean text as a normal user message. Steer/follow_up
+//    deliveries cannot be extension commands, so they carry a `[shepherd:command <id>]`
+//    preamble that the input handler below strips and persists as the same custom entry.
 
 import { Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -23,6 +25,13 @@ export const COMMAND_ENTRY_TYPE = "shepherd.command";
 export const REMINDER_ENTRY_TYPE = "shepherd.report-reminder";
 /** Extension command name; prompts are delivered as `/<name> <commandId>\n<text>`. */
 export const COMMAND_NAME = "shepherd";
+
+/** §6.3 steer/follow_up marker preamble: `[shepherd:command <commandId>]\n<text>`. */
+export const MARKER_PREAMBLE = "[shepherd:command ";
+
+function appendCommandEntry(pi: ExtensionAPI, commandId: string): void {
+  pi.appendEntry(COMMAND_ENTRY_TYPE, { commandId, at: Date.now() });
+}
 
 const REMINDER_TEXT =
   "[Shepherd] You finished without calling the `report` tool. Call `report` now as your " +
@@ -93,9 +102,24 @@ export default function shepherdExtension(pi: ExtensionAPI): void {
       const newline = args.indexOf("\n");
       const commandId = newline === -1 ? null : args.slice(0, newline).trim();
       const text = newline === -1 ? args : args.slice(newline + 1);
-      if (commandId) pi.appendEntry(COMMAND_ENTRY_TYPE, { commandId, at: Date.now() });
+      if (commandId) appendCommandEntry(pi, commandId);
       pi.sendUserMessage(text, { expandPromptTemplates: false });
     },
+  });
+
+  // §6.3: steer/follow_up deliveries arrive with a marker preamble (extension commands are
+  // not allowed there). The input handler runs before the message is queued or persisted, so
+  // it strips the preamble and appends the commandId custom entry in the same synchronous
+  // step — when the connector later crashes mid-`sending`, the presence of this entry in the
+  // session tail means the queued message was delivered, and its absence is evidence too.
+  pi.on("input", (event) => {
+    const text = typeof event.text === "string" ? event.text : null;
+    if (!text || !text.startsWith(MARKER_PREAMBLE)) return undefined;
+    const newline = text.indexOf("\n");
+    const commandId = newline === -1 ? null : text.slice(MARKER_PREAMBLE.length, newline).replace(/\]$/, "").trim();
+    if (!commandId || /[\r\n]/.test(commandId)) return undefined;
+    appendCommandEntry(pi, commandId);
+    return { action: "transform" as const, text: newline === -1 ? "" : text.slice(newline + 1) };
   });
 
   pi.on("agent_before_settle", (event) => {

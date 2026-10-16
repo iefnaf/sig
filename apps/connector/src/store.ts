@@ -86,6 +86,14 @@ export class LocalStore {
     // The worktree base (§8.2) persisted so a restarted connector can still collect git
     // facts for a retroactive report (§9.1) — spikes kept it only in memory.
     this.addColumnIfMissing("worker", "base", "TEXT");
+    // Issue #15, §6.3/§10: crash-window evidence — the command's recovery context and the
+    // session-entry watermark a pre-launch comparison starts from.
+    this.addColumnIfMissing("worker", "lastKnownEntryId", "TEXT");
+    for (const column of ["workerId", "kind", "sessionFile", "afterEntryId"]) {
+      this.addColumnIfMissing("command", column, "TEXT");
+    }
+    this.addColumnIfMissing("command", "markerExpected", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing("command", "recovered", "INTEGER NOT NULL DEFAULT 0");
     // §8.2/§13 (issue #16): per-repo local settings. Both are CLI-only — a command from the
     // steward gets their effects but can never set them.
     this.addColumnIfMissing("repo", "workspace", "TEXT NOT NULL DEFAULT 'worktree'");
@@ -222,10 +230,11 @@ export class LocalStore {
   upsertWorker(worker: WorkerRow): void {
     this.db
       .prepare(
-        `INSERT INTO worker (workerId, threadId, repoId, mode, state, sessionId, sessionFile, branch, worktree, base, lastOutcome, createdAt, updatedAt)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO worker (workerId, threadId, repoId, mode, state, sessionId, sessionFile, lastKnownEntryId, branch, worktree, base, lastOutcome, createdAt, updatedAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(workerId) DO UPDATE SET state = excluded.state, sessionId = excluded.sessionId,
-           sessionFile = excluded.sessionFile, branch = excluded.branch, worktree = excluded.worktree,
+           sessionFile = excluded.sessionFile, lastKnownEntryId = excluded.lastKnownEntryId,
+           branch = excluded.branch, worktree = excluded.worktree,
            base = excluded.base, lastOutcome = excluded.lastOutcome, updatedAt = excluded.updatedAt`,
       )
       .run(
@@ -236,6 +245,7 @@ export class LocalStore {
         worker.state,
         worker.sessionId ?? null,
         worker.sessionFile ?? null,
+        worker.lastKnownEntryId ?? null,
         worker.branch ?? null,
         worker.worktree ?? null,
         worker.base ?? null,
@@ -249,11 +259,16 @@ export class LocalStore {
     return (
       (this.db
         .prepare(
-          `SELECT workerId, threadId, repoId, mode, state, sessionId, sessionFile, branch, worktree, base, worktreeCleanedAt, lastOutcome, createdAt, updatedAt
+          `SELECT workerId, threadId, repoId, mode, state, sessionId, sessionFile, lastKnownEntryId, branch, worktree, base, worktreeCleanedAt, lastOutcome, createdAt, updatedAt
            FROM worker WHERE workerId = ?`,
         )
         .get(workerId) as WorkerRow | undefined) ?? null
     );
+  }
+
+  setSessionObservation(workerId: string, sessionFile: string, lastKnownEntryId: string | null): void {
+    this.db.prepare("UPDATE worker SET sessionFile = ?, sessionId = workerId, lastKnownEntryId = ? WHERE workerId = ?")
+      .run(sessionFile, lastKnownEntryId, workerId);
   }
 
   setWorkerState(workerId: string, state: string, lastOutcome?: string): void {
@@ -266,7 +281,7 @@ export class LocalStore {
     // Creation order (workerId as tiebreak): the serial write queue drains FIFO on it.
     return this.db
       .prepare(
-        `SELECT workerId, threadId, repoId, mode, state, sessionId, sessionFile, branch, worktree, base, worktreeCleanedAt, lastOutcome, createdAt, updatedAt
+        `SELECT workerId, threadId, repoId, mode, state, sessionId, sessionFile, lastKnownEntryId, branch, worktree, base, worktreeCleanedAt, lastOutcome, createdAt, updatedAt
          FROM worker ORDER BY createdAt, workerId`,
       )
       .all() as unknown as WorkerRow[];
@@ -394,6 +409,8 @@ export interface WorkerRow {
   state: string;
   sessionId?: string | null;
   sessionFile?: string | null;
+  /** §10: the last session entry id the connector saw (pre-launch external-change baseline). */
+  lastKnownEntryId?: string | null;
   branch?: string | null;
   worktree?: string | null;
   /** The commit-ish the worktree branch started from (§8.2); git-facts input after a restart. */

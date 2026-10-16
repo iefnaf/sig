@@ -36,11 +36,12 @@ export interface ClientOptions {
   workersSnapshot?: () => Array<Record<string, unknown>>;
   /** Honest hello snapshot for the non-worker sections (protocol §6.1): agents, repos, limits. */
   snapshot?: () => { agents: unknown[]; repos: unknown[]; limits: { maxWorkers: number; running: number } };
-  /**
-   * L3 raw-history loader (connector-pi.md §11.4): when set, `history_req` messages are
-   * answered with windowed `history_chunk` streams; without it they get `error{unsupported}`.
-   */
+  /** L3 raw-history loader (connector-pi.md §11.4): when set, `history_req` messages are
+   *  answered with windowed `history_chunk` streams; without it they get `error{unsupported}`. */
   loadHistory?: (workerId: string, since: string | undefined, maxBytes: number) => Promise<HistoryPage>;
+  /** Called when a command's handler starts, so the app can enrich the row's recovery
+   *  context (session file, marker expectations) before delivery decides them (§6.3). */
+  onCommandSending?: (cmdId: string) => void;
   pingIntervalMs?: number;
   pongTimeoutMs?: number;
   deadAfterMs?: number;
@@ -83,6 +84,7 @@ export class ConnectorClient {
   private flushTimer?: NodeJS.Timeout;
   /** §6.6 history streams for the current connection; reset whenever the socket dies. */
   private readonly history: HistoryStreams | undefined;
+  private readonly marker: ((cmdId: string) => void) | undefined;
 
   constructor(options: ClientOptions) {
     this.options = options;
@@ -111,8 +113,10 @@ export class ConnectorClient {
           load: options.loadHistory,
         })
       : undefined;
-    // A crash mid-`sending` left undecidable commands; they become `ambiguous` and ride the
-    // next hello's pendingAcks so the DO can settle its outbox rows (protocol §6.1).
+    this.marker = options.onCommandSending;
+    // A crash mid-`sending` is adjudicated from the persisted evidence at the next boot
+    // (§6.3): marker commands become delivered/not_delivered from the session tail; the rest
+    // stay honestly ambiguous. All outcomes ride hello.pendingAcks (protocol §6.1).
     this.commands.reconcileCrashed();
   }
 
@@ -283,7 +287,7 @@ export class ConnectorClient {
       }
       return;
     }
-    this.commands.begin(cmd.id);
+    this.commands.begin(cmd.id, commandMeta(cmd));
     const handler = this.options.handleCommand;
     if (!handler) {
       this.commands.settle(cmd.id, { ok: false, error: { code: "unsupported" } });
@@ -296,6 +300,7 @@ export class ConnectorClient {
 
   private async runHandler(ws: WebSocket, handler: CommandHandler, cmd: CmdMessage): Promise<void> {
     this.commands.markSending(cmd.id);
+    this.marker?.(cmd.id);
     let result: CommandResult;
     try {
       result = await handler(cmd);
@@ -399,4 +404,9 @@ function toWsOrigin(serverUrl: string): string {
   const url = new URL(serverUrl);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   return url.origin;
+}
+
+function commandMeta(cmd: CmdMessage): import("./commands.ts").CommandMeta {
+  const workerId = typeof cmd.args?.workerId === "string" && cmd.args.workerId.length > 0 ? cmd.args.workerId : cmd.workerId;
+  return { workerId: workerId ?? null, kind: cmd.kind };
 }

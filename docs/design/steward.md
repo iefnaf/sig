@@ -384,6 +384,8 @@ Workers in the `lost` / `broken` states do not count as running; `broken` produc
 | `lost` / `resumed` | timeline | none | no |
 | `broken` | Create a question | push | yes |
 | `external_activity` | timeline | none | yes (low priority; update the summary; 10-minute merge window) |
+| Command `ambiguous` (§4.2/#15) | timeline note | none | yes (high priority; `ask_user` whether to re-issue; never re-send) |
+| `cmd_result` failed `session_in_use` / `not_delivered` (#15) | timeline note | none | yes (high priority; tell the user; re-issue only on their confirmation) |
 | Machine offline / online | Mark that machine's workers `unreachable` | Only when in-flight tasks are affected; 2-minute debounce | no |
 | Stall (§8.4) | timeline | Reports once: "X has shown no activity for N minutes" | no |
 

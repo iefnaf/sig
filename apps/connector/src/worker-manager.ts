@@ -11,6 +11,8 @@ import { killOrphans, listDescendants, type ProcRef } from "./descendants.ts";
 import { collectGitFacts } from "./git-facts.ts";
 import { acquireLock, markLocksHeldByDeadProcess, releaseLock, removeStaleLocks } from "./locks.ts";
 import { RESUME_PROMPT, PiAdapter } from "./pi-adapter.ts";
+import { externalActivity, observeSession } from "./session-observation.ts";
+import { findSessionHolders } from "./session-holders.ts";
 import { ProgressThrottle } from "./progress.ts";
 import { inspectSessionTail, type SessionTail } from "./session-tail.ts";
 import { readSessionHistory } from "./session-history.ts";
@@ -115,6 +117,10 @@ export interface RecoveryOptions {
   killOrphans?: (refs: ProcRef[]) => Promise<ProcRef[]>;
   /** Session-tail seam (tests script tails and crash-mid-reconciliation faults). */
   inspectTail?: (sessionFile: string | null | undefined) => SessionTail;
+  /** Session-holder seam (tests inject a deterministic `ps`). */
+  findSessionHolders?: (workerId: string, sessionFile: string | null | undefined, excludePids: number[]) => Promise<Array<{ pid: number; args: string }>>;
+  /** ms within which a session-entry change counts as "someone is using it right now". */
+  sessionInUseWindowMs?: number;
 }
 
 export interface WorkerManagerOptions {
@@ -129,6 +135,8 @@ export interface WorkerManagerOptions {
   emit?: (workerId: string, fields: Record<string, unknown>) => void;
   now?: () => number;
   recovery?: RecoveryOptions;
+  /** §6.3: persist a command's recovery context when its handler starts. Tests observe it. */
+  noteCommandContext?: (cmdId: string, meta: { sessionFile: string | null; afterEntryId: string | null; markerExpected: boolean }) => void;
 }
 
 /** workerId must satisfy pi's --session-id restrictions (§4.2). */
@@ -166,6 +174,9 @@ export class WorkerManager {
   private readonly listDescendantsFn: (pid: number) => Promise<ProcRef[]>;
   private readonly killOrphansFn: (refs: ProcRef[]) => Promise<ProcRef[]>;
   private readonly inspectTailFn: (sessionFile: string | null | undefined) => SessionTail;
+  private readonly findSessionHoldersFn: (workerId: string, sessionFile: string | null | undefined, excludePids: number[]) => Promise<Array<{ pid: number; args: string }>>;
+  private readonly sessionInUseWindowMs: number;
+  private readonly noteCommandContext?: (cmdId: string, meta: { sessionFile: string | null; afterEntryId: string | null; markerExpected: boolean }) => void;
   private snapshotTimer?: NodeJS.Timeout;
   private readonly resumeTimers = new Map<string, NodeJS.Timeout>();
   /** Repos with a queued-write launch in flight (guards pump re-entry). */
@@ -211,6 +222,9 @@ export class WorkerManager {
     this.listDescendantsFn = recovery.listDescendants ?? listDescendants;
     this.killOrphansFn = recovery.killOrphans ?? killOrphans;
     this.inspectTailFn = recovery.inspectTail ?? inspectSessionTail;
+    this.findSessionHoldersFn = recovery.findSessionHolders ?? findSessionHolders;
+    this.sessionInUseWindowMs = recovery.sessionInUseWindowMs ?? 30_000;
+    this.noteCommandContext = options.noteCommandContext;
     this.adapter.on("worker-event", (event) => {
       void this.onAdapterEvent(event).catch((err) => {
         // Event handling must never take the connector down (e.g. store closed at shutdown).
@@ -232,9 +246,8 @@ export class WorkerManager {
   ): Promise<unknown> {
     switch (kind) {
       case "start_worker":
-        // §8.2/§13 (issue #16): local-only settings are rejected at the entrance, before
-        // the transition is even opened.
         rejectLocalOnlyArgs(args);
+        this.trackCommandWorker(commandId, commandWorkerId(args, envelopeWorkerId, kind));
         // Tracked as a transition: an interrupt arriving mid-start waits it out, and queued
         // sends (§6.2) drain when startup completes.
         return this.withTransition(
@@ -242,20 +255,24 @@ export class WorkerManager {
           () => this.startWorker(commandId, parseStartWorkerArgs(args)),
         );
       case "send":
+        this.trackCommandWorker(commandId, commandWorkerId(args, envelopeWorkerId, kind));
         return this.sendToWorker(commandId, parseSendArgs(args, envelopeWorkerId));
       case "interrupt":
+        this.trackCommandWorker(commandId, commandWorkerId(args, envelopeWorkerId, kind));
         return this.interruptWorker(commandId, parseInterruptArgs(args, envelopeWorkerId));
       case "stop_process": {
         const workerId = commandWorkerId(args, envelopeWorkerId, kind);
+        this.trackCommandWorker(commandId, workerId);
         await this.stopProcess(workerId);
         return {};
       }
       case "resume": {
         const workerId = commandWorkerId(args, envelopeWorkerId, kind);
         const reason = typeof args.reason === "string" && args.reason.length > 0 ? args.reason : "manual";
+        this.trackCommandWorker(commandId, workerId);
         return this.withTransition(workerId, async () => {
           const count = this.store.recordResume(workerId, this.resumeWindowMs);
-          await this.resumeWorker(workerId, reason, count);
+          await this.resumeWorker(workerId, reason, count, { commandId });
           return { resumed: true, count };
         });
       }
@@ -330,6 +347,7 @@ export class WorkerManager {
    * client, only the single JS turn serializes them). The same claim closes the stop-vs-pump
    * window (finding 3): a stop landing after the claim sees `starting`, not `queued`. */
   private async launchWorker(commandId: string, args: StartWorkerArgs, repo: RegisteredRepo): Promise<StartWorkerResult> {
+    this.trackCommandWorker(commandId, args.workerId);
     // --- One process per session (§4.3): lock file, `lock_held` when alive, stale removed.
     const lock = acquireLock(this.stateDir, args.workerId);
     if (!lock.ok) {
@@ -393,6 +411,7 @@ export class WorkerManager {
 
       try {
         handle = await this.adapter.start(spec);
+        this.noteCommand(commandId, { sessionFile: handle.sessionFile ?? null, markerExpected: true });
       } catch (err) {
         if (this.stopRequested.has(args.workerId)) {
           // The stop could not kill what had not spawned; the start raced it and lost.
@@ -613,6 +632,7 @@ export class WorkerManager {
   private async launchQueued(worker: WorkerRow, queued: { commandId: string; args: unknown }): Promise<void> {
     if (this.crashed) return;
     this.store.deleteQueuedStart(worker.workerId);
+    this.trackCommandWorker(queued.commandId, worker.workerId);
     if (typeof queued.args !== "object" || queued.args === null) {
       await this.breakWorker(worker.workerId, "unknown", "Queued start args were unreadable; re-dispatch the task.", "queue_lost");
       return;
@@ -782,7 +802,8 @@ export class WorkerManager {
       // handler first collects git facts) — a steer that lands after the run ended simply
       // waits in pi's queue for the next one. Never lost, never racing.
       const how: Delivery = input.intent === "after" ? "follow_up" : "steer";
-      await this.adapter.send(workerId, { text: input.text, images: input.images }, how);
+      this.noteCommand(commandId, { sessionFile: worker.sessionFile ?? null, markerExpected: true });
+      await this.adapter.send(workerId, { text: input.text, images: input.images, commandId, markerExpected: true }, how);
       return how === "steer" ? { delivery: "steer", effect: "after_current_tools" } : { delivery: "follow_up" };
     }
     // idle: prompt starts the next run in the same session. State flips first so a
@@ -807,8 +828,9 @@ export class WorkerManager {
   ): Promise<SendResult> {
     const { workerId } = worker;
     this.store.setWorkerState(workerId, "running");
+    this.noteCommand(commandId, { sessionFile: worker.sessionFile ?? null, markerExpected: true });
     try {
-      await this.adapter.send(workerId, { text: input.text, images: input.images, commandId }, "prompt");
+      await this.adapter.send(workerId, { text: input.text, images: input.images, commandId, markerExpected: true }, "prompt");
     } catch (err) {
       this.store.setWorkerState(workerId, "idle");
       this.armIdleReclaim(workerId);
@@ -832,6 +854,13 @@ export class WorkerManager {
     const lock = acquireLock(this.stateDir, workerId);
     if (!lock.ok) throw new CommandError("lock_held", `worker ${workerId} is locked by pid ${lock.pid}`, true);
     this.store.setWorkerState(workerId, "starting");
+    this.launching.add(workerId); // the stop-vs-launch window opens with the state claim
+    try {
+      await this.checkSessionBeforeRelaunch(worker);
+    } catch (err) {
+      releaseLock(this.stateDir, workerId);
+      throw err;
+    }
     this.active.set(workerId, {
       repoId: worker.repoId,
       worktree: worker.worktree ?? undefined,
@@ -845,6 +874,9 @@ export class WorkerManager {
       mode: worker.mode === "readonly" ? "readonly" : "write",
       prompt: input.text,
       commandId,
+      onSession: (sessionFile, lastKnownEntryId) =>
+        this.store.setSessionObservation(workerId, sessionFile, lastKnownEntryId),
+      markerExpected: true,
       // §13: approveProject comes from the repo's local config on every spawn — the
       // send-relaunch path included (issue #16 merge stitch).
       approveProject: repo?.approved === true ? true : undefined,
@@ -852,6 +884,7 @@ export class WorkerManager {
     };
     try {
       const handle = await this.adapter.start(spec);
+      this.noteCommand(commandId, { sessionFile: handle.sessionFile ?? null, markerExpected: true });
       this.store.upsertWorker({
         workerId,
         threadId: worker.threadId,
@@ -1109,11 +1142,17 @@ export class WorkerManager {
       await this.cleanupOrphans(workerId).catch(() => undefined);
     }
     removeStaleLocks(this.stateDir);
-    for (const worker of this.store.listWorkers()) {
+    // Re-read the row per iteration: reconciliation itself mutates worker state (lost rows
+    // adopt their tail, in-flight rows adjudicate), and the §8.2 pump consults the store —
+    // a stale snapshot would make a just-lost runner block the serial slot for the whole loop.
+    for (const { workerId } of this.store.listWorkers()) {
       if (this.crashed) return;
+      const worker = this.store.getWorker(workerId);
+      if (!worker) continue;
       if (worker.state === "lost") {
         // A resume was pending when the connector died (e.g. killed mid-reconciliation or
         // inside the backoff window): schedule again — the persisted budget bounds this.
+        this.recordSessionTail(worker.workerId); // §10 baseline for the resume's comparison
         this.scheduleAutoResume(worker.workerId, "connector_restart");
         continue;
       }
@@ -1130,6 +1169,7 @@ export class WorkerManager {
 
   private async reconcileWorkerTail(worker: WorkerRow): Promise<void> {
     const tail = this.inspectTailFn(worker.sessionFile);
+    this.recordSessionTail(worker.workerId); // §10: adopt the crashed run's own entries before any resume
     if (tail.kind === "settled") {
       // The crash happened shortly before agent_settled: emit the wrap-up retroactively,
       // git facts merged exactly like the live path (§7.2: facts from git, not the model).
@@ -1153,11 +1193,16 @@ export class WorkerManager {
         "Connector restarted during startup; the task never began. Re-dispatch it.",
         "startup_interrupted",
       );
+      this.pumpQueuedWorkers(); // §8.2: the break freed the serial slot (PR #43 pattern)
       return;
     }
     this.store.setWorkerState(worker.workerId, "lost", "restart");
     await this.emitEvent(worker.workerId, "lost", { reason: "connector_restart" });
     this.scheduleAutoResume(worker.workerId, "connector_restart");
+    // §8.2: a lost runner still holds the serial slot while its resume is pending — but a
+    // queued start whose *own* runner broke is not blocked by that. The pump here covers the
+    // restart case where the queue row's runner adjudicated to settled/broken above.
+    this.pumpQueuedWorkers();
   }
 
   // --- Automatic resume (connector-pi.md §9.2) ----------------------------------------------
@@ -1207,7 +1252,7 @@ export class WorkerManager {
     try {
       // Tracked as a transition: queued sends (§6.2) drain when the resume completes, and an
       // interrupt waits it out instead of racing the relaunch.
-      await this.withTransition(workerId, () => this.resumeWorker(workerId, reason, count));
+      await this.withTransition(workerId, () => this.resumeWorker(workerId, reason, count, { commandId: `auto-${workerId}-${count}-${this.now()}` }));
     } catch (err) {
       if (err instanceof CommandError && err.code === "aborted") {
         // PR #43 review N2: a stop_process settled this worker while the resume relaunch was
@@ -1226,7 +1271,12 @@ export class WorkerManager {
    * delivered over RPC; otherwise the process is relaunched with the same `--session-id` in
    * the worker's own cwd. Emits `resumed{reason, count}` on success.
    */
-  private async resumeWorker(workerId: string, reason: string, count: number): Promise<void> {
+  private async resumeWorker(
+    workerId: string,
+    reason: string,
+    count: number,
+    options: { commandId?: string } = {},
+  ): Promise<void> {
     const worker = this.store.getWorker(workerId);
     if (!worker) throw new CommandError("not_found", `worker ${workerId} is unknown on this machine`);
     if (worker.state === "queued") {
@@ -1246,7 +1296,10 @@ export class WorkerManager {
       );
     }
     if (this.adapter.isRunning?.(workerId)) {
-      await this.adapter.resume(workerId, reason);
+      const commandId = options.commandId;
+      this.noteCommand(commandId ?? "", { sessionFile: worker.sessionFile ?? null, markerExpected: true });
+      await this.adapter.resume(workerId, reason, commandId ? { commandId } : undefined);
+      this.recordSessionTail(workerId);
       this.store.setWorkerState(workerId, "running");
       await this.emitEvent(workerId, "resumed", { reason, count });
       return;
@@ -1271,13 +1324,27 @@ export class WorkerManager {
     if (!cwd) throw new CommandError("startup_failed", `no worktree or repo path to resume worker ${workerId} in`);
     const lock = acquireLock(this.stateDir, workerId);
     if (!lock.ok) throw new CommandError("lock_held", `worker ${workerId} is locked by pid ${lock.pid}`, true);
+    // The stop-vs-launch window opens with the lock: a stop landing anywhere past this point
+    // must find `launching` set (review N2's invariant), including across the §10 pre-launch
+    // check's awaits — otherwise it settles the worker while the relaunch still spawns.
+    this.launching.add(workerId);
+    try {
+      await this.checkSessionBeforeRelaunch(worker);
+    } catch (err) {
+      releaseLock(this.stateDir, workerId);
+      this.launching.delete(workerId);
+      throw err;
+    }
     const spec: StartSpec = {
       workerId,
       threadId: worker.threadId,
       cwd,
       mode: worker.mode === "readonly" ? "readonly" : "write",
       prompt: RESUME_PROMPT,
-      commandId: `resume-${count}-${this.now()}`,
+      commandId: options.commandId ?? `resume-${count}-${this.now()}`,
+      onSession: (sessionFile, lastKnownEntryId) =>
+        this.store.setSessionObservation(workerId, sessionFile, lastKnownEntryId),
+      markerExpected: true,
       // §13: the repo's local trust applies to resumes exactly like first starts.
       approveProject: repo?.approved === true ? true : undefined,
     };
@@ -1287,11 +1354,11 @@ export class WorkerManager {
       branch: worker.branch ?? undefined,
       base: worker.base ?? undefined,
     });
-    this.launching.add(workerId);
     try {
       let handle: WorkerHandle;
       try {
         handle = await this.adapter.start(spec);
+        this.noteCommand(spec.commandId, { sessionFile: handle.sessionFile ?? null, markerExpected: true });
       } catch (err) {
         if (this.stopRequested.has(workerId)) throw new CommandError("aborted", "worker was stopped during resume");
         throw err;
@@ -1441,6 +1508,7 @@ export class WorkerManager {
       }
       case "settled": {
         const context = this.active.get(event.workerId);
+        this.recordSessionTail(event.workerId); // §10 baseline: everything up to this settle is ours
         // `report` merged with GitFacts (§7.2): facts come from git, not the model.
         if (event.outcome === "reported" && event.report) {
           const git =
@@ -1480,6 +1548,7 @@ export class WorkerManager {
         return;
       }
       case "process_exit": {
+        this.recordSessionTail(event.workerId); // §10: adopt whatever the process wrote before dying
         await this.emitEvent(event.workerId, "process_exit", { code: event.code, signal: event.signal });
         releaseLock(this.stateDir, event.workerId);
         this.throttles.delete(event.workerId);
@@ -1503,10 +1572,93 @@ export class WorkerManager {
     }
   }
 
+  /** §10: refresh the worker's external-activity baseline from the session tail. Called at
+   *  every settle and process exit — anything appended after this point was not us. */
+  private recordSessionTail(workerId: string): void {
+    const worker = this.store.getWorker(workerId);
+    if (!worker?.sessionFile) return;
+    const observation = observeSession(worker.sessionFile);
+    if (observation.lastEntryId) this.store.setSessionObservation(workerId, worker.sessionFile, observation.lastEntryId);
+  }
+
   /** Hands the event to the transport's persist-and-send (§11.3: EventLog seq first, then wire). */
   private async emitEvent(workerId: string, type: string, payload: Record<string, unknown>): Promise<void> {
     const clean = Object.fromEntries(Object.entries(payload).filter(([, v]) => v !== undefined));
     this.emit?.(workerId, { type, ...clean });
+  }
+
+  /** §6.3: enrich a command's row with recovery evidence the moment its delivery context is
+   *  known (the session the marker will land in, and the entry id that closes the tail
+   *  window proving absence). Applied for every path that can crash mid-`sending`. */
+  private noteCommand(
+    commandId: string,
+    meta: { sessionFile: string | null; markerExpected: boolean; afterEntryId?: string | null },
+  ): void {
+    if (!commandId) return;
+    const workerId = this.commandWorkerId(commandId) ?? undefined;
+    const worker = workerId ? this.store.getWorker(workerId) : undefined;
+    this.noteCommandContext?.(commandId, {
+      sessionFile: meta.sessionFile || worker?.sessionFile || null,
+      markerExpected: meta.markerExpected,
+      afterEntryId: meta.afterEntryId ?? worker?.lastKnownEntryId ?? null,
+    });
+  }
+
+  /** The worker a command addresses, from the tracked in-flight command map. */
+  private readonly commandWorkers = new Map<string, string>();
+  private trackCommandWorker(commandId: string, workerId: string): void {
+    this.commandWorkers.set(commandId, workerId);
+  }
+  commandWorkerId(commandId: string): string | null {
+    return this.commandWorkers.get(commandId) ?? null;
+  }
+
+  /** §10 pre-launch check: refuse when another live process is using the session, and emit
+   *  `external_activity` (count, timestamps, coarse summary) when the tail moved past the
+   *  last entry the connector recorded. Runs under the worker's lock; the launch proceeds
+   *  only when the session is free. */
+  private async checkSessionBeforeRelaunch(worker: WorkerRow): Promise<void> {
+    if (!worker.sessionFile) return;
+    const live = this.adapter.workerPids?.().map((p) => p.pid) ?? [];
+    const holders = await this.findSessionHoldersFn(worker.workerId, worker.sessionFile, live);
+    if (holders.length > 0) {
+      throw new CommandError(
+        "session_in_use",
+        `session ${worker.sessionId ?? worker.workerId} is being used by another live pi process (pid ${holders[0]!.pid}); ` +
+          `the owner may be working on this machine right now`,
+        true,
+      );
+    }
+    const observation = observeSession(worker.sessionFile);
+    if (!observation.readable) return; // nothing to compare against; the launch itself will fail or adopt
+    const activity = externalActivity(observation, worker.lastKnownEntryId);
+    if (!activity) return;
+    if (!worker.lastKnownEntryId) {
+      // No baseline yet (a pre-#15 row): adopt the tail silently rather than invent activity.
+      this.store.setSessionObservation(worker.workerId, worker.sessionFile, observation.lastEntryId);
+      return;
+    }
+    if (activity.lastTimestamp !== null) {
+      const last = Date.parse(activity.lastTimestamp);
+      if (Number.isFinite(last) && Math.abs(this.now() - last) <= this.sessionInUseWindowMs) {
+        // Fresh writes by someone else: treat as in-use too — the writer is alive right now.
+        throw new CommandError(
+          "session_in_use",
+          `session ${worker.sessionId ?? worker.workerId} received new entries moments ago; ` +
+            `another pi process appears to be using it right now`,
+          true,
+        );
+      }
+    }
+    await this.emitEvent(worker.workerId, "external_activity", {
+      entries: activity.entryCount,
+      firstAt: activity.firstTimestamp,
+      lastAt: activity.lastTimestamp,
+      summary: activity.summary,
+      changedFiles: activity.changedFiles,
+      partial: activity.partial || undefined,
+    });
+    this.store.setSessionObservation(worker.workerId, worker.sessionFile, observation.lastEntryId);
   }
 
   private requireWorker(workerId: string): WorkerRow {

@@ -86,7 +86,7 @@ import { failureCard, notifyCard, askUserCard, reportCardFor, type AskCardButton
 import { MIGRATIONS, runMigrations } from "./schema.ts";
 import { openSecret, sealSecret } from "./secretbox.ts";
 import { renderSetupPage, type SetupView } from "./setup-page.ts";
-import { escapeMarkers, verifyWakeText } from "./wake-text.ts";
+import { ambiguousWakeText, escapeMarkers, verifyWakeText } from "./wake-text.ts";
 import { WebApp, linkTargetForThread, parseSessionCookie } from "./web.ts";
 
 interface ConnState {
@@ -216,6 +216,25 @@ function jsonByteLength(value: unknown): number {
 
 function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** A short, human-readable phrase for what a command asked the worker to do — used in the
+ *  ambiguous/not-delivered/in-use notices (issue #15). Reads the stored args defensively. */
+function commandInstruction(kind: string, payload: string): string {
+  let args: Record<string, unknown> = {};
+  try {
+    args = JSON.parse(payload) as Record<string, unknown>;
+  } catch {
+    // unparsable payload: fall through to the generic label
+  }
+  if (kind === "send" || kind === "interrupt") {
+    const thenText = (args.then as { text?: unknown } | undefined)?.text;
+    const text = typeof args.text === "string" ? args.text : typeof thenText === "string" ? thenText : "";
+    if (text) return text.slice(0, 60);
+  }
+  if (kind === "start_worker" && typeof args.prompt === "string") return args.prompt.slice(0, 60);
+  if (kind === "resume") return "恢复运行";
+  return kind;
 }
 
 function versionRangesOverlap(a: { min: number; max: number }, b: { min: number; max: number }): boolean {
@@ -1044,10 +1063,10 @@ export class Steward extends Agent<Env> {
     connection.send(JSON.stringify(welcome));
     // Reconciliation (protocol §6.1): the connector reports the states of commands that never
     // settled (e.g. `ambiguous` after a crash mid-sending). Settle the matching outbox rows;
-    // ambiguous rows are never re-delivered (§4.2).
+    // ambiguous rows are never re-delivered (§4.2) — the steward is woken to ask (issue #15).
     for (const pending of hello.pendingAcks) {
       if (pending.state === "ambiguous") {
-        this.sql`UPDATE outbox SET state = 'ambiguous' WHERE cmdId = ${pending.cmdId} AND state NOT IN ('done', 'failed', 'expired', 'ambiguous')`;
+        this.markCommandAmbiguous(pending.cmdId, "hello.pendingAcks");
       } else if (pending.state === "done" || pending.state === "failed") {
         this.sql`
           UPDATE outbox SET state = ${pending.state}, result = ${JSON.stringify({ source: "pendingAck" })}
@@ -1101,8 +1120,9 @@ export class Steward extends Agent<Env> {
       `;
       this.noteCommandFailure(ack.re, `连接器拒绝（${ack.code ?? "未知原因"}）`);
     } else if (ack.status === "ambiguous") {
-      // protocol §4.2: a crash during `sending`, undecidable — no automatic re-send.
-      this.sql`UPDATE outbox SET state = 'ambiguous' WHERE cmdId = ${ack.re}`;
+      // protocol §4.2: a crash during `sending`, undecidable — no automatic re-send. The row
+      // is marked ambiguous and the steward is woken to ask the user (issue #15).
+      this.markCommandAmbiguous(ack.re, "cmd_ack");
     }
   }
 
@@ -1120,7 +1140,46 @@ export class Steward extends Agent<Env> {
         .filter((part): part is string => part !== null)
         .join("：") || "未知原因";
       this.noteCommandFailure(result.re, reason);
+      // Issue #15: two failure classes carry their own user-facing story — a session the
+      // owner is using at the keyboard (§10), and an instruction the connector provably
+      // never delivered (§6.3 recovery). Both land on the timeline and wake the steward;
+      // the ordinary tool says the delivery happened, so silence would mislead.
+      const code = typeof error.code === "string" ? error.code : null;
+      if (code === "session_in_use" || code === "not_delivered") {
+        this.noteCommandAttention(result.re, code, typeof error.message === "string" ? error.message : "");
+      }
     }
+  }
+
+  /** A delivery-class failure the user should hear about even without the LLM's help: a
+   *  deterministic timeline note plus a wake (the steward relays/asks). Idempotent on the
+   *  cmdId through the wake's dedupeKey. */
+  private noteCommandAttention(cmdId: string, code: string, message: string): void {
+    const row = this.sql<{ workerId: string | null; kind: string; payload: string }>`
+      SELECT workerId, kind, payload FROM outbox WHERE cmdId = ${cmdId}
+    `[0];
+    if (!row || !row.workerId) return;
+    const worker = this.ledger.workers.get(row.workerId);
+    if (!worker) return;
+    const instruction = commandInstruction(row.kind, row.payload);
+    const text =
+      code === "session_in_use"
+        ? `「${instruction}」没有送达：这个会话此刻正被机器上的另一个 pi 进程使用（可能是本人在键盘上继续）。`
+        : `「${instruction}」没有送达：连接器在投递前重启了，worker 从未收到这条指令。`;
+    this.ledger.timeline.add(worker.threadId, "note", text, { cmdId, workerId: row.workerId, code });
+    this.ledger.wakes.queue(
+      "event",
+      `attention:${cmdId}`,
+      [
+        `⟦event⟧ thread=${worker.threadId}`,
+        `- 指向 worker ${worker.workerId} 的命令（${row.kind}：「${instruction}」）失败：${text}`,
+        code === "session_in_use"
+          ? "请告知用户：那台机器上的这个会话正被他本人使用，稍后再试即可；需要时用 ask_user 问是否稍后重试。"
+          : "请告知用户这条指令没有送达（用户可能以为已发出）；要重发必须以用户的确认或回复为依据（basis=user_reply_to），不要自行重发。",
+      ].join("\n"),
+      { priority: "high" },
+    );
+    void this.drainWakes();
   }
 
   // A start_worker the connector could not run: the worker lands `broken`, the failure reaches
@@ -1134,6 +1193,41 @@ export class Steward extends Agent<Env> {
     if (this.ledger.workers.markStartFailed(row.workerId, cmdId, reason)) {
       void this.drainNotifications();
     }
+  }
+
+  /** Issue #15 / protocol §4.2: the connector reported a command `ambiguous` (a crash during
+   *  `sending` — delivery unknowable). Mark the outbox row ambiguous (never re-sent) and wake
+   *  the steward to ask the user; idempotent on the cmdId via the wake's dedupeKey. */
+  private markCommandAmbiguous(cmdId: string, via: string): void {
+    this.sql`UPDATE outbox SET state = 'ambiguous' WHERE cmdId = ${cmdId} AND state NOT IN ('done', 'failed', 'expired', 'ambiguous')`;
+    const settled = this.sql<{ state: string }>`SELECT state FROM outbox WHERE cmdId = ${cmdId}`[0]?.state;
+    // Idempotency gate: the wake/note fire only when this call actually transitioned the row
+    // (a duplicate cmd_ack or hello.pendingAcks replays find it already ambiguous).
+    if (settled !== "ambiguous") return;
+    const seen = this.sql<{ n: number }>`
+      SELECT COUNT(*) AS n FROM sh_timeline WHERE refs IS NOT NULL AND refs LIKE ${'%"ambiguous":true%'} AND refs LIKE ${`%"cmdId":"${cmdId}"%`}
+    `[0]!.n;
+    if (seen > 0) return;
+    const row = this.sql<{ workerId: string | null; kind: string; payload: string }>`
+      SELECT workerId, kind, payload FROM outbox WHERE cmdId = ${cmdId}
+    `[0];
+    if (!row || !row.workerId) return;
+    const worker = this.ledger.workers.get(row.workerId);
+    if (!worker) return;
+    const instruction = commandInstruction(row.kind, row.payload);
+    this.ledger.timeline.add(
+      worker.threadId,
+      "note",
+      `命令结果不确定（${via}）：连接器在投递「${instruction}」时崩溃，无法判断 worker 是否已收到。不会自动重发。`,
+      { cmdId, workerId: row.workerId, ambiguous: true },
+    );
+    this.ledger.wakes.queue(
+      "event",
+      `ambiguous:${cmdId}`,
+      ambiguousWakeText({ thread: this.ledger.threads.get(worker.threadId), worker, cmdId, kind: row.kind, instruction }),
+      { priority: "high" },
+    );
+    void this.drainWakes();
   }
 
   private handleEvents(connection: Connection, raw: unknown): void {

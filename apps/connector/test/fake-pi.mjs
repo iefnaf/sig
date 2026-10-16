@@ -64,6 +64,7 @@ if (sessionIdx !== -1 && argv[sessionIdx + 1]) sessionId = argv[sessionIdx + 1];
 const sessionsDir = process.env.FAKE_PI_SESSIONS_DIR ?? "/tmp/fake-sessions";
 const sessionFile = join(sessionsDir, `${sessionId}.jsonl`);
 let entrySeq = 0;
+let lastEntryId = null;
 
 /** Appends one entry like real pi's session JSONL (header first, then tree entries). */
 function appendSessionEntry(entry) {
@@ -75,7 +76,11 @@ function appendSessionEntry(entry) {
     );
   }
   const id = typeof entry.id === "string" ? entry.id : `e${++entrySeq}`;
-  appendFileSync(sessionFile, JSON.stringify({ id, parentId: null, timestamp: new Date().toISOString(), ...entry }) + "\n");
+  // Like real pi, entries chain onto the current leaf; the spread lets a scripted entry
+  // pin its own parentId (branch fixtures), defaulting to the live leaf.
+  const parentId = "parentId" in entry ? entry.parentId : lastEntryId;
+  appendFileSync(sessionFile, JSON.stringify({ id, parentId, timestamp: new Date().toISOString(), ...entry }) + "\n");
+  lastEntryId = id;
   return id;
 }
 
@@ -181,12 +186,15 @@ async function handle(command) {
     case "prompt": {
       let text = command.message ?? "";
       // Simulate the shepherd extension's /shepherd command (ADR-0001 marker): unwrap
-      // `/shepherd <commandId>\n<text>` and record the marker.
+      // `/shepherd <commandId>\n<text>` and record the marker as a custom session entry,
+      // then send the clean text as the user message.
       let commandId = null;
       if (typeof text === "string" && text.startsWith("/shepherd ")) {
         const nl = text.indexOf("\n");
         commandId = text.slice("/shepherd ".length, nl);
         text = text.slice(nl + 1);
+        appendSessionEntry({ type: "custom", customType: "shepherd.command", data: { commandId, at: Date.now() } });
+        appendSessionEntry({ type: "message", message: { role: "user", content: text, timestamp: Date.now() } });
       }
       logPrompt({ commandId, text, at: Date.now() });
       const run = scenario.runs?.[promptCount] ?? [];
@@ -204,6 +212,22 @@ async function handle(command) {
     case "steer":
     case "follow_up": {
       const text = messageText();
+      // The shepherd extension's input handler (§6.3 marker for queued deliveries): strip
+      // the `[shepherd:command <id>]` preamble and persist it as the same custom entry at
+      // the moment the message enters pi's queue — like real pi, the entry is appended when
+      // the message is delivered, so the session tail answers "was it delivered?".
+      let delivered = text;
+      const marker = /^\[shepherd:command ([^\]\r\n]+)\]\n?/;
+      if (typeof delivered === "string" && marker.test(delivered)) {
+        const commandId = delivered.match(marker)[1];
+        delivered = delivered.replace(marker, "");
+        appendSessionEntry({ type: "custom", customType: "shepherd.command", data: { commandId, at: Date.now() } });
+        appendSessionEntry({ type: "message", message: { role: "user", content: delivered, timestamp: Date.now() } });
+        (command.type === "steer" ? steeringQueue : followUpQueue).push(delivered);
+        logPrompt({ type: command.type, text: delivered, at: Date.now() });
+        respond(id, command.type, { disposition: "queued" });
+        return;
+      }
       (command.type === "steer" ? steeringQueue : followUpQueue).push(text);
       logPrompt({ type: command.type, text, at: Date.now() });
       respond(id, command.type, { disposition: "queued" });
