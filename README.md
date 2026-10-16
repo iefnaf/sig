@@ -32,6 +32,8 @@ wrangler secret put SERVER_KEY   # openssl rand -hex 32; signs device tokens, se
 wrangler secret put SETUP_TOKEN  # a second, different random string; one-time gate for the setup page
 ```
 
+The steward's model selection is deploy config (ADR-0001 decision 11): unset `vars.STEWARD_MODEL` (root `wrangler.jsonc`) defaults to `deepseek`/`deepseek-flash` — the eval baseline; set it to pick another catalog provider or a proxy base URL, e.g. `{"provider": "deepseek", "modelId": "deepseek-v4-pro", "baseUrl": "https://…"}`. The API key never rides in vars: it is the sealed `sh_model` row inside the Durable Object (seeded once from the `MODEL_KEY` you set at deploy — see the [deploy guide's model provider section](docs/deploy.md#model-provider)), and inside the Worker the provider is always built with an inline `auth.apiKey.resolve` closure over that sealed key — never ambient environment-variable auth (spike bug 7). A missing key or an unknown provider/model fails visibly (`sh_run` settles `unanswered`) rather than silently using a different model.
+
 After deploy, open `https://<your-domain>/setup?token=<SETUP_TOKEN>`. The page opens with a reachability self-check (workers.dev vs custom domain — Feishu cannot deliver webhooks to `*.workers.dev`), then walks the QR-code flow (issue #24): scan once to create the bot — the scanner becomes the owner and the credentials are stored encrypted — scan a second time to add the `application:application:patch` scope, and the app is then switched to webhook delivery (`im.message.receive_v1` + `card.action.trigger` to `https://<your-domain>/channels/feishu/events`) with one guided manual step: republishing the version in the developer console. The page verifies the switch through real event delivery (an API-accepted config PATCH alone does not move delivery, see the [Feishu research](docs/research/feishu-channel.md) §8.2) and closes permanently once the first event lands. Manually entering App ID / App Secret / Verification Token (validated live against Feishu) remains available as the fallback at every step (ADR-0001 decisions 8–9). When rotating `SERVER_KEY`, remember a resident Durable Object isolate pins old code and secrets for minutes — evict it before verifying ([deploy guide](docs/deploy.md#secrets-and-rotation)).
 
 Every deployment needs a custom domain before the webhook switch: Feishu's event servers sit in mainland China and cannot reach `*.workers.dev` at all (URL verification fails with 210042 — live-tested), so no event can arrive over workers.dev. For mainland users the custom domain is additionally what makes the web app and the connector reachable — workers.dev is blocked there outright ([deploy guide](docs/deploy.md#custom-domain), [Feishu research](docs/research/feishu-channel.md) §3 and §8.2).
@@ -74,18 +76,18 @@ shepherd uninstall                 # remove the service (keeps ~/.shepherd data)
 
 State lives under `~/.shepherd/` (set `SHEPHERD_HOME` to move it): credentials in `connector.sqlite` (0600), pi sessions and the versioned extension/prompt files, worker worktrees, and logs that contain no keys or session content. The service unit runs the same `shepherd daemon` the package ships, so `upgrade` is just an npm reinstall plus a service restart.
 
-## Talking to it (M1)
+## Talking to it (M2)
 
-The LLM steward arrives with M2; until then the Feishu bot understands fixed command phrases only, and everything else — machine choice, branch relay, the three-part done-report card — is deterministic:
+The Feishu bot is the steward LLM: a pi conversation hosted in the Durable Object, talking to the model configured above. Natural language in, natural language out — the model dispatches through its `start_worker` tool (machine choice, branch relay, and the three-part done-report card stay deterministic), keeps Thread summaries current when workers report back, and only ever disturbs you on its own initiative through `notify_user`/`ask_user`. In event-triggered runs its plain text output is discarded by structure — quiet by default is guaranteed by the code, not the prompt.
+
+Two exact phrases stay deterministic and never reach the model — they mint credentials, so they must work without one:
 
 | Phrase | What it does |
 |---|---|
-| `/派发 <repo>[@<machine>] <要做的事>` (also `/dispatch`, `/run`) | Creates a Thread and dispatches a write task to a machine that has the repo (unique online winner; ties and offline-only machines come back as a question) |
-| `/状态` (also `/status`) | Lists machines and Threads with their derived state (`running` / `waiting_you` / `idle`) |
 | `/加机器` (also `/添加机器`, `/add-machine`) | Issues a one-time pairing code and replies with `npx @iefnaf/shepherd connect <url> <code>` to run on the new machine |
 | `/网页` (also `/web`, `/login`) | Replies with a one-time login link (15 min, single use) to the companion web |
 
-Quote-replying to a report card continues the same Thread on its last machine — queuing until it comes back online if it dropped — and the next worker starts from the previous worker's branch. Report cards' buttons (e.g. "排队等上线" while a machine is offline) resolve the Thread from the card itself, never from data stuffed into the button.
+Quote-replying to a report card attaches your message to that Thread (resolved from the card's message id, never through the model's judgment) and the next worker starts from the previous worker's branch. Report cards' buttons (e.g. "排队等上线" while a machine is offline) resolve the Thread the same way.
 
 ## The companion web
 

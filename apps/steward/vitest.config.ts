@@ -124,11 +124,13 @@ export default defineConfig({
       miniflare: {
         bindings: {
           SERVER_KEY: "test-server-key-not-a-secret",
-          // The rotation-window key (issue #27): tests mint "pre-rotation" tokens with it.
           SERVER_KEY_PREVIOUS: "test-previous-server-key-not-a-secret",
           SETUP_TOKEN: "test-setup-token-not-a-secret",
           // The deploy-form model key (issue #25): modelConfig() seeds sh_model from it once.
           MODEL_KEY: "test-model-key-not-a-secret",
+          // The scripted model provider (issue #6): replies are queued per-test through
+          // Steward.fauxScript; requests are captured for assertions through fauxRequests.
+          STEWARD_MODEL: JSON.stringify({ provider: "faux", modelId: "faux-1" }),
         },
         serviceBindings: { FEISHU_API: feishuMock },
       },

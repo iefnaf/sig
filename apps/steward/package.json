@@ -11,6 +11,8 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@earendil-works/pi-ai": "1.3.0",
+    "@earendil-works/pi-durable": "1.3.0",
     "@shepherd/protocol": "workspace:*",
     "agents": "0.28.1",
     "uqr": "^0.1.3"

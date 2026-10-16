@@ -3,13 +3,14 @@
 import { describe, expect, it } from "vitest";
 import type { ReportRow, WorkerRow } from "../src/ledger.ts";
 import {
+  askUserText,
   didBullets,
   failureCard,
   MAX_CONCLUSION,
   needsYouOf,
+  notifyCard,
   offlineAskCard,
   renderReportCard,
-  statusText,
   toneOfReport,
 } from "../src/report-template.ts";
 
@@ -149,21 +150,24 @@ describe("failure and offline-ask cards", () => {
   });
 });
 
-describe("statusText", () => {
-  it("lists machines with online dots and threads with derived-state marks", () => {
-    const text = statusText(
-      [
-        { title: "修复登录 bug", state: "running", unread: true },
-        { title: "整理依赖", state: "idle", unread: false },
-      ],
-      [
-        { name: "mac-studio", online: true },
-        { name: "macbook", online: false },
-      ],
-    );
-    expect(text).toContain("🟢 mac-studio");
-    expect(text).toContain("⚫️ macbook");
-    expect(text).toContain("▶ 修复登录 bug（running，未读）");
-    expect(text).toContain("· 整理依赖（idle）");
+describe("notifyCard / askUserText (issue #6)", () => {
+  it("notifyCard renders the three-part card the steward's notify_user sends", () => {
+    const card = notifyCard({ tone: "attention", conclusion: "构建坏了，需要你拍板", did: ["定位到依赖冲突"], needsYou: "回滚还是升级？", threadTitle: "登录 bug" }) as {
+      header: Record<string, unknown>;
+      elements: unknown[];
+    };
+    expect(JSON.stringify(card.header)).toContain("orange");
+    expect(JSON.stringify(card.header)).toContain("构建坏了，需要你拍板");
+    const parts = JSON.stringify(card.elements);
+    expect(parts).toContain("定位到依赖冲突");
+    expect(parts).toContain("回滚还是升级？");
+    expect(parts).toContain("Thread「登录 bug」");
+  });
+
+  it("askUserText lists up to 3 options and says the reply carries the Thread", () => {
+    const text = askUserText("你指的是哪件事？", ["A 登录 bug", "B 登录页样式", "新开一件事"], "登录 bug");
+    expect(text).toContain("【登录 bug】");
+    expect(text).toContain("1. A 登录 bug");
+    expect(text).toContain("直接回复这句话");
   });
 });
