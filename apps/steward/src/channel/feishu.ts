@@ -152,12 +152,39 @@ export class FeishuAdapter implements ChannelAdapter {
     if (header.event_type === "im.message.receive_v1") {
       return this.parseMessageEvent(header.event_id, header.event_type, (body as FeishuEnvelope).event);
     }
+    if (header.event_type === "card.action.trigger") {
+      return this.parseCardActionEvent(header.event_id, header.event_type, (body as FeishuEnvelope).event);
+    }
     return {
       kind: "other",
       msgId: header.event_id,
       eventId: header.event_id,
       eventType: header.event_type,
       raw: body,
+    };
+  }
+
+  // feishu-channel.md §8.2: `action.value` round-trips verbatim and `context.open_message_id`
+  // points at the card message — the callback routing signal. The value carries only the
+  // action; Thread identity is resolved server-side from the card's providerMsgId.
+  private parseCardActionEvent(eventId: string, eventType: string, event: Record<string, unknown> | undefined): InboundEvent | Response {
+    const operatorId = (event?.operator as Record<string, unknown> | undefined)?.open_id;
+    const context = event?.context as Record<string, unknown> | undefined;
+    const value = (event?.action as Record<string, unknown> | undefined)?.value;
+    const cardMsgId = context?.open_message_id;
+    if (typeof operatorId !== "string" || typeof cardMsgId !== "string") {
+      return new Response("bad request", { status: 400 });
+    }
+    const action = value && typeof (value as Record<string, unknown>).action === "string" ? String((value as Record<string, unknown>).action) : "";
+    return {
+      kind: "card_action",
+      msgId: eventId,
+      eventId,
+      eventType,
+      operatorId,
+      action,
+      cardMsgId,
+      raw: event,
     };
   }
 

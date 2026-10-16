@@ -154,16 +154,33 @@ describe("webhook: owner binding and DM filtering (issue #4)", () => {
     const res = await postEvent({
       schema: "2.0",
       header: {
-        event_id: "evt_card_1",
+        event_id: "evt_other_1",
+        event_type: "contact.user.updated_v3",
+        create_time: String(Date.now()),
+        token: TEST_VERIFY_TOKEN,
+        app_id: TEST_APP_ID,
+      },
+      event: { obj: {} },
+    });
+    expect(res.status).toBe(200);
+    expect(await ownerStub().inboundSeen("evt_other_1")).toBe(true); // deduped on event id
+    expect((await ownerStub().channelLogEntries(10)).some((l) => l.reason === "event_ignored_other")).toBe(true);
+  });
+
+  it("rejects a malformed card.action.trigger (no card context) instead of acking it", async () => {
+    await configureAndBind("ou_owner");
+    const res = await postEvent({
+      schema: "2.0",
+      header: {
+        event_id: "evt_card_bad",
         event_type: "card.action.trigger",
         create_time: String(Date.now()),
         token: TEST_VERIFY_TOKEN,
         app_id: TEST_APP_ID,
       },
-      event: { operator: { open_id: "ou_owner" } },
+      event: { operator: { open_id: "ou_owner" } }, // missing action/context
     });
-    expect(res.status).toBe(200);
-    expect(await ownerStub().inboundSeen("evt_card_1")).toBe(true); // deduped on event id
-    expect((await ownerStub().channelLogEntries(10)).some((l) => l.reason === "event_ignored_other")).toBe(true);
+    expect(res.status).toBe(400);
+    expect(await ownerStub().inboundSeen("evt_card_bad")).toBe(false);
   });
 });
