@@ -116,7 +116,9 @@ const feishuMock = async (request: Request): Promise<Response> => {
 export default defineConfig({
   plugins: [
     cloudflareTest({
-      wrangler: { configPath: "./wrangler.jsonc" },
+      // The Worker's config lives at the repo root (issue #25: Deploy-to-Cloudflare reads it
+      // there); paths inside it resolve relative to the config file.
+      wrangler: { configPath: "../../wrangler.jsonc" },
       // SERVER_KEY and SETUP_TOKEN are `wrangler secret put` values in real deployments; tests
       // supply deterministic stand-ins instead of relying on committed or ambient secrets.
       miniflare: {

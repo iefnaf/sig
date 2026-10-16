@@ -70,6 +70,37 @@ describe("setup page: credential submission", () => {
   });
 });
 
+describe("setup page: post-deploy reachability self-check (issue #25)", () => {
+  const page = async (origin: string) =>
+    (await SELF.fetch(`${origin}/setup?token=test-setup-token-not-a-secret`)).text();
+
+  it("on a workers.dev host: warns that Feishu cannot deliver webhooks and points at the custom-domain guide", async () => {
+    const html = await page("https://shepherd-steward.demo.workers.dev");
+    expect(html).toContain("部署自检");
+    expect(html).toContain("shepherd-steward.demo.workers.dev");
+    expect(html).toContain("无法访问 <code>*.workers.dev</code>");
+    expect(html).toContain("绑定自定义域名");
+    expect(html).toContain("deploy.md#custom-domain");
+    // The definitive Feishu-side reachability proof is the webhook switch, so say so.
+    expect(html).toContain("地址校验");
+  });
+
+  it("on a custom domain: green check naming the host the webhook URL will use", async () => {
+    const html = await page("https://shepherd.example.com");
+    expect(html).toContain("自定义域名</b> <code>shepherd.example.com</code>");
+    expect(html).toContain("deploy.md#custom-domain");
+    expect(html).not.toContain("无法访问");
+  });
+
+  it("stays quiet for local dev hosts", async () => {
+    for (const origin of ["http://localhost:8787", "http://127.0.0.1:8787"]) {
+      const html = await page(origin);
+      expect(html).not.toContain("部署自检");
+      expect(html).not.toContain("网络自检");
+    }
+  });
+});
+
 describe("setup page: closing permanently on owner binding", () => {
   it("404s for GET and POST once the owner has DM'd the bot", async () => {
     await submitSetupCredentials();
