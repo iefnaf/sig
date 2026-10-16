@@ -91,7 +91,11 @@ Two exact phrases stay deterministic and never reach the model — they mint cre
 | `/加机器` (also `/添加机器`, `/add-machine`) | Issues a one-time pairing code and replies with `npx @iefnaf/shepherd connect <url> <code>` to run on the new machine |
 | `/网页` (also `/web`, `/login`) | Replies with a one-time login link (15 min, single use) to the companion web |
 
-Quote-replying to a report card attaches your message to that Thread (resolved from the card's message id, never through the model's judgment) and the next worker starts from the previous worker's branch. Report cards' buttons (e.g. "排队等上线" while a machine is offline) resolve the Thread the same way.
+Quote-replying to a report card attaches your message to that Thread (resolved from the card's message id, never through the model's judgment) and the next worker starts from the previous worker's branch. Report cards' buttons (e.g. "排队等上线" while a machine is offline) resolve the Thread the same way; an `ask_user` card's candidate buttons settle routing with one tap, and the choice routes back as a reply to that Thread.
+
+### The routing eval gate
+
+Routing quality has a measurable bar: a fixed 106-case set (ported from the spike) run against the real steward extension. Any change to the steward prompt, the tool definitions, `findCandidates`, or the model must re-run it and meet the thresholds before merge — `pnpm --filter @shepherd/steward eval:routing` exits non-zero when they are missed. See [docs/routing-eval.md](docs/routing-eval.md) for the metrics, the recorded baselines, and the no-model selftest.
 
 ## The companion web
 
