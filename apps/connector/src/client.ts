@@ -16,6 +16,7 @@ import {
 import { CommandLog, type CommandResult } from "./commands.ts";
 import { EventLog, type StoredEvent } from "./events.ts";
 import type { LocalStore } from "./store.ts";
+import { VERSION } from "./version.ts";
 
 export type CommandHandler = (cmd: CmdMessage) => Promise<CommandResult>;
 
@@ -132,7 +133,7 @@ export class ConnectorClient {
           deviceId: credentials.deviceId,
           bootId: this.bootId,
           connEpoch,
-          connector: { version: "0.1.0", os: process.platform, arch: process.arch, node: process.version },
+          connector: { version: VERSION, os: process.platform, arch: process.arch, node: process.version },
           machine: {
             name: this.options.machineName ?? os.hostname(),
             memTotalMB: Math.round(os.totalmem() / 1_000_000),

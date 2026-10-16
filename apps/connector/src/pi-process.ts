@@ -8,6 +8,8 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { randomUUID } from "node:crypto";
+import { appendCapped } from "./logger.ts";
+import { redactText } from "./redact.ts";
 
 export class RpcError extends Error {
   constructor(
@@ -30,6 +32,11 @@ export interface PiProcessOptions {
   onExit: (info: { code: number | null; signal: NodeJS.Signals | null }) => void;
   /** Keep only the last N bytes of stderr (connector-pi.md §4.4). */
   stderrTailBytes?: number;
+  /** When set, stderr is also appended (redacted, capped) to this file — the per-worker
+   * tail the design keeps under ~/.shepherd/logs/ (§12). */
+  stderrFile?: string;
+  /** Cap for the stderr file; defaults to the same 64 KiB as the in-memory tail. */
+  stderrFileMaxBytes?: number;
   /** Grace period between closing stdin and SIGKILL on stop (§4.4: 3s measured). */
   stopGraceMs?: number;
 }
@@ -201,7 +208,12 @@ export class PiProcess {
   }
 
   private appendStderr(chunk: Buffer): void {
-    this.stderrTail = (this.stderrTail + chunk.toString("utf8")).slice(-this.stderrLimit);
+    const text = chunk.toString("utf8");
+    this.stderrTail = (this.stderrTail + text).slice(-this.stderrLimit);
+    if (this.options.stderrFile) {
+      // Diagnostics only, never session content (that flows over stdout); still redacted.
+      appendCapped(this.options.stderrFile, redactText(text), this.options.stderrFileMaxBytes ?? this.stderrLimit);
+    }
   }
 
   private handleExit(code: number | null, signal: NodeJS.Signals | null, error?: Error): void {
