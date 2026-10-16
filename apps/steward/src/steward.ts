@@ -2,6 +2,9 @@
 // outbox, the event inbox, and the bidirectional heartbeat. See docs/design/connector-do-protocol.md
 // §4 (envelope and reliability), §6.2-6.4 (commands/events), ADR-0001 (heartbeat + redelivery
 // corrections), and docs/spike-conclusions.md bugs 5 and 10.
+//
+// Channel layer (issue #4, steward.md §6.1 / §9): the SETUP_TOKEN-guarded setup page, manual
+// Feishu credentials, the webhook inbound path, and the alarm-driven outbound queue.
 import { Agent, type Connection, type ConnectionContext, type WSMessage } from "agents";
 import {
   CloseCode,
@@ -24,7 +27,16 @@ import {
   type WelcomeMessage,
 } from "@shepherd/protocol";
 import { bearer } from "./auth.ts";
+import {
+  FeishuAdapter,
+  SEND_TIMEOUT_MS,
+  TOKEN_REFRESH_MARGIN_MS,
+  type FeishuCredentials,
+} from "./channel/feishu.ts";
+import { RetriableChannelError, type InboundEvent } from "./channel/types.ts";
 import { MIGRATIONS, runMigrations } from "./schema.ts";
+import { openSecret, sealSecret } from "./secretbox.ts";
+import { renderSetupPage } from "./setup-page.ts";
 
 interface ConnState {
   deviceId: string;
@@ -59,6 +71,45 @@ const IDLE_SWEEP_INTERVAL_S = 60;
 // to come online" pass `notAfter: null` explicitly.
 const DEFAULT_NOTAFTER_MS = 10 * 60_000;
 
+// ---- Channel: Feishu webhook inbound + outbound queue (steward.md §6.1, §9; spike bugs 1, 3) ----
+// A claim is the double-send guard (bug 1): the conditional UPDATE hands a row to exactly one
+// delivery pass; it outlives the 10s send timeout so a merely-slow send keeps its owner.
+const OUTBOUND_CLAIM_MS = 30_000;
+// feishu-channel.md §4: 5 QPS per receiver — space sends ≥220ms apart, with margin.
+const OUTBOUND_SEND_SPACING_MS = 220;
+// Alarm-driven exponential backoff retries (bug 3): 5s, 10s, 20s … capped at 15min, terminal
+// after 8 attempts (~1h of retrying).
+const OUTBOUND_BACKOFF_BASE_MS = 5_000;
+const OUTBOUND_BACKOFF_CAP_MS = 15 * 60_000;
+const OUTBOUND_MAX_ATTEMPTS = 8;
+const OUTBOUND_BATCH = 20;
+const OWNER_BOUND_REPLY = "✅ 已绑定，设置完成。此后直接在这里与 Shepherd 对话即可；设置页面已永久关闭。";
+
+export interface ShOutboundRow {
+  id: string;
+  channel: string;
+  kind: string;
+  receiveId: string;
+  threadId: string | null;
+  payload: string;
+  urgency: string;
+  status: string;
+  attempts: number;
+  claimToken: string | null;
+  claimExpiresAt: number | null;
+  nextAttemptAt: number;
+  providerMsgId: string | null;
+  lastError: string | null;
+  createdAt: number;
+  sentAt: number | null;
+}
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 function versionRangesOverlap(a: { min: number; max: number }, b: { min: number; max: number }): boolean {
   return a.min <= b.max && b.min <= a.max;
 }
@@ -69,6 +120,20 @@ function versionRangesOverlap(a: { min: number; max: number }, b: { min: number;
 export class Steward extends Agent<Env> {
   onStart(): void {
     runMigrations(this.sql.bind(this), MIGRATIONS);
+  }
+
+  // Plain-HTTP surface reached via the Worker's stub.fetch forwards (index.ts): the Feishu
+  // webhook (unauthenticated — the adapter validates Feishu's own token) and the setup page
+  // (the Worker has already checked SETUP_TOKEN before forwarding).
+  async onRequest(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname === "/channels/feishu/events" && request.method === "POST") {
+      return this.handleFeishuWebhook(request);
+    }
+    if (url.pathname === "/setup" && (request.method === "GET" || request.method === "POST")) {
+      return this.handleSetup(request);
+    }
+    return new Response("not found", { status: 404 });
   }
 
   shouldSendProtocolMessages(): boolean {
@@ -433,5 +498,344 @@ export class Steward extends Agent<Env> {
     }
     const waiting = this.sql<{ n: number }>`SELECT COUNT(*) AS n FROM outbox WHERE state = 'queued'`[0]!.n;
     if (waiting > 0) void this.schedule(IDLE_SWEEP_INTERVAL_S, "sweepIdle");
+  }
+
+  // =================================================================================================
+  // Channel: setup page, Feishu webhook inbound, outbound queue (steward.md §6.1, §9)
+  // =================================================================================================
+
+  // Tests shrink this via runInDurableObject to exercise the timeout path quickly.
+  protected feishuSendTimeoutMs = SEND_TIMEOUT_MS;
+
+  // Single-flight delivery: concurrent passes (inline enqueue fire + alarm + explicit calls)
+  // chain here instead of racing. Without this, two passes could interleave around the
+  // per-receiver pacing sleep and burst past the 5 QPS cap; the claim token still guards the
+  // row itself, this keeps the *wire* quiet too.
+  private deliveryChain: Promise<void> = Promise.resolve();
+
+  private async loadFeishuConfig(): Promise<(FeishuCredentials & { ownerOpenId: string | null }) | null> {
+    const row = this.sql<{ appId: string; appSecretEnc: string; verificationTokenEnc: string; ownerOpenId: string | null }>`
+      SELECT appId, appSecretEnc, verificationTokenEnc, ownerOpenId FROM sh_channel WHERE channel = 'feishu'
+    `[0];
+    if (!row) return null;
+    // A failed open means SERVER_KEY was rotated (secretbox.ts): read back as unconfigured so
+    // the SETUP_TOKEN-guarded setup page accepts fresh credentials — recovery, not a deadlock.
+    const appSecret = await openSecret(this.env.SERVER_KEY, row.appSecretEnc);
+    const verificationToken = await openSecret(this.env.SERVER_KEY, row.verificationTokenEnc);
+    if (appSecret === null || verificationToken === null) return null;
+    return { appId: row.appId, appSecret, verificationToken, ownerOpenId: row.ownerOpenId };
+  }
+
+  protected newFeishuAdapter(credentials: FeishuCredentials): FeishuAdapter {
+    return new FeishuAdapter({
+      credentials,
+      tokenStore: {
+        getCachedToken: () =>
+          (this.sql<{ token: string; expiresAt: number }>`
+            SELECT token, expiresAt FROM sh_channel_token WHERE channel = 'feishu'
+          `[0] ?? null),
+        saveToken: (token, expiresAt) => {
+          this.sql`
+            INSERT INTO sh_channel_token (channel, token, expiresAt) VALUES ('feishu', ${token}, ${expiresAt})
+            ON CONFLICT (channel) DO UPDATE SET token = excluded.token, expiresAt = excluded.expiresAt
+          `;
+          // steward.md §9.2: the token is refreshed by an alarm ahead of its expiry.
+          void this.schedule(
+            Math.max(1, Math.ceil((expiresAt - TOKEN_REFRESH_MARGIN_MS - Date.now()) / 1000)),
+            "refreshChannelToken",
+          );
+        },
+      },
+      // FEISHU_API exists only in tests (a service binding that mocks Feishu); production
+      // calls the real endpoint via global fetch.
+      fetcher: this.env.FEISHU_API ? (this.env.FEISHU_API.fetch.bind(this.env.FEISHU_API) as typeof fetch) : undefined,
+      sendTimeoutMs: this.feishuSendTimeoutMs,
+    });
+  }
+
+  // Scheduled callback: keep tenant_access_token fresh even while nothing is being sent.
+  async refreshChannelToken(): Promise<void> {
+    const cfg = await this.loadFeishuConfig();
+    if (!cfg) return;
+    const cached = this.sql<{ token: string; expiresAt: number }>`
+      SELECT token, expiresAt FROM sh_channel_token WHERE channel = 'feishu'
+    `[0];
+    if (cached && cached.expiresAt - TOKEN_REFRESH_MARGIN_MS > Date.now()) return;
+    try {
+      await this.newFeishuAdapter(cfg).getTenantAccessToken();
+    } catch {
+      // Retry lazily; a send needing the token retries the fetch on demand anyway.
+      void this.schedule(600, "refreshChannelToken");
+    }
+  }
+
+  private async handleSetup(request: Request): Promise<Response> {
+    const cfg = await this.loadFeishuConfig();
+    // ADR-0001 decision 8: once the owner is bound the setup page is closed permanently.
+    if (cfg?.ownerOpenId) return new Response("not found", { status: 404 });
+    const url = new URL(request.url);
+    const webhookUrl = `${url.origin}/channels/feishu/events`;
+    const page = (opts: { state: "form" | "awaiting_owner"; error?: string; appIdValue?: string }) =>
+      new Response(renderSetupPage({ ...opts, actionUrl: `${url.pathname}${url.search}`, webhookUrl }), {
+        headers: { "content-type": "text/html; charset=utf-8" },
+      });
+
+    if (request.method === "GET") {
+      return page({ state: cfg ? "awaiting_owner" : "form" });
+    }
+
+    let form: FormData;
+    try {
+      form = await request.formData();
+    } catch {
+      return page({ state: "form", error: "表单解析失败，请重试。" });
+    }
+    const appId = String(form.get("appId") ?? "").trim();
+    const appSecret = String(form.get("appSecret") ?? "").trim();
+    const verificationToken = String(form.get("verificationToken") ?? "").trim();
+    if (!appId || !appSecret || !verificationToken) {
+      return page({ state: "form", error: "三个字段都必填。", appIdValue: appId });
+    }
+
+    // Validate live: a tenant_access_token must actually be obtainable with these credentials
+    // (and the fresh token is cached for the first send). adapter.getTenantAccessToken() is
+    // public for exactly this reuse.
+    try {
+      await this.newFeishuAdapter({ appId, appSecret, verificationToken }).getTenantAccessToken();
+    } catch (err) {
+      return page({ state: "form", error: `凭据校验失败：${errorText(err)}`, appIdValue: appId });
+    }
+
+    const [appSecretEnc, verificationTokenEnc] = await Promise.all([
+      sealSecret(this.env.SERVER_KEY, appSecret),
+      sealSecret(this.env.SERVER_KEY, verificationToken),
+    ]);
+    this.sql`
+      INSERT INTO sh_channel (channel, appId, appSecretEnc, verificationTokenEnc, ownerOpenId, configuredAt, boundAt)
+      VALUES ('feishu', ${appId}, ${appSecretEnc}, ${verificationTokenEnc}, NULL, ${Date.now()}, NULL)
+      ON CONFLICT (channel) DO UPDATE SET
+        appId = excluded.appId, appSecretEnc = excluded.appSecretEnc,
+        verificationTokenEnc = excluded.verificationTokenEnc, configuredAt = excluded.configuredAt
+    `;
+    return page({ state: "awaiting_owner" });
+  }
+
+  async setupState(): Promise<{ state: "unconfigured" | "awaiting_owner" | "bound"; appId: string | null; ownerOpenId: string | null }> {
+    const cfg = await this.loadFeishuConfig();
+    if (!cfg) return { state: "unconfigured", appId: null, ownerOpenId: null };
+    return { state: cfg.ownerOpenId ? "bound" : "awaiting_owner", appId: cfg.appId, ownerOpenId: cfg.ownerOpenId };
+  }
+
+  private async handleFeishuWebhook(request: Request): Promise<Response> {
+    const cfg = await this.loadFeishuConfig();
+    if (!cfg) return new Response("not found", { status: 404 });
+    const parsed = await this.newFeishuAdapter(cfg).verifyAndParse(request);
+    if (parsed instanceof Response) return parsed;
+
+    // Persist before 200 (steward.md §9.1): the dedup insert below is the durable record, and
+    // the dispatch that follows only touches SQLite synchronously (its sole await, enqueue,
+    // is sync SQL plus a void-fired delivery) — so the 200 goes out only after the event's
+    // effects are on disk. The Feishu send itself settles later through the durable queue.
+    const dup = this.sql`SELECT 1 AS one FROM sh_inbound WHERE channel = 'feishu' AND msgId = ${parsed.msgId}`;
+    if (dup.length > 0) return Response.json({ code: 0 }); // Feishu redelivery: ack and drop
+    this.sql`
+      INSERT INTO sh_inbound (channel, msgId, eventId, eventType, receivedAt)
+      VALUES ('feishu', ${parsed.msgId}, ${parsed.eventId}, ${parsed.eventType}, ${Date.now()})
+    `;
+
+    if (parsed.kind === "message") {
+      await this.dispatchInboundMessage(parsed, cfg.ownerOpenId);
+    } else {
+      this.logChannel("event_ignored_other", `${parsed.eventType} ${parsed.eventId}`);
+    }
+    return Response.json({ code: 0 });
+  }
+
+  private async dispatchInboundMessage(ev: InboundEvent, ownerOpenId: string | null): Promise<void> {
+    if (ev.chatType !== "p2p") {
+      this.logChannel("ignored_group", `${ev.senderId ?? "?"} ${ev.msgId}`);
+      return;
+    }
+    if (ownerOpenId === null) {
+      // First p2p DM after credentials were saved binds the sender as owner (issue #4, spec
+      // §12.1). Everything before this point was SETUP_TOKEN-guarded, and only someone who
+      // can already reach this private bot can be here; first-DM-wins is the accepted design.
+      this.sql`UPDATE sh_channel SET ownerOpenId = ${ev.senderId!}, boundAt = ${Date.now()} WHERE channel = 'feishu'`;
+      this.logChannel("owner_bound", ev.senderId!);
+      await this.enqueueOutbound({ kind: "text", to: ev.senderId!, text: OWNER_BOUND_REPLY, urgency: "push" });
+      return;
+    }
+    if (ev.senderId !== ownerOpenId) {
+      this.logChannel("ignored_not_owner", `${ev.senderId} ${ev.msgId}`);
+      return;
+    }
+    if (ev.messageType !== "text") {
+      // Attachments land via fetchAttachment once ingestion is wired (§9.1); for now they are
+      // durably recorded in sh_inbound and logged.
+      this.logChannel("ignored_message_type", `${ev.messageType} ${ev.msgId}`);
+      return;
+    }
+    // The DM is durably recorded (sh_inbound) and logged; handing it to the steward
+    // conversation (harness.submit, sh_run) is the M2 ticket — nothing here decides routing yet.
+    this.logChannel("owner_message", `${ev.msgId} parent=${ev.parentId ?? "-"} ${ev.text ?? ""}`.slice(0, 500));
+  }
+
+  private logChannel(reason: string, detail: string): void {
+    this.sql`INSERT INTO sh_channel_log (ts, channel, reason, detail) VALUES (${Date.now()}, 'feishu', ${reason}, ${detail})`;
+  }
+
+  async channelLogEntries(limit = 50): Promise<{ ts: number; reason: string; detail: string | null }[]> {
+    return this.sql<{ ts: number; reason: string; detail: string | null }>`
+      SELECT ts, reason, detail FROM sh_channel_log ORDER BY seq DESC LIMIT ${limit}
+    `;
+  }
+
+  async inboundSeen(msgId: string): Promise<boolean> {
+    return this.sql`SELECT 1 AS one FROM sh_inbound WHERE channel = 'feishu' AND msgId = ${msgId}`.length > 0;
+  }
+
+  // ---- Outbound queue (steward.md §6.1) ----------------------------------------------------------
+
+  async enqueueOutbound(input: {
+    kind: "text" | "card";
+    to: string;
+    text?: string;
+    card?: unknown;
+    threadId?: string | null;
+    urgency?: "push" | "quiet";
+  }): Promise<{ id: string }> {
+    const id = ulid(); // stable across retries; doubles as the provider-side uuid
+    this.sql`
+      INSERT INTO sh_outbound (id, channel, kind, receiveId, threadId, payload, urgency, status, attempts, nextAttemptAt, createdAt)
+      VALUES (${id}, 'feishu', ${input.kind}, ${input.to}, ${input.threadId ?? null},
+              ${JSON.stringify({ text: input.text, card: input.card })}, ${input.urgency ?? "quiet"}, 'queued', 0, ${Date.now()}, ${Date.now()})
+    `;
+    void this.deliverOutbound();
+    return { id };
+  }
+
+  async outboundRow(id: string): Promise<ShOutboundRow | null> {
+    return (this.sql`SELECT * FROM sh_outbound WHERE id = ${id}`[0] as ShOutboundRow | undefined) ?? null;
+  }
+
+  async outboundRows(limit = 10): Promise<ShOutboundRow[]> {
+    return this.sql`SELECT * FROM sh_outbound ORDER BY createdAt, id LIMIT ${limit}` as ShOutboundRow[];
+  }
+
+  // Scheduled callback (also fired inline after each enqueue): claims due rows, sends them
+  // through the adapter, and re-arms itself. Safe to run concurrently — passes serialize on
+  // deliveryChain and the claim guard still makes every row the property of exactly one pass.
+  deliverOutbound(): Promise<void> {
+    const run = this.deliveryChain.then(() => this.deliverOutboundPass());
+    this.deliveryChain = run.catch(() => {});
+    return run;
+  }
+
+  private async deliverOutboundPass(): Promise<void> {
+    // Reclaim rows whose delivery pass died mid-send (claim expired): back to queued.
+    this.sql`UPDATE sh_outbound SET status = 'queued' WHERE status = 'sending' AND claimExpiresAt <= ${Date.now()}`;
+    const due = this.sql<{ id: string }>`
+      SELECT id FROM sh_outbound WHERE status = 'queued' AND nextAttemptAt <= ${Date.now()}
+      ORDER BY createdAt, id LIMIT ${OUTBOUND_BATCH}
+    `;
+    for (const row of due) await this.deliverOneOutbound(row.id);
+    this.rearmDeliveryAlarm();
+  }
+
+  private async deliverOneOutbound(id: string): Promise<void> {
+    const claim = crypto.randomUUID();
+    // The claim (spike bug 1): one conditional, synchronous UPDATE — only a queued row (or one
+    // whose claim has expired) can be taken, so two concurrent passes never both send it.
+    this.sql`
+      UPDATE sh_outbound SET status = 'sending', claimToken = ${claim}, claimExpiresAt = ${Date.now() + OUTBOUND_CLAIM_MS}
+      WHERE id = ${id} AND (status = 'queued' OR (status = 'sending' AND claimExpiresAt <= ${Date.now()}))
+    `;
+    const row = this.sql<{ kind: string; receiveId: string; channel: string; attempts: number; payload: string; threadId: string | null }>`
+      SELECT kind, receiveId, channel, attempts, payload, threadId FROM sh_outbound WHERE id = ${id} AND claimToken = ${claim}
+    `[0];
+    if (!row) return; // another pass owns this row
+
+    const cfg = await this.loadFeishuConfig();
+    if (!cfg || !this.stillOwnsClaim(id, claim)) {
+      this.settleOutboundFailure(id, claim, row.attempts + 1, "channel_not_configured", true);
+      return;
+    }
+
+    // 5 QPS per receiver (feishu-channel.md §4): space this send from the previous one.
+    const pace = this.sql<{ lastSendAt: number }>`
+      SELECT lastSendAt FROM sh_channel_pace WHERE channel = ${row.channel} AND receiveId = ${row.receiveId}
+    `[0];
+    const wait = pace ? pace.lastSendAt + OUTBOUND_SEND_SPACING_MS - Date.now() : 0;
+    if (wait > 0) await sleep(wait);
+
+    const payload = JSON.parse(row.payload) as { text?: string; card?: unknown };
+    try {
+      const { providerMsgId } = await this.newFeishuAdapter(cfg).send({
+        id,
+        to: row.receiveId,
+        kind: row.kind === "card" ? "card" : "text",
+        text: payload.text,
+        card: payload.card,
+        threadId: row.threadId,
+      });
+      this.touchPace(row.channel, row.receiveId);
+      if (!this.stillOwnsClaim(id, claim)) return; // a reclaim took over mid-send; its send settles
+      this.sql`
+        UPDATE sh_outbound SET status = 'sent', providerMsgId = ${providerMsgId}, sentAt = ${Date.now()},
+                               attempts = attempts + 1, claimToken = NULL, claimExpiresAt = NULL, lastError = NULL
+        WHERE id = ${id}
+      `;
+    } catch (err) {
+      // The attempt hit the wire (or timed out at 10s — spike bug 3), so it counts against
+      // the receiver's rate budget either way.
+      this.touchPace(row.channel, row.receiveId);
+      if (!this.stillOwnsClaim(id, claim)) return;
+      const attempts = row.attempts + 1;
+      const retriable = err instanceof RetriableChannelError;
+      this.settleOutboundFailure(id, claim, attempts, errorText(err), !retriable || attempts >= OUTBOUND_MAX_ATTEMPTS);
+    }
+  }
+
+  private settleOutboundFailure(id: string, claim: string, attempts: number, error: string, permanent: boolean): void {
+    if (!this.stillOwnsClaim(id, claim)) return;
+    if (permanent) {
+      this.sql`
+        UPDATE sh_outbound SET status = 'failed', attempts = ${attempts}, lastError = ${error},
+                               claimToken = NULL, claimExpiresAt = NULL
+        WHERE id = ${id}
+      `;
+      return;
+    }
+    const delay = Math.min(OUTBOUND_BACKOFF_BASE_MS * 2 ** Math.max(0, attempts - 1), OUTBOUND_BACKOFF_CAP_MS);
+    this.sql`
+      UPDATE sh_outbound SET status = 'queued', attempts = ${attempts}, nextAttemptAt = ${Date.now() + delay},
+                             lastError = ${error}, claimToken = NULL, claimExpiresAt = NULL
+      WHERE id = ${id}
+    `;
+  }
+
+  private stillOwnsClaim(id: string, claim: string): boolean {
+    const row = this.sql<{ claimToken: string | null }>`SELECT claimToken FROM sh_outbound WHERE id = ${id}`[0];
+    return row?.claimToken === claim;
+  }
+
+  private touchPace(channel: string, receiveId: string): void {
+    this.sql`
+      INSERT INTO sh_channel_pace (channel, receiveId, lastSendAt) VALUES (${channel}, ${receiveId}, ${Date.now()})
+      ON CONFLICT (channel, receiveId) DO UPDATE SET lastSendAt = excluded.lastSendAt
+    `;
+  }
+
+  private rearmDeliveryAlarm(): void {
+    const nextDue = this.sql<{ at: number | null }>`
+      SELECT MIN(nextAttemptAt) AS at FROM sh_outbound WHERE status = 'queued'
+    `[0]?.at ?? null;
+    const nextReclaim = this.sql<{ at: number | null }>`
+      SELECT MIN(claimExpiresAt) AS at FROM sh_outbound WHERE status = 'sending'
+    `[0]?.at ?? null;
+    const candidates = [nextDue, nextReclaim].filter((v): v is number => v !== null);
+    if (candidates.length === 0) return;
+    const at = Math.min(...candidates);
+    void this.schedule(Math.max(1, Math.ceil((at - Date.now()) / 1000)), "deliverOutbound");
   }
 }

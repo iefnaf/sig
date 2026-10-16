@@ -15,3 +15,16 @@ Status: spec and design complete, spike phase concluded — ready for the real i
 - [docs/design/steward.md](docs/design/steward.md): the steward inside the Durable Object (memory module, routing, event pipeline, notifications, proactive behavior)
 
 The spike code (protocol prototype, steward M1/M2, full e2e loop, pi-rpc scripts) was removed after the phase concluded; it is sealed under git tag `spike-final` for reference.
+
+## Deploying the steward
+
+```sh
+cd apps/steward
+wrangler secret put SERVER_KEY    # signs device tokens; rotate by re-running and restarting
+wrangler secret put SETUP_TOKEN   # one-time bootstrap secret for the setup page
+wrangler deploy
+```
+
+After deploy, open `https://<your-domain>/setup?token=<SETUP_TOKEN>` and follow the steps there: create a Feishu custom app, enter its App ID / App Secret / Verification Token (validated live against Feishu), point the app's event subscription at `https://<your-domain>/channels/feishu/events` with the `im.message.receive_v1` event, republish the app, then DM the bot once — the sender becomes the owner and the setup page closes permanently (ADR-0001 decisions 8–9).
+
+Mainland-China users must bind a custom domain to the Worker: `*.workers.dev` is unreachable there, which breaks the web app, the connector, and Feishu's webhook delivery alike (see the [Feishu research](docs/research/feishu-channel.md) §3 and §8.2).

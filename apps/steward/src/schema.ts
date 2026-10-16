@@ -65,4 +65,57 @@ export const MIGRATIONS: readonly Migration[] = [
       sql`CREATE TABLE IF NOT EXISTS worker_ack (workerId TEXT PRIMARY KEY, upTo INTEGER NOT NULL DEFAULT 0)`;
     },
   },
+  {
+    // Channel layer (steward.md §6.1, §9): the `sh_` names follow the design doc so the channel
+    // queue is never confused with the connector protocol `outbox` above.
+    id: "003_channel_feishu",
+    up: (sql) => {
+      // One row per channel once manual credentials are submitted (ADR-0001 decisions 8-9).
+      // Secrets are AES-GCM sealed under SERVER_KEY (secretbox.ts); `ownerOpenId` NULL means
+      // "credentials configured, awaiting the owner's first DM". Once set, setup is closed
+      // forever — the row is never unbound.
+      sql`CREATE TABLE IF NOT EXISTS sh_channel (
+        channel TEXT PRIMARY KEY,
+        appId TEXT NOT NULL,
+        appSecretEnc TEXT NOT NULL,
+        verificationTokenEnc TEXT NOT NULL,
+        ownerOpenId TEXT,
+        configuredAt INTEGER NOT NULL,
+        boundAt INTEGER
+      )`;
+      // Inbound dedup, the persist-before-200 row (steward.md §9.1 / §11): Feishu retries
+      // events, so (channel, msgId) is the idempotency key.
+      sql`CREATE TABLE IF NOT EXISTS sh_inbound (
+        channel TEXT NOT NULL, msgId TEXT NOT NULL, eventId TEXT, eventType TEXT,
+        receivedAt INTEGER NOT NULL,
+        PRIMARY KEY (channel, msgId)
+      )`;
+      // Outbound queue state machine: queued -> sending -> sent | failed. `claimToken` +
+      // `claimExpiresAt` are the double-send guard (spike bug 1); `nextAttemptAt` drives the
+      // alarm-backed exponential backoff (spike bug 3: 10s send timeouts + retries).
+      sql`CREATE TABLE IF NOT EXISTS sh_outbound (
+        id TEXT PRIMARY KEY, channel TEXT NOT NULL DEFAULT 'feishu', kind TEXT NOT NULL,
+        receiveId TEXT NOT NULL, threadId TEXT, payload TEXT NOT NULL,
+        urgency TEXT NOT NULL DEFAULT 'quiet', status TEXT NOT NULL DEFAULT 'queued',
+        attempts INTEGER NOT NULL DEFAULT 0, claimToken TEXT, claimExpiresAt INTEGER,
+        nextAttemptAt INTEGER NOT NULL, providerMsgId TEXT, lastError TEXT,
+        createdAt INTEGER NOT NULL, sentAt INTEGER
+      )`;
+      sql`CREATE INDEX IF NOT EXISTS sh_outbound_due ON sh_outbound (status, nextAttemptAt)`;
+      // "Everything else is ignored and logged": the audit trail for skipped inbound traffic.
+      sql`CREATE TABLE IF NOT EXISTS sh_channel_log (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
+        channel TEXT NOT NULL, reason TEXT NOT NULL, detail TEXT
+      )`;
+      // tenant_access_token cache (steward.md §9.2), refreshed ahead of expiry by an alarm.
+      sql`CREATE TABLE IF NOT EXISTS sh_channel_token (
+        channel TEXT PRIMARY KEY, token TEXT NOT NULL, expiresAt INTEGER NOT NULL
+      )`;
+      // 5 QPS-per-receiver pacing (feishu-channel.md §4): last send time per receive_id.
+      sql`CREATE TABLE IF NOT EXISTS sh_channel_pace (
+        channel TEXT NOT NULL, receiveId TEXT NOT NULL, lastSendAt INTEGER NOT NULL,
+        PRIMARY KEY (channel, receiveId)
+      )`;
+    },
+  },
 ];
