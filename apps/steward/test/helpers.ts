@@ -21,11 +21,29 @@ export async function resetChannelState(): Promise<void> {
       instance as unknown as { sql: (strings: TemplateStringsArray, ...values: unknown[]) => unknown }
     ).sql.bind(instance);
     sql`DELETE FROM sh_channel`;
+    sql`DELETE FROM sh_qr_setup`;
     sql`DELETE FROM sh_inbound`;
     sql`DELETE FROM sh_outbound`;
     sql`DELETE FROM sh_channel_log`;
     sql`DELETE FROM sh_channel_token`;
     sql`DELETE FROM sh_channel_pace`;
+  });
+}
+
+/** Clears everything issue #5's loop touches: the ledger tables, the protocol queues, pairing. */
+export async function resetLedgerState(): Promise<void> {
+  await resetChannelState();
+  await runInDurableObject(ownerStub(), (instance: Steward) => {
+    // The tagged template needs literal fragments; table names are looped, so use the raw
+    // storage executor instead (same SQLite the migrations run on). `ctx` is protected on the
+    // SDK class, hence the shape cast.
+    const storage = (instance as unknown as { ctx: { storage: { sql: { exec: (query: string) => unknown } } } }).ctx.storage;
+    for (const table of [
+      "sh_machine", "sh_repo", "sh_thread", "sh_thread_repo", "sh_worker", "sh_report",
+      "sh_timeline", "sh_question", "sh_notify", "event_inbox", "worker_ack", "outbox",
+    ]) {
+      storage.sql.exec(`DELETE FROM ${table}`);
+    }
   });
 }
 
@@ -40,6 +58,7 @@ export interface MockReply {
 export interface RecordedCall {
   method: string;
   path: string;
+  url: string;
   body: string | null;
   at: number;
 }
@@ -60,6 +79,11 @@ export async function mockQueue(...replies: MockReply[]): Promise<void> {
   await feishuMock().fetch(`${MOCK}/__control/queue`, { method: "POST", body: JSON.stringify(replies) });
 }
 
+/** Scripts the device flow (see vitest.config.ts): `begin`/`polls` are FIFO arrays whose last entry repeats. */
+export async function mockRegistration(script: { begin?: unknown[]; polls?: unknown[] }): Promise<void> {
+  await feishuMock().fetch(`${MOCK}/__control/registration`, { method: "POST", body: JSON.stringify(script) });
+}
+
 export async function mockCalls(): Promise<RecordedCall[]> {
   const res = await feishuMock().fetch(`${MOCK}/__control/calls`, { method: "POST" });
   return res.json();
@@ -71,6 +95,14 @@ export function sendCalls(calls: RecordedCall[]): RecordedCall[] {
 
 export function tokenCalls(calls: RecordedCall[]): RecordedCall[] {
   return calls.filter((c) => c.path.startsWith("/open-apis/auth/v3/tenant_access_token"));
+}
+
+export function registrationCalls(calls: RecordedCall[]): RecordedCall[] {
+  return calls.filter((c) => c.path === "/oauth/v1/app/registration");
+}
+
+export function configPatchCalls(calls: RecordedCall[]): RecordedCall[] {
+  return calls.filter((c) => c.method === "PATCH" && /\/open-apis\/application\/v7\/applications\/[^/]+\/config$/.test(c.path));
 }
 
 // The credentials every helper below uses; the webhook's verification token must match
@@ -85,11 +117,49 @@ export async function submitSetupCredentials(
   appSecret = TEST_APP_SECRET,
   verificationToken = TEST_VERIFY_TOKEN,
 ): Promise<Response> {
-  const body = new URLSearchParams({ appId, appSecret, verificationToken });
+  const body = new URLSearchParams({ action: "manual", appId, appSecret, verificationToken });
   return SELF.fetch(SETUP_URL, {
     method: "POST",
     body,
     headers: { "content-type": "application/x-www-form-urlencoded" },
+  });
+}
+
+/** Posts a setup-page action (QR flow start / scope scan / webhook PATCH). */
+export function postSetupAction(action: string): Promise<Response> {
+  return SELF.fetch(SETUP_URL, {
+    method: "POST",
+    body: new URLSearchParams({ action }),
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+  });
+}
+
+/** Polls the QR state machine until the given phase appears (alarm-driven, so async). */
+export async function waitForQrPhase(phase: string | string[], timeoutMs = 20_000): Promise<void> {
+  const wanted = Array.isArray(phase) ? phase : [phase];
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const row = await ownerStub().qrSetupState();
+    if (row && wanted.includes(row.phase)) return;
+    if (Date.now() > deadline) throw new Error(`qr phase ${wanted.join("|")} not reached; now: ${row?.phase ?? "none"} err=${row?.lastError ?? "-"}`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+/** The decrypted channel config, read inside the DO — tests need the QR-generated verification token. */
+export interface ChannelConfigView {
+  appId: string;
+  appSecret: string;
+  verificationToken: string;
+  ownerOpenId: string | null;
+  brand: "feishu" | "lark";
+  source: "manual" | "qr";
+  webhookStatus: string | null;
+}
+export async function readChannelConfig(): Promise<ChannelConfigView | null> {
+  return runInDurableObject(ownerStub(), async (instance: Steward) => {
+    const load = (instance as unknown as { loadFeishuConfig: () => Promise<ChannelConfigView | null> }).loadFeishuConfig;
+    return await load.call(instance);
   });
 }
 
@@ -257,4 +327,200 @@ export async function connectAndHello(
   ws.send(JSON.stringify(helloPayload(deviceId, connEpoch, overrides)));
   const welcome = await reader.nextWhere((m) => m.t === "welcome");
   return { ws, reader, welcome };
+}
+
+// ---- The protocol-level fake worker (issue #5 e2e) ----------------------------------------------
+//
+// The connector's own e2e (apps/connector/test/e2e-worker.test.ts) drives the real
+// WorkerManager with fake-pi over a mock steward. Steward-side tests run inside workerd,
+// where Node APIs (node:sqlite, child_process) do not exist — so this class stands in for
+// "connector + fake-pi" at the protocol level: it speaks hello/cmd_ack/cmd_result/events and
+// plays a scripted worker (started → progress → report(+git) → settled) for every start_worker
+// it receives, with the same event shapes fake-pi produces.
+
+export interface FakeRepo {
+  repoId: string;
+  name: string;
+  path?: string;
+}
+
+export interface FakeWorkerRun {
+  status?: "done" | "blocked" | "needs_decision";
+  summary?: string;
+  changes?: string[];
+  question?: string;
+  next?: string;
+  leftovers?: string[];
+  tests?: { ran: boolean; passed?: boolean; note?: string };
+  /** Emitted as the `started` event's branch and the report's git facts. */
+  branch?: string;
+  /** Extra delay (ms) between the report and settled events. */
+  settleDelayMs?: number;
+}
+
+export class FakeConnector {
+  readonly deviceId: string;
+  readonly token: string;
+  readonly machineName: string;
+  readonly repos: FakeRepo[];
+  ws: WebSocket | null = null;
+  reader: MessageReader | null = null;
+  /** Every `cmd` frame received so far; assert with `waitForCmds`. */
+  readonly cmds: Array<Record<string, unknown>> = [];
+  private readonly seqs = new Map<string, number>();
+  private readonly connEpochs = new Map<string, number>();
+  private readonly runs: FakeWorkerRun[] = [];
+  private readonly autorun: boolean;
+
+  constructor(options: {
+    deviceId: string;
+    token: string;
+    machineName?: string;
+    repos: FakeRepo[];
+    run?: FakeWorkerRun | null;
+    /** Set false to script worker behavior by hand (`emit`) instead of the canned run. */
+    autorun?: boolean;
+  }) {
+    this.deviceId = options.deviceId;
+    this.token = options.token;
+    this.machineName = options.machineName ?? "mac-studio";
+    this.repos = options.repos;
+    this.runs = options.run === null ? [] : [options.run ?? {}];
+    this.autorun = options.autorun ?? true;
+  }
+
+  /** Per-run script: each start_worker consumes the next entry (default: a plain done run). */
+  queueRun(run: FakeWorkerRun | null): void {
+    this.runs.push(run ?? {});
+  }
+
+  helloOverrides(): Record<string, unknown> {
+    return {
+      machine: { name: this.machineName, memTotalMB: 65536, memFreeMB: 31000 },
+      agents: [
+        {
+          kind: "pi",
+          version: "1.2.0",
+          capabilities: { steer: true, followUp: true, interrupt: true, resume: true, history: true, images: true, structuredReport: true, readonly: true },
+        },
+      ],
+      repos: this.repos.map((r) => ({
+        repoId: r.repoId,
+        name: r.name,
+        path: r.path ?? `/srv/${r.name}`,
+        defaultBranch: "main",
+        remote: `git@github.com:example/${r.name}.git`,
+      })),
+      limits: { maxWorkers: 4, running: 0 },
+    };
+  }
+
+  async connect(connEpoch?: number): Promise<void> {
+    const epoch = connEpoch ?? (this.connEpochs.get(this.deviceId) ?? 0) + 1;
+    this.connEpochs.set(this.deviceId, epoch);
+    const { ws, reader } = await connectAndHello(this.deviceId, this.token, epoch, this.helloOverrides());
+    this.ws = ws;
+    this.reader = reader;
+    void this.listen();
+  }
+
+  /** Single consumer of the shared reader: records cmds, plays scripted runs. */
+  private async listen(): Promise<void> {
+    const reader = this.reader;
+    const ws = this.ws;
+    if (!reader || !ws) return;
+    while (this.ws === ws && this.reader === reader) {
+      let message: Record<string, unknown>;
+      try {
+        message = await reader.next(250);
+      } catch {
+        continue; // poll timeout: re-check liveness so close() ends the loop
+      }
+      if (message.t !== "cmd") continue;
+      this.cmds.push(message);
+      if (this.autorun && message.kind === "start_worker") {
+        const run = this.runs.length > 1 ? this.runs.shift() : (this.runs[0] ?? {});
+        try {
+          await this.playRun(message, run ?? {});
+        } catch {
+          // socket closed mid-run; the reconnect test replays from there
+        }
+      }
+    }
+  }
+
+  /** Waits until `count` cmd frames have arrived and returns them in order. */
+  async waitForCmds(count: number, timeoutMs = 5000): Promise<Array<Record<string, unknown>>> {
+    const startedAt = Date.now();
+    for (;;) {
+      if (this.cmds.length >= count) return this.cmds.slice(0, count);
+      if (Date.now() - startedAt > timeoutMs) throw new Error(`only ${this.cmds.length}/${count} cmds arrived`);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+
+  /** Scripted worker behavior: ack → result → started → progress → report(+git) → settled. */
+  private async playRun(cmd: Record<string, unknown>, run: FakeWorkerRun): Promise<void> {
+    const args = cmd.args as Record<string, unknown>;
+    const workerId = String(args.workerId);
+    const branch = run.branch ?? `shepherd/${String(args.threadId).replace(/[^a-zA-Z0-9._-]/g, "")}-1`;
+    this.send({ t: "cmd_ack", re: cmd.id, status: "accepted" });
+    this.send({
+      t: "cmd_result",
+      re: cmd.id,
+      ok: true,
+      data: { sessionId: workerId, branch, cwd: `/srv/${String(args.repoId)}` },
+    });
+    await this.emit("started", workerId, { sessionId: workerId, cwd: "/srv", branch });
+    await this.emit("progress", workerId, { type: "progress", phase: "tool", tool: "edit", target: "src/a.ts", turn: 1 });
+    await this.emit("report", workerId, {
+      type: "report",
+      status: run.status ?? "done",
+      summary: run.summary ?? "任务完成",
+      ...(run.changes ? { changes: run.changes } : {}),
+      ...(run.question ? { question: run.question } : {}),
+      ...(run.next ? { next: run.next } : {}),
+      ...(run.leftovers ? { leftovers: run.leftovers } : {}),
+      ...(run.tests ? { tests: run.tests } : {}),
+      git: { branch, base: "main", ahead: 1, dirty: 0, filesChanged: 2, insertions: 10, deletions: 2, pushed: false },
+    });
+    if (run.settleDelayMs) await new Promise((resolve) => setTimeout(resolve, run.settleDelayMs));
+    await this.emit("settled", workerId, {
+      type: "settled",
+      outcome: "reported",
+      usage: { tokens: { input: 100, output: 20 }, cost: 0.001 },
+    });
+  }
+
+  /** Sends one worker event with the next seq for that worker (connector-persisted seqs). */
+  async emit(kind: "started" | "progress" | "report" | "settled", workerId: string, fields: Record<string, unknown>): Promise<void> {
+    const seq = (this.seqs.get(workerId) ?? 0) + 1;
+    this.seqs.set(workerId, seq);
+    this.send({ t: "events", id: `evt-${workerId}-${seq}`, batch: [{ workerId, seq, ts: Date.now(), type: kind, ...fields }] });
+  }
+
+  private send(message: Record<string, unknown>): void {
+    if (!this.ws) throw new Error("fake connector not connected");
+    this.ws.send(JSON.stringify(message));
+  }
+
+  close(): void {
+    const ws = this.ws;
+    this.ws = null;
+    this.reader = null;
+    try {
+      ws?.close(); // real close: the DO's onClose flips the machine offline
+    } catch {
+      // already closed
+    }
+  }
+}
+
+/** Pairs a device for the fake connector and returns it, ready to connect. */
+export async function pairFakeConnector(
+  name = "mac-studio",
+  options: { run?: FakeWorkerRun | null; repos?: FakeRepo[] } = {},
+): Promise<FakeConnector> {
+  const { deviceId, token } = await pairDevice(name);
+  return new FakeConnector({ deviceId, token, repos: options.repos ?? [{ repoId: "/srv/repo-a", name: "repo-a" }], run: options.run });
 }

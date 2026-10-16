@@ -155,8 +155,7 @@ describe("PiProcess (rpc.md framing + spike-conclusions §2)", () => {
       command: [
         process.execPath,
         "-e",
-        `process.stderr.write("sk-abcdefghijklmnopqrst secret\\n");
-         for (let i = 0; i < 60; i++) process.stderr.write("noise " + i + " " + "x".repeat(100) + "\\n");`,
+        `for (let i = 0; i < 60; i++) process.stderr.write("sk-abcdefghijklmnopqrst noise " + i + " " + "x".repeat(60) + "\\n");`,
       ],
       args: [],
       cwd: dir,
@@ -168,9 +167,12 @@ describe("PiProcess (rpc.md framing + spike-conclusions §2)", () => {
     proc.spawn();
     await proc.waitExit();
 
+    // Every line carried the key, so any window the cap kept is fully redacted — the
+    // assertion cannot depend on which chunk boundaries the platform happens to deliver.
     const content = readFileSync(stderrFile, "utf8");
     expect(content).not.toContain("sk-abcdefghijklmnopqrst");
     expect(content).toContain("[redacted]");
-    expect(content.length).toBeLessThan(8192);
+    expect(content.length).toBeLessThan(8192); // bounded (worst case: one big final append)
+    expect(content).toContain("noise 59");
   });
 });

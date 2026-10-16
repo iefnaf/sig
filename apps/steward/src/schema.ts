@@ -108,6 +108,8 @@ export const MIGRATIONS: readonly Migration[] = [
         channel TEXT NOT NULL, reason TEXT NOT NULL, detail TEXT
       )`;
       // tenant_access_token cache (steward.md §9.2), refreshed ahead of expiry by an alarm.
+      // The token is a Feishu bearer credential: sealed at rest (issue #27; the column is
+      // renamed to tokenEnc by migration 004).
       sql`CREATE TABLE IF NOT EXISTS sh_channel_token (
         channel TEXT PRIMARY KEY, token TEXT NOT NULL, expiresAt INTEGER NOT NULL
       )`;
@@ -116,6 +118,155 @@ export const MIGRATIONS: readonly Migration[] = [
         channel TEXT NOT NULL, receiveId TEXT NOT NULL, lastSendAt INTEGER NOT NULL,
         PRIMARY KEY (channel, receiveId)
       )`;
+    },
+  },
+  {
+    // Ledger core (issue #5, steward.md §2.2 / §5): the sh_* tables the memory module owns.
+    // Callers reach them only through ledger.ts — never with raw SQL.
+    id: "004_ledger_core",
+    up: (sql) => {
+      // Machines. `online` derives from live connections, never asserted by anyone else.
+      // `reliability` (online habits) is record-only in the MVP (steward.md §2.2).
+      sql`CREATE TABLE IF NOT EXISTS sh_machine (
+        deviceId TEXT PRIMARY KEY, name TEXT NOT NULL, online INTEGER NOT NULL DEFAULT 0,
+        lastSeen INTEGER, agents TEXT, maxWorkers INTEGER NOT NULL DEFAULT 1,
+        reliability TEXT
+      )`;
+      // Repositories reported by connectors at hello; one row per (repo, machine).
+      sql`CREATE TABLE IF NOT EXISTS sh_repo (
+        repoId TEXT NOT NULL, deviceId TEXT NOT NULL, name TEXT NOT NULL, path TEXT NOT NULL,
+        defaultBranch TEXT, remote TEXT, updatedAt INTEGER NOT NULL,
+        PRIMARY KEY (repoId, deviceId)
+      )`;
+      sql`CREATE INDEX IF NOT EXISTS sh_repo_name ON sh_repo (name)`;
+      // Threads. `state` is derived (steward.md §5.2): recomputed by the reducer after every
+      // change, never set directly by the LLM or the user. `lastMachine` is dispatch affinity
+      // (spike bug 4): a continuation goes back to the same machine and queues while offline.
+      sql`CREATE TABLE IF NOT EXISTS sh_thread (
+        threadId TEXT PRIMARY KEY, title TEXT NOT NULL, goal TEXT,
+        state TEXT NOT NULL DEFAULT 'idle', unread INTEGER NOT NULL DEFAULT 0,
+        lastMachine TEXT, lastActivityAt INTEGER NOT NULL,
+        archived INTEGER NOT NULL DEFAULT 0, createdFromMsg TEXT, createdAt INTEGER NOT NULL
+      )`;
+      sql`CREATE TABLE IF NOT EXISTS sh_thread_repo (
+        threadId TEXT NOT NULL, repoId TEXT NOT NULL, PRIMARY KEY (threadId, repoId)
+      )`;
+      // One row per worker session (steward.md §2.2; parentWorker/relay arrives with M2).
+      sql`CREATE TABLE IF NOT EXISTS sh_worker (
+        workerId TEXT PRIMARY KEY, threadId TEXT NOT NULL, deviceId TEXT NOT NULL, repoId TEXT,
+        agent TEXT NOT NULL, mode TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'starting', sessionId TEXT, branch TEXT, cmdId TEXT,
+        lastOutcome TEXT, lastEventAt INTEGER, lastProgress TEXT,
+        createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL
+      )`;
+      sql`CREATE INDEX IF NOT EXISTS sh_worker_thread ON sh_worker (threadId)`;
+      // A worker's structured closing report (the protocol `report` event); raw material for
+      // handoff briefs and the deterministic done-report card. Keyed (workerId, seq): the
+      // reducer only ever processes a seq once (worker_ack.processedUpTo).
+      sql`CREATE TABLE IF NOT EXISTS sh_report (
+        workerId TEXT NOT NULL, seq INTEGER NOT NULL, threadId TEXT NOT NULL,
+        status TEXT NOT NULL, summary TEXT NOT NULL,
+        changes TEXT, decisions TEXT, leftovers TEXT, tests TEXT, question TEXT, next TEXT, git TEXT,
+        receivedAt INTEGER NOT NULL,
+        PRIMARY KEY (workerId, seq)
+      )`;
+      // Summary-level timeline (L2): user instructions, dispatches, reports, questions,
+      // system notes. No raw transcripts.
+      sql`CREATE TABLE IF NOT EXISTS sh_timeline (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, threadId TEXT NOT NULL, ts INTEGER NOT NULL,
+        kind TEXT NOT NULL, text TEXT NOT NULL, refs TEXT
+      )`;
+      sql`CREATE INDEX IF NOT EXISTS sh_timeline_thread ON sh_timeline (threadId, id)`;
+      // Open questions; the basis of the "waiting for you" state (steward.md §5.2).
+      sql`CREATE TABLE IF NOT EXISTS sh_question (
+        qid TEXT PRIMARY KEY, threadId TEXT NOT NULL, workerId TEXT,
+        text TEXT NOT NULL, options TEXT, status TEXT NOT NULL DEFAULT 'open',
+        askedAt INTEGER NOT NULL, answeredAt INTEGER
+      )`;
+      sql`CREATE INDEX IF NOT EXISTS sh_question_thread ON sh_question (threadId, status)`;
+      // Notification intents: written inside the reducer's transaction, drained afterwards
+      // into sh_outbound (steward.md §5.1 step 4). A crash between commit and send leaves the
+      // row pending; the next wake drains it — done reports must not depend on in-memory state.
+      sql`CREATE TABLE IF NOT EXISTS sh_notify (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, dedupeKey TEXT NOT NULL UNIQUE,
+        kind TEXT NOT NULL, threadId TEXT NOT NULL, workerId TEXT,
+        createdAt INTEGER NOT NULL, sentAt INTEGER
+      )`;
+      // Reducer watermark (protocol §4.3 "processing decoupled from persistence"): events are
+      // persisted to event_inbox + acked by the transport, then applied to the ledger exactly
+      // once per (workerId, seq), in order, stopping at gaps.
+      ignoringDuplicateColumn(() => {
+        sql`ALTER TABLE worker_ack ADD COLUMN processedUpTo INTEGER NOT NULL DEFAULT 0`;
+      });
+      // "Reply to this message → which Thread" (steward.md §3.1 signal 1).
+      sql`CREATE INDEX IF NOT EXISTS sh_outbound_provider_msg ON sh_outbound (providerMsgId)`;
+    },
+  },
+  {
+    // QR-code onboarding (issue #24, steward.md §9.0): the device-flow state machine lives in
+    // `sh_qr_setup` (one row — a deployment runs one onboarding); the resulting per-app facts
+    // (brand, source, webhook-switch progress) extend the `sh_channel` row.
+    id: "005_qr_onboarding",
+    up: (sql) => {
+      ignoringDuplicateColumn(() => {
+        // `source` distinguishes the QR flow (owner bound at scan time; setup stays open until
+        // webhook delivery is verified) from the manual flow (closed on the owner's first DM).
+        // NULL reads as 'manual' — the pre-#24 rows and SERVER_KEY-rotation recoveries.
+        sql`ALTER TABLE sh_channel ADD COLUMN source TEXT`;
+        sql`ALTER TABLE sh_channel ADD COLUMN brand TEXT NOT NULL DEFAULT 'feishu'`;
+        sql`ALTER TABLE sh_channel ADD COLUMN webhookStatus TEXT`;
+        sql`ALTER TABLE sh_channel ADD COLUMN webhookPatchedAt INTEGER`;
+        sql`ALTER TABLE sh_channel ADD COLUMN webhookVerifiedAt INTEGER`;
+      });
+      // phase: awaiting_scan (QR #1) -> awaiting_scope_scan (QR #2) -> scope_added (PATCH
+      // pending/failed) -> webhook_patched (console republish + first event awaited) -> done;
+      // failed is terminal for the create flow (restart offered), created = scan #1 done but
+      // scan #2 not begun. `origin` is the setup page's origin — the source of the PATCH's
+      // request_url and of the prefilled, deployment-distinguishing bot name.
+      sql`CREATE TABLE IF NOT EXISTS sh_qr_setup (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        phase TEXT NOT NULL,
+        flow TEXT NOT NULL,
+        deviceCode TEXT NOT NULL,
+        brand TEXT NOT NULL DEFAULT 'feishu',
+        intervalS INTEGER NOT NULL,
+        expiresAt INTEGER NOT NULL,
+        qrUrl TEXT NOT NULL,
+        userCode TEXT,
+        origin TEXT,
+        lastError TEXT,
+        updatedAt INTEGER NOT NULL
+      )`;
+    },
+  },
+  {
+    // Security hardening (issue #27): /pair brute-force lockout + sealed credentials.
+    id: "006_security_hardening",
+    up: (sql) => {
+      // Sliding failure windows for /pair (protocol doc §5.2): 5 failures lock the bucket for
+      // 15 minutes. One row per source IP (`scope='ip'`) plus one global bucket (`scope='all'`)
+      // so a distributed guesser cannot sidestep the per-IP lock.
+      sql`CREATE TABLE IF NOT EXISTS pair_fail (
+        scope TEXT NOT NULL,
+        key TEXT NOT NULL,
+        fails INTEGER NOT NULL DEFAULT 0,
+        windowStart INTEGER NOT NULL,
+        lockedUntil INTEGER NOT NULL DEFAULT 0,
+        updatedAt INTEGER NOT NULL,
+        PRIMARY KEY (scope, key)
+      )`;
+      // Model provider credentials (spec §12.2 "model keys stored encrypted"): single row,
+      // apiKey AES-GCM sealed under SERVER_KEY exactly like the Feishu secrets. The LLM wiring
+      // (M2) reads it back through Steward.modelConfig(); nothing stores the raw key.
+      sql`CREATE TABLE IF NOT EXISTS sh_model (
+        id INTEGER PRIMARY KEY CHECK (id = 0),
+        provider TEXT NOT NULL,
+        apiKeyEnc TEXT NOT NULL,
+        updatedAt INTEGER NOT NULL
+      )`;
+      // The cached tenant_access_token is a Feishu bearer credential — seal it too. 003 always
+      // ran before this (fresh and existing installs alike), so the rename never misses.
+      sql`ALTER TABLE sh_channel_token RENAME COLUMN token TO tokenEnc`;
     },
   },
 ];
