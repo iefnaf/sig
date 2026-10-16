@@ -371,45 +371,63 @@ async function addRepo(path: string | undefined): Promise<void> {
 
 // --- repo-config -----------------------------------------------------------------------------
 
+/** Parses repo-config argv: positional path + `--workspace worktree|serial|main` (also the
+ * `--workspace=x` form) + `--approve|--no-approve`. Unknown flags fail loudly instead of
+ * silently degrading into a read-only invocation (review finding 4). */
+function parseRepoConfigArgv(argv: string[]): { path?: string; workspace?: string; approve?: boolean } {
+  // Expand `--flag=value` into `--flag value` so both spellings share one path.
+  const expanded: string[] = [];
+  for (const token of argv) {
+    const eq = token.indexOf("=");
+    if (token.startsWith("--") && eq !== -1) expanded.push(token.slice(0, eq), token.slice(eq + 1));
+    else expanded.push(token);
+  }
+  const { value: workspace, rest } = takeFlag(expanded, "--workspace");
+  if (expanded.includes("--workspace") && workspace === undefined) {
+    fail("--workspace requires a value: worktree | serial | main");
+  }
+  if (rest.includes("--approve") && rest.includes("--no-approve")) {
+    fail("--approve and --no-approve are mutually exclusive");
+  }
+  const approve = rest.includes("--approve") ? true : rest.includes("--no-approve") ? false : undefined;
+  const positional = rest.filter((token) => !token.startsWith("--"));
+  const knownBooleans = new Set(["--approve", "--no-approve"]);
+  const unknown = rest.filter((token) => token.startsWith("--") && !knownBooleans.has(token));
+  if (unknown.length > 0) fail(`unknown option(s): ${unknown.join(" ")} (expected --workspace, --approve, or --no-approve)`);
+  return { path: positional[0], workspace, approve };
+}
+
 /** `shepherd repo-config <path> [--workspace worktree|serial|main] [--approve|--no-approve]`
  * (§8.2/§13, issue #16): the per-repo settings that live only in the connector's local
  * store. A command from the steward carrying them is rejected; this is the only writer.
- * With no flags it just prints the current configuration. */
+ * With no settings flags it just prints the current configuration. */
 async function repoConfig(argv: string[]): Promise<void> {
-  const [path] = argv.filter((a) => !a.startsWith("--"));
+  const { path, workspace, approve } = parseRepoConfigArgv(argv);
   if (!path) usage();
-  const { value: workspace } = takeFlag(argv, "--workspace");
-  const approve = argv.includes("--approve") ? true : argv.includes("--no-approve") ? false : undefined;
   if (workspace !== undefined && !isWorkspaceMode(workspace)) {
     fail(`unknown workspace mode '${workspace}' (expected one of: ${WORKSPACE_MODES.join(" | ")})`);
-  }
-  if (argv.includes("--approve") && argv.includes("--no-approve")) {
-    fail("--approve and --no-approve are mutually exclusive");
-  }
-  if (workspace === undefined && approve === undefined) {
-    // Read-only invocation: show the current settings.
-    const topLevel = await repoTopLevel(path);
-    const store = new LocalStore(join(stateDir(), "connector.sqlite"));
-    try {
-      const repo = store.getRepo(topLevel);
-      if (!repo) fail(`${topLevel} is not registered; run 'shepherd add-repo ${path}' first`);
-      console.log(`${repo.name} (${repo.repoId})`);
-      console.log(`workspace: ${repo.workspace}`);
-      console.log(`approved:  ${repo.approved ? "yes (pi runs with --approve)" : "no (pi runs with --no-approve)"}`);
-    } finally {
-      store.close();
-    }
-    return;
   }
 
   const topLevel = await repoTopLevel(path);
   const store = new LocalStore(join(stateDir(), "connector.sqlite"));
   try {
-    if (!store.setRepoConfig(topLevel, { ...(workspace !== undefined ? { workspace } : {}), ...(approve !== undefined ? { approved: approve } : {}) })) {
+    const repo = store.getRepo(topLevel);
+    if (!repo) {
       fail(`${topLevel} is not registered; run 'shepherd add-repo ${path}' first`);
     }
-    const repo = store.getRepo(topLevel)!;
-    console.log(`${repo.name}: workspace=${repo.workspace}, approved=${repo.approved ? "yes" : "no"}`);
+    if (workspace === undefined && approve === undefined) {
+      // Read-only invocation: show the current settings.
+      console.log(`${repo.name} (${repo.repoId})`);
+      console.log(`workspace: ${repo.workspace}`);
+      console.log(`approved:  ${repo.approved ? "yes (pi runs with --approve)" : "no (pi runs with --no-approve)"}`);
+      return;
+    }
+    store.setRepoConfig(topLevel, {
+      ...(workspace !== undefined ? { workspace } : {}),
+      ...(approve !== undefined ? { approved: approve } : {}),
+    });
+    const updated = store.getRepo(topLevel)!;
+    console.log(`${updated.name}: workspace=${updated.workspace}, approved=${updated.approved ? "yes" : "no"}`);
   } finally {
     store.close();
   }

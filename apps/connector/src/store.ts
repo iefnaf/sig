@@ -90,6 +90,10 @@ export class LocalStore {
     // steward gets their effects but can never set them.
     this.addColumnIfMissing("repo", "workspace", "TEXT NOT NULL DEFAULT 'worktree'");
     this.addColumnIfMissing("repo", "approved", "INTEGER NOT NULL DEFAULT 0");
+    // Review finding 5 (PR #43): marks a worktree removed by cleanup_worktree, so a later
+    // manual resume can be refused instead of silently running write-mode in the checkout.
+    // A NULL worktree alone cannot carry that meaning — synthetic/legacy rows have it NULL.
+    this.addColumnIfMissing("worker", "worktreeCleanedAt", "INTEGER");
     // §9.3: the latest 5-second descendant snapshot per running worker.
     this.db.exec(`CREATE TABLE IF NOT EXISTS orphan_snapshot (
       workerId TEXT PRIMARY KEY,
@@ -245,7 +249,7 @@ export class LocalStore {
     return (
       (this.db
         .prepare(
-          `SELECT workerId, threadId, repoId, mode, state, sessionId, sessionFile, branch, worktree, base, lastOutcome, createdAt, updatedAt
+          `SELECT workerId, threadId, repoId, mode, state, sessionId, sessionFile, branch, worktree, base, worktreeCleanedAt, lastOutcome, createdAt, updatedAt
            FROM worker WHERE workerId = ?`,
         )
         .get(workerId) as WorkerRow | undefined) ?? null
@@ -262,7 +266,7 @@ export class LocalStore {
     // Creation order (workerId as tiebreak): the serial write queue drains FIFO on it.
     return this.db
       .prepare(
-        `SELECT workerId, threadId, repoId, mode, state, sessionId, sessionFile, branch, worktree, base, lastOutcome, createdAt, updatedAt
+        `SELECT workerId, threadId, repoId, mode, state, sessionId, sessionFile, branch, worktree, base, worktreeCleanedAt, lastOutcome, createdAt, updatedAt
          FROM worker ORDER BY createdAt, workerId`,
       )
       .all() as unknown as WorkerRow[];
@@ -271,8 +275,10 @@ export class LocalStore {
   /** Drops the worktree/branch columns after cleanup_worktree removed the directory. */
   clearWorkerWorktree(workerId: string): void {
     this.db
-      .prepare("UPDATE worker SET worktree = NULL, branch = NULL, base = NULL, updatedAt = ? WHERE workerId = ?")
-      .run(Date.now(), workerId);
+      .prepare(
+        "UPDATE worker SET worktree = NULL, branch = NULL, base = NULL, worktreeCleanedAt = ?, updatedAt = ? WHERE workerId = ?",
+      )
+      .run(Date.now(), Date.now(), workerId);
   }
 
   // --- Serial write queue (connector-pi.md §8.2, issue #16) ----------------------------
@@ -378,6 +384,8 @@ export interface WorkerRow {
   worktree?: string | null;
   /** The commit-ish the worktree branch started from (§8.2); git-facts input after a restart. */
   base?: string | null;
+  /** Set by cleanup_worktree (review finding 5): the worktree is gone on purpose. */
+  worktreeCleanedAt?: number | null;
   lastOutcome?: string | null;
   createdAt?: number;
   updatedAt?: number;

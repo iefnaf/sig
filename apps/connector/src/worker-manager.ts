@@ -4,7 +4,7 @@
 // into the `report` event, and the §9 failure/recovery slice — orphan cleanup from
 // descendant snapshots (§9.3), startup reconciliation with the session-tail check (§9.1),
 // and automatic resume with the fixed prompt, 30 s backoff, and the ≤2/hour budget (§9.2).
-import type { AgentAdapter, ErrorClass, RawAdapterEvent, StartSpec, WorkerMode } from "./agent.ts";
+import type { AgentAdapter, ErrorClass, RawAdapterEvent, StartSpec, WorkerHandle, WorkerMode } from "./agent.ts";
 import { classifyError } from "./adjudication.ts";
 import { killOrphans, listDescendants, type ProcRef } from "./descendants.ts";
 import { collectGitFacts } from "./git-facts.ts";
@@ -120,6 +120,12 @@ export class WorkerManager {
   private readonly resumeTimers = new Map<string, NodeJS.Timeout>();
   /** Repos with a queued-write launch in flight (guards pump re-entry). */
   private readonly pumpingRepos = new Set<string>();
+  /** Workers with a launch between its synchronous `starting` claim and `running` — the
+   * window in which a stop cannot reach the process through the adapter yet. */
+  private readonly launching = new Set<string>();
+  /** Workers stopped while `launching`: the launch checks this after every await and bails
+   * without touching the stop's bookkeeping (review finding 3). */
+  private readonly stopRequested = new Set<string>();
   /** Set by simulateCrash: a crashed instance processes nothing further. */
   private crashed = false;
 
@@ -236,70 +242,97 @@ export class WorkerManager {
   /** Everything after validation: lock, workspace resolution (§8.2), the `starting` row,
    * adapter start, and the `started` event. Both the direct path and the serial pump land
    * here; launch failures surface as CommandError (the direct path forwards them to
-   * cmd_result, the pump breaks the worker instead). */
+   * cmd_result, the pump breaks the worker instead).
+   *
+   * The `starting` row is written BEFORE the first await: from the serial queue check in
+   * startWorker to this claim there is no await, so overlapping start_worker commands can
+   * never both see an empty slot (review finding 1 — commands run concurrently in the
+   * client, only the single JS turn serializes them). The same claim closes the stop-vs-pump
+   * window (finding 3): a stop landing after the claim sees `starting`, not `queued`. */
   private async launchWorker(commandId: string, args: StartWorkerArgs, repo: RegisteredRepo): Promise<StartWorkerResult> {
     // --- One process per session (§4.3): lock file, `lock_held` when alive, stale removed.
     const lock = acquireLock(this.stateDir, args.workerId);
     if (!lock.ok) {
       throw new CommandError("lock_held", `worker ${args.workerId} is locked by pid ${lock.pid}`, true);
     }
+    this.launching.add(args.workerId);
 
-    // --- §8.2 workspace resolution. Write + worktree/serial → a dedicated worktree; write +
-    // main, and every readonly run (§8.3) → the repository's own checkout, no worktree.
-    const useWorktree = args.mode === "write" && repo.workspace !== "main";
-    let cwd = repo.path;
-    let branch: string | undefined;
-    let base: string | undefined;
-    let worktree: string | undefined;
-    if (useWorktree) {
-      try {
-        const created = await this.worktrees.create({ repoPath: repo.path, threadId: args.threadId, base: args.base });
-        cwd = created.path;
-        branch = created.branch;
-        base = created.base;
-        worktree = created.path;
-      } catch (err) {
-        releaseLock(this.stateDir, args.workerId);
-        const message = err instanceof Error ? err.message : String(err);
-        throw new CommandError("worktree_failed", `could not create worktree: ${message}`);
-      }
-    }
-    // `main` mode ignores `base`: the checkout is whatever the owner left it at — the
-    // connector never checks branches out in the user's own working directory.
-
+    // Synchronous slot claim: the row exists (state `starting`) before any await, so a
+    // concurrent start_worker / stop_process / pump decision reads this launch, not a void.
     this.store.upsertWorker({
       workerId: args.workerId,
       threadId: args.threadId,
       repoId: args.repoId,
       mode: args.mode,
       state: "starting",
-      branch,
-      worktree,
-      base,
     });
-    this.active.set(args.workerId, { repoId: args.repoId, worktree, branch, base });
-
-    const spec: StartSpec = {
-      workerId: args.workerId,
-      threadId: args.threadId,
-      cwd,
-      mode: args.mode,
-      prompt: args.prompt,
-      commandId,
-      // §13: approveProject comes from the repo's local config, never from the command.
-      approveProject: repo.approved === true ? true : undefined,
-      images: args.images,
-      model: args.model,
-    };
 
     try {
-      const handle = await this.adapter.start(spec);
+      // --- §8.2 workspace resolution. Write + worktree/serial → a dedicated worktree; write +
+      // main, and every readonly run (§8.3) → the repository's own checkout, no worktree.
+      const useWorktree = args.mode === "write" && repo.workspace !== "main";
+      let cwd = repo.path;
+      let branch: string | undefined;
+      let base: string | undefined;
+      let worktree: string | undefined;
+      if (useWorktree) {
+        try {
+          const created = await this.worktrees.create({ repoPath: repo.path, threadId: args.threadId, base: args.base });
+          if (this.stopRequested.has(args.workerId)) throw new CommandError("aborted", "worker was stopped during startup");
+          cwd = created.path;
+          branch = created.branch;
+          base = created.base;
+          worktree = created.path;
+        } catch (err) {
+          if (err instanceof CommandError) throw err;
+          const message = err instanceof Error ? err.message : String(err);
+          throw new CommandError("worktree_failed", `could not create worktree: ${message}`);
+        }
+      }
+      // `main` mode ignores `base`: the checkout is whatever the owner left it at — the
+      // connector never checks branches out in the user's own working directory.
+      if (this.stopRequested.has(args.workerId)) {
+        throw new CommandError("aborted", "worker was stopped during startup");
+      }
+
+      this.active.set(args.workerId, { repoId: args.repoId, worktree, branch, base });
+
+      const spec: StartSpec = {
+        workerId: args.workerId,
+        threadId: args.threadId,
+        cwd,
+        mode: args.mode,
+        prompt: args.prompt,
+        commandId,
+        // §13: approveProject comes from the repo's local config, never from the command.
+        approveProject: repo.approved === true ? true : undefined,
+        images: args.images,
+        model: args.model,
+      };
+
+      let handle: WorkerHandle;
+      try {
+        handle = await this.adapter.start(spec);
+      } catch (err) {
+        if (this.stopRequested.has(args.workerId)) {
+          // The stop could not kill what had not spawned; the start raced it and lost.
+          throw new CommandError("aborted", "worker was stopped during startup");
+        }
+        throw err;
+      }
+      if (this.stopRequested.has(args.workerId)) {
+        // The process did spawn after all — reclaim it, leave the stop's bookkeeping alone.
+        await this.adapter.stopProcess(args.workerId).catch(() => undefined);
+        throw new CommandError("aborted", "worker was stopped during startup");
+      }
+
       const result: StartWorkerResult = {
         sessionId: handle.sessionId,
         branch,
         cwd,
         worktree,
       };
+      this.stopRequested.delete(args.workerId);
       this.store.upsertWorker({
         workerId: args.workerId,
         threadId: args.threadId,
@@ -323,16 +356,32 @@ export class WorkerManager {
     } catch (err) {
       releaseLock(this.stateDir, args.workerId);
       this.active.delete(args.workerId);
+      if (err instanceof CommandError && err.code === "aborted") {
+        // A stop settled this worker (idle + settled:aborted) while the launch was in
+        // flight; the launch must not overwrite that with broken/running state or events.
+        this.stopRequested.delete(args.workerId);
+        throw err;
+      }
       this.store.setWorkerState(args.workerId, "broken");
       const code = (err as { code?: string }).code ?? "startup_failed";
       const message = err instanceof Error ? err.message : String(err);
       throw new CommandError(code, message);
+    } finally {
+      this.launching.delete(args.workerId);
     }
   }
 
-  /** stop_process (§6.1): reclaim the process, keep the session on disk. On a queued write
-   * worker (§8.2) there is no process yet — the pending start is dropped instead, so the
-   * queue does not launch a task the user tried to stop. */
+  /** stop_process (§6.1): reclaim the process, keep the session on disk.
+   *
+   * Bookkeeping by state (review findings 2/3):
+   * - `queued` (§8.2): no process yet — drop the pending start so the queue does not launch
+   *   a task the user tried to stop. Race-free: a concurrent pump flips the row to `starting`
+   *   synchronously before its first await, so this branch can only win the row outright.
+   * - in flight or `lost`: the run ends here — an expected process_exit carries no state and
+   *   no settled event, so without this the worker (and a serial repo's write slot) would be
+   *   stuck `running` until a connector restart. The worker settles `aborted`, stays idle
+   *   (resumable), a pending auto-resume is cancelled, and the serial queue is pumped.
+   * - otherwise (idle-hot reclaim, broken): the memory play it always was — nothing to settle. */
   async stopProcess(workerId: string): Promise<void> {
     const worker = this.store.getWorker(workerId);
     if (worker?.state === "queued") {
@@ -341,9 +390,23 @@ export class WorkerManager {
       await this.emitEvent(workerId, "settled", { outcome: "aborted" });
       return;
     }
+    const inFlight = worker ? IN_FLIGHT_STATES.has(worker.state) || worker.state === "lost" : false;
+    if (inFlight && this.launching.has(workerId)) this.stopRequested.add(workerId);
+    // Cancel a pending automatic resume: the stop is the user's final word for this run.
+    const timer = this.resumeTimers.get(workerId);
+    if (timer) {
+      clearTimeout(timer);
+      this.resumeTimers.delete(workerId);
+    }
     await this.adapter.stopProcess(workerId); // process_exit handler releases the lock
     // §9.3: a stop that had to escalate to SIGKILL may have orphaned tool children.
     await this.cleanupOrphans(workerId);
+    if (inFlight) {
+      this.store.setWorkerState(workerId, "idle", "stopped");
+      await this.emitEvent(workerId, "settled", { outcome: "aborted" });
+      // §8.2: the serial write slot freed with the runner.
+      this.pumpQueuedWorkers();
+    }
   }
 
   // --- Serial write queue (connector-pi.md §8.2) --------------------------------------------
@@ -366,14 +429,23 @@ export class WorkerManager {
   }
 
   /** Starts the next queued write worker of every repo whose slot freed up. Triggered by
-   * settle/break transitions, reconciliation, and queue-loss cleanup — never by a timer. */
+   * settle/break transitions, reconciliation, and queue-loss cleanup — never by a timer.
+   * Best-effort by design: it runs from void-fired continuations (including after a
+   * shutdown), so a failed kick is logged, never thrown. */
   private pumpQueuedWorkers(): void {
     if (this.crashed) return;
-    const repos = new Set(
-      this.store.listWorkers().filter((w) => w.state === "queued" && !this.pumpingRepos.has(w.repoId)).map((w) => w.repoId),
-    );
-    for (const repoId of repos) {
-      this.pumpOnce(repoId);
+    try {
+      const repos = new Set(
+        this.store
+          .listWorkers()
+          .filter((w) => w.state === "queued" && !this.pumpingRepos.has(w.repoId))
+          .map((w) => w.repoId),
+      );
+      for (const repoId of repos) {
+        this.pumpOnce(repoId);
+      }
+    } catch (err) {
+      console.error("[shepherd] serial queue pump failed:", err);
     }
   }
 
@@ -424,6 +496,11 @@ export class WorkerManager {
       // by launchWorker) is what tells the steward the run is now live.
       await this.launchWorker(queued.commandId, args, repo);
     } catch (err) {
+      if (err instanceof CommandError && err.code === "aborted") {
+        // A stop_process settled this worker while the launch was between its synchronous
+        // claim and the spawn — the stop's bookkeeping (idle + settled:aborted) stands.
+        return;
+      }
       const message = err instanceof Error ? err.message : String(err);
       await this.breakWorker(worker.workerId, "unknown", `Queued start failed: ${message}`, "startup_failed");
     }
@@ -447,6 +524,14 @@ export class WorkerManager {
       throw new CommandError(
         "worker_running",
         `worker ${workerId} is ${worker.state}; stop it and let it settle before cleaning up its worktree`,
+      );
+    }
+    // Settled but still idle-hot: the process is alive inside that directory — never delete
+    // under it (review finding 5's other half; also keeps resume-after-cleanup cold).
+    if (this.adapter.isRunning?.(workerId) === true) {
+      throw new CommandError(
+        "worker_running",
+        `worker ${workerId} still has a live (idle) process in its worktree; stop_process first`,
       );
     }
     const repo = this.store.getRepo(worker.repoId);
@@ -600,6 +685,21 @@ export class WorkerManager {
       return;
     }
     const repo = this.store.getRepo(worker.repoId);
+    // Review finding 5: a write worker whose worktree was explicitly cleaned up must not
+    // silently resume in the owner's main checkout. (A NULL worktree alone is not the
+    // signal — legacy rows never had one; only the cleanup marker counts.)
+    if (
+      worker.mode === "write" &&
+      repo &&
+      repo.workspace !== "main" &&
+      !worker.worktree &&
+      worker.worktreeCleanedAt
+    ) {
+      throw new CommandError(
+        "no_worktree",
+        `worker ${workerId}'s worktree was cleaned up; re-dispatch the task instead of resuming`,
+      );
+    }
     const cwd = worker.worktree ?? repo?.path;
     if (!cwd) throw new CommandError("startup_failed", `no worktree or repo path to resume worker ${workerId} in`);
     const lock = acquireLock(this.stateDir, workerId);
@@ -620,8 +720,20 @@ export class WorkerManager {
       branch: worker.branch ?? undefined,
       base: worker.base ?? undefined,
     });
+    this.launching.add(workerId);
     try {
-      const handle = await this.adapter.start(spec);
+      let handle: WorkerHandle;
+      try {
+        handle = await this.adapter.start(spec);
+      } catch (err) {
+        if (this.stopRequested.has(workerId)) throw new CommandError("aborted", "worker was stopped during resume");
+        throw err;
+      }
+      if (this.stopRequested.has(workerId)) {
+        await this.adapter.stopProcess(workerId).catch(() => undefined);
+        throw new CommandError("aborted", "worker was stopped during resume");
+      }
+      this.stopRequested.delete(workerId);
       this.store.upsertWorker({
         workerId,
         threadId: worker.threadId,
@@ -639,7 +751,14 @@ export class WorkerManager {
     } catch (err) {
       releaseLock(this.stateDir, workerId);
       this.active.delete(workerId);
+      if (err instanceof CommandError && err.code === "aborted") {
+        // The stop already settled this worker (idle + settled:aborted); leave its
+        // bookkeeping untouched (review finding 3, same window on the resume path).
+        this.stopRequested.delete(workerId);
+      }
       throw err;
+    } finally {
+      this.launching.delete(workerId);
     }
   }
 
@@ -697,9 +816,12 @@ export class WorkerManager {
 
   // --- Shutdown ------------------------------------------------------------------------------
 
-  /** Graceful shutdown: stop background loops. Worker processes are left to the OS — on
-   * connector exit stdin closes and pi disposes of its tool tree itself (§9.1 measurement). */
+  /** Graceful shutdown: stop background loops and take the manager out of service — no
+   * further queue pumps, launches, or event handling (a late void-fired continuation must
+   * never spawn work after the caller closed the store). Worker processes are left to the
+   * OS — on connector exit stdin closes and pi disposes of its tool tree itself (§9.1). */
   stop(): void {
+    this.crashed = true;
     this.stopSnapshotLoop();
     for (const timer of this.resumeTimers.values()) clearTimeout(timer);
     this.resumeTimers.clear();

@@ -11,6 +11,7 @@ import { PiAdapter } from "../src/pi-adapter.ts";
 import { LocalStore, WORKSPACE_MODES } from "../src/store.ts";
 import { CommandError, WorkerManager, type StartWorkerArgs } from "../src/worker-manager.ts";
 import { EventLog } from "../src/events.ts";
+import { lockPath } from "../src/locks.ts";
 import {
   fakePiAdapter,
   makeGitRepo,
@@ -48,6 +49,9 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  // Take the manager out of service first (no queue pumps or launches may fire once the
+  // store starts closing), then reclaim any fake-pi processes still holding a session.
+  manager?.stop();
   for (const workerId of workerIds) {
     await manager?.stopProcess(workerId).catch(() => undefined);
   }
@@ -200,6 +204,83 @@ describe("per-repo workspace modes (spec §11, connector-pi.md §8.2)", () => {
     expect(existsSync(join(repo, "one.txt"))).toBe(false);
   }, 45_000);
 
+  it("concurrent start_worker on a serial repo: exactly one launches, the other queues (review finding 1)", async () => {
+    const slow: ScenarioStep[] = [{ delayMs: 2500 }, ...reportRun({ status: "done", summary: "done" })];
+    setup([slow]);
+    registerRepo("serial");
+
+    // Commands run concurrently on the connector (client.runHandler is void-fired per cmd);
+    // only the synchronous claim serializes them. Before the claim this raced: both saw an
+    // empty slot, both created worktrees, both ran.
+    const [a, b] = await Promise.all([
+      manager.startWorker("cmd-conc-1", args({ workerId: "w-conc-1" })),
+      manager.startWorker("cmd-conc-2", args({ workerId: "w-conc-2", threadId: "conc-thread" })),
+    ]);
+    const states = [store.getWorker("w-conc-1")?.state, store.getWorker("w-conc-2")?.state].sort();
+    expect(states).toEqual(["queued", "running"]); // never running + running
+    expect([a.queued, b.queued].filter(Boolean)).toHaveLength(1);
+
+    // And the queue still drains: the queued one starts when the runner settles.
+    const queuedId = store.getWorker("w-conc-1")?.state === "queued" ? "w-conc-1" : "w-conc-2";
+    await waitFor(() => startedOf(queuedId), 25_000, "concurrently queued worker started");
+    await waitFor(() => settledOf(queuedId), 15_000, "concurrently queued worker settled");
+  }, 60_000);
+
+  it("stopping the running serial worker settles it and releases the write slot (review finding 2)", async () => {
+    setup([[{ delayMs: 60_000 }, ...reportRun({ status: "done", summary: "never reached" })]]);
+    registerRepo("serial");
+    await manager.startWorker("cmd-f2-run", args({ workerId: "w-f2-run" }));
+    const second = await manager.startWorker("cmd-f2-q", args({ workerId: "w-f2-q", threadId: "f2-thread" }));
+    expect(second.queued).toBe(true);
+
+    await manager.stopProcess("w-f2-run");
+    // The stop ends the run — no phantom `running` row holding the slot until a restart.
+    expect(store.getWorker("w-f2-run")).toMatchObject({ state: "idle", lastOutcome: "stopped" });
+    expect(events.some((e) => e.type === "settled" && e.workerId === "w-f2-run" && e.outcome === "aborted")).toBe(true);
+
+    // The queued worker starts without a connector restart…
+    await waitFor(() => startedOf("w-f2-q"), 20_000, "queue drained after the runner was stopped");
+
+    // …and the same stop path frees the slot again, so a brand-new write task launches
+    // instead of queueing behind a ghost holder.
+    await manager.stopProcess("w-f2-q");
+    await waitFor(() => store.getWorker("w-f2-q")?.state === "idle", 10_000, "drained worker stopped");
+    const third = await manager.startWorker("cmd-f3", args({ workerId: "w-f3", threadId: "f3-thread" }));
+    expect(third.queued).toBeUndefined();
+    await waitFor(() => startedOf("w-f3"), 15_000, "post-stop write task launched");
+  }, 60_000);
+
+  it("a stop racing the pump never leaves a started-after-aborted worker (review finding 3)", async () => {
+    // The runner settles after 5s; the victim (same scenario, fresh process) then spends its
+    // first 5s in the opening delay — so a stop issued right after the runner settles always
+    // lands inside the victim's launch window or its in-flight run, never after its settle.
+    setup([[{ delayMs: 5000 }, ...reportRun({ status: "done", summary: "done" })]]);
+    registerRepo("serial");
+    const runnerId = "w-r3-run";
+    const victimId = "w-r3-victim";
+    workerIds.add(runnerId);
+    workerIds.add(victimId);
+    await manager.startWorker("cmd-r3-1", args({ workerId: runnerId }));
+    await manager.startWorker("cmd-r3-2", args({ workerId: victimId, threadId: "r3-thread" }));
+    expect(store.getWorker(victimId)?.state).toBe("queued");
+
+    // The pump fires the moment the runner settles; stop the victim right after — wherever
+    // in the launch window the stop lands, the abort must win.
+    await waitFor(() => settledOf(runnerId), 15_000, "runner settled");
+    await manager.stopProcess(victimId);
+    await new Promise((resolve) => setTimeout(resolve, 1000)); // let any rogue launch surface
+
+    const victimEvents = events.filter((e) => e.workerId === victimId);
+    const abortedAt = victimEvents.findIndex((e) => e.type === "settled" && e.outcome === "aborted");
+    const startedAt = victimEvents.findIndex((e) => e.type === "started");
+    expect(abortedAt).toBeGreaterThanOrEqual(0);
+    // started may only precede the abort (stop of a fully launched run), never follow it.
+    expect(startedAt === -1 || startedAt < abortedAt).toBe(true);
+    expect(store.getWorker(victimId)?.state).toBe("idle");
+    expect(store.getQueuedStart(victimId)).toBeNull();
+    await waitFor(() => !existsSync(lockPath(stateDir, victimId)), 10_000, "victim lock released");
+  }, 60_000);
+
   it("serial mode: readonly tasks neither queue nor get blocked by the write worker", async () => {
     setup([
       [
@@ -300,6 +381,9 @@ describe("cleanup_worktree (connector-pi.md §6.1/§8.2)", () => {
     workerIds.add(workerId);
     const result = await manager.startWorker(`cmd-${workerId}`, args({ workerId }));
     await waitFor(() => settledOf(workerId), 15_000, "settled event");
+    // Reclaim the idle-hot process: cleanup must never delete under a live process.
+    await manager.stopProcess(workerId);
+    await waitFor(() => !existsSync(lockPath(stateDir, workerId)), 10_000, "lock released");
     if (pushed) {
       // Put HEAD inside a remote-tracking ref (shared object store) so it counts as pushed.
       const head = (await git(result.worktree!, ["rev-parse", "HEAD"])).trim();
@@ -327,7 +411,7 @@ describe("cleanup_worktree (connector-pi.md §6.1/§8.2)", () => {
     expect(existsSync(worktree)).toBe(false);
   }, 30_000);
 
-  it("refuses while the worker still runs, and has nothing to do for worktree-less workers", async () => {
+  it("refuses while the worker still runs — including settled-but-idle-hot — and has nothing to do for worktree-less workers", async () => {
     setup([reportRun({ status: "done", summary: "done" })]);
     registerRepo();
     const runningId = "w-still-running";
@@ -336,6 +420,11 @@ describe("cleanup_worktree (connector-pi.md §6.1/§8.2)", () => {
     const worktree = store.getWorker(runningId)!.worktree!;
     await expect(manager.cleanupWorktree(runningId, true)).rejects.toMatchObject({ code: "worker_running" });
     expect(existsSync(worktree)).toBe(true); // even force never deletes under a live run
+
+    // Settled but idle-hot: the process still lives in the directory — still refused.
+    await waitFor(() => settledOf(runningId), 15_000, "settled");
+    await expect(manager.cleanupWorktree(runningId, true)).rejects.toMatchObject({ code: "worker_running" });
+    expect(existsSync(worktree)).toBe(true);
 
     await expect(manager.cleanupWorktree("w-never-heard-of", false)).rejects.toMatchObject({ code: "not_found" });
   }, 30_000);
@@ -427,10 +516,30 @@ describe("CommandError surface for the new paths", () => {
     workerIds.add(workerId);
     const result = await manager.startWorker("cmd-cc", args({ workerId }));
     await waitFor(() => settledOf(workerId), 15_000, "settled event");
+    await manager.stopProcess(workerId); // idle-hot process out of the way first
+    await waitFor(() => !existsSync(lockPath(stateDir, workerId)), 10_000, "lock released");
     // dirty: the report committed nothing, but the branch is unpushed → refused without force
     await expect(manager.handleCommand("cmd-cw1", "cleanup_worktree", { workerId })).rejects.toBeInstanceOf(CommandError);
     await expect(manager.handleCommand("cmd-cw2", "cleanup_worktree", { workerId, force: true })).resolves.toMatchObject({
       removed: result.worktree,
     });
+  }, 30_000);
+
+  it("resume after cleanup_worktree refuses instead of running write-mode in the main checkout (review finding 5)", async () => {
+    setup([reportRun({ status: "done", summary: "done" })]);
+    registerRepo(); // worktree mode
+    const workerId = "w-resume-after-cleanup";
+    workerIds.add(workerId);
+    await manager.startWorker("cmd-rac", args({ workerId }));
+    await waitFor(() => settledOf(workerId), 15_000, "settled event");
+    await manager.stopProcess(workerId);
+    await waitFor(() => !existsSync(lockPath(stateDir, workerId)), 10_000, "lock released");
+    await manager.cleanupWorktree(workerId, true);
+    expect(store.getWorker(workerId)?.worktree).toBeNull();
+
+    // A manual resume must not silently fall back to the owner's checkout with write tools.
+    await expect(
+      manager.handleCommand("cmd-rac-rs", "resume", { workerId, reason: "manual" }),
+    ).rejects.toMatchObject({ code: "no_worktree" });
   }, 30_000);
 });

@@ -121,4 +121,28 @@ describe("bin/shepherd.js (skipped when dist has not been built)", () => {
     const status = await run(["status"]);
     expect(status.stdout).toContain("repo-a[serial, approved]");
   });
+
+  it("repo-config parses flags in any position and both --workspace spellings (review finding 4)", async () => {
+    const repo = await makeGitRepo(home);
+    expect((await run(["add-repo", repo])).code).toBe(0);
+
+    // Flags before the path: the path is still the path.
+    const flagsFirst = await run(["repo-config", "--workspace", "main", repo]);
+    expect(flagsFirst.code).toBe(0);
+    expect(flagsFirst.stdout).toContain("workspace=main");
+
+    // The --workspace=value form is honored, not silently ignored.
+    const eqForm = await run(["repo-config", repo, "--workspace=serial"]);
+    expect(eqForm.code).toBe(0);
+    expect(eqForm.stdout).toContain("workspace=serial");
+
+    // A valueless --workspace and unknown flags fail loudly instead of degrading into a
+    // read-only print with exit 0.
+    const missingValue = await run(["repo-config", repo, "--workspace"]);
+    expect(missingValue.code).toBe(1);
+    expect(missingValue.stderr).toContain("requires a value");
+    const unknown = await run(["repo-config", repo, "--workspacex"]);
+    expect(unknown.code).toBe(1);
+    expect(unknown.stderr).toContain("unknown option");
+  });
 });
