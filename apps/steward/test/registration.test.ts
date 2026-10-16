@@ -8,6 +8,28 @@ import { APP_CONFIG_PATCH_SCOPE, beginDeviceFlow, encodeAddons, pollDeviceFlow }
 const ADDONS_SCOPE_VECTOR =
   "H4sIAAAAAAAAE6tWKk7OL0gtVrKqVipJzUvMK1GyilZKLCjIyUxOLMnMz7NCZhckliRnKMXW1gIAR9dnbTcAAAA";
 
+/** base64url (unpadded) → bytes. */
+function b64urlToBytes(text: string): Uint8Array {
+  const binary = atob(text.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(text.length / 4) * 4, "="));
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+  return out;
+}
+
+/**
+ * Parity with the SDK's `encodeAddons`: the deflate payload (bytes after the 10-byte gzip
+ * header) must match byte-for-byte; the header's OS byte is runtime-dependent (node zlib
+ * writes 3, workerd's CompressionStream writes 255) and any conforming gzip stream decodes
+ * identically on Feishu's side, so it is deliberately not compared.
+ */
+async function expectAddonsParity(encoded: string): Promise<void> {
+  const ours = b64urlToBytes(encoded);
+  const vector = b64urlToBytes(ADDONS_SCOPE_VECTOR);
+  expect(Array.from(ours.slice(10))).toEqual(Array.from(vector.slice(10)));
+  const json = await new Response(new Blob([ours as BlobPart]).stream().pipeThrough(new DecompressionStream("gzip"))).text();
+  expect(JSON.parse(json)).toEqual({ scopes: { tenant: ["application:application:patch"] } });
+}
+
 function formHandler(reply: (params: URLSearchParams) => unknown): typeof fetch {
   return (async (input: RequestInfo | URL) => {
     const req = new Request(input);
@@ -18,7 +40,7 @@ function formHandler(reply: (params: URLSearchParams) => unknown): typeof fetch 
 
 describe("encodeAddons (SDK pipeline parity)", () => {
   it("produces the SDK's gzip+base64url encoding for the scope top-up", async () => {
-    expect(await encodeAddons({ scopes: { tenant: [APP_CONFIG_PATCH_SCOPE] } })).toBe(ADDONS_SCOPE_VECTOR);
+    await expectAddonsParity(await encodeAddons({ scopes: { tenant: [APP_CONFIG_PATCH_SCOPE] } }));
   });
 
   it("round-trips only through the whitelisted public fields and rejects the rest", async () => {
@@ -66,7 +88,7 @@ describe("beginDeviceFlow", () => {
     const res = await beginDeviceFlow({ fetcher, clientId: "cli_x", addons: { scopes: { tenant: [APP_CONFIG_PATCH_SCOPE] } }, now: () => 0 });
     const qr = new URL(res.qrUrl);
     expect(qr.searchParams.get("clientID")).toBe("cli_x");
-    expect(qr.searchParams.get("addons")).toBe(ADDONS_SCOPE_VECTOR);
+    await expectAddonsParity(qr.searchParams.get("addons")!);
   });
 });
 
