@@ -722,7 +722,14 @@ export function renderTimeline(view: TimelineView, now: number): string {
     return `<li><span class="k">${esc(label)}</span><span class="t">${esc(entry.text)}</span><span class="ts">${relTime(entry.ts, now)}</span></li>`;
   });
   const workerRows = workers.map((w) => {
-    const state = w.state === "running" || w.state === "starting" ? "▶" : w.state === "broken" ? "❌" : "·";
+    const state =
+      w.state === "running" || w.state === "starting" || w.state === "recovering"
+        ? "▶"
+        : w.state === "queued"
+          ? "⏳"
+          : w.state === "broken"
+            ? "❌"
+            : "·";
     return `<li>${state} ${esc(w.agent)} @ ${esc(w.machineName)}${w.branch ? ` · 分支 ${esc(w.branch)}` : ""}${w.lastOutcome ? ` · ${esc(w.lastOutcome)}` : ""} · <a href="/app/threads/${esc(view.thread.threadId)}/workers/${esc(w.workerId)}">原始过程</a></li>`;
   });
   return `<h1>${thread.unread ? "● " : ""}${esc(thread.title)}</h1>${stateBadge(thread.state)}

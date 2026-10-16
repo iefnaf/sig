@@ -148,7 +148,9 @@ export class PiAdapter implements AgentAdapter {
       assets.extensionPath,
       "--append-system-prompt",
       assets.promptPath,
-      "--no-approve",
+      // §13: --no-approve unless the repo is locally approved (approveProject is a
+      // connector-local per-repo setting, never taken from a command).
+      spec.approveProject === true ? "--approve" : "--no-approve",
     ];
     if (spec.mode === "readonly") args.push("--tools", "read,grep,find,ls,report");
     if (spec.model) args.push("--model", spec.model);

@@ -96,6 +96,8 @@ That pairs the machine (redeeming the one-time pairing code), installs a backgro
 
 ```sh
 shepherd add-repo ~/code/myproject   # allow-list a repo for start_worker (machine-local by design)
+shepherd repo-config ~/code/myproject --workspace serial   # per-repo workspace: worktree (default) | serial | main
+shepherd repo-config ~/code/myproject --approve            # trust the repo's local pi extensions (§13; never settable remotely)
 shepherd status                       # service, pairing, workers, installed assets
 shepherd logs                         # tail ~/.shepherd/logs/connector.log (no keys, no session content)
 shepherd stop | start | restart       # control the service
