@@ -111,7 +111,7 @@ Table names all carry the `sh_` prefix. Only semantics are listed below, not eve
 | `sh_routine` / `sh_watch` / `sh_followup` | See §8 | Proactive behavior |
 | `sh_command` | Protocol-layer `outbox` | Adds a `provenance` column for auditing |
 
-Full-text index for threads: `sh_thread_fts` (FTS5, covering `title + goal + summary + the latest report.summary`), kept in sync by triggers. FTS5 is supported in the DO's SQLite (official docs).
+Full-text index for threads: `sh_thread_fts` (FTS5, covering `title + goal + summary + the latest report.summary`), kept in sync by triggers. FTS5 is supported in the DO's SQLite (official docs; verified by #7 — trigram tokenizer included, see §13).
 
 ### 2.3 Notes: data model and layering
 
@@ -238,6 +238,13 @@ Routing is the core of the product's value and needs a measurable bar. Build a f
 | Unnecessary ask-back rate | < 15% |
 
 Re-run this evaluation set whenever the model, prompts, or candidate-assembly rules change.
+
+> **Implemented (issue #7).** The 106-case set was ported verbatim from `spike-final`
+> (ADR-0001 decision 1) into `apps/steward/eval/` with a runner over the real extension
+> (fresh in-memory world per case, node:sqlite + the trigram FTS index, the confidence gate
+> live). `pnpm --filter @shepherd/steward eval:routing` enforces the thresholds as the exit
+> code — the required merge check for routing changes per ADR-0001 decision 14. Recorded
+> runs, the key handling, and the OpenAI-compatible `--endpoint` override: [routing-eval.md](../routing-eval.md).
 
 ## 4. The steward (LLM)
 
@@ -599,7 +606,7 @@ Legend: ✓ verified in the protocol spike; ◦ seen only in docs or type declar
 | The `beforeRequest` hook replaces only the single request and persists nothing | ✓ (issue #6: verified by test — see §4.1) |
 | A tool result's `control.terminate` ends the turn | ✓ (issue #6: ask_user / no_action terminate) |
 | `input` with a custom `entry` (distinguishing user vs event) | ? `pi-durable@1.1.0` types disallow it, the repo README allows it; `PiHarness.submit` does not expose it. The MVP uses content markers (§4.2) |
-| DO SQLite supports FTS5 and JSON functions | ◦ (official docs); trigger-sync behavior unverified |
+| DO SQLite supports FTS5 and JSON functions | ✓ (issue #7): the trigram tokenizer works in workerd and node:sqlite; the sh_thread_fts triggers (insert / title-goal-summary update / delete / report insert) keep the index current — verified by probe and `test/schema.test.ts` (migration 010) |
 | `ctx.storage.transactionSync` | ◦ (DO storage API) |
 | `this.schedule(cron, ...)` idempotent | ◦ (Agents SDK docs) |
 | Feishu: QR-code creation (`registerApp` device flow) | ◦ official SDK source; no live scan performed |

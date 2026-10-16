@@ -156,6 +156,7 @@ describe("review #5 (round 2): budget invariants — no omission is ever silent"
         list: () => Array.from({ length: machineCount }, (_, i) => ({ deviceId: `d${i}`, name: `machine-with-a-very-long-name-${i}`, online: i % 2 === 0, maxWorkers: 4 })),
         runningCount: () => 0,
       },
+      repos: { list: () => [] as never[] },
       threads: { list: () => threads.map((t) => thread(t.id, t.state, t.title ?? `标题${t.id}`)) },
       questions: { openForThread: (id: string) => (questions[id] !== undefined ? ({ text: questions[id] } as never) : null) },
     } as unknown as Ledger;
@@ -254,7 +255,8 @@ describe("review #7: a routed reply closes the thread's open question", () => {
     await waitWhileOutboundPending();
     let snap = await ownerStub().debugSnapshot();
     expect(snap.threads[0]!.state).toBe("waiting_you");
-    const askRow = (await ownerStub().outboundRows(20)).find((r) => r.kind === "text" && r.status === "sent" && (JSON.parse(r.payload as string) as { text?: string }).text?.includes("用哪个方案"));
+    // Issue #7: the ask rides an interactive card; quoting it routes back to the thread.
+    const askRow = (await ownerStub().outboundRows(20)).find((r) => r.kind === "card" && r.status === "sent" && JSON.stringify(r.payload).includes("用哪个方案"));
     expect(askRow?.providerMsgId).toBeTruthy();
 
     // The user answers by quoting the ask; the answer is "算了" — no dispatch involved.
@@ -291,8 +293,9 @@ describe("review #9: empty final texts are only a failure when nothing reached t
     await dm("那个方案", "om_empty_2");
     await waitRunsSettled();
     await waitWhileOutboundPending();
+    const askCards = (await ownerStub().outboundRows(30)).filter((r) => r.kind === "card" && r.status === "sent" && JSON.stringify(r.payload).includes("这样行吗"));
+    expect(askCards).toHaveLength(1);
     const texts2 = await sentTexts();
-    expect(texts2.some((t) => t.includes("这样行吗"))).toBe(true);
     expect(texts2.filter((t) => t.includes("没有给出回复")).length).toBeLessThanOrEqual(1); // only the first run's
     fake.close();
   }, 30_000);

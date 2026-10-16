@@ -87,3 +87,16 @@ export function routineWakeText(routineId: string, instruction: string): string 
 export function followupWakeText(followupId: string, reason: string): string {
   return `${MARK_OPEN}followup ${followupId}${MARK_CLOSE} ${reason}`;
 }
+
+/**
+ * ⟦verify⟧ inputs (issue #7, spike-conclusions §2 “post-dispatch settle-time verification”):
+ * the corrective follow-up when a user run claimed a dispatch that never happened. The
+ * original user message's provenance rides on the run (replyTo), so the steward may still
+ * dispatch — or must correct itself to the user via notify_user.
+ */
+export function verifyWakeText(claim: string): string {
+  return [
+    `${MARK_OPEN}verify${MARK_CLOSE} 你上一条回复声称已派发任务（“${claim.slice(0, 80)}”），但这次运行中没有发生任何 start_worker 调用。`,
+    "请现在真正调用 start_worker 完成派发；如果其实不该派发，用 notify_user 向用户发一句更正。",
+  ].join("\n");
+}

@@ -360,4 +360,73 @@ export const MIGRATIONS: readonly Migration[] = [
       )`;
     },
   },
+  {
+    // Routing (issue #7, steward.md §3): the FTS5 index behind threads.findCandidates, the
+    // question shape ask_user's candidate buttons need, and the per-run dispatch counter the
+    // settle-time verification compares against "dispatched" claims (spike-conclusions §2).
+    id: "010_routing",
+    up: (sql) => {
+      // §2.2: full-text index over title + goal + summary + the latest report summary. The
+      // trigram tokenizer gives substring matching for both CJK and latin text (verified in
+      // workerd and node:sqlite — see docs/routing-eval.md); queries under 3 characters are
+      // covered by findCandidates' bigram scorer, never by this index alone.
+      sql`CREATE VIRTUAL TABLE IF NOT EXISTS sh_thread_fts USING fts5(threadId UNINDEXED, body, tokenize='trigram')`;
+      // Trigger-synced (§13 lists this as unverified before #7): every write path keeps the
+      // index current — insert, title/goal/summary updates, delete, and each new report
+      // (whose summary joins the body as the thread's freshest facet).
+      sql`CREATE TRIGGER IF NOT EXISTS sh_thread_fts_ai AFTER INSERT ON sh_thread BEGIN
+        INSERT INTO sh_thread_fts (threadId, body) VALUES (
+          new.threadId,
+          COALESCE(new.title, '') || ' ' || COALESCE(new.goal, '') || ' ' || COALESCE(new.summary, '')
+        );
+      END`;
+      sql`CREATE TRIGGER IF NOT EXISTS sh_thread_fts_au AFTER UPDATE OF title, goal, summary ON sh_thread BEGIN
+        DELETE FROM sh_thread_fts WHERE threadId = new.threadId;
+        INSERT INTO sh_thread_fts (threadId, body) VALUES (
+          new.threadId,
+          COALESCE(new.title, '') || ' ' || COALESCE(new.goal, '') || ' ' || COALESCE(new.summary, '') || ' ' ||
+            COALESCE((SELECT r.summary FROM sh_report r WHERE r.threadId = new.threadId ORDER BY r.receivedAt DESC, r.seq DESC LIMIT 1), '')
+        );
+      END`;
+      sql`CREATE TRIGGER IF NOT EXISTS sh_thread_fts_ad AFTER DELETE ON sh_thread BEGIN
+        DELETE FROM sh_thread_fts WHERE threadId = old.threadId;
+      END`;
+      sql`CREATE TRIGGER IF NOT EXISTS sh_thread_fts_report AFTER INSERT ON sh_report BEGIN
+        DELETE FROM sh_thread_fts WHERE threadId = new.threadId;
+        INSERT INTO sh_thread_fts (threadId, body) SELECT
+          new.threadId,
+          COALESCE(t.title, '') || ' ' || COALESCE(t.goal, '') || ' ' || COALESCE(t.summary, '') || ' ' || COALESCE(new.summary, '')
+          FROM sh_thread t WHERE t.threadId = new.threadId;
+      END`;
+      // Backfill for deployments that already have threads (idempotent guard: only rows the
+      // index does not have yet — INSERT OR IGNORE cannot dedupe here because fts5 rows have
+      // no unique constraint on the UNINDEXED column, so delete-then-insert per missing row).
+      sql`INSERT INTO sh_thread_fts (threadId, body)
+        SELECT th.threadId, COALESCE(th.title, '') || ' ' || COALESCE(th.goal, '') || ' ' || COALESCE(th.summary, '') || ' ' ||
+          COALESCE((SELECT r.summary FROM sh_report r WHERE r.threadId = th.threadId ORDER BY r.receivedAt DESC, r.seq DESC LIMIT 1), '')
+        FROM sh_thread th
+        WHERE NOT EXISTS (SELECT 1 FROM sh_thread_fts f WHERE f.threadId = th.threadId)`;
+
+      // ask_user's routing questions belong to no particular Thread (steward.md §3.3): the
+      // question row is rebuilt with a nullable threadId, and `candidates` stores the button
+      // mapping ({threadId, label}[] JSON) the card-action handler resolves clicks against.
+      sql`CREATE TABLE IF NOT EXISTS sh_question_v2 (
+        qid TEXT PRIMARY KEY, threadId TEXT, workerId TEXT,
+        text TEXT NOT NULL, options TEXT, candidates TEXT,
+        status TEXT NOT NULL DEFAULT 'open', askedAt INTEGER NOT NULL, answeredAt INTEGER
+      )`;
+      sql`INSERT INTO sh_question_v2 (qid, threadId, workerId, text, options, candidates, status, askedAt, answeredAt)
+        SELECT qid, threadId, workerId, text, options, NULL, status, askedAt, answeredAt FROM sh_question`;
+      sql`DROP TABLE sh_question`;
+      sql`ALTER TABLE sh_question_v2 RENAME TO sh_question`;
+      sql`CREATE INDEX IF NOT EXISTS sh_question_thread ON sh_question (threadId, status)`;
+
+      // Settle-time dispatch verification (spike-conclusions §2): how many real dispatches
+      // happened inside this run. 0 + a reply claiming "dispatched" triggers the corrective
+      // follow-up (see steward.ts settleRun).
+      ignoringDuplicateColumn(() => {
+        sql`ALTER TABLE sh_run ADD COLUMN dispatchCount INTEGER NOT NULL DEFAULT 0`;
+      });
+    },
+  },
 ];
