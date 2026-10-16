@@ -12,15 +12,21 @@ import { HELP_TEXT, offlineAskCard, statusText } from "./report-template.ts";
 /** The M1 fixed phrases. Natural language arrives with the M2 steward LLM. */
 const DISPATCH_RE = /^\/(?:派发|dispatch|run)\s+(\S+)(?:\s+([\s\S]+))?$/;
 const STATUS_RE = /^\/(?:状态|status)\s*$/;
+const ADD_MACHINE_RE = /^\/(?:加机器|添加机器|add-machine|addmachine)\s*$/;
+const WEB_RE = /^\/(?:网页|web|login)\s*$/;
 
 export type OwnerCommand =
   | { kind: "dispatch"; repoRef: string; machineHint: string | null; prompt: string }
-  | { kind: "status" };
+  | { kind: "status" }
+  | { kind: "add_machine" }
+  | { kind: "web_link" };
 
-/** Parses `/派发 <repo>[@<machine>] <prompt>` and `/状态`. Anything else returns null. */
+/** Parses `/派发 <repo>[@<machine>] <prompt>`, `/状态`, `/加机器`, `/网页`. Anything else → null. */
 export function parseOwnerText(text: string): OwnerCommand | null {
   const trimmed = text.trim();
   if (STATUS_RE.test(trimmed)) return { kind: "status" };
+  if (ADD_MACHINE_RE.test(trimmed)) return { kind: "add_machine" };
+  if (WEB_RE.test(trimmed)) return { kind: "web_link" };
   const match = DISPATCH_RE.exec(trimmed);
   if (!match) return null;
   const prompt = (match[2] ?? "").trim();
@@ -100,6 +106,12 @@ export interface DispatcherDeps {
   cancelQueuedCommand: (cmdId: string) => boolean;
   sendText: (text: string, threadId?: string | null) => Promise<void>;
   sendCard: (card: unknown, threadId: string) => Promise<void>;
+  /** Issues a one-time pairing code (protocol §5.2) for `/加机器`. */
+  createPairing: () => Promise<{ code: string }>;
+  /** The deployment's public origin for the connect command; null until a request revealed it. */
+  deployOrigin: () => string | null;
+  /** Mints an absolute one-time web URL, or null when no origin is known yet. */
+  webLinkUrl: (target: string) => Promise<string | null>;
 }
 
 const AGENT = "pi"; // the only agent the connector drives in the MVP (ADR-0001 decision 3)
@@ -146,7 +158,39 @@ export class Dispatcher {
       await this.#deps.sendText(statusText(this.ledger.threads.list(), this.ledger.machines.list()));
       return;
     }
+    if (command.kind === "add_machine") {
+      await this.addMachine();
+      return;
+    }
+    if (command.kind === "web_link") {
+      const url = await this.#deps.webLinkUrl("home");
+      await this.#deps.sendText(
+        url
+          ? `一次性登录链接（15 分钟内有效，只能打开一次）：\n${url}`
+          : "暂时不知道本部署的对外地址，发过一条消息后再试。",
+      );
+      return;
+    }
     await this.dispatch(command, { thread: null, fromMsgId: input.msgId });
+  }
+
+  /** `/加机器` (protocol §5.2): mint a one-time code, reply with the connect command. */
+  private async addMachine(): Promise<void> {
+    const origin = this.#deps.deployOrigin();
+    if (!origin) {
+      // Unreachable in practice — this reply itself rides a webhook that revealed the origin —
+      // but never hand out a code whose command cannot be built.
+      await this.#deps.sendText("暂时不知道本部署的对外地址，发过一条消息后再试。");
+      return;
+    }
+    const { code } = await this.#deps.createPairing();
+    await this.#deps.sendText(
+      [
+        "在要接入的那台电脑的终端里运行：",
+        `npx @iefnaf/shepherd connect ${origin} ${code}`,
+        "（配对码 10 分钟内有效，只能使用一次；接好后它会自动上线，发 /状态 可以看到。）",
+      ].join("\n"),
+    );
   }
 
   /** A card button callback (already deduped); the Thread comes from the card's message id. */

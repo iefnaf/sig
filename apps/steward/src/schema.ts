@@ -281,4 +281,30 @@ export const MIGRATIONS: readonly Migration[] = [
       });
     },
   },
+  {
+    // The signed-link web (issue #22, spec §7.3/§12.2, steward.md §10): one-time links minted
+    // for the owner's chat, the sessions they are exchanged for, and the deployment's public
+    // origin (links and pairing commands need absolute URLs, and the DO only ever sees the
+    // origin through the requests it serves). These tables belong to web.ts. Numbered 008:
+    // #12's machine_boot_id took 007 on main first.
+    id: "008_web",
+    up: (sql) => {
+      // Single-use enforcement for signed links: the token's HMAC covers target + expiry
+      // statelessly; this row is the "already opened" bit. tokenHash = SHA-256(token).
+      sql`CREATE TABLE IF NOT EXISTS sh_web_link (
+        tokenHash TEXT PRIMARY KEY, target TEXT NOT NULL,
+        expiresAt INTEGER NOT NULL, usedAt INTEGER, createdAt INTEGER NOT NULL
+      )`;
+      // Sessions are random ids in the DB (revocable by deletion), not self-signed claims;
+      // the cookie carries `ws1.<sid>.<mac>` so the Worker layer can reject garbage probes
+      // without waking the DO (ADR-0001 decision 7's stateless pre-check pattern).
+      sql`CREATE TABLE IF NOT EXISTS sh_web_session (
+        sid TEXT PRIMARY KEY, csrf TEXT NOT NULL,
+        createdAt INTEGER NOT NULL, expiresAt INTEGER NOT NULL, lastSeenAt INTEGER NOT NULL
+      )`;
+      sql`CREATE TABLE IF NOT EXISTS sh_deploy (
+        id INTEGER PRIMARY KEY CHECK (id = 1), origin TEXT NOT NULL, updatedAt INTEGER NOT NULL
+      )`;
+    },
+  },
 ];
