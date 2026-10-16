@@ -280,6 +280,31 @@ export class PiAdapter implements AgentAdapter {
     return !!runtime && !runtime.process.hasExited;
   }
 
+  /** Live worker pids for the descendant-snapshot loop (connector-pi.md §9.3). */
+  workerPids(): Array<{ workerId: string; pid: number }> {
+    const out: Array<{ workerId: string; pid: number }> = [];
+    for (const [workerId, runtime] of this.runtimes) {
+      const pid = runtime.process.pid;
+      if (!runtime.process.hasExited && pid !== undefined) out.push({ workerId, pid });
+    }
+    return out;
+  }
+
+  /** Test support: emulate a connector crash — every child is SIGKILLed with no graceful
+   * stop, lock files are left on disk exactly as a real crash leaves them, and exit events
+   * are marked "expected" so a still-listening manager takes no recovery action. */
+  simulateCrash(): void {
+    for (const runtime of this.runtimes.values()) {
+      runtime.stopping = true;
+      try {
+        runtime.process.kill();
+      } catch {
+        // already gone
+      }
+    }
+    this.runtimes.clear();
+  }
+
   stderrTail(id: string): string {
     return this.runtimes.get(id)?.process.getStderrTail() ?? "";
   }
@@ -389,7 +414,10 @@ export class PiAdapter implements AgentAdapter {
       workerId: runtime.workerId,
       code: info.code,
       signal: info.signal,
-      unexpected: !runtime.stopping,
+      // An exit while still buffering (start() has not resolved) is reported through
+      // start()'s own rejection — an `unexpected` process_exit here would race the
+      // startup-failure handling in the WorkerManager.
+      unexpected: !runtime.stopping && runtime.buffered === null,
     });
   }
 }
@@ -441,6 +469,8 @@ function extractText(content: unknown): string {
     })
     .join("");
 }
+
+export { extractText as extractAssistantText };
 
 /** First 80 chars of a path or command — never file contents or command output (§11.2). */
 function extractTarget(args: unknown): string | undefined {

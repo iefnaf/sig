@@ -1,8 +1,8 @@
 // One-file-one-process invariant, docs/design/connector-pi.md §4.3. pi has no session-file
 // lock, so the connector guarantees: only one pi process per workerId at any moment, doubly
 // enforced by ~/.shepherd/locks/<workerId>.lock (pid + start time) plus in-memory state.
-import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -67,11 +67,7 @@ export function acquireLock(stateDir: string, workerId: string): AcquireResult {
   if (existing) {
     // Alive = pid responds AND (when a start time was recorded) it is still the same process,
     // so a reused pid never reads as a held lock (§9.3 applies the same idea to orphans).
-    let alive = pidAlive(existing.pid);
-    if (alive && existing.startTime !== undefined) {
-      alive = processStartTime(existing.pid) === existing.startTime;
-    }
-    if (alive) return { ok: false, error: "lock_held", pid: existing.pid, path };
+    if (lockIsHeld(existing)) return { ok: false, error: "lock_held", pid: existing.pid, path };
     // Stale: the process no longer exists (or the pid was reused by a different process).
     rmSync(path, { force: true });
   }
@@ -101,4 +97,51 @@ export function isLockHeld(stateDir: string, workerId: string): boolean {
   const existing = readLock(lockPath(stateDir, workerId));
   if (!existing) return false;
   return pidAlive(existing.pid);
+}
+
+/** The same pid + start-time identity check acquireLock uses, over an arbitrary lock. */
+function lockIsHeld(existing: LockFileContent): boolean {
+  let alive = pidAlive(existing.pid);
+  if (alive && existing.startTime !== undefined) {
+    alive = processStartTime(existing.pid) === existing.startTime;
+  }
+  return alive;
+}
+
+/** Startup stale-lock sweep (connector-pi.md §9.1): after a crash every lock names a dead
+ * connector process — remove those so reconciliation and resume can proceed. A lock naming
+ * a LIVE process is left untouched: that is another connector, and lock_held is the correct
+ * answer for it. Returns the workerIds whose stale locks were removed. */
+export function removeStaleLocks(stateDir: string): string[] {
+  const dir = locksDir(stateDir);
+  if (!existsSync(dir)) return [];
+  const removed: string[] = [];
+  for (const name of readdirSync(dir)) {
+    if (!name.endsWith(".lock")) continue;
+    const path = join(dir, name);
+    const workerId = name.slice(0, -".lock".length);
+    const lock = readLock(path);
+    if (!lock || !lockIsHeld(lock)) {
+      rmSync(path, { force: true });
+      removed.push(lock?.workerId ?? workerId);
+    }
+  }
+  return removed;
+}
+
+/** Test support: an in-process "crash" cannot kill the test runner, so the locks it wrote
+ * still name a live pid. Rewrite them to name a dead process — exactly the state a real
+ * connector crash leaves behind for removeStaleLocks to sweep. */
+export function markLocksHeldByDeadProcess(stateDir: string): void {
+  const dir = locksDir(stateDir);
+  if (!existsSync(dir)) return;
+  const probe = spawnSync("true");
+  const deadPid = probe.pid ?? 999_999_999; // reaped before spawnSync returns
+  for (const name of readdirSync(dir)) {
+    if (!name.endsWith(".lock")) continue;
+    const path = join(dir, name);
+    const lock = readLock(path);
+    if (!lock) continue;
+    writeFileSync(path, JSON.stringify({ ...lock, pid: deadPid }) + "\n", { mode: 0o600 });
+  }
 }

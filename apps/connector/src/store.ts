@@ -3,10 +3,13 @@
 // all in node:sqlite so they survive connector restarts (the spike's seqs.json bug: the DO
 // dedups on (workerId, seq), so a restart that renumbers events silently drops them all).
 // The worker-pi slice adds the repo whitelist (§8.1) and worker lifecycle rows (§5.1); command
-// and event persistence live in CommandLog/EventLog over the same database.
+// and event persistence live in CommandLog/EventLog over the same database. Issue #12 adds
+// the §9 recovery tables: descendant snapshots for orphan cleanup (§9.3) and the per-worker
+// auto-resume budget (§9.2), both read at startup before the first hello.
 import { DatabaseSync } from "node:sqlite";
 import { chmodSync, existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import type { ProcRef } from "./descendants.ts";
 
 export interface Credentials {
   serverUrl: string;
@@ -69,7 +72,30 @@ export class LocalStore {
       createdAt INTEGER NOT NULL,
       updatedAt INTEGER NOT NULL
     )`);
+    // The worktree base (§8.2) persisted so a restarted connector can still collect git
+    // facts for a retroactive report (§9.1) — spikes kept it only in memory.
+    this.addColumnIfMissing("worker", "base", "TEXT");
+    // §9.3: the latest 5-second descendant snapshot per running worker.
+    this.db.exec(`CREATE TABLE IF NOT EXISTS orphan_snapshot (
+      workerId TEXT PRIMARY KEY,
+      refs TEXT NOT NULL,
+      updatedAt INTEGER NOT NULL
+    )`);
+    // §9.2: auto-resume attempts; the ≤2/hour budget is computed over these rows.
+    this.db.exec(`CREATE TABLE IF NOT EXISTS worker_resume (
+      workerId TEXT NOT NULL,
+      at INTEGER NOT NULL
+    )`);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS worker_resume_worker_at ON worker_resume (workerId, at)`);
     chmodSync(path, 0o600);
+  }
+
+  /** Idempotent ALTER for databases created before a column existed (spike bug 2 pattern). */
+  private addColumnIfMissing(table: string, column: string, ddl: string): void {
+    const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    if (!columns.some((c) => c.name === column)) {
+      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
+    }
   }
 
   // Shared with CommandLog / EventLog, which own their own tables' logic.
@@ -155,11 +181,11 @@ export class LocalStore {
   upsertWorker(worker: WorkerRow): void {
     this.db
       .prepare(
-        `INSERT INTO worker (workerId, threadId, repoId, mode, state, sessionId, sessionFile, branch, worktree, lastOutcome, createdAt, updatedAt)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO worker (workerId, threadId, repoId, mode, state, sessionId, sessionFile, branch, worktree, base, lastOutcome, createdAt, updatedAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(workerId) DO UPDATE SET state = excluded.state, sessionId = excluded.sessionId,
            sessionFile = excluded.sessionFile, branch = excluded.branch, worktree = excluded.worktree,
-           lastOutcome = excluded.lastOutcome, updatedAt = excluded.updatedAt`,
+           base = excluded.base, lastOutcome = excluded.lastOutcome, updatedAt = excluded.updatedAt`,
       )
       .run(
         worker.workerId,
@@ -171,6 +197,7 @@ export class LocalStore {
         worker.sessionFile ?? null,
         worker.branch ?? null,
         worker.worktree ?? null,
+        worker.base ?? null,
         worker.lastOutcome ?? null,
         worker.createdAt ?? Date.now(),
         Date.now(),
@@ -181,7 +208,7 @@ export class LocalStore {
     return (
       (this.db
         .prepare(
-          `SELECT workerId, threadId, repoId, mode, state, sessionId, sessionFile, branch, worktree, lastOutcome, createdAt, updatedAt
+          `SELECT workerId, threadId, repoId, mode, state, sessionId, sessionFile, branch, worktree, base, lastOutcome, createdAt, updatedAt
            FROM worker WHERE workerId = ?`,
         )
         .get(workerId) as WorkerRow | undefined) ?? null
@@ -197,10 +224,59 @@ export class LocalStore {
   listWorkers(): WorkerRow[] {
     return this.db
       .prepare(
-        `SELECT workerId, threadId, repoId, mode, state, sessionId, sessionFile, branch, worktree, lastOutcome, createdAt, updatedAt
+        `SELECT workerId, threadId, repoId, mode, state, sessionId, sessionFile, branch, worktree, base, lastOutcome, createdAt, updatedAt
          FROM worker ORDER BY workerId`,
       )
       .all() as unknown as WorkerRow[];
+  }
+
+  // --- Recovery (connector-pi.md §9) -----------------------------------------------------
+
+  setOrphanSnapshot(workerId: string, refs: ProcRef[]): void {
+    this.db
+      .prepare(
+        `INSERT INTO orphan_snapshot (workerId, refs, updatedAt) VALUES (?, ?, ?)
+         ON CONFLICT(workerId) DO UPDATE SET refs = excluded.refs, updatedAt = excluded.updatedAt`,
+      )
+      .run(workerId, JSON.stringify(refs), Date.now());
+  }
+
+  getOrphanSnapshot(workerId: string): ProcRef[] | null {
+    const row = this.db.prepare("SELECT refs FROM orphan_snapshot WHERE workerId = ?").get(workerId) as
+      | { refs: string }
+      | undefined;
+    if (!row) return null;
+    try {
+      const parsed = JSON.parse(row.refs) as ProcRef[];
+      return Array.isArray(parsed) ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+
+  listOrphanSnapshots(): string[] {
+    return (this.db.prepare("SELECT workerId FROM orphan_snapshot").all() as Array<{ workerId: string }>).map(
+      (r) => r.workerId,
+    );
+  }
+
+  deleteOrphanSnapshot(workerId: string): void {
+    this.db.prepare("DELETE FROM orphan_snapshot WHERE workerId = ?").run(workerId);
+  }
+
+  /** Records one resume attempt at `now` and returns the count inside the window, this
+   * attempt included — the ≤2/hour budget of §9.2, persisted so a crash mid-recovery
+   * (a connector killed between two attempts) cannot reset it. */
+  recordResume(workerId: string, windowMs = 3_600_000): number {
+    this.db.prepare("INSERT INTO worker_resume (workerId, at) VALUES (?, ?)").run(workerId, Date.now());
+    return this.countResumes(workerId, windowMs);
+  }
+
+  countResumes(workerId: string, windowMs = 3_600_000): number {
+    const { n } = this.db
+      .prepare("SELECT COUNT(*) AS n FROM worker_resume WHERE workerId = ? AND at > ?")
+      .get(workerId, Date.now() - windowMs) as { n: number };
+    return n;
   }
 
 }
@@ -223,6 +299,8 @@ export interface WorkerRow {
   sessionFile?: string | null;
   branch?: string | null;
   worktree?: string | null;
+  /** The commit-ish the worktree branch started from (§8.2); git-facts input after a restart. */
+  base?: string | null;
   lastOutcome?: string | null;
   createdAt?: number;
   updatedAt?: number;

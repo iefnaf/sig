@@ -429,6 +429,10 @@ export class Steward extends Agent<Env> {
     // A reconnect is also the natural catch-up point for events persisted but not yet reduced
     // (crash between the events_ack and the reducer, protocol §4.3): drain, then notify.
     this.applyLedgerEvents();
+    // Reconciliation against hello.workers (issue #12, connector-pi.md §9.1 step 4): with the
+    // pending events drained first, the gate inside (lastSeq <= processedUpTo) means this only
+    // fires for workers whose event stream cannot tell the story anymore. Timeline, no push.
+    this.ledger.workers.reconcileFromSnapshot(auth.deviceId, hello.workers);
   }
 
   // protocol §4.2 + ADR-0001 (spike bug 10): hello redelivers queued, sent, AND

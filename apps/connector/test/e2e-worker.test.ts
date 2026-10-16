@@ -35,10 +35,9 @@ afterEach(async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-function startApp(scenarioPath: string): ConnectorApp {
+function startApp(scenarioPath: string): Promise<ConnectorApp> {
   app = new ConnectorApp({ store, stateDir, adapter: fakePiAdapter(stateDir, scenarioPath) });
-  app.start();
-  return app;
+  return app.start().then(() => app);
 }
 
 describe("start_worker over the real transport (issue #3 + #30)", () => {

@@ -270,11 +270,24 @@ export const MIGRATIONS: readonly Migration[] = [
     },
   },
   {
+    // Issue #12 (connector-pi.md §9.1 / protocol §6.1): hello.bootId distinguishes “reconnect
+    // after a network blip” (same bootId) from “connector restart” (new bootId — every pi
+    // process died in between). Stored per machine; the workers snapshot that rides the same
+    // hello is reconciled against sh_worker in ledger.ts (workers.reconcileFromSnapshot).
+    id: "007_machine_boot_id",
+    up: (sql) => {
+      ignoringDuplicateColumn(() => {
+        sql`ALTER TABLE sh_machine ADD COLUMN bootId TEXT`;
+      });
+    },
+  },
+  {
     // The signed-link web (issue #22, spec §7.3/§12.2, steward.md §10): one-time links minted
     // for the owner's chat, the sessions they are exchanged for, and the deployment's public
     // origin (links and pairing commands need absolute URLs, and the DO only ever sees the
-    // origin through the requests it serves). These tables belong to web.ts.
-    id: "007_web",
+    // origin through the requests it serves). These tables belong to web.ts. Numbered 008:
+    // #12's machine_boot_id took 007 on main first.
+    id: "008_web",
     up: (sql) => {
       // Single-use enforcement for signed links: the token's HMAC covers target + expiry
       // statelessly; this row is the "already opened" bit. tokenHash = SHA-256(token).
