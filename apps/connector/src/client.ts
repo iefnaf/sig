@@ -31,6 +31,8 @@ export interface ClientOptions {
   // connector rejects every kind so the DO's outbox row settles immediately.
   handleCommand?: CommandHandler;
   workersSnapshot?: () => Array<Record<string, unknown>>;
+  /** Honest hello snapshot for the non-worker sections (protocol §6.1): agents, repos, limits. */
+  snapshot?: () => { agents: unknown[]; repos: unknown[]; limits: { maxWorkers: number; running: number } };
   pingIntervalMs?: number;
   pongTimeoutMs?: number;
   deadAfterMs?: number;
@@ -136,9 +138,9 @@ export class ConnectorClient {
             memTotalMB: Math.round(os.totalmem() / 1_000_000),
             memFreeMB: Math.round(os.freemem() / 1_000_000),
           },
-          agents: [],
-          repos: [],
-          limits: { maxWorkers: 1, running: 0 },
+          agents: this.options.snapshot?.().agents ?? [],
+          repos: this.options.snapshot?.().repos ?? [],
+          limits: this.options.snapshot?.().limits ?? { maxWorkers: 1, running: 0 },
           workers: this.options.workersSnapshot?.() ?? [],
           pendingAcks: this.commands.pendingAcks(),
         }),

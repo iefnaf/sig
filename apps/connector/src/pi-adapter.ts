@@ -1,0 +1,429 @@
+// PiAdapter: the first AgentAdapter implementation, docs/design/connector-pi.md §3–§7.
+// Normalizes pi's raw event stream into coarse-grained adapter events and runs outcome
+// adjudication on `agent_settled` (§5.2). Git facts are NOT collected here — the
+// WorkerManager merges those after adjudication so they come from git, not the model.
+import type {
+  AgentAdapter,
+  AgentCapabilities,
+  Delivery,
+  RawAdapterEvent,
+  ReportPayload,
+  SessionUsage,
+  StartSpec,
+  WorkerHandle,
+} from "./agent.ts";
+import { adjudicate, type RunWindow } from "./adjudication.ts";
+import { installAssets, type InstalledAssets } from "./install.ts";
+import { PiProcess } from "./pi-process.ts";
+
+/** Must match COMMAND_NAME in ./ext/shepherd-pi.ts (locked together by a test). */
+const SHEPHERD_COMMAND = "shepherd";
+
+export class AdapterError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+    readonly retriable = false,
+  ) {
+    super(message);
+    this.name = "AdapterError";
+  }
+}
+
+export interface PiAdapterOptions {
+  stateDir: string;
+  /** argv prefix for the pi binary; default ["pi"]. Tests point this at fake-pi. */
+  command?: string[];
+  /** get_state must succeed within this window after spawn (§4.4: 5 seconds). */
+  getStateTimeoutMs?: number;
+  /** Extra env passed to the child (tests). The connector's own credentials never ride along. */
+  env?: Record<string, string | undefined>;
+}
+
+const PI_CAPABILITIES: AgentCapabilities = {
+  steer: true,
+  followUp: true,
+  interrupt: true,
+  resume: true,
+  history: true,
+  images: true,
+  structuredReport: true,
+  readonly: true,
+};
+
+/** The fixed resume prompt, connector-pi.md §9.2. */
+export const RESUME_PROMPT =
+  "Your previous process was interrupted (machine or process restart). First check the current " +
+  "files and git status, confirm what is already done, then continue the task. Interrupted tool " +
+  "calls may have been only partially executed.";
+
+interface WorkerRuntime {
+  workerId: string;
+  process: PiProcess;
+  cwd: string;
+  /** Set when the connector itself is stopping the process; makes exits "expected". */
+  stopping: boolean;
+  turn: number;
+  window: RunWindow & { open: boolean };
+  /**
+   * Events are buffered from spawn until start() resolves: a fast agent can begin streaming
+   * (agent_start …) before the caller has emitted its `started` event, which must come first
+   * on the wire (§11.1). The flush rides a macrotask, so the caller's `await` continuation —
+   * which emits `started` — deterministically runs first.
+   */
+  buffered: RawAdapterEvent[] | null;
+}
+
+export class PiAdapter implements AgentAdapter {
+  readonly kind = "pi" as const;
+  readonly capabilities = PI_CAPABILITIES;
+
+  private readonly options: PiAdapterOptions;
+  private readonly runtimes = new Map<string, WorkerRuntime>();
+  private readonly listeners: ((e: RawAdapterEvent) => void)[] = [];
+  private assets?: InstalledAssets;
+
+  constructor(options: PiAdapterOptions) {
+    this.options = options;
+  }
+
+  on(event: "worker-event", fn: (e: RawAdapterEvent) => void): void {
+    if (event !== "worker-event") throw new Error(`unknown event: ${event}`);
+    this.listeners.push(fn);
+  }
+
+  private emit(e: RawAdapterEvent): void {
+    const runtime = this.runtimes.get(e.workerId);
+    if (runtime?.buffered) {
+      runtime.buffered.push(e);
+      return;
+    }
+    for (const fn of this.listeners) fn(e);
+  }
+
+  private flushBuffered(runtime: WorkerRuntime): void {
+    const buffered = runtime.buffered;
+    runtime.buffered = null;
+    if (!buffered) return;
+    for (const event of buffered) {
+      for (const fn of this.listeners) fn(event);
+    }
+  }
+
+  /** Builds the startup command line (§4.2). */
+  buildArgs(spec: StartSpec, assets: InstalledAssets): string[] {
+    const args = [
+      "--mode",
+      "rpc",
+      "--session-id",
+      spec.workerId,
+      "--extension",
+      assets.extensionPath,
+      "--append-system-prompt",
+      assets.promptPath,
+      "--no-approve",
+    ];
+    if (spec.mode === "readonly") args.push("--tools", "read,grep,find,ls,report");
+    if (spec.model) args.push("--model", spec.model);
+    return args;
+  }
+
+  async start(spec: StartSpec): Promise<WorkerHandle> {
+    // In-memory half of the one-file-one-process invariant (§4.3); the lock file is the
+    // WorkerManager's half.
+    if (this.runtimes.has(spec.workerId)) {
+      throw new AdapterError("lock_held", `a pi process for ${spec.workerId} is already running`);
+    }
+    this.assets = this.assets ?? installAssets(this.options.stateDir);
+
+    let runtime!: WorkerRuntime;
+    const proc = new PiProcess({
+      command: this.options.command ?? ["pi"],
+      args: this.buildArgs(spec, this.assets),
+      cwd: spec.cwd,
+      env: { ...process.env, ...this.options.env },
+      onEvent: (record) => this.onPiEvent(runtime, record),
+      onExit: (info) => this.onPiExit(runtime, info),
+    });
+    runtime = {
+      workerId: spec.workerId,
+      process: proc,
+      cwd: spec.cwd,
+      stopping: false,
+      turn: 0,
+      window: { open: false, aborted: false },
+      buffered: [],
+    };
+    this.runtimes.set(spec.workerId, runtime);
+    proc.spawn();
+
+    try {
+      // §4.4 step 4: get_state must succeed within the timeout and sessionId must match.
+      const timeout = this.options.getStateTimeoutMs ?? 5000;
+      const state = await proc.rpc({ type: "get_state" }, timeout);
+      if (state.sessionId !== spec.workerId) {
+        throw new AdapterError(
+          "startup_failed",
+          `sessionId mismatch: expected ${spec.workerId}, got ${String(state.sessionId)}`,
+        );
+      }
+      const handle: WorkerHandle = {
+        workerId: spec.workerId,
+        sessionId: String(state.sessionId),
+        sessionFile: typeof state.sessionFile === "string" ? state.sessionFile : undefined,
+        cwd: spec.cwd,
+      };
+
+      // §4.4 step 5: send the prompt, wrapped for the extension's commandId marker
+      // (ADR-0001). The `/shepherd` extension command consumes it, so the response's
+      // disposition must be "handled".
+      const message = wrapPrompt(spec.commandId, spec.prompt);
+      const response = await proc.rpc(
+        { type: "prompt", message, images: spec.images?.map((i) => ({ type: "image", data: i.data, mimeType: i.mimeType })) },
+        timeout,
+      );
+      const disposition = String(response.disposition ?? "");
+      if (disposition !== "handled") {
+        throw new AdapterError(
+          "startup_failed",
+          `shepherd extension did not consume the prompt (disposition: ${disposition || "missing"}); ` +
+            `is ~/.shepherd/ext loadable?`,
+        );
+      }
+      this.pendingResumeSpecs.set(spec.workerId, spec);
+      setImmediate(() => this.flushBuffered(runtime));
+      return handle;
+    } catch (err) {
+      // Startup failed → broken (§5.1); clean up the process and rethrow.
+      runtime.buffered = null; // nothing started, so nothing to replay
+      this.runtimes.delete(spec.workerId);
+      runtime.stopping = true;
+      await proc.close().catch(() => proc.kill());
+      if (err instanceof AdapterError) throw err;
+      const reason = err instanceof Error ? err.message : String(err);
+      throw new AdapterError("startup_failed", `pi startup failed: ${reason}`);
+    }
+  }
+
+  async send(
+    id: string,
+    input: { text: string; images?: { data: string; mimeType: string }[] },
+    how: Delivery,
+  ): Promise<{ effect?: string }> {
+    const runtime = this.require(id);
+    const images = input.images?.map((i) => ({ type: "image", data: i.data, mimeType: i.mimeType }));
+    if (how === "prompt") {
+      await runtime.process.rpc({ type: "prompt", message: input.text, images });
+      return {};
+    }
+    const type = how === "steer" ? "steer" : "follow_up";
+    await runtime.process.rpc({ type, message: input.text, images });
+    // §6.2: steer takes effect after the current tool batch finishes.
+    return { effect: how === "steer" ? "after_current_tools" : undefined };
+  }
+
+  async interrupt(id: string): Promise<void> {
+    const runtime = this.require(id);
+    await runtime.process.rpc({ type: "abort" });
+  }
+
+  async resume(id: string, reason: string): Promise<void> {
+    const runtime = this.runtimes.get(id);
+    if (runtime && !runtime.process.hasExited) {
+      await runtime.process.rpc({ type: "prompt", message: `${RESUME_PROMPT}\n\nReason: ${reason}` });
+      return;
+    }
+    // Relaunch with the same session id and send the fixed resume prompt (§9.2).
+    const existing = this.pendingResumeSpecs.get(id);
+    if (!existing) throw new AdapterError("not_found", `no known spec to resume worker ${id}`);
+    await this.start({ ...existing, prompt: RESUME_PROMPT, commandId: `resume-${Date.now()}` });
+  }
+
+  /** Remembered so `resume` can relaunch a dead worker (§9.2). */
+  private readonly pendingResumeSpecs = new Map<string, StartSpec>();
+
+  async stopProcess(id: string): Promise<void> {
+    const runtime = this.runtimes.get(id);
+    if (!runtime) return;
+    runtime.stopping = true;
+    this.runtimes.delete(id);
+    await runtime.process.close();
+  }
+
+  isRunning(id: string): boolean {
+    const runtime = this.runtimes.get(id);
+    return !!runtime && !runtime.process.hasExited;
+  }
+
+  stderrTail(id: string): string {
+    return this.runtimes.get(id)?.process.getStderrTail() ?? "";
+  }
+
+  private require(id: string): WorkerRuntime {
+    const runtime = this.runtimes.get(id);
+    if (!runtime || runtime.process.hasExited) {
+      throw new AdapterError("not_running", `no live pi process for worker ${id}`);
+    }
+    return runtime;
+  }
+
+  // --- Event normalization (§11.1 sources) ------------------------------------------------
+
+  private onPiEvent(runtime: WorkerRuntime, record: Record<string, unknown>): void {
+    switch (record.type) {
+      case "agent_start": {
+        // Run window = from the FIRST agent_start after a command is accepted to the next
+        // agent_settled (§5.2); retries re-entering agent_start stay inside the window.
+        if (!runtime.window.open) {
+          runtime.window = { open: true, aborted: false };
+        }
+        return;
+      }
+      case "turn_start": {
+        runtime.turn += 1;
+        this.emit({
+          type: "progress",
+          workerId: runtime.workerId,
+          phase: "thinking",
+          turn: runtime.turn,
+        });
+        return;
+      }
+      case "tool_execution_start": {
+        const tool = String(record.toolName ?? "unknown");
+        if (tool === "report") {
+          const report = normalizeReport(record.args);
+          if (report) runtime.window.report = report;
+        }
+        this.emit({
+          type: "progress",
+          workerId: runtime.workerId,
+          phase: "tool",
+          tool,
+          target: extractTarget(record.args),
+          turn: runtime.turn,
+        });
+        return;
+      }
+      case "message_end": {
+        const message = record.message as Record<string, unknown> | undefined;
+        if (message?.role === "assistant") {
+          runtime.window.lastAssistant = {
+            stopReason: typeof message.stopReason === "string" ? message.stopReason : undefined,
+            errorMessage: typeof message.errorMessage === "string" ? message.errorMessage : undefined,
+            text: extractText(message.content),
+          };
+        }
+        return;
+      }
+      case "auto_retry_end": {
+        runtime.window.lastRetry = {
+          success: record.success === true,
+          finalError: typeof record.finalError === "string" ? record.finalError : undefined,
+        };
+        return;
+      }
+      case "agent_settled": {
+        if (!runtime.window.open) return;
+        runtime.window.aborted = record.aborted === true;
+        void this.settle(runtime);
+        return;
+      }
+      default:
+        return;
+    }
+  }
+
+  private async settle(runtime: WorkerRuntime): Promise<void> {
+    const facts = runtime.window;
+    const adjudicated = adjudicate(facts);
+    runtime.window = { open: false, aborted: false };
+    runtime.turn = 0;
+
+    // usage from get_session_stats at settlement (§11.2).
+    let usage: SessionUsage | undefined;
+    if (!runtime.process.hasExited) {
+      usage = (await runtime.process.rpc({ type: "get_session_stats" }, 2000).catch(() => undefined)) as SessionUsage | undefined;
+    }
+
+    this.emit({
+      type: "settled",
+      workerId: runtime.workerId,
+      outcome: adjudicated.outcome,
+      errorClass: adjudicated.errorClass,
+      lastText: adjudicated.lastText?.slice(0, 4000),
+      report: adjudicated.report,
+      usage,
+    });
+  }
+
+  private onPiExit(runtime: WorkerRuntime, info: { code: number | null; signal: NodeJS.Signals | null }): void {
+    if (this.runtimes.get(runtime.workerId) === runtime) this.runtimes.delete(runtime.workerId);
+    this.emit({
+      type: "process_exit",
+      workerId: runtime.workerId,
+      code: info.code,
+      signal: info.signal,
+      unexpected: !runtime.stopping,
+    });
+  }
+}
+
+/** `/shepherd <commandId>\n<text>` — the extension unwraps it and writes the marker (ADR-0001). */
+export function wrapPrompt(commandId: string, text: string): string {
+  return `/${SHEPHERD_COMMAND} ${commandId}\n${text}`;
+}
+
+/** Validates and normalizes `report` tool args into the §7.2 payload; null when invalid. */
+export function normalizeReport(args: unknown): ReportPayload | null {
+  if (typeof args !== "object" || args === null) return null;
+  const raw = args as Record<string, unknown>;
+  const status = raw.status;
+  if (status !== "done" && status !== "blocked" && status !== "needs_decision") return null;
+  const summary = typeof raw.summary === "string" ? raw.summary : "";
+  const stringList = (value: unknown): string[] | undefined =>
+    Array.isArray(value) && value.every((v) => typeof v === "string") ? (value as string[]) : undefined;
+  const payload: ReportPayload = { status, summary };
+  const changes = stringList(raw.changes);
+  if (changes) payload.changes = changes;
+  const decisions = stringList(raw.decisions);
+  if (decisions) payload.decisions = decisions;
+  const leftovers = stringList(raw.leftovers);
+  if (leftovers) payload.leftovers = leftovers;
+  if (typeof raw.question === "string") payload.question = raw.question;
+  if (typeof raw.next === "string") payload.next = raw.next;
+  if (typeof raw.tests === "object" && raw.tests !== null) {
+    const tests = raw.tests as Record<string, unknown>;
+    payload.tests = {
+      ran: tests.ran === true,
+      passed: typeof tests.passed === "boolean" ? tests.passed : undefined,
+      note: typeof tests.note === "string" ? tests.note : undefined,
+    };
+  }
+  return payload;
+}
+
+function extractText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((block) => {
+      if (typeof block === "object" && block !== null && (block as { type?: string }).type === "text") {
+        const text = (block as { text?: unknown }).text;
+        if (typeof text === "string") return text;
+      }
+      return "";
+    })
+    .join("");
+}
+
+/** First 80 chars of a path or command — never file contents or command output (§11.2). */
+function extractTarget(args: unknown): string | undefined {
+  if (typeof args !== "object" || args === null) return undefined;
+  const raw = args as Record<string, unknown>;
+  for (const key of ["file_path", "path", "filename", "command", "pattern", "query", "url"]) {
+    const value = raw[key];
+    if (typeof value === "string" && value.length > 0) return value.slice(0, 80);
+  }
+  return undefined;
+}
