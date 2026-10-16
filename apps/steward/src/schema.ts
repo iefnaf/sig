@@ -269,4 +269,16 @@ export const MIGRATIONS: readonly Migration[] = [
       sql`ALTER TABLE sh_channel_token RENAME COLUMN token TO tokenEnc`;
     },
   },
+  {
+    // Issue #12 (connector-pi.md §9.1 / protocol §6.1): hello.bootId distinguishes “reconnect
+    // after a network blip” (same bootId) from “connector restart” (new bootId — every pi
+    // process died in between). Stored per machine; the workers snapshot that rides the same
+    // hello is reconciled against sh_worker in ledger.ts (workers.reconcileFromSnapshot).
+    id: "007_machine_boot_id",
+    up: (sql) => {
+      ignoringDuplicateColumn(() => {
+        sql`ALTER TABLE sh_machine ADD COLUMN bootId TEXT`;
+      });
+    },
+  },
 ];

@@ -212,7 +212,8 @@ describe("WorkerManager over fake-pi (connector-pi.md §4–§8, §11)", () => {
     expect(settled()).toMatchObject({ outcome: "error", errorClass: "auth" });
     // No report event may mask the failure (§5.2 ordering).
     expect(reportEvent()).toBeUndefined();
-    expect(store.getWorker("w-test-worker-1")?.lastOutcome).toBe("error");
+    // §9.2: auth errors never auto-resume — the connector is done with this worker.
+    expect(store.getWorker("w-test-worker-1")).toMatchObject({ state: "broken", lastOutcome: "error:auth" });
   }, 30_000);
 
   it("aborted: settled outcome aborted", async () => {

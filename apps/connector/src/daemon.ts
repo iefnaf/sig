@@ -67,7 +67,10 @@ export async function runDaemon(options: DaemonOptions): Promise<DaemonHandle> {
     onWelcome: () => logger.info("welcomed", { serverUrl: credentials.serverUrl }),
     onClose: (code, reason) => logger.warn("connection_closed", { code, reason: reason.slice(0, 200) }),
   });
-  app.start();
+  // §9.1 reconciliation completes before the first hello, so the workers snapshot + bootId
+  // the DO reconciles against reflect the crash that preceded this boot (issue #12). A
+  // reconciliation failure fails the daemon start (the supervisor restarts it).
+  await app.start();
 
   return {
     logger,
