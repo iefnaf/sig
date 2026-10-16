@@ -360,4 +360,77 @@ export const MIGRATIONS: readonly Migration[] = [
       )`;
     },
   },
+  {
+    // Proactive behavior (issue #20, steward.md §8, spec §8): routines (recurring or one-shot
+    // prescriptions the owner made by conversation) and follow-ups (a Thread-scoped alarm the
+    // steward sets itself). Every row traces back to something the owner said — createdFromMsg
+    // / sourceRef are NOT NULL, the data-layer half of "proactive behavior must have
+    // provenance" (spec §8.3). Suggestions (steward.md §8.5) send a button card only; the
+    // offer row holds the spec until the owner taps it.
+    id: "010_routines_followups",
+    up: (sql) => {
+      // kind: 'digest' (deterministic ledger summary, no LLM — spike-conclusions §2) or
+      // 'instruction' (a ⟦routine⟧ steward input executes it).
+      // status: active | paused | done (a once-routine that fired) | cancelled.
+      // lastFireKey = the latest processed `routine:<id>:<fireTime>` — the SDK may re-dispatch
+      // a job (retry after handler error); the key makes the whole fire idempotent.
+      sql`CREATE TABLE IF NOT EXISTS sh_routine (
+        routineId TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        createdFromMsg TEXT NOT NULL,
+        scheduleKind TEXT NOT NULL,
+        cron TEXT,
+        onceAt INTEGER,
+        instruction TEXT NOT NULL,
+        repoId TEXT,
+        threadId TEXT,
+        status TEXT NOT NULL DEFAULT 'active',
+        scheduleId TEXT,
+        lastRunAt INTEGER,
+        lastFireKey TEXT,
+        lastResult TEXT,
+        outcomeRecorded INTEGER NOT NULL DEFAULT 0,
+        createdAt INTEGER NOT NULL
+      )`;
+      // A Thread-scoped "look at this again in two hours" (steward.md §8.3). createdBy=
+      // 'steward' rows must carry a sourceRef pointing at the user message or routine that
+      // authorized them (verified at creation — checkProvenanceRef).
+      sql`CREATE TABLE IF NOT EXISTS sh_followup (
+        followupId TEXT PRIMARY KEY,
+        threadId TEXT NOT NULL,
+        dueAt INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        createdBy TEXT NOT NULL,
+        sourceRef TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'open',
+        scheduleId TEXT,
+        lastResult TEXT,
+        outcomeRecorded INTEGER NOT NULL DEFAULT 0,
+        createdAt INTEGER NOT NULL
+      )`;
+      // A suggestion sent as a button card (steward.md §8.5): the spec waits here until the
+      // owner taps; the tap is the consent that create_routine would otherwise lack.
+      sql`CREATE TABLE IF NOT EXISTS sh_routine_offer (
+        offerId TEXT PRIMARY KEY,
+        spec TEXT NOT NULL,
+        sourceMsg TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'offered',
+        outboundId TEXT,
+        createdAt INTEGER NOT NULL
+      )`;
+      // Routine fires may be Thread-less (a digest scans everything); the timeline's
+      // threadId becomes nullable so every fire still leaves an auditable entry (§8.6).
+      // Table rebuild: SQLite cannot relax NOT NULL in place. A leftover sh_timeline_new
+      // from an interrupted run is dropped first so the copy always starts clean.
+      sql`DROP TABLE IF EXISTS sh_timeline_new`;
+      sql`CREATE TABLE sh_timeline_new (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, threadId TEXT, ts INTEGER NOT NULL,
+        kind TEXT NOT NULL, text TEXT NOT NULL, refs TEXT
+      )`;
+      sql`INSERT INTO sh_timeline_new (id, threadId, ts, kind, text, refs) SELECT id, threadId, ts, kind, text, refs FROM sh_timeline`;
+      sql`DROP TABLE sh_timeline`;
+      sql`ALTER TABLE sh_timeline_new RENAME TO sh_timeline`;
+      sql`CREATE INDEX IF NOT EXISTS sh_timeline_thread ON sh_timeline (threadId, id)`;
+    },
+  },
 ];

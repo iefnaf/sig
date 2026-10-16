@@ -16,6 +16,11 @@
 // poll, §6.3), worker events wake it for bookkeeping through the durable wake queue (§5.1/
 // §5.4), and in event-triggered runs its plain text is discarded by structure (§6.2): only
 // notify_user / ask_user reach the user.
+//
+// Proactive behavior (issue #20, steward.md §8): routines and follow-ups schedule through
+// the Agents SDK (`fireRoutine`/`fireFollowup`); digest routines render deterministically
+// with no LLM, instruction fires submit ⟦routine⟧ inputs whose operationId
+// (routine:<id>:<fireTime>) dedups duplicate fires; every row traces back to a user message.
 import { Agent, type Connection, type ConnectionContext, type WSMessage } from "agents";
 import { PiHarness } from "agents/harness/pi";
 import { Harness, createRegistry, type Extension, type Registry } from "@earendil-works/pi-durable";
@@ -69,6 +74,7 @@ import {
   type StewardModels,
 } from "./llm/models.ts";
 import { createLedger, type Ledger, type LedgerSql, type NotifyRow, type RunRow } from "./ledger.ts";
+import { RoutineService } from "./routines.ts";
 import { failureCard, notifyCard, askUserText, reportCardFor } from "./report-template.ts";
 import { MIGRATIONS, runMigrations } from "./schema.ts";
 import { openSecret, sealSecret } from "./secretbox.ts";
@@ -200,6 +206,9 @@ export class Steward extends Agent<Env> {
     // Wakes queued by past reducers (crash between queue and submit, §11) drain now.
     void this.drainWakes();
     void this.pollRuns();
+    // Routine/follow-up rows and their SDK schedules live in different stores — a crash
+    // between INSERT and schedule() must not silently kill a routine (issue #20, §11).
+    void this.reconcileRoutineSchedules();
   }
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -340,7 +349,59 @@ export class Steward extends Agent<Env> {
       createPairing: () => this.createPairing(),
       deployOrigin: () => this.web.origin(),
       webLinkUrl: (target) => this.web.linkUrl(target),
+      // Routine suggestion cards (`offer:` outbound ids) route their taps here (§8.5).
+      onOfferTap: (offerId, action) => this.routineService.handleOfferTap(offerId, action),
     }));
+  }
+
+  // The proactive-behavior service (issue #20, steward.md §8): routines, follow-ups, offers.
+  // Same lazy-bind pattern as the ledger/dispatcher.
+  private routineService_?: RoutineService;
+  protected get routineService(): RoutineService {
+    return (this.routineService_ ??= new RoutineService({
+      ledger: this.ledger,
+      schedule: (when, callback, payload, opts) => this.schedule(when, callback, payload, opts),
+      cancelSchedule: (id) => this.cancelSchedule(id),
+      enqueueOutbound: (input) => this.enqueueOutbound(input),
+      ownerOpenId: () => this.ownerOpenIdSync(),
+      onWakeQueued: () => {
+        void this.drainWakes();
+        void this.pollRuns();
+      },
+      audit: (kind, detail) => this.logChannel(kind, detail),
+    }));
+  }
+
+  /** Agents SDK callback (this.schedule(cron, "fireRoutine", { routineId }), §8.2). */
+  async fireRoutine(payload?: { routineId?: string }, schedule?: { id?: string; time?: number }): Promise<void> {
+    if (!payload?.routineId) return;
+    try {
+      await this.routineService.fire(payload.routineId, schedule);
+    } catch (err) {
+      this.logChannel("routine_fire_failed", `${payload.routineId} ${errorText(err)}`);
+    }
+  }
+
+  /** Agents SDK callback for a due follow-up (§8.3): submits ⟦followup F⟧. */
+  async fireFollowup(payload?: { followupId?: string }): Promise<void> {
+    if (!payload?.followupId) return;
+    try {
+      await this.routineService.fireFollowup(payload.followupId);
+    } catch (err) {
+      this.logChannel("followup_fire_failed", `${payload.followupId} ${errorText(err)}`);
+    }
+  }
+
+  /** onStart reconciliation driver (§11): rows ↔ SDK schedules must agree after any crash. */
+  async reconcileRoutineSchedules(): Promise<void> {
+    try {
+      const schedules = await this.listSchedules();
+      await this.routineService.reconcile(
+        schedules.map((s) => ({ id: s.id, callback: s.callback, type: s.type, time: s.time, payload: s.payload })),
+      );
+    } catch (err) {
+      this.logChannel("routine_reconcile_failed", errorText(err));
+    }
   }
 
   // The signed-link web app (issue #22, steward.md §10): login exchange, Thread timeline,
@@ -367,12 +428,23 @@ export class Steward extends Agent<Env> {
       buildBrief: () => buildSituationBrief(this.ledger),
       currentRun: () => this.currentRunBinding(),
       checkProvenanceRef: async (ref) => {
-        // §7.2 (review #4): a `user:<msgId>` reference is valid only if this deployment
-        // actually received that message. Routine/followup/watch ids join when #20 lands.
-        if (!ref.startsWith("user:")) return false;
-        const msgId = ref.slice("user:".length);
-        if (msgId.length === 0) return false;
-        return this.sql`SELECT 1 AS one FROM sh_inbound WHERE channel = 'feishu' AND msgId = ${msgId}`.length > 0;
+        // §7.2 (review #4 + issue #20): a provenance reference is valid only if this
+        // deployment actually holds what it points at — a received user message, or a
+        // routine/follow-up the owner prescribed earlier (spec §8.3).
+        if (ref.startsWith("user:")) {
+          const msgId = ref.slice("user:".length);
+          if (msgId.length === 0) return false;
+          return this.sql`SELECT 1 AS one FROM sh_inbound WHERE channel = 'feishu' AND msgId = ${msgId}`.length > 0;
+        }
+        if (ref.startsWith("routine:")) {
+          const routineId = ref.slice("routine:".length);
+          return routineId.length > 0 && this.ledger.routines.exists(routineId);
+        }
+        if (ref.startsWith("followup:")) {
+          const followupId = ref.slice("followup:".length);
+          return followupId.length > 0 && this.ledger.followups.exists(followupId);
+        }
+        return false;
       },
       startWorker: async (input) => {
         const outcome = await this.dispatcher.startWorker(input);
@@ -440,6 +512,17 @@ export class Steward extends Agent<Env> {
       },
       audit: (kind, detail) => {
         this.logChannel(kind, detail);
+      },
+      routines: this.routineService,
+      // §8.6 (audit trail): an explicit in-run outcome (no_action) beats the settle fallback.
+      recordProactiveOutcome: (operationId, outcome) => {
+        const followup = /^followup:(f_.+)$/.exec(operationId);
+        if (followup) {
+          this.ledger.followups.recordOutcome(followup[1]!, outcome);
+          return;
+        }
+        const routine = /^routine:(r_.+):\d+$/.exec(operationId);
+        if (routine) this.ledger.routines.recordOutcome(routine[1]!, outcome);
       },
     };
   }
@@ -1800,6 +1883,9 @@ export class Steward extends Agent<Env> {
   }
 
   private settleRun(run: RunRow, result: { status: string; reason?: string; text?: string }): void {
+    // §8.6: every fire leaves a result. An explicit in-run outcome (no_action) was recorded
+    // during the run; the settle summary is the fallback for everything else.
+    this.recordSettledProactiveOutcome(run, result);
     if (run.kind === "user") {
       const owner = this.ownerOpenIdSync();
       const hasText = Boolean(result.text && result.text.trim().length > 0);
@@ -1853,6 +1939,20 @@ export class Steward extends Agent<Env> {
     // Event/routine/follow-up runs, and user runs that already reached the user: the text is
     // kept for audit and nothing more is sent (§6.2).
     this.ledger.runs.settle(run.operationId, result);
+  }
+
+  /** The settle-time lastResult for routine/follow-up runs (§8.6), when none was recorded. */
+  private recordSettledProactiveOutcome(run: RunRow, result: { status: string; reason?: string; text?: string }): void {
+    const summary =
+      `${result.status}${result.reason !== undefined && result.reason !== null ? `:${result.reason}` : ""}` +
+      (result.text && result.text.trim().length > 0 ? ` — ${result.text.trim().slice(0, 140)}` : "");
+    const followup = /^followup:(f_.+)$/.exec(run.operationId);
+    if (followup) {
+      this.ledger.followups.recordOutcome(followup[1]!, summary);
+      return;
+    }
+    const routine = /^routine:(r_.+):\d+$/.exec(run.operationId);
+    if (routine) this.ledger.routines.recordOutcome(routine[1]!, summary);
   }
 
   /**
@@ -1970,6 +2070,25 @@ export class Steward extends Agent<Env> {
     });
   }
 
+  /** Test entry into the proactive-behavior service (issue #20): create + arm a routine. */
+  async createRoutineForTest(
+    input: import("./routines.ts").RoutineSpecInput & { routineId?: string; createdFromMsg?: string },
+  ): Promise<{ ok: true; routineId: string } | { ok: false; reason: string }> {
+    const outcome = await this.routineService.create({
+      ...input,
+      routineId: input.routineId ?? `r_test_${ulid()}`,
+      createdFromMsg: input.createdFromMsg ?? "om_test_source",
+    });
+    return outcome.ok ? { ok: true, routineId: outcome.routine.routineId } : { ok: false, reason: outcome.reason };
+  }
+
+  /** Test read: the fireRoutine/fireFollowup schedule rows the Agents SDK currently holds. */
+  async routineSchedulesForTest(): Promise<Array<{ id: string; callback: string; type: string; time: number; payload: unknown }>> {
+    return (await this.listSchedules())
+      .filter((s) => s.callback === "fireRoutine" || s.callback === "fireFollowup")
+      .map((s) => ({ id: s.id, callback: s.callback, type: s.type, time: s.time, payload: s.payload }));
+  }
+
   // ---- Steward-LLM test surface (the `faux` provider is configured via STEWARD_MODEL) ----
 
   /** Queues scripted model replies (FIFO); each model request consumes one step. */
@@ -2019,6 +2138,17 @@ export class Steward extends Agent<Env> {
     this.ctx.storage.sql.exec("DELETE FROM sh_run");
     this.ctx.storage.sql.exec("DELETE FROM sh_wake");
     if (this.llmModels.faux) this.llmModels.faux.reset();
+  }
+
+  /** Test-only: cancels every routine/follow-up schedule and clears the proactive tables. */
+  async resetRoutineStateForTests(): Promise<void> {
+    for (const s of await this.listSchedules()) {
+      if (s.callback === "fireRoutine" || s.callback === "fireFollowup") await this.cancelSchedule(s.id).catch(() => {});
+    }
+    this.ctx.storage.sql.exec("DELETE FROM sh_routine");
+    this.ctx.storage.sql.exec("DELETE FROM sh_followup");
+    this.ctx.storage.sql.exec("DELETE FROM sh_routine_offer");
+    this.routineService_ = undefined;
   }
 
   // Scheduled callback (also fired inline after each enqueue): claims due rows, sends them

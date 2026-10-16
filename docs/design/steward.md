@@ -466,7 +466,7 @@ The `beforeTool` hook (pi-durable's `hook(ToolTask, { beforeTool })`) consults t
 
 The `provenance` rule (spec §8.3): in event-triggered runs, calling `start_worker`/`send_to_worker` requires a `provenance` that is an existing routine, follow-up, or watch ID, or a user message ID; an empty value is always rejected. This makes it impossible for the steward to decide to act "out of thin air".
 
-> **Implemented boundary (issue #6, PR #40 review #4):** in event/routine/follow-up-triggered runs the `start_worker` tool requires an explicit `provenanceRef`; `user:<msgId>` values are verified against `sh_inbound` (a message this deployment actually received), anything else — including the wake's own `evt:` id — is refused at the tool. Routine/follow-up/watch reference checks join when those tables land (#20).
+> **Implemented boundary (issue #6, PR #40 review #4; extended by #20):** in event/routine/follow-up-triggered runs the `start_worker` tool requires an explicit `provenanceRef`; `user:<msgId>` values are verified against `sh_inbound` (a message this deployment actually received), `routine:<id>` / `followup:<id>` against their ledger rows, anything else — including the wake's own `evt:` id — is refused at the tool.
 
 The autonomy switch (cautious / balanced / hands-off) = three settings of this policy table; the MVP implements only "balanced", and the table structure leaves room for swapping in the others.
 
@@ -487,6 +487,8 @@ A non-null `createdFromMsg` is the data-layer guarantee of the spec's rule that 
 
 - Creation: the user says 「每个工作日早上 9 点……」 ("every workday at 9 a.m., …"); the steward repeats it back, confirms, then calls `create_routine`.
 - Triggering: via the Agents SDK's `this.schedule(cron, "fireRoutine", { routineId })` (cron scheduling is idempotent). On fire, the core submits `⟦routine R⟧ <instruction>` with `operationId = routine:<id>:<fireTime>`, so duplicate fires are never processed twice.
+
+> **Implemented (issue #20).** `fireTime` is the fire's scheduled second (the SDK hands the callback the due time, not the next occurrence), and `sh_routine.lastFireKey` gates the whole fire — an SDK re-dispatch after a handler error is a no-op for both digests and instruction wakes. Digest routines never reach the LLM at all (spike-conclusions §2 wins over the design's blanket "submit ⟦routine⟧"): the core renders running/waiting/unread into one card, stays silent when there is nothing to say, and only `instruction` routines queue a wake. Suggestions send a button card whose tap creates the routine deterministically (`sh_routine_offer`, resolved via the card's providerMsgId); `create_routine` refuses to run outside a user message. Every fire leaves `lastResult` and a timeline entry (thread-less when the routine has no Thread — `sh_timeline.threadId` is nullable since #20).
 - The steward executes per the instruction with `provenance = routine:<id>`; if there is nothing to do, `no_action`.
 
 ### 8.3 Follow-ups (setting an alarm for yourself)
@@ -601,7 +603,7 @@ Legend: ✓ verified in the protocol spike; ◦ seen only in docs or type declar
 | `input` with a custom `entry` (distinguishing user vs event) | ? `pi-durable@1.1.0` types disallow it, the repo README allows it; `PiHarness.submit` does not expose it. The MVP uses content markers (§4.2) |
 | DO SQLite supports FTS5 and JSON functions | ◦ (official docs); trigger-sync behavior unverified |
 | `ctx.storage.transactionSync` | ◦ (DO storage API) |
-| `this.schedule(cron, ...)` idempotent | ◦ (Agents SDK docs) |
+| `this.schedule(cron, ...)` idempotent | ✓ (issue #20: cron dedups by expression+payload, one-shots opt in with `idempotent: true`; verified by tests incl. lost-schedule reconciliation) |
 | Feishu: QR-code creation (`registerApp` device flow) | ◦ official SDK source; no live scan performed |
 | Feishu: long-connection protocol, message send / reply / card update, rate limits and lengths | ◦ official SDK source and comments; not exercised live |
 | Feishu: switching a QR-created app to webhook, publish review, personal-account limits, long-connection stability inside the DO | ? unverified; see [feishu-channel.md](../research/feishu-channel.md) §6 |

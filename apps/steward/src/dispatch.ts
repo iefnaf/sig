@@ -123,6 +123,8 @@ export interface DispatcherDeps {
   deployOrigin: () => string | null;
   /** Mints an absolute one-time web URL, or null when no origin is known yet. */
   webLinkUrl: (target: string) => Promise<string | null>;
+  /** A tap on a routine-suggestion card (`offer:` outbound ids, issue #20). */
+  onOfferTap: (offerId: string, action: string) => Promise<void>;
 }
 
 const AGENT = "pi"; // the only agent the connector drives in the MVP (ADR-0001 decision 3)
@@ -275,6 +277,13 @@ export class Dispatcher {
 
   /** A card button callback (already deduped); the Thread comes from the card's message id. */
   async handleCardAction(input: { operatorId: string; action: string; cardMsgId: string }): Promise<void> {
+    // Routine suggestion cards (steward.md §8.5): resolved via the outbound row's `offer:` id —
+    // the tap is the consent that creates the routine; no Thread is required.
+    const outboundRow = this.ledger.outbound.rowForProviderMsg(input.cardMsgId);
+    if (outboundRow && outboundRow.id.startsWith("offer:")) {
+      await this.#deps.onOfferTap(outboundRow.id.slice("offer:".length), input.action);
+      return;
+    }
     const threadId = this.ledger.outbound.threadIdForProviderMsg(input.cardMsgId);
     const thread = threadId ? this.ledger.threads.get(threadId) : null;
     if (!thread) {

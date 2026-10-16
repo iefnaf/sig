@@ -164,6 +164,66 @@ export interface RunRow {
   settledAt: number | null;
 }
 
+// ---- proactive behavior (issue #20, steward.md §8) ----------------------------------------------
+
+export type RoutineKind = "digest" | "instruction";
+export type RoutineStatus = "active" | "paused" | "done" | "cancelled";
+export type FollowupStatus = "open" | "fired" | "cancelled";
+
+export interface RoutineRow {
+  routineId: string;
+  kind: RoutineKind;
+  createdFromMsg: string;
+  scheduleKind: "cron" | "once";
+  cron: string | null;
+  onceAt: number | null;
+  instruction: string;
+  repoId: string | null;
+  threadId: string | null;
+  status: RoutineStatus;
+  scheduleId: string | null;
+  lastRunAt: number | null;
+  /** The latest processed `routine:<id>:<fireTime>` — the fire-level idempotency key. */
+  lastFireKey: string | null;
+  lastResult: string | null;
+  outcomeRecorded: boolean;
+  createdAt: number;
+}
+
+export interface FollowupRow {
+  followupId: string;
+  threadId: string;
+  dueAt: number;
+  reason: string;
+  createdBy: "user" | "steward";
+  sourceRef: string;
+  status: FollowupStatus;
+  scheduleId: string | null;
+  lastResult: string | null;
+  outcomeRecorded: boolean;
+  createdAt: number;
+}
+
+/** A routine suggestion waiting for the owner's button tap (steward.md §8.5). */
+export interface RoutineOfferRow {
+  offerId: string;
+  spec: RoutineSpecStored;
+  sourceMsg: string;
+  status: "offered" | "accepted" | "dismissed";
+  outboundId: string | null;
+  createdAt: number;
+}
+
+/** The offer's stored spec (JSON in sh_routine_offer.spec). */
+export interface RoutineSpecStored {
+  instruction: string;
+  kind: RoutineKind;
+  cron?: string;
+  onceAt?: number;
+  threadId?: string;
+  repoId?: string;
+}
+
 // ---- web read model (steward.md §10: pages are served from the memory module's views) -------------
 
 /** L2 Timeline view: thread header, its summary events, its workers with machine names. */
@@ -276,6 +336,48 @@ const viewQuestion = (r: Record<string, unknown>): QuestionRow => ({
   status: r.status as QuestionRow["status"],
   askedAt: r.askedAt as number,
   answeredAt: (r.answeredAt as number | null) ?? null,
+});
+
+const viewRoutine = (r: Record<string, unknown>): RoutineRow => ({
+  routineId: r.routineId as string,
+  kind: r.kind as RoutineKind,
+  createdFromMsg: r.createdFromMsg as string,
+  scheduleKind: r.scheduleKind as RoutineRow["scheduleKind"],
+  cron: (r.cron as string | null) ?? null,
+  onceAt: (r.onceAt as number | null) ?? null,
+  instruction: r.instruction as string,
+  repoId: (r.repoId as string | null) ?? null,
+  threadId: (r.threadId as string | null) ?? null,
+  status: r.status as RoutineStatus,
+  scheduleId: (r.scheduleId as string | null) ?? null,
+  lastRunAt: (r.lastRunAt as number | null) ?? null,
+  lastFireKey: (r.lastFireKey as string | null) ?? null,
+  lastResult: (r.lastResult as string | null) ?? null,
+  outcomeRecorded: !!r.outcomeRecorded,
+  createdAt: r.createdAt as number,
+});
+
+const viewFollowup = (r: Record<string, unknown>): FollowupRow => ({
+  followupId: r.followupId as string,
+  threadId: r.threadId as string,
+  dueAt: r.dueAt as number,
+  reason: r.reason as string,
+  createdBy: r.createdBy as FollowupRow["createdBy"],
+  sourceRef: r.sourceRef as string,
+  status: r.status as FollowupStatus,
+  scheduleId: (r.scheduleId as string | null) ?? null,
+  lastResult: (r.lastResult as string | null) ?? null,
+  outcomeRecorded: !!r.outcomeRecorded,
+  createdAt: r.createdAt as number,
+});
+
+const viewOffer = (r: Record<string, unknown>): RoutineOfferRow => ({
+  offerId: r.offerId as string,
+  spec: jsonOrNull<RoutineSpecStored>(r.spec as string | null) ?? { instruction: "", kind: "instruction" },
+  sourceMsg: r.sourceMsg as string,
+  status: r.status as RoutineOfferRow["status"],
+  outboundId: (r.outboundId as string | null) ?? null,
+  createdAt: r.createdAt as number,
 });
 
 export function createLedger(deps: LedgerDeps) {
@@ -550,12 +652,14 @@ export function createLedger(deps: LedgerDeps) {
   };
 
   const timeline = {
-    add(threadId: string, kind: string, text: string, refs: Record<string, unknown> | null): void {
+    /** A summary event. `threadId` null = a Thread-less record (a routine fire, §8.6) — kept
+     *  for audit; thread pages filter by id so it never leaks into a Thread's timeline. */
+    add(threadId: string | null, kind: string, text: string, refs: Record<string, unknown> | null): void {
       sql`
         INSERT INTO sh_timeline (threadId, ts, kind, text, refs)
         VALUES (${threadId}, ${now()}, ${kind}, ${text}, ${refs ? JSON.stringify(refs) : null})
       `;
-      sql`UPDATE sh_thread SET lastActivityAt = ${now()} WHERE threadId = ${threadId}`;
+      if (threadId !== null) sql`UPDATE sh_thread SET lastActivityAt = ${now()} WHERE threadId = ${threadId}`;
     },
     list(threadId: string): TimelineRow[] {
       return sql<TimelineRow>`SELECT id, threadId, ts, kind, text FROM sh_timeline WHERE threadId = ${threadId} ORDER BY id`;
@@ -617,6 +721,13 @@ export function createLedger(deps: LedgerDeps) {
           SELECT threadId FROM sh_outbound WHERE providerMsgId = ${providerMsgId} AND threadId IS NOT NULL
         `[0]?.threadId ?? null
       );
+    },
+    /** The full routing row behind a provider message: id (button actions key off it — e.g.
+     *  `offer:` ids resolve a routine suggestion) plus its Thread, when bound. */
+    rowForProviderMsg(providerMsgId: string): { id: string; threadId: string | null } | null {
+      return sql<{ id: string; threadId: string | null }>`
+        SELECT id, threadId FROM sh_outbound WHERE providerMsgId = ${providerMsgId}
+      `[0] ?? null;
     },
     row(id: string): Record<string, unknown> | null {
       return sql<Record<string, unknown>>`SELECT * FROM sh_outbound WHERE id = ${id}`[0] ?? null;
@@ -695,11 +806,20 @@ export function createLedger(deps: LedgerDeps) {
   // ---- steward runs and wake_requests (steward.md §5.1 step 4, §6.3) --------------------------
 
   /** `mergeMs` is the 3-second merge window (§5.4); rows merge into a still-pending wake of
-   *  the same kind without extending its dueAt, so wake latency stays bounded. */
+   *  the same kind without extending its dueAt, so wake latency stays bounded.
+   *  `opts.operationId` (routine/follow-up fires): a fixed id with NO merging — each fire is
+   *  its own steward input, and the operationId itself is the dedup (§8.2/§11). */
   const wakes = {
-    queue(kind: WakeRow["kind"], dedupeKey: string, text: string, opts: { priority?: WakeRow["priority"]; mergeMs?: number } = {}): void {
-      const mergeMs = opts.mergeMs ?? WAKE_MERGE_MS;
+    queue(kind: WakeRow["kind"], dedupeKey: string, text: string, opts: { priority?: WakeRow["priority"]; mergeMs?: number; operationId?: string; dueAt?: number } = {}): void {
       const ts = now();
+      if (opts.operationId !== undefined) {
+        sql`
+          INSERT OR IGNORE INTO sh_wake (operationId, kind, dedupeKey, text, priority, status, dueAt, createdAt)
+          VALUES (${opts.operationId}, ${kind}, ${dedupeKey}, ${text}, ${opts.priority ?? "normal"}, 'pending', ${opts.dueAt ?? ts}, ${ts})
+        `;
+        return;
+      }
+      const mergeMs = opts.mergeMs ?? WAKE_MERGE_MS;
       const open = sql<{ id: number; text: string }>`
         SELECT id, text FROM sh_wake WHERE kind = ${kind} AND status = 'pending' AND dueAt > ${ts} ORDER BY id LIMIT 1
       `[0];
@@ -765,6 +885,149 @@ export function createLedger(deps: LedgerDeps) {
                           resultText = ${result.text ?? null}, replyOutboundId = ${replyOutboundId ?? null}, settledAt = ${now()}
         WHERE operationId = ${operationId} AND status = 'open'
       `;
+    },
+  };
+
+  // ---- routines / follow-ups / offers (issue #20, steward.md §8) -------------------------------
+
+  const routines = {
+    create(input: {
+      routineId: string;
+      kind: RoutineKind;
+      createdFromMsg: string;
+      scheduleKind: "cron" | "once";
+      cron?: string | null;
+      onceAt?: number | null;
+      instruction: string;
+      threadId?: string | null;
+      repoId?: string | null;
+    }): RoutineRow {
+      const ts = now();
+      sql`
+        INSERT OR IGNORE INTO sh_routine (routineId, kind, createdFromMsg, scheduleKind, cron, onceAt, instruction, repoId, threadId, status, createdAt)
+        VALUES (${input.routineId}, ${input.kind}, ${input.createdFromMsg}, ${input.scheduleKind}, ${input.cron ?? null}, ${input.onceAt ?? null},
+                ${input.instruction}, ${input.repoId ?? null}, ${input.threadId ?? null}, 'active', ${ts})
+      `;
+      return routines.get(input.routineId)!;
+    },
+    get(routineId: string): RoutineRow | null {
+      const row = sql<Record<string, unknown>>`SELECT * FROM sh_routine WHERE routineId = ${routineId}`[0];
+      return row ? viewRoutine(row) : null;
+    },
+    list(): RoutineRow[] {
+      return sql<Record<string, unknown>>`SELECT * FROM sh_routine ORDER BY createdAt, routineId`.map(viewRoutine);
+    },
+    exists(routineId: string): boolean {
+      return sql`SELECT 1 AS one FROM sh_routine WHERE routineId = ${routineId}`.length > 0;
+    },
+    setScheduleId(routineId: string, scheduleId: string): void {
+      sql`UPDATE sh_routine SET scheduleId = ${scheduleId} WHERE routineId = ${routineId}`;
+    },
+    setStatus(routineId: string, status: RoutineStatus): boolean {
+      sql`UPDATE sh_routine SET status = ${status} WHERE routineId = ${routineId}`;
+      return sql<{ changes: number }>`SELECT changes() AS changes`[0]!.changes > 0;
+    },
+    /**
+     * The fire-level gate (§8.2/§11): claims this exact fire (`routine:<id>:<fireTime>`)
+     * atomically. False = already processed — the SDK re-dispatched the job, or the alarm
+     * replayed it — and the caller must do nothing. Also stamps lastRunAt/lastResult and
+     * retires once-routines (a re-armed past onceAt must never fire twice).
+     */
+    beginFire(routineId: string, operationId: string, initialResult: string): boolean {
+      return tx(() => {
+        const row = sql<{ status: string; lastFireKey: string | null; scheduleKind: string }>`
+          SELECT status, lastFireKey, scheduleKind FROM sh_routine WHERE routineId = ${routineId}
+        `[0];
+        if (!row || row.status !== "active" || row.lastFireKey === operationId) return false;
+        sql`
+          UPDATE sh_routine SET lastFireKey = ${operationId}, lastRunAt = ${now()}, lastResult = ${initialResult},
+                                outcomeRecorded = 0,
+                                status = CASE WHEN scheduleKind = 'once' THEN 'done' ELSE status END
+          WHERE routineId = ${routineId}
+        `;
+        return true;
+      });
+    },
+    /** The run's outcome (explicit no_action, or the settle fallback). Explicit wins. */
+    recordOutcome(routineId: string, outcome: string): void {
+      sql`
+        UPDATE sh_routine SET lastResult = ${outcome}, outcomeRecorded = 1
+        WHERE routineId = ${routineId} AND outcomeRecorded = 0
+      `;
+    },
+  };
+
+  const followups = {
+    create(input: {
+      followupId: string;
+      threadId: string;
+      dueAt: number;
+      reason: string;
+      createdBy: "user" | "steward";
+      sourceRef: string;
+    }): FollowupRow {
+      sql`
+        INSERT OR IGNORE INTO sh_followup (followupId, threadId, dueAt, reason, createdBy, sourceRef, status, createdAt)
+        VALUES (${input.followupId}, ${input.threadId}, ${input.dueAt}, ${input.reason}, ${input.createdBy}, ${input.sourceRef}, 'open', ${now()})
+      `;
+      return followups.get(input.followupId)!;
+    },
+    get(followupId: string): FollowupRow | null {
+      const row = sql<Record<string, unknown>>`SELECT * FROM sh_followup WHERE followupId = ${followupId}`[0];
+      return row ? viewFollowup(row) : null;
+    },
+    listByThread(threadId: string): FollowupRow[] {
+      return sql<Record<string, unknown>>`SELECT * FROM sh_followup WHERE threadId = ${threadId} ORDER BY createdAt`.map(viewFollowup);
+    },
+    list(): FollowupRow[] {
+      return sql<Record<string, unknown>>`SELECT * FROM sh_followup ORDER BY createdAt, followupId`.map(viewFollowup);
+    },
+    exists(followupId: string): boolean {
+      return sql`SELECT 1 AS one FROM sh_followup WHERE followupId = ${followupId}`.length > 0;
+    },
+    setScheduleId(followupId: string, scheduleId: string): void {
+      sql`UPDATE sh_followup SET scheduleId = ${scheduleId} WHERE followupId = ${followupId}`;
+    },
+    setStatus(followupId: string, status: FollowupStatus): boolean {
+      sql`UPDATE sh_followup SET status = ${status} WHERE followupId = ${followupId}`;
+      return sql<{ changes: number }>`SELECT changes() AS changes`[0]!.changes > 0;
+    },
+    /** The fire gate: only an `open` follow-up fires exactly once (status flips to `fired`). */
+    beginFire(followupId: string, initialResult: string): boolean {
+      return tx(() => {
+        sql`
+          UPDATE sh_followup SET status = 'fired', lastResult = ${initialResult}, outcomeRecorded = 0
+          WHERE followupId = ${followupId} AND status = 'open'
+        `;
+        return sql<{ changes: number }>`SELECT changes() AS changes`[0]!.changes > 0;
+      });
+    },
+    recordOutcome(followupId: string, outcome: string): void {
+      sql`
+        UPDATE sh_followup SET lastResult = ${outcome}, outcomeRecorded = 1
+        WHERE followupId = ${followupId} AND outcomeRecorded = 0
+      `;
+    },
+  };
+
+  const offers = {
+    create(input: { offerId: string; spec: RoutineSpecStored; sourceMsg: string; outboundId: string }): RoutineOfferRow {
+      sql`
+        INSERT OR IGNORE INTO sh_routine_offer (offerId, spec, sourceMsg, status, outboundId, createdAt)
+        VALUES (${input.offerId}, ${JSON.stringify(input.spec)}, ${input.sourceMsg}, 'offered', ${input.outboundId}, ${now()})
+      `;
+      return offers.get(input.offerId)!;
+    },
+    get(offerId: string): RoutineOfferRow | null {
+      const row = sql<Record<string, unknown>>`SELECT * FROM sh_routine_offer WHERE offerId = ${offerId}`[0];
+      return row ? viewOffer(row) : null;
+    },
+    /** The tap consumes the offer exactly once; false = already handled or unknown. */
+    consume(offerId: string, status: "accepted" | "dismissed"): RoutineOfferRow | null {
+      const row = offers.get(offerId);
+      if (!row || row.status !== "offered") return null;
+      sql`UPDATE sh_routine_offer SET status = ${status} WHERE offerId = ${offerId} AND status = 'offered'`;
+      return { ...row, status };
     },
   };
 
@@ -1029,6 +1292,11 @@ export function createLedger(deps: LedgerDeps) {
       pendingNotifications: NotifyRow[];
       runs: RunRow[];
       wakes: WakeRow[];
+      routines: RoutineRow[];
+      followups: FollowupRow[];
+      offers: RoutineOfferRow[];
+      /** The newest timeline entries across ALL threads — routine fires may be Thread-less. */
+      timelineRecent: Array<{ id: number; threadId: string | null; ts: number; kind: string; text: string }>;
     } {
       return {
         machines: machines.list(),
@@ -1045,13 +1313,19 @@ export function createLedger(deps: LedgerDeps) {
         pendingNotifications: notifications.pending(),
         runs: runs.rows(),
         wakes: sql<WakeRow>`SELECT * FROM sh_wake ORDER BY id`,
+        routines: routines.list(),
+        followups: followups.list(),
+        offers: sql<Record<string, unknown>>`SELECT * FROM sh_routine_offer ORDER BY createdAt`.map(viewOffer),
+        timelineRecent: sql<{ id: number; threadId: string | null; ts: number; kind: string; text: string }>`
+          SELECT id, threadId, ts, kind, text FROM sh_timeline ORDER BY id DESC LIMIT 20
+        `.reverse(),
       };
     },
   };
 
   return {
     machines, repos, threads, workers, reports, questions, timeline, notifications, outbound,
-    runs, wakes, views, applyPendingEvents, recomputeThreadState, debug,
+    runs, wakes, routines, followups, offers, views, applyPendingEvents, recomputeThreadState, debug,
   };
 }
 
