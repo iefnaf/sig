@@ -8,7 +8,6 @@ import type { Steward } from "../src/steward.ts";
 import {
   FakeConnector,
   configureAndBind,
-  messageEvent,
   mockCalls,
   mockReset,
   ownerStub,
@@ -26,7 +25,9 @@ beforeEach(async () => {
 
 const MIN = 60_000;
 
-/** Dispatches a task, lets the (script-by-hand) connector accept it, and emits `started`. */
+/** Dispatches a task, lets the (script-by-hand) connector accept it, and emits `started`.
+ * Issue #6 moved dispatch behind the steward LLM; dispatchForTest drives the start_worker
+ * tool's deterministic code path, so no model needs scripting for lifecycle tests. */
 async function dispatchRunningWorker(prompt: string): Promise<{ fake: FakeConnector; workerId: string; threadId: string }> {
   const { deviceId, token } = await pairDevice("mac-studio");
   const fake = new FakeConnector({
@@ -37,9 +38,29 @@ async function dispatchRunningWorker(prompt: string): Promise<{ fake: FakeConnec
     autorun: false,
   });
   await fake.connect();
-  const res = await postEvent(messageEvent({ msgId: `om_${crypto.randomUUID().slice(0, 8)}`, text: `/派发 repo-a ${prompt}` }));
-  expect(res.status).toBe(200);
-  const [cmd] = await fake.waitForCmds(1);
+  const outcome = await ownerStub().dispatchForTest({ prompt, repoRef: "repo-a", newTitle: prompt });
+  console.log("ZZ dispatch outcome:", JSON.stringify(outcome));
+  if (outcome.kind !== "dispatched") throw new Error(`ZZ not dispatched: ${JSON.stringify(outcome)}`);
+  // ZZ diagnostics: dump outbox + machine state while waiting for the cmd.
+  const zzDeadline = Date.now() + 12_000;
+  let zzCmd: Record<string, unknown> | undefined;
+  for (;;) {
+    if (fake.cmds.length > 0) {
+      zzCmd = fake.cmds[0];
+      break;
+    }
+    if (Date.now() > zzDeadline) break;
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+    const zz = await runInDurableObject(ownerStub(), (instance: Steward, state: DurableObjectState) => {
+      const outbox = state.storage.sql.exec("SELECT cmdId, state, failReason, workerId FROM outbox").toArray();
+      const machines = state.storage.sql.exec("SELECT name, online FROM sh_machine").toArray();
+      const conns = (instance as unknown as { getConnections?: (t: string) => unknown[] }).getConnections?.("dev:*") ?? [];
+      return { outbox, machines, connCount: conns.length };
+    });
+    console.log("ZZ waiting:", JSON.stringify(zz), "cmds:", fake.cmds.length);
+  }
+  if (!zzCmd) throw new Error(`ZZ cmd never arrived; see ZZ logs above`);
+  const [cmd] = [zzCmd];
   const workerId = String((cmd!.args as Record<string, unknown>).workerId);
   const threadId = String((cmd!.args as Record<string, unknown>).threadId);
   await fake.emit("started", workerId, { sessionId: workerId, cwd: "/srv/repo-a", branch: `shepherd/${threadId}-1` });
@@ -182,7 +203,9 @@ describe("the §8.4 stall alarm (online machine, lastEventAt + 20 min)", () => {
     const { fake, workerId } = await dispatchRunningWorker("等真实闹钟");
     await backdate(workerId, 3);
 
-    const deadline = Date.now() + 15_000;
+    // Generous window: #6's wake/run machinery shares the DO's alarm slot, so under suite
+    // load the 1 s maintenance alarm can lag.
+    const deadline = Date.now() + 22_000;
     while (Date.now() < deadline) {
       const row = await workerRow(workerId);
       if (row!.thread.timeline.some((e) => e.kind === "stall")) break;
@@ -194,7 +217,7 @@ describe("the §8.4 stall alarm (online machine, lastEventAt + 20 min)", () => {
     expect((await sentCards()).length).toBe(1);
     fake.close();
     void (await mockCalls());
-  }, 30_000);
+  }, 45_000);
 });
 
 describe("the reap sweep (running + offline 10 min, or online-but-silent 45 min → lost)", () => {
@@ -406,7 +429,8 @@ describe("a queued start_worker is never reaped into a duplicate dispatch (issue
     await fake.connect(); // the repo registers
     fake.close(); // …then the machine goes offline before the dispatch
 
-    await postEvent(messageEvent({ msgId: `om_${crypto.randomUUID().slice(0, 8)}`, text: "/派发 repo-a 修个东西" }));
+    const outcome = await ownerStub().dispatchForTest({ prompt: "修个东西", repoRef: "repo-a", newTitle: "修个东西" });
+    expect(outcome.kind).toBe("asked_offline"); // the wait/cancel card went out
     await waitWhileOutboundPending();
     const [askCard] = await sentCards(); // the offline ask card
     expect(askCard?.providerMsgId).toMatch(/^om_mock_/);
@@ -502,7 +526,8 @@ describe("a queued start_worker is never reaped into a duplicate dispatch (issue
       autorun: false,
     });
     await fake.connect();
-    await postEvent(messageEvent({ msgId: `om_${crypto.randomUUID().slice(0, 8)}`, text: "/派发 repo-a 卡在启动" }));
+    const outcome = await ownerStub().dispatchForTest({ prompt: "卡在启动", repoRef: "repo-a", newTitle: "卡在启动" });
+    expect(outcome.kind).toBe("dispatched");
     const [cmd] = await fake.waitForCmds(1);
     return { fake, workerId: String((cmd!.args as Record<string, unknown>).workerId) };
   }
