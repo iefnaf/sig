@@ -10,9 +10,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # `version` is intentionally omitted: pnpm/action-setup reads the authoritative
+      # `packageManager` pin from package.json. Declaring both is a hard error in the action
+      # ("Multiple versions of pnpm specified") — and Corepack re-adds the field on every
+      # local `pnpm` run when it is missing, so reverting it fights a battle CI keeps losing.
       - uses: pnpm/action-setup@v4
-        with:
-          version: 10
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
