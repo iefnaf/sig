@@ -7,6 +7,7 @@
 // budget is brief.ts's.
 import { ulid } from "@shepherd/protocol";
 import type { HelloMessage } from "@shepherd/protocol";
+import { createBudget } from "./budget.ts";
 import { createNotes, type NoteRow } from "./notes.ts";
 import { eventWakeText, queueReturnedWakeText } from "./wake-text.ts";
 
@@ -146,7 +147,8 @@ export interface WakeRow {
   dedupeKey: string;
   text: string;
   priority: "normal" | "high";
-  status: "pending" | "merged" | "submitted";
+  /** 'skipped' = the daily budget cap kept this wake from the model (issue #28, steward.md §12). */
+  status: "pending" | "merged" | "submitted" | "skipped";
   dueAt: number;
   mergedInto: number | null;
   createdAt: number;
@@ -489,6 +491,10 @@ export function createLedger(deps: LedgerDeps) {
   // The notes half of the memory module (issue #18, steward.md §2.3-§2.5): layered
   // knowledge with a two-phase write. Same SQL handle, same transaction wrapper.
   const notes = createNotes({ sql, tx, now });
+
+  // The daily budget counter (issue #28, steward.md §12): sh_usage_day / sh_usage_cursor.
+  // Same SQL handle, same transaction wrapper.
+  const budget = createBudget({ sql, tx, now });
 
   const threadFromRow = (r: Record<string, unknown>): ThreadRow => ({
     threadId: r.threadId as string,
@@ -1136,6 +1142,12 @@ export function createLedger(deps: LedgerDeps) {
     markSubmitted(id: number): void {
       sql`UPDATE sh_wake SET status = 'submitted', submittedAt = ${now()} WHERE id = ${id} AND status = 'pending'`;
     },
+    /** Issue #28 (steward.md §12): the daily budget cap kept this wake from the model. The
+     *  row is done — 'skipped' never re-drains — and its audit trail stays in sh_channel_log
+     *  (plus sh_routine/sh_followup.lastResult for fires, which own an outcome either way). */
+    markSkipped(id: number): void {
+      sql`UPDATE sh_wake SET status = 'skipped', submittedAt = ${now()} WHERE id = ${id} AND status = 'pending'`;
+    },
   };
 
   const runs = {
@@ -1669,7 +1681,7 @@ export function createLedger(deps: LedgerDeps) {
 
   return {
     machines, repos, threads, workers, reports, questions, timeline, notifications, outbound,
-    runs, wakes, notes, routines, followups, offers, views, applyPendingEvents, recomputeThreadState, debug,
+    runs, wakes, notes, budget, routines, followups, offers, views, applyPendingEvents, recomputeThreadState, debug,
   };
 }
 

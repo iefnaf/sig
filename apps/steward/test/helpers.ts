@@ -50,6 +50,7 @@ export async function resetLedgerState(): Promise<void> {
       "sh_machine", "sh_repo", "sh_thread", "sh_thread_repo", "sh_worker", "sh_report",
       "sh_timeline", "sh_question", "sh_notify", "sh_note", "sh_note_log", "event_inbox", "worker_ack", "outbox",
       "sh_web_link", "sh_web_session", "sh_deploy", "device", "pairing",
+      "sh_usage_day", "sh_usage_cursor",
     ]) {
       storage.sql.exec(`DELETE FROM ${table}`);
     }

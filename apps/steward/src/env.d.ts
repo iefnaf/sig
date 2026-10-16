@@ -22,6 +22,9 @@ interface Env {
   MODEL_KEY?: string;
   FEISHU_API?: Fetcher;
   STEWARD_MODEL?: string | { provider?: unknown; modelId?: unknown; baseUrl?: unknown };
+  // Issue #28 (steward.md §12): USD per UTC day for the daily budget soft cap. Unset →
+  // budget.ts DEFAULT_DAILY_BUDGET_USD; 0 disables automatic model wakes entirely.
+  DAILY_BUDGET_USD?: string | number;
 }
 
 declare namespace Cloudflare {
@@ -32,5 +35,6 @@ declare namespace Cloudflare {
     MODEL_KEY?: string;
     FEISHU_API?: Fetcher;
     STEWARD_MODEL?: string | { provider?: unknown; modelId?: unknown; baseUrl?: unknown };
+    DAILY_BUDGET_USD?: string | number;
   }
 }
