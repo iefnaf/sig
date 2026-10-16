@@ -46,6 +46,17 @@ export function buildSituationBrief(ledger: Ledger, now: number = Date.now()): s
           })
           .join("，")}`;
 
+  // The repos the machines reported (issue #7): dispatching needs a repoRef, and a named
+  // repo is a routing clue (§3.1 signal 2) — the brief must show what exists.
+  const repoRows = ledger.repos.list();
+  const repoLine =
+    repoRows.length === 0
+      ? "仓库：机器上还没有登记任何仓库。"
+      : `仓库：${repoRows
+          .slice(0, 8)
+          .map((r) => `${r.name}（${machines.find((m) => m.deviceId === r.deviceId)?.name ?? r.deviceId}${r.online ? "" : "，离线"}）`)
+          .join("、")}${repoRows.length > 8 ? ` 等 ${repoRows.length} 个` : ""}`;
+
   // Open questions lead: they are the brief's most action-relevant content and must survive
   // any budget pressure (review #5).
   const questions: Array<{ threadId: string; text: string }> = [];
@@ -85,7 +96,7 @@ export function buildSituationBrief(ledger: Ledger, now: number = Date.now()): s
   };
 
   const assemble = (keepQuestions: number, withSummaries: boolean): string =>
-    [header, machineLine, ...questionLines(keepQuestions), ...threadLines(withSummaries)].join("\n");
+    [header, machineLine, repoLine, ...questionLines(keepQuestions), ...threadLines(withSummaries)].join("\n");
 
   // Spend the budget in priority order: all questions with summaries, all questions without,
   // then progressively fewer questions — every partial drop carries its count line.
@@ -103,7 +114,7 @@ export function buildSituationBrief(ledger: Ledger, now: number = Date.now()): s
   const SUFFIX = "…（已截断，用 get_thread 看细节）";
   const countLine =
     questions.length > 0 ? [`（另有 ${questions.length} 个未决问题未列出，用 get_thread 逐条查看）`] : [];
-  const body = [header, ...countLine, machineLine, ...threadLines(false)].join("\n");
+  const body = [header, ...countLine, machineLine, repoLine, ...threadLines(false)].join("\n");
   return body.length + SUFFIX.length <= SITUATION_BUDGET
     ? `${body}${SUFFIX}`
     : `${body.slice(0, SITUATION_BUDGET - SUFFIX.length)}${SUFFIX}`;

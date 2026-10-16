@@ -14,19 +14,27 @@ export interface Migration {
  * to an existing table; a ledger of applied migration ids plus plain ALTER statements fixes it).
  *
  * `tx` (when provided — the DO passes `ctx.storage.transactionSync`) wraps each migration's
- * `up()` in one atomic transaction, so a multi-statement rebuild can never persist half of
- * itself (review #47-2: the 010 timeline rebuild's DROP→RENAME window was the concrete case).
- * A crash after commit but before the ledger row write merely re-runs a migration that must
- * already be re-run-safe — every `up()` here is.
+ * `up()` AND its `_migrations` ledger-row write in one atomic transaction, so a
+ * multi-statement rebuild can never persist half of itself. Reviews #47-2 and #48 finding 3
+ * hit the same DROP→RENAME window from two sides (the 011 timeline rebuild, the 010_routing
+ * question rebuild). The ledger write stays INSIDE the transaction deliberately: with it
+ * outside, a crash after commit but before the row write re-runs the migration — safe only
+ * when every `up()` is re-run-safe, and the copy-drop-rename shapes are not (a re-run
+ * re-copies with candidates→NULL and wipes in-flight ask buttons).
  */
 export function runMigrations(sql: SqlExecutor, migrations: readonly Migration[], tx?: <T>(fn: () => T) => T): void {
   sql`CREATE TABLE IF NOT EXISTS _migrations (id TEXT PRIMARY KEY, appliedAt INTEGER)`;
   for (const migration of migrations) {
     const applied = sql<{ id: string }>`SELECT id FROM _migrations WHERE id = ${migration.id}`;
     if (applied.length > 0) continue;
-    if (tx !== undefined) tx(() => migration.up(sql));
-    else migration.up(sql);
-    sql`INSERT INTO _migrations (id, appliedAt) VALUES (${migration.id}, ${Date.now()})`;
+    // The ledger row commits atomically with the migration (review #48 finding 3): the
+    // copy-drop-rename migrations are not re-run-safe, so a crash-then-re-run would lose data.
+    const apply = (): void => {
+      migration.up(sql);
+      sql`INSERT INTO _migrations (id, appliedAt) VALUES (${migration.id}, ${Date.now()})`;
+    };
+    if (tx === undefined) apply();
+    else tx(apply);
   }
 }
 
@@ -509,14 +517,158 @@ export const MIGRATIONS: readonly Migration[] = [
     },
   },
   {
+    // Routing (issue #7, steward.md §3): the FTS5 index behind threads.findCandidates, the
+    // question shape ask_user's candidate buttons need, and the per-run dispatch counter the
+    // settle-time verification compares against "dispatched" claims (spike-conclusions §2).
+    // (Stays numbered 010 from the branch: the ledger keys on the full id string, so it does
+    // not collide with main's 010_history_relay_cursor — same precedent as 009_web vs
+    // 009_history_relay above. Renaming it would re-run the NOT re-runnable sh_question
+    // rebuild on every DO that already applied this branch's 010.)
+    id: "010_routing",
+    up: (sql) => {
+      // §2.2: full-text index over title + goal + summary + the latest report summary. The
+      // trigram tokenizer gives substring matching for both CJK and latin text (verified in
+      // workerd and node:sqlite — see docs/routing-eval.md); queries under 3 characters are
+      // covered by findCandidates' bigram scorer, never by this index alone.
+      sql`CREATE VIRTUAL TABLE IF NOT EXISTS sh_thread_fts USING fts5(threadId UNINDEXED, body, tokenize='trigram')`;
+      // Trigger-synced (§13 lists this as unverified before #7): every write path keeps the
+      // index current — insert, title/goal/summary updates, delete, and each new report
+      // (whose summary joins the body as the thread's freshest facet).
+      sql`CREATE TRIGGER IF NOT EXISTS sh_thread_fts_ai AFTER INSERT ON sh_thread BEGIN
+        INSERT INTO sh_thread_fts (threadId, body) VALUES (
+          new.threadId,
+          COALESCE(new.title, '') || ' ' || COALESCE(new.goal, '') || ' ' || COALESCE(new.summary, '')
+        );
+      END`;
+      sql`CREATE TRIGGER IF NOT EXISTS sh_thread_fts_au AFTER UPDATE OF title, goal, summary ON sh_thread BEGIN
+        DELETE FROM sh_thread_fts WHERE threadId = new.threadId;
+        INSERT INTO sh_thread_fts (threadId, body) VALUES (
+          new.threadId,
+          COALESCE(new.title, '') || ' ' || COALESCE(new.goal, '') || ' ' || COALESCE(new.summary, '') || ' ' ||
+            COALESCE((SELECT r.summary FROM sh_report r WHERE r.threadId = new.threadId ORDER BY r.receivedAt DESC, r.seq DESC LIMIT 1), '')
+        );
+      END`;
+      sql`CREATE TRIGGER IF NOT EXISTS sh_thread_fts_ad AFTER DELETE ON sh_thread BEGIN
+        DELETE FROM sh_thread_fts WHERE threadId = old.threadId;
+      END`;
+      sql`CREATE TRIGGER IF NOT EXISTS sh_thread_fts_report AFTER INSERT ON sh_report BEGIN
+        DELETE FROM sh_thread_fts WHERE threadId = new.threadId;
+        INSERT INTO sh_thread_fts (threadId, body) SELECT
+          new.threadId,
+          COALESCE(t.title, '') || ' ' || COALESCE(t.goal, '') || ' ' || COALESCE(t.summary, '') || ' ' || COALESCE(new.summary, '')
+          FROM sh_thread t WHERE t.threadId = new.threadId;
+      END`;
+      // Backfill for deployments that already have threads (idempotent guard: only rows the
+      // index does not have yet — INSERT OR IGNORE cannot dedupe here because fts5 rows have
+      // no unique constraint on the UNINDEXED column, so delete-then-insert per missing row).
+      sql`INSERT INTO sh_thread_fts (threadId, body)
+        SELECT th.threadId, COALESCE(th.title, '') || ' ' || COALESCE(th.goal, '') || ' ' || COALESCE(th.summary, '') || ' ' ||
+          COALESCE((SELECT r.summary FROM sh_report r WHERE r.threadId = th.threadId ORDER BY r.receivedAt DESC, r.seq DESC LIMIT 1), '')
+        FROM sh_thread th
+        WHERE NOT EXISTS (SELECT 1 FROM sh_thread_fts f WHERE f.threadId = th.threadId)`;
+
+      // ask_user's routing questions belong to no particular Thread (steward.md §3.3): the
+      // question row is rebuilt with a nullable threadId, and `candidates` stores the button
+      // mapping ({threadId, label}[] JSON) the card-action handler resolves clicks against.
+      // The copy-drop-rename below is the one non-reentrant stretch in this migration — the
+      // runner wraps each migration in the caller's transaction (storage.transactionSync in
+      // the DO), so a crash rolls the whole rebuild back instead of stranding the deployment
+      // between the DROP and the RENAME (review #48 finding 3).
+      sql`CREATE TABLE IF NOT EXISTS sh_question_v2 (
+        qid TEXT PRIMARY KEY, threadId TEXT, workerId TEXT,
+        text TEXT NOT NULL, options TEXT, candidates TEXT,
+        status TEXT NOT NULL DEFAULT 'open', askedAt INTEGER NOT NULL, answeredAt INTEGER
+      )`;
+      sql`INSERT INTO sh_question_v2 (qid, threadId, workerId, text, options, candidates, status, askedAt, answeredAt)
+        SELECT qid, threadId, workerId, text, options, NULL, status, askedAt, answeredAt FROM sh_question`;
+      sql`DROP TABLE sh_question`;
+      sql`ALTER TABLE sh_question_v2 RENAME TO sh_question`;
+      sql`CREATE INDEX IF NOT EXISTS sh_question_thread ON sh_question (threadId, status)`;
+
+      // Settle-time dispatch verification (spike-conclusions §2): how many real dispatches
+      // happened inside this run. 0 + a reply claiming "dispatched" triggers the corrective
+      // follow-up (see steward.ts settleRun).
+      ignoringDuplicateColumn(() => {
+        sql`ALTER TABLE sh_run ADD COLUMN dispatchCount INTEGER NOT NULL DEFAULT 0`;
+      });
+    },
+  },
+  {
+    // Notes: the layered memory (issue #18, steward.md §2.3-§2.5, spec §10). resident =
+    // always-loaded preferences/conventions (2,400-char hard cap); project = per-repo
+    // conventions (1,500 per repo); archive = superseded/demoted/evicted entries — never
+    // deleted, fetched on demand. Writes are two-phase (notes_propose → notes_commit with
+    // `replaces`); every change lands in sh_note_log and is relayed to the user with the
+    // next reply (spec §10.3: silent memory is unacceptable).
+    id: "012_notes",
+    up: (sql) => {
+      // status: 'active' = current knowledge (any layer — an evicted/demoted entry stays
+      // valid content in the archive); 'superseded' = replaced by a newer note; 'removed' =
+      // deleted at the user's word (kept as a tombstone; the layer always reads 'archive').
+      // `bytes` is the normalized text's character count — the unit of both layer caps.
+      sql`CREATE TABLE IF NOT EXISTS sh_note (
+        noteId TEXT PRIMARY KEY,
+        layer TEXT NOT NULL,
+        scope_repoId TEXT,
+        kind TEXT NOT NULL,
+        text TEXT NOT NULL,
+        bytes INTEGER NOT NULL,
+        source TEXT NOT NULL,
+        evidence TEXT,
+        -- The message that carried the owner's confirmation (notes_confirm); the
+        -- promotion path inherits this so the row itself says who confirmed it (PR #44 R3).
+        confirmedBy TEXT,
+        confirmed INTEGER NOT NULL DEFAULT 0,
+        pinned INTEGER NOT NULL DEFAULT 0,
+        createdAt INTEGER NOT NULL,
+        lastUsedAt INTEGER,
+        useCount INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'active',
+        supersededBy TEXT
+      )`;
+      sql`CREATE INDEX IF NOT EXISTS sh_note_placement ON sh_note (layer, scope_repoId, status)`;
+      // FTS5 trigram (verified against workerd for issue #18, incl. CJK substring matching
+      // and trigger sync): substring search that works for Chinese text, where the default
+      // unicode61 tokenizer would collapse whole sentences into single tokens. External
+      // content table: the index can never drift from sh_note because only the triggers
+      // below ever write it.
+      sql`CREATE VIRTUAL TABLE IF NOT EXISTS sh_note_fts USING fts5(text, content = 'sh_note', content_rowid = 'rowid', tokenize = 'trigram')`;
+      sql`CREATE TRIGGER IF NOT EXISTS sh_note_fts_ai AFTER INSERT ON sh_note BEGIN
+            INSERT INTO sh_note_fts (rowid, text) VALUES (new.rowid, new.text);
+          END`;
+      sql`CREATE TRIGGER IF NOT EXISTS sh_note_fts_ad AFTER DELETE ON sh_note BEGIN
+            INSERT INTO sh_note_fts (sh_note_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
+          END`;
+      sql`CREATE TRIGGER IF NOT EXISTS sh_note_fts_au AFTER UPDATE OF text ON sh_note BEGIN
+            INSERT INTO sh_note_fts (sh_note_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
+            INSERT INTO sh_note_fts (rowid, text) VALUES (new.rowid, new.text);
+          END`;
+      // Every change (noted/superseded/evicted/demoted/suggest_demote/pinned/unpinned/
+      // removed/confirmed) with a text snapshot, so the relay renders even after the note
+      // itself changes. `reportedAt` = already relayed to the user; the next user reply
+      // drains pending rows (steward.md §2.1: the module reports, the steward relays).
+      sql`CREATE TABLE IF NOT EXISTS sh_note_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        op TEXT NOT NULL,
+        noteId TEXT NOT NULL,
+        text TEXT NOT NULL,
+        reason TEXT,
+        reportedAt INTEGER
+      )`;
+      sql`CREATE INDEX IF NOT EXISTS sh_note_log_pending ON sh_note_log (reportedAt, id)`;
+      sql`CREATE INDEX IF NOT EXISTS sh_note_log_note ON sh_note_log (noteId, op, ts)`;
+    },
+  },
+  {
     // Issue #13 review: when hello.workers reconciliation is gated behind undelivered events
     // (snap.lastSeq > processedUpTo), the DO remembers the pending verdict for a reaped
     // worker and applies it once the event stream catches up — otherwise a worker reaped
     // while its machine was offline stays `lost` forever even though it is alive (the events
-    // that would prove it are exactly the ones that blocked the reconcile). Numbered 012:
-    // main's #23 took 009/010 and #20 took 011; ids are unique, which is what the ledger
-    // keys on — the number just keeps the order readable.
-    id: "012_reap_reconcile",
+    // that would prove it are exactly the ones that blocked the reconcile). Numbered 013:
+    // main's #23 took 009/010, #20 took 011, #7 kept 010_routing, #18 took 012_notes; ids
+    // are unique, which is what the ledger keys on — the number keeps the order readable.
+    id: "013_reap_reconcile",
     up: (sql) => {
       sql`CREATE TABLE IF NOT EXISTS sh_reap_pending (
         workerId TEXT PRIMARY KEY,

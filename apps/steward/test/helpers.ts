@@ -1,6 +1,7 @@
 import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { expect } from "vitest";
 import type { ShOutboundRow, Steward } from "../src/steward.ts";
+import type { FauxRequestRecord } from "../src/llm/models.ts";
 
 export function ownerStub() {
   const id = env.Steward.idFromName("owner");
@@ -47,8 +48,9 @@ export async function resetLedgerState(): Promise<void> {
     const storage = (instance as unknown as { ctx: { storage: { sql: { exec: (query: string) => unknown } } } }).ctx.storage;
     for (const table of [
       "sh_machine", "sh_repo", "sh_thread", "sh_thread_repo", "sh_worker", "sh_report",
-      "sh_timeline", "sh_question", "sh_notify", "event_inbox", "worker_ack", "outbox",
+      "sh_timeline", "sh_question", "sh_notify", "sh_note", "sh_note_log", "event_inbox", "worker_ack", "outbox",
       "sh_web_link", "sh_web_session", "sh_deploy", "device", "pairing", "sh_reap_pending",
+
     ]) {
       storage.sql.exec(`DELETE FROM ${table}`);
     }
@@ -58,7 +60,7 @@ export async function resetLedgerState(): Promise<void> {
 /** llmState's shape, declared locally: through the RPC stub's inferred type the class method's
  *  return collapses to `never`, so tests read it through this view instead. */
 export interface LlmStateView {
-  runs: Array<{ operationId: string; kind: string; status: string; text: string; resultStatus: string | null; resultReason: string | null; resultText: string | null; replyOutboundId: string | null; routedThreadId: string | null }>;
+  runs: Array<{ operationId: string; kind: string; status: string; text: string; resultStatus: string | null; resultReason: string | null; resultText: string | null; replyOutboundId: string | null; replyTo: string | null; routedThreadId: string | null; dispatchCount: number }>;
   inputs: Array<{ operationId: string; kind: string; text: string }>;
   assistantTexts: string[];
   raw: unknown[];
@@ -77,7 +79,7 @@ export async function scriptModel(...steps: unknown[]): Promise<void> {
   await ownerStub().fauxScript(steps as never[]);
 }
 
-export async function modelRequests(): Promise<Array<{ at: number; userText: string; brief: string | null; lastToolResult: string }>> {
+export async function modelRequests(): Promise<FauxRequestRecord[]> {
   return ownerStub().fauxRequests();
 }
 

@@ -407,6 +407,12 @@ export class Dispatcher {
     );
   }
 
+  /** Replies into the Thread a card belongs to (ask-card edge cases, issue #7). */
+  async replyToCard(cardMsgId: string, text: string, threadId?: string | null): Promise<void> {
+    const resolved = threadId ?? this.ledger.outbound.threadIdForProviderMsg(cardMsgId);
+    await this.#deps.sendText(text, resolved ?? null);
+  }
+
   /** A card button callback (already deduped); the Thread comes from the card's message id. */
   async handleCardAction(input: { operatorId: string; action: string; cardMsgId: string }): Promise<void> {
     // Routine suggestion cards (steward.md §8.5): resolved via the outbound row's `offer:` id —

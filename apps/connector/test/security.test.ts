@@ -44,7 +44,7 @@ describe("spawned agent env carries no connector credentials", () => {
 
   afterEach(async () => {
     for (const key of Object.keys(POISON)) delete process.env[key];
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
   });
 
   it("fake-pi sees no SHEPHERD_* vars and no credential values", async () => {

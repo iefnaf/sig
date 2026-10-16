@@ -54,7 +54,7 @@ afterEach(async () => {
   for (const app of apps) app.stop();
   await mock.close();
   store.close();
-  rmSync(dir, { recursive: true, force: true });
+  rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
 });
 
 function bootApp(scenarioPath: string | null, recovery: ConstructorParameters<typeof ConnectorApp>[0]["recovery"] = {}): Promise<ConnectorApp> {
@@ -140,6 +140,7 @@ describe("connector restart fault injection (issue #12, connector-pi.md §9/§14
 
     await bootApp(null);
     await mock.waitConnected();
+    await mock.waitHello(); // the frame can trail the OPEN on slow runners (CI flake)
 
     const hello = mock.hellos().at(-1) as { pendingAcks: Array<{ cmdId: string; state: string }> };
     expect(hello.pendingAcks).toContainEqual({ cmdId: "cmd-sending-crash", state: "ambiguous" });

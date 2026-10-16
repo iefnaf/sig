@@ -5,3 +5,6 @@ worker-configuration.d.ts
 .dev.vars
 *.log
 .DS_Store
+
+# Ad-hoc eval runs (timestamped); named baselines are committed.
+apps/steward/eval/results/2*.json

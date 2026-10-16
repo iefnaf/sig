@@ -203,6 +203,45 @@ export function askUserText(question: string, options: string[], threadTitle?: s
   return `${head}❓ ${body}\n（直接回复这句话即可；回复会带上所属 Thread。）`;
 }
 
+/** One button of the ask card: `action` is what the card-action handler parses. */
+export interface AskCardButton {
+  label: string;
+  /** The full action string carried in the button's value ({action}). */
+  action: string;
+  primary?: boolean;
+}
+
+/**
+ * The ask_user card (issue #7, steward.md §3.3/§9.2): the question plus ≤3 candidate buttons
+ * and a “新开一件事” button for routing asks. Button values carry only an opaque action
+ * string (`ask:<qid>:<idx>` / `asknew:<qid>`) — Thread identity is resolved server-side from
+ * the question row and the card's providerMsgId, never stuffed into the card (§3.1).
+ */
+export function askUserCard(input: { question: string; threadTitle?: string; buttons: AskCardButton[] }): {
+  config: unknown;
+  header: unknown;
+  elements: unknown[];
+} {
+  const elements: unknown[] = [{ tag: "div", text: { tag: "lark_md", content: clip(input.question, 600) } }];
+  if (input.buttons.length > 0) {
+    elements.push({
+      tag: "action",
+      actions: input.buttons.map((button) => ({
+        tag: "button",
+        text: { tag: "plain_text", content: clip(button.label, 24) },
+        type: button.primary ? "primary" : "default",
+        value: { action: button.action },
+      })),
+    });
+  }
+  const note = input.buttons.length > 0 ? "点按钮即可回答；也可以直接回复这张卡片。" : "直接回复这张卡片即可回答。";
+  elements.push({
+    tag: "note",
+    elements: [{ tag: "plain_text", content: input.threadTitle ? `❓ ${input.threadTitle} · ${note}` : `❓ ${note}` }],
+  });
+  return { config: { wide_screen_mode: true }, header: { template: "orange", title: { tag: "plain_text", content: "❓ 需要你拍板" } }, elements };
+}
+
 // ---- proactive behavior (issue #20, steward.md §8; spike-conclusions §2 "digest routines") ----
 
 /** What a digest renders from — collected deterministically from the ledger, no LLM. */

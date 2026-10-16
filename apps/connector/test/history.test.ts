@@ -35,7 +35,7 @@ afterEach(async () => {
   app?.stop();
   await mock.close();
   store.close();
-  rmSync(dir, { recursive: true, force: true });
+  rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
 });
 
 /** A run that records a real (small) conversation into the session JSONL and settles. */
