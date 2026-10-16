@@ -52,13 +52,23 @@ export interface ScenarioStep {
   shell?: string;
   /** Append one entry to the session JSONL (pi-shaped) for §9.1 tail-reconciliation tests. */
   session?: Record<string, unknown>;
+  /** Fail this prompt's RPC with this error (fake-pi): no run plays — a broken pi boundary. */
+  fail?: string;
   exit?: number;
 }
 
-/** Writes a fake-pi scenario file and returns its path. */
-export function writeScenario(dir: string, name: string, runs: ScenarioStep[][]): string {
+/** Writes a fake-pi scenario file and returns its path. `startup` models a held-back or
+ *  crashing get_state (the connector's `starting` window), e.g. `{ delayMs: 500 }`;
+ *  `extra` merges any other top-level scenario knobs (e.g. `statsDelayMs`). */
+export function writeScenario(
+  dir: string,
+  name: string,
+  runs: ScenarioStep[][],
+  startup?: Record<string, unknown>,
+  extra?: Record<string, unknown>,
+): string {
   const path = join(dir, `${name}.scenario.json`);
-  writeFileSync(path, JSON.stringify({ runs }));
+  writeFileSync(path, JSON.stringify({ ...(startup ? { startup } : {}), ...(extra ?? {}), runs }));
   return path;
 }
 

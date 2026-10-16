@@ -49,6 +49,26 @@ export interface WorkerHandle {
 
 export type Delivery = "prompt" | "steer" | "follow_up";
 
+/** `interrupt` (connector-pi.md §6.2): the texts pi's `clear_queue` handed back — the
+ *  undelivered steer/follow_up messages, surfaced to the steward as `queue_returned`. */
+export interface InterruptResult {
+  returned: string[];
+}
+
+/** Thrown by an adapter whose `clear_queue` succeeded but the subsequent `abort` failed
+ *  (PR #45 review round 2, R2-3): the agent already handed its queued texts back and
+ *  emptied its queue, so the texts ride the error — the manager surfaces them as
+ *  `queue_returned` before failing the command, or they are lost (the agent has no copy). */
+export class PartialInterruptError extends Error {
+  constructor(
+    readonly returned: string[],
+    readonly causeErr: Error,
+  ) {
+    super(`interrupt failed after clear_queue: ${causeErr.message}`);
+    this.name = "PartialInterruptError";
+  }
+}
+
 /** Report tool payload, connector-pi.md §7.2 (v1 fields). */
 export interface ReportPayload {
   status: "done" | "blocked" | "needs_decision";
@@ -115,15 +135,18 @@ export interface AgentAdapter {
   start(spec: StartSpec): Promise<WorkerHandle>; // must
   send(
     id: string,
-    input: { text: string; images?: { data: string; mimeType: string }[] },
+    input: { text: string; images?: { data: string; mimeType: string }[]; commandId?: string },
     how: Delivery,
   ): Promise<{ effect?: string }>; // must
-  interrupt(id: string): Promise<void>; // must
+  interrupt(id: string): Promise<InterruptResult>; // must
   resume(id: string, reason: string): Promise<void>; // must
   stopProcess(id: string): Promise<void>; // must; frees memory, the session stays on disk
   on(event: "worker-event", fn: (e: RawAdapterEvent) => void): void;
   /** Whether the worker's process is alive (idle-hot counts). Used to pick the resume path (§9.2). */
   isRunning?(id: string): boolean;
+  /** Whether a run window is open (between agent_start and agent_settled) — i.e. there is
+   *  something for `interrupt` to abort, and a settle event must follow the abort. */
+  isStreaming?(id: string): boolean;
   /** Live worker pids for the descendant-snapshot loop (connector-pi.md §9.3). */
   workerPids?(): Array<{ workerId: string; pid: number }>;
   /**
