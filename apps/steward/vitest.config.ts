@@ -120,7 +120,12 @@ export default defineConfig({
       // SERVER_KEY and SETUP_TOKEN are `wrangler secret put` values in real deployments; tests
       // supply deterministic stand-ins instead of relying on committed or ambient secrets.
       miniflare: {
-        bindings: { SERVER_KEY: "test-server-key-not-a-secret", SETUP_TOKEN: "test-setup-token-not-a-secret" },
+        bindings: {
+          SERVER_KEY: "test-server-key-not-a-secret",
+          // The rotation-window key (issue #27): tests mint "pre-rotation" tokens with it.
+          SERVER_KEY_PREVIOUS: "test-previous-server-key-not-a-secret",
+          SETUP_TOKEN: "test-setup-token-not-a-secret",
+        },
         serviceBindings: { FEISHU_API: feishuMock },
       },
     }),

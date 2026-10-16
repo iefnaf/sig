@@ -96,6 +96,32 @@ describe("ConnectorClient", () => {
     expect(onWelcome).toHaveBeenCalledTimes(1);
   });
 
+  it("persists a rotation token from welcome and uses it on the next connect (issue #27)", async () => {
+    const client = new ConnectorClient({ store, WebSocketImpl: FakeWebSocket as never, minBackoffMs: 1, maxBackoffMs: 5 });
+    client.start();
+    const ws = FakeWebSocket.instances[0]!;
+    ws.simulateOpen();
+    const rekeyed = "st1.0f0e0d0c.dev_abc.1.200." + "a".repeat(64);
+    ws.simulateMessage({ t: "welcome", re: "x", protocol: 1, serverTime: 1, sessionId: "s", acks: {}, limits: {}, token: rekeyed });
+
+    // The credentials row is updated in place: same device, new token.
+    expect(store.getCredentials()).toMatchObject({ deviceId: "dev_abc", token: rekeyed, serverUrl: "https://example.com" });
+
+    // The current connection is untouched; the next connect authenticates with the new token.
+    ws.simulateClose(1000, "rotation window");
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2));
+    expect((FakeWebSocket.instances[1]!.options as { headers: Record<string, string> }).headers.authorization).toBe(`Bearer ${rekeyed}`);
+  });
+
+  it("leaves the stored token alone when welcome carries no rotation token", () => {
+    const client = new ConnectorClient({ store, WebSocketImpl: FakeWebSocket as never });
+    client.start();
+    const ws = FakeWebSocket.instances[0]!;
+    ws.simulateOpen();
+    ws.simulateMessage({ t: "welcome", re: "x", protocol: 1, serverTime: 1, sessionId: "s", acks: {}, limits: {} });
+    expect(store.getCredentials()!.token).toBe("st1.dev_abc.1.100.deadbeef");
+  });
+
   it("reconnects with jittered exponential backoff on a reconnect-eligible close code", () => {
     vi.useFakeTimers();
     const client = new ConnectorClient({ store, WebSocketImpl: FakeWebSocket as never, minBackoffMs: 1000, maxBackoffMs: 60_000 });

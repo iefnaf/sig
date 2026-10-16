@@ -29,9 +29,10 @@ import {
   type EventsAckMessage,
   type PongMessage,
   type ResyncMessage,
+  type ServerKey,
   type WelcomeMessage,
 } from "@shepherd/protocol";
-import { bearer } from "./auth.ts";
+import { bearer, resolveServerKeys } from "./auth.ts";
 import {
   FeishuAdapter,
   SEND_TIMEOUT_MS,
@@ -56,6 +57,9 @@ import { renderSetupPage, type SetupView } from "./setup-page.ts";
 
 interface ConnState {
   deviceId: string;
+  epoch: number;
+  /** Key that authenticated the connection (issue #27): ≠ primary ⇒ welcome rekeys. */
+  keyId: string;
   connEpoch?: number;
 }
 
@@ -124,6 +128,11 @@ export interface ShQrSetupRow {
   updatedAt: number;
 }
 
+// /pair brute-force lockout (protocol doc §5.2, issue #27): 5 failures lock the bucket —
+// per source IP and globally — for 15 minutes.
+export const PAIR_MAX_FAILURES = 5;
+export const PAIR_LOCK_MS = 15 * 60_000;
+
 export interface ShOutboundRow {
   id: string;
   channel: string;
@@ -153,6 +162,11 @@ function versionRangesOverlap(a: { min: number; max: number }, b: { min: number;
   return a.min <= b.max && b.min <= a.max;
 }
 
+export type PairResult =
+  | { ok: true; deviceId: string; token: string }
+  | { ok: false; reason: "invalid_code" }
+  | { ok: false; reason: "rate_limited"; retryAfterSec: number };
+
 // Base `Connection` (unknown state) is used in overridden signatures — narrowing the state
 // generic there breaks Liskov substitutability against `Agent`'s own declarations; state is
 // cast at the read/write sites instead (same tradeoff the do-protocol spike made).
@@ -160,6 +174,15 @@ export class Steward extends Agent<Env> {
   onStart(): void {
     runMigrations(this.sql.bind(this), MIGRATIONS);
   }
+
+  // The signing/sealing key set (primary = SERVER_KEY, plus SERVER_KEY_PREVIOUS during a
+  // rotation window). Overridable so tests can simulate rotation states inside the DO.
+  protected async serverKeys(): Promise<ServerKey[]> {
+    return resolveServerKeys(this.env);
+  }
+
+  // Tests shrink the /pair lockout (see feishuSendTimeoutMs for the same pattern).
+  protected pairLockMs = PAIR_LOCK_MS;
 
   // The memory module (steward.md §2): all sh_* ledger SQL lives behind this handle. Bound
   // lazily because `sql`/`ctx` only mean something once the DO is live.
@@ -220,7 +243,7 @@ export class Steward extends Agent<Env> {
   }
 
   async getConnectionTags(_connection: Connection, ctx: ConnectionContext): Promise<string[]> {
-    const parsed = await parseToken(this.env.SERVER_KEY, bearer(ctx.request));
+    const parsed = await parseToken(await this.serverKeys(), bearer(ctx.request));
     return parsed ? [`dev:${parsed.deviceId}`] : [];
   }
 
@@ -229,7 +252,7 @@ export class Steward extends Agent<Env> {
   }
 
   async onConnect(connection: Connection, ctx: ConnectionContext): Promise<void> {
-    const parsed = await parseToken(this.env.SERVER_KEY, bearer(ctx.request));
+    const parsed = await parseToken(await this.serverKeys(), bearer(ctx.request));
     if (!parsed) {
       connection.close(CloseCode.UNAUTHORIZED, "unauthorized");
       return;
@@ -245,7 +268,7 @@ export class Steward extends Agent<Env> {
       connection.close(CloseCode.REVOKED, "revoked");
       return;
     }
-    connection.setState({ deviceId: parsed.deviceId } satisfies ConnState);
+    connection.setState({ deviceId: parsed.deviceId, epoch: parsed.epoch, keyId: parsed.keyId } satisfies ConnState);
     // Machine online state derives from live connections (issue #5): this and onClose are the
     // only writers. hello fills in the machine's real name and facts moments later.
     this.ledger.machines.setOnline(parsed.deviceId, true, row.name ?? undefined);
@@ -307,7 +330,7 @@ export class Steward extends Agent<Env> {
     connection.send(JSON.stringify({ t: "pong", re: parsed.data.id } satisfies PongMessage));
   }
 
-  private handleHello(connection: Connection, raw: unknown): void {
+  private async handleHello(connection: Connection, raw: unknown): Promise<void> {
     const parsedHello = HelloMessageSchema.safeParse(raw);
     if (!parsedHello.success) {
       this.sendError(connection, "bad_request", "invalid hello");
@@ -332,13 +355,19 @@ export class Steward extends Agent<Env> {
       }
       other.close(CloseCode.SUPERSEDED, "superseded by a newer connection");
     }
-    connection.setState({ deviceId: auth.deviceId, connEpoch: hello.connEpoch } satisfies ConnState);
+    connection.setState({ deviceId: auth.deviceId, epoch: auth.epoch, keyId: auth.keyId, connEpoch: hello.connEpoch } satisfies ConnState);
     // hello is the machine/repo snapshot's source of truth (protocol §6.1, steward.md §2.2):
     // name, agents, limits, and the full repo list — removals included — land in the ledger.
     this.ledger.machines.upsertFromHello(hello);
     const acks = Object.fromEntries(
       this.sql<{ workerId: string; upTo: number }>`SELECT workerId, upTo FROM worker_ack`.map((row) => [row.workerId, row.upTo]),
     );
+    // SERVER_KEY rotation (issue #27): the connection authenticated with a non-primary key —
+    // hand the connector a fresh primary-key token so it can rekey without re-pairing. The
+    // connector persists it for reconnects; once every machine has reconnected once, the
+    // operator can drop SERVER_KEY_PREVIOUS.
+    const [primary] = await this.serverKeys();
+    const rotatedToken = primary && auth.keyId !== primary.id ? await mintToken(primary, auth.deviceId, auth.epoch) : undefined;
     const welcome: WelcomeMessage = {
       t: "welcome",
       re: hello.id,
@@ -347,6 +376,7 @@ export class Steward extends Agent<Env> {
       sessionId: ulid(),
       acks,
       limits: { maxMessageBytes: 262144, batchMs: 250, batchEvents: 50 },
+      ...(rotatedToken ? { token: rotatedToken } : {}),
     };
     connection.send(JSON.stringify(welcome));
     // Reconciliation (protocol §6.1): the connector reports the states of commands that never
@@ -559,16 +589,65 @@ export class Steward extends Agent<Env> {
     return { code };
   }
 
-  async pair(code: string, name: string): Promise<{ deviceId: string; token: string } | null> {
+  // Pairing + brute-force lockout (protocol doc §5.2, issue #27). The code's entropy and the
+  // 10-minute validity make enumeration infeasible on top of this; the lockout bounds the
+  // trying either way — per source IP and globally, 5 failures each lock for `pairLockMs`.
+  // `clientIp` comes from the Worker's CF-Connecting-IP; attempts without one (local dev)
+  // share the "unknown" bucket.
+  async pair(code: string, name: string, clientIp = "unknown"): Promise<PairResult> {
+    const now = Date.now();
+    const lockedFor = (scope: string, key: string) =>
+      this.sql<{ until: number }>`SELECT lockedUntil AS until FROM pair_fail WHERE scope = ${scope} AND key = ${key}`[0]?.until ?? 0;
+    const retryAfterMs = Math.max(lockedFor("ip", clientIp), lockedFor("all", "*")) - now;
+    if (retryAfterMs > 0) {
+      return { ok: false, reason: "rate_limited", retryAfterSec: Math.ceil(retryAfterMs / 1000) };
+    }
+
     const row = this.sql<{ expiresAt: number; used: number }>`
       SELECT expiresAt, used FROM pairing WHERE code = ${code}
     `[0];
-    if (!row || row.used || row.expiresAt < Date.now()) return null;
+    if (!row || row.used || row.expiresAt < now) {
+      this.registerPairFailure("ip", clientIp, now);
+      this.registerPairFailure("all", "*", now);
+      return { ok: false, reason: "invalid_code" };
+    }
     this.sql`UPDATE pairing SET used = 1 WHERE code = ${code}`;
+    // A success proves the caller is mid-onboarding, not guessing: clear their IP bucket so a
+    // lockout from earlier fat-fingered attempts does not outlive the pairing.
+    this.sql`DELETE FROM pair_fail WHERE scope = 'ip' AND key = ${clientIp}`;
     const deviceId = `dev_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
-    this.sql`INSERT INTO device (deviceId, name, epoch, createdAt) VALUES (${deviceId}, ${name}, 1, ${Date.now()})`;
-    const token = await mintToken(this.env.SERVER_KEY, deviceId, 1);
-    return { deviceId, token };
+    this.sql`INSERT INTO device (deviceId, name, epoch, createdAt) VALUES (${deviceId}, ${name}, 1, ${now})`;
+    const [primary] = await this.serverKeys();
+    const token = await mintToken(primary!, deviceId, 1);
+    return { ok: true, deviceId, token };
+  }
+
+  // Sliding failure window: the window spans `pairLockMs`; hitting PAIR_MAX_FAILURES inside it
+  // locks until now + pairLockMs and leaves a clean bucket behind for when the lock lifts.
+  private registerPairFailure(scope: string, key: string, now: number): void {
+    const row = this.sql<{ fails: number; windowStart: number; lockedUntil: number }>`
+      SELECT fails, windowStart, lockedUntil FROM pair_fail WHERE scope = ${scope} AND key = ${key}
+    `[0];
+    if (!row) {
+      this.sql`
+        INSERT INTO pair_fail (scope, key, fails, windowStart, lockedUntil, updatedAt)
+        VALUES (${scope}, ${key}, 1, ${now}, 0, ${now})
+      `;
+      return;
+    }
+    const windowExpired = row.lockedUntil <= now && now - row.windowStart >= this.pairLockMs;
+    const fails = windowExpired ? 1 : row.fails + 1;
+    if (fails >= PAIR_MAX_FAILURES) {
+      this.sql`
+        UPDATE pair_fail SET fails = 0, windowStart = ${now}, lockedUntil = ${now + this.pairLockMs}, updatedAt = ${now}
+        WHERE scope = ${scope} AND key = ${key}
+      `;
+      return;
+    }
+    this.sql`
+      UPDATE pair_fail SET fails = ${fails}, windowStart = ${windowExpired ? now : row.windowStart}, updatedAt = ${now}
+      WHERE scope = ${scope} AND key = ${key}
+    `;
   }
 
   async revoke(deviceId: string): Promise<void> {
@@ -724,15 +803,28 @@ export class Steward extends Agent<Env> {
       FROM sh_channel WHERE channel = 'feishu'
     `[0];
     if (!row) return null;
-    // A failed open means SERVER_KEY was rotated (secretbox.ts): read back as unconfigured so
-    // the SETUP_TOKEN-guarded setup page accepts fresh credentials — recovery, not a deadlock.
-    const appSecret = await openSecret(this.env.SERVER_KEY, row.appSecretEnc);
-    const verificationToken = await openSecret(this.env.SERVER_KEY, row.verificationTokenEnc);
+    const keys = await this.serverKeys();
+    // Open with any configured key (rotation window, issue #27). A failed open means the
+    // ciphertext was sealed under a key that has since been dropped entirely: read back as
+    // unconfigured so the SETUP_TOKEN-guarded setup page accepts fresh credentials — recovery,
+    // not a deadlock. A non-primary open re-seals under the primary so the window can close.
+    const appSecret = await openSecret(keys, row.appSecretEnc);
+    const verificationToken = await openSecret(keys, row.verificationTokenEnc);
     if (appSecret === null || verificationToken === null) return null;
+    if (appSecret.keyId !== keys[0]!.id || verificationToken.keyId !== keys[0]!.id) {
+      const [appSecretEnc, verificationTokenEnc] = await Promise.all([
+        sealSecret(keys[0]!, appSecret.text),
+        sealSecret(keys[0]!, verificationToken.text),
+      ]);
+      this.sql`
+        UPDATE sh_channel SET appSecretEnc = ${appSecretEnc}, verificationTokenEnc = ${verificationTokenEnc}
+        WHERE channel = 'feishu'
+      `;
+    }
     return {
       appId: row.appId,
-      appSecret,
-      verificationToken,
+      appSecret: appSecret.text,
+      verificationToken: verificationToken.text,
       ownerOpenId: row.ownerOpenId,
       brand: row.brand === "lark" ? "lark" : "feishu",
       source: row.source === "qr" ? "qr" : "manual",
@@ -753,14 +845,22 @@ export class Steward extends Agent<Env> {
     return new FeishuAdapter({
       credentials,
       tokenStore: {
-        getCachedToken: () =>
-          (this.sql<{ token: string; expiresAt: number }>`
-            SELECT token, expiresAt FROM sh_channel_token WHERE channel = 'feishu'
-          `[0] ?? null),
-        saveToken: (token, expiresAt) => {
+        // The tenant_access_token is a Feishu bearer credential, so it is sealed at rest like
+        // every other secret (issue #27); opening it needs the key set, hence async halves.
+        getCachedToken: async () => {
+          const row = this.sql<{ tokenEnc: string; expiresAt: number }>`
+            SELECT tokenEnc, expiresAt FROM sh_channel_token WHERE channel = 'feishu'
+          `[0];
+          if (!row) return null;
+          const opened = await openSecret(await this.serverKeys(), row.tokenEnc);
+          return opened ? { token: opened.text, expiresAt: row.expiresAt } : null;
+        },
+        saveToken: async (token, expiresAt) => {
+          const [primary] = await this.serverKeys();
+          const tokenEnc = await sealSecret(primary!, token);
           this.sql`
-            INSERT INTO sh_channel_token (channel, token, expiresAt) VALUES ('feishu', ${token}, ${expiresAt})
-            ON CONFLICT (channel) DO UPDATE SET token = excluded.token, expiresAt = excluded.expiresAt
+            INSERT INTO sh_channel_token (channel, tokenEnc, expiresAt) VALUES ('feishu', ${tokenEnc}, ${expiresAt})
+            ON CONFLICT (channel) DO UPDATE SET tokenEnc = excluded.tokenEnc, expiresAt = excluded.expiresAt
           `;
           // steward.md §9.2: the token is refreshed by an alarm ahead of its expiry.
           void this.schedule(
@@ -780,8 +880,9 @@ export class Steward extends Agent<Env> {
   async refreshChannelToken(): Promise<void> {
     const cfg = await this.loadFeishuConfig();
     if (!cfg) return;
-    const cached = this.sql<{ token: string; expiresAt: number }>`
-      SELECT token, expiresAt FROM sh_channel_token WHERE channel = 'feishu'
+    // Expiry check only — no need to decrypt just to decide whether to refresh.
+    const cached = this.sql<{ expiresAt: number }>`
+      SELECT expiresAt FROM sh_channel_token WHERE channel = 'feishu'
     `[0];
     if (cached && cached.expiresAt - TOKEN_REFRESH_MARGIN_MS > Date.now()) return;
     try {
@@ -882,9 +983,10 @@ export class Steward extends Agent<Env> {
       return respond(`凭据校验失败：${errorText(err)}`, appId);
     }
 
+    const [primary] = await this.serverKeys();
     const [appSecretEnc, verificationTokenEnc] = await Promise.all([
-      sealSecret(this.env.SERVER_KEY, appSecret),
-      sealSecret(this.env.SERVER_KEY, verificationToken),
+      sealSecret(primary!, appSecret),
+      sealSecret(primary!, verificationToken),
     ]);
     const existing = this.sql<{ appId: string | null }>`SELECT appId FROM sh_channel WHERE channel = 'feishu'`[0];
     const sameApp = existing?.appId === appId;
@@ -1078,9 +1180,10 @@ export class Steward extends Agent<Env> {
       // into the app's encrypt strategy during the switch (a QR-created app's console token
       // is unknowable via API — research §1: sensitive config goes through the config PATCH).
       const verificationToken = crypto.randomUUID().replace(/-/g, "");
+      const [primary] = await this.serverKeys();
       const [appSecretEnc, verificationTokenEnc] = await Promise.all([
-        sealSecret(this.env.SERVER_KEY, outcome.appSecret),
-        sealSecret(this.env.SERVER_KEY, verificationToken),
+        sealSecret(primary!, outcome.appSecret),
+        sealSecret(primary!, verificationToken),
       ]);
       if (!this.qrFlowStillLive(row, "awaiting_scan")) return;
       this.sql`
@@ -1111,7 +1214,8 @@ export class Steward extends Agent<Env> {
     // if Feishu actually returned a different one for the same app.
     const cfg = await this.loadFeishuConfig();
     if (cfg && outcome.appId === cfg.appId && outcome.appSecret && outcome.appSecret !== cfg.appSecret) {
-      const appSecretEnc = await sealSecret(this.env.SERVER_KEY, outcome.appSecret);
+      const [primary] = await this.serverKeys();
+      const appSecretEnc = await sealSecret(primary!, outcome.appSecret);
       this.sql`UPDATE sh_channel SET appSecretEnc = ${appSecretEnc} WHERE channel = 'feishu'`;
       this.sql`DELETE FROM sh_channel_token WHERE channel = 'feishu'`;
       this.logChannel("qr_secret_rotated", outcome.appId);
@@ -1157,6 +1261,31 @@ export class Steward extends Agent<Env> {
     this.sql`UPDATE sh_qr_setup SET phase = 'webhook_patched', lastError = NULL, updatedAt = ${Date.now()} WHERE id = 1`;
     this.logChannel("webhook_patched", webhookUrl);
     return { ok: true };
+  }
+
+  // ---- Model credentials (spec §12.2 "model keys stored encrypted", issue #27) ---------------
+  // The provider API key is AES-GCM sealed under SERVER_KEY exactly like the Feishu secrets
+  // (sh_model.apiKeyEnc); the plaintext exists only in transit and in memory. The LLM wiring
+  // (M2) reads it back through modelConfig(). Not reachable over HTTP — RPC on the stub only,
+  // which the routes-audit test pins down.
+
+  async setModelConfig(provider: string, apiKey: string): Promise<void> {
+    if (!provider.trim() || !apiKey.trim()) throw new Error("provider and apiKey are required");
+    const [primary] = await this.serverKeys();
+    const apiKeyEnc = await sealSecret(primary!, apiKey);
+    this.sql`
+      INSERT INTO sh_model (id, provider, apiKeyEnc, updatedAt) VALUES (0, ${provider}, ${apiKeyEnc}, ${Date.now()})
+      ON CONFLICT(id) DO UPDATE SET provider = excluded.provider, apiKeyEnc = excluded.apiKeyEnc, updatedAt = excluded.updatedAt
+    `;
+  }
+
+  async modelConfig(): Promise<{ provider: string; apiKey: string } | null> {
+    const row = this.sql<{ provider: string; apiKeyEnc: string }>`SELECT provider, apiKeyEnc FROM sh_model WHERE id = 0`[0];
+    if (!row) return null;
+    const opened = await openSecret(await this.serverKeys(), row.apiKeyEnc);
+    // Sealed under a dropped key: report unconfigured rather than failing calls forever.
+    if (!opened) return null;
+    return { provider: row.provider, apiKey: opened.text };
   }
 
   private async handleFeishuWebhook(request: Request): Promise<Response> {
