@@ -15,6 +15,8 @@ import {
 } from "@shepherd/protocol";
 import { CommandLog, type CommandResult } from "./commands.ts";
 import { EventLog, type StoredEvent } from "./events.ts";
+import { HistoryStreams } from "./history-stream.ts";
+import type { HistoryPage } from "@shepherd/protocol";
 import type { LocalStore } from "./store.ts";
 import { VERSION } from "./version.ts";
 
@@ -34,6 +36,11 @@ export interface ClientOptions {
   workersSnapshot?: () => Array<Record<string, unknown>>;
   /** Honest hello snapshot for the non-worker sections (protocol §6.1): agents, repos, limits. */
   snapshot?: () => { agents: unknown[]; repos: unknown[]; limits: { maxWorkers: number; running: number } };
+  /**
+   * L3 raw-history loader (connector-pi.md §11.4): when set, `history_req` messages are
+   * answered with windowed `history_chunk` streams; without it they get `error{unsupported}`.
+   */
+  loadHistory?: (workerId: string, since: string | undefined, maxBytes: number) => Promise<HistoryPage>;
   pingIntervalMs?: number;
   pongTimeoutMs?: number;
   deadAfterMs?: number;
@@ -74,6 +81,8 @@ export class ConnectorClient {
   private lastFrameAt = 0;
   private sendQueue: StoredEvent[] = [];
   private flushTimer?: NodeJS.Timeout;
+  /** §6.6 history streams for the current connection; reset whenever the socket dies. */
+  private readonly history: HistoryStreams | undefined;
 
   constructor(options: ClientOptions) {
     this.options = options;
@@ -90,6 +99,18 @@ export class ConnectorClient {
     this.batchMs = options.batchMs ?? DEFAULT_BATCH_MS;
     this.batchEvents = options.batchEvents ?? DEFAULT_BATCH_EVENTS;
     this.batchBytes = options.batchBytes ?? DEFAULT_BATCH_BYTES;
+    this.history = options.loadHistory
+      ? new HistoryStreams({
+          // Always targets the current socket: a chunk for a dead connection is dropped by
+          // the readyState check, and the close handler resets the streams anyway (§6.6: a
+          // history request is never re-sent over a new connection).
+          send: (message) => {
+            const ws = this.ws;
+            if (ws && ws.readyState === this.WebSocketImpl.OPEN) ws.send(JSON.stringify(message));
+          },
+          load: options.loadHistory,
+        })
+      : undefined;
     // A crash mid-`sending` left undecidable commands; they become `ambiguous` and ride the
     // next hello's pendingAcks so the DO can settle its outbox rows (protocol §6.1).
     this.commands.reconcileCrashed();
@@ -163,6 +184,7 @@ export class ConnectorClient {
     ws.on("close", (code: number, reasonBuf: unknown) => {
       this.clearConnectionTimers();
       this.sendQueue = []; // unsent events stay in the durable log and are replayed after welcome
+      this.history?.reset(); // §6.6: history requests are not re-sent; the browser retries
       const reason = reasonBuf ? String(reasonBuf) : "";
       this.options.onClose?.(code, reason);
       if (CREDENTIALS_CLEARING_CODES.has(code)) this.store.clearCredentials();
@@ -222,6 +244,27 @@ export class ConnectorClient {
       case "cmd":
         this.handleCmd(ws, message as unknown as CmdMessage);
         return;
+      case "history_req": {
+        // §6.6: same wire as cmd but deliberately outside the outbox/command log — a fresh
+        // request per browser view, deduped by nothing, re-sent by nobody.
+        const req = message as { id?: unknown; workerId?: unknown; since?: unknown; maxBytes?: unknown };
+        if (typeof req.id !== "string" || typeof req.workerId !== "string") return;
+        if (this.history) {
+          this.history.onRequest({
+            id: req.id,
+            workerId: req.workerId,
+            since: typeof req.since === "string" && req.since.length > 0 ? req.since : undefined,
+            maxBytes: typeof req.maxBytes === "number" ? req.maxBytes : undefined,
+          });
+        } else {
+          this.send(ws, { t: "error", re: req.id, code: "unsupported", message: "history reads are not available on this connector", retriable: false });
+        }
+        return;
+      }
+      case "history_ack": {
+        if (typeof message.re === "string" && typeof message.n === "number") this.history?.onAck(message.re, message.n);
+        return;
+      }
       default:
         return;
     }

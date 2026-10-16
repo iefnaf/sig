@@ -372,13 +372,55 @@ export const MIGRATIONS: readonly Migration[] = [
     },
   },
   {
+    // History relay (issue #23, protocol §6.6): bookkeeping only — which browser connection
+    // asked, which worker/machine, the byte meter, and the deadline. Chunk CONTENT never
+    // reaches this table (or any other): it passes through DO memory between sockets.
+    // (Number 009 collides with 009_web — ids are unique, which is what the ledger keys on.)
+    id: "009_history_relay",
+    up: (sql) => {
+      // state lives in SQLite because the DO may sleep between chunks (§6.6). `cursor` is the
+      // last entry id forwarded — an id, not content — so a DO-side cap cut can still tell
+      // the browser where it stopped and how to continue. (Created here on fresh databases;
+      // 010's ALTER adds it on ones that ran the pre-review 009.)
+      sql`CREATE TABLE IF NOT EXISTS history_relay (
+        reqId TEXT PRIMARY KEY,
+        webConnId TEXT NOT NULL,
+        workerId TEXT NOT NULL,
+        deviceId TEXT NOT NULL,
+        maxBytes INTEGER NOT NULL,
+        sentBytes INTEGER NOT NULL DEFAULT 0,
+        cursor TEXT,
+        expiresAt INTEGER NOT NULL,
+        createdAt INTEGER NOT NULL
+      )`;
+      sql`CREATE INDEX IF NOT EXISTS history_relay_conn ON history_relay (webConnId)`;
+      sql`CREATE INDEX IF NOT EXISTS history_relay_device ON history_relay (deviceId)`;
+    },
+  },
+  {
+    // Issue #23 review: 009 originally shipped without `cursor` (head 1efaaf3) and was then
+    // edited in place — but runMigrations skips by applied id, so any dev/preview DO that
+    // already ran the old 009 would never see the new column and the relay's SELECT would
+    // throw. This is the repo's spike-bug-2 pattern: the column is added by ALTER, and the
+    // duplicate-column error on fresh databases (where 009's CREATE TABLE already made it)
+    // is tolerated by ignoringDuplicateColumn.
+    id: "010_history_relay_cursor",
+    up: (sql) => {
+      ignoringDuplicateColumn(() => {
+        sql`ALTER TABLE history_relay ADD COLUMN cursor TEXT`;
+      });
+    },
+  },
+  {
     // Proactive behavior (issue #20, steward.md §8, spec §8): routines (recurring or one-shot
     // prescriptions the owner made by conversation) and follow-ups (a Thread-scoped alarm the
     // steward sets itself). Every row traces back to something the owner said — createdFromMsg
     // / sourceRef are NOT NULL, the data-layer half of "proactive behavior must have
     // provenance" (spec §8.3). Suggestions (steward.md §8.5) send a button card only; the
     // offer row holds the spec until the owner taps it.
-    id: "010_routines_followups",
+    // (Numbered 011: main's #23 took 009_history_relay/010_history_relay_cursor; ids are
+    // unique, which is what the ledger keys on — the number just keeps the order readable.)
+    id: "011_routines_followups",
     up: (sql) => {
       // kind: 'digest' (deterministic ledger summary, no LLM — spike-conclusions §2) or
       // 'instruction' (a ⟦routine⟧ steward input executes it).
