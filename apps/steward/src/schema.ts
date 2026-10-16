@@ -422,6 +422,9 @@ export const MIGRATIONS: readonly Migration[] = [
         bytes INTEGER NOT NULL,
         source TEXT NOT NULL,
         evidence TEXT,
+        -- The message that carried the owner's confirmation (notes_confirm); the
+        -- promotion path inherits this so the row itself says who confirmed it (PR #44 R3).
+        confirmedBy TEXT,
         confirmed INTEGER NOT NULL DEFAULT 0,
         pinned INTEGER NOT NULL DEFAULT 0,
         createdAt INTEGER NOT NULL,

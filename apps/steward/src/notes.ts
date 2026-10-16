@@ -80,6 +80,9 @@ export interface NoteRow {
   bytes: number;
   source: NoteSource;
   evidence: string | null;
+  /** The owner's confirmation message (`user:<msgId>`), set by confirm() — the promoted
+   *  row inherits this, so the audit trail does not depend on sh_note_log alone. */
+  confirmedBy: string | null;
   confirmed: boolean;
   pinned: boolean;
   createdAt: number;
@@ -166,6 +169,7 @@ const viewNote = (r: Record<string, unknown>): NoteRow => ({
   bytes: r.bytes as number,
   source: r.source as NoteSource,
   evidence: (r.evidence as string | null) ?? null,
+  confirmedBy: (r.confirmedBy as string | null) ?? null,
   confirmed: !!r.confirmed,
   pinned: !!r.pinned,
   createdAt: r.createdAt as number,
@@ -489,7 +493,10 @@ export function createNotes(deps: NotesDeps) {
     tx(() => {
       const note = noteById(noteId);
       if (!note || note.status === "removed" || note.confirmed) return { ok: note !== null, changes: [] };
-      sql`UPDATE sh_note SET confirmed = 1, lastUsedAt = ${now()} WHERE noteId = ${noteId}`;
+      sql`
+        UPDATE sh_note SET confirmed = 1, confirmedBy = COALESCE(${evidence ?? null}, confirmedBy), lastUsedAt = ${now()}
+        WHERE noteId = ${noteId}
+      `;
       return { ok: true, changes: [log("confirmed", note, evidence ? `confirmed_by:${evidence}` : "owner_confirmed")] };
     });
 

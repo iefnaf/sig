@@ -964,7 +964,9 @@ describe("notes trust gates: the evidence rules (PR #44 review finding 3)", () =
     await dm("提升为全局", "om_r1_promote");
     await waitRunsSettled();
     const promoted = (await ownerStub().debugSnapshot()).notes.find((n) => n.layer === "resident");
-    expect(promoted).toMatchObject({ confirmed: true, evidence: "user:om_first_report" }); // trail on the row (R1)
+    // The row carries WHO confirmed it — the confirmation message, not just the origin
+    // report (nit 1): confirm() backfills confirmedBy, the promotion inherits it.
+    expect(promoted).toMatchObject({ confirmed: true, evidence: "user:om_r1_confirm" });
     expect((await ownerStub().debugSnapshot()).notes.find((n) => n.noteId === noteId)).toMatchObject({
       layer: "archive",
       supersededBy: promoted?.noteId,

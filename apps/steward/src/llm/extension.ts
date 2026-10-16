@@ -391,9 +391,11 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
           );
         if (basis !== undefined) {
           // Parked → confirmed (notes_confirm bound the owner's message to it) → promoted.
+          // Prefer the predecessor's confirmation ref so the row says who confirmed it;
+          // fall back to its origin evidence when the confirmation carried none.
           draft.confirmed = true;
-          draft.evidence = draft.evidence ?? basis.evidence ?? undefined;
-      } else if (
+          draft.evidence = draft.evidence ?? basis.confirmedBy ?? basis.evidence ?? undefined;
+        } else if (
           (args.replaces ?? []).some((id) => {
             const n = ctx.ledger.notes.get(id);
             return n !== null && n.status === "active" && n.confirmed && LOW_TRUST_SOURCES.includes(n.source);
