@@ -251,11 +251,13 @@ Re-run this evaluation set whenever the model, prompts, or candidate-assembly ru
 |---|---|---|
 | Role, rules, autonomy, report format | System prompt (static sections) | Rarely changes; prompt-cache friendly |
 | Resident-layer notes | One section of the system prompt | Changes rarely; when it changes, only the delta is appended |
-| **Situation brief** (per-Thread state, machine online status, open questions) | Injected by the `beforeRequest` hook into the **single request**, not written into the conversation | Freshest every turn without bloating the conversation |
+| **Situation brief** (per-Thread state, machine online status, open questions) | Injected by the `beforeRequest` hook into the **single request**, not written into the conversation | Freshest every turn without bloating the conversation (**verified**: see the note at the end of this section) |
 | Project-layer notes for the repos involved | Return values of tools like `get_thread` | Appears only when relevant |
 | This turn's input | A user message or a system event | |
 
 The `beforeRequest` hook can replace a single request's message list (pi-durable README, Generation hooks); whether it satisfies "append just one brief block, persist nothing" needs prototype validation. Fallback: put the situation brief into an input-text prefix.
+
+> **Verified (issue #6, 2026-10-16).** The `beforeRequest` hook of pi-durable 1.3.0 replaces only the outgoing request's messages: pi commits the transcript *view*, not the hook's copy, so the injected `shepherd-situation` section never lands in any stored entry. Verified by test (`llm-reply.test.ts`, "the situation brief"): the outgoing request carries the fresh brief every turn, no stored `pi.system`/`pi.user` entry contains the section or its body, and two turns see different briefs after a state change. The input-prefix fallback stays unused. One implementation note: the hook rewrites the **leading system message's `sections` record** (adding `shepherd-situation` by name) rather than appending a mid-conversation system message — deepseek-flash's catalog entry does not declare `supportsMidConvoSystemMessages`, so the leading message is the safe place.
 
 ### 4.2 The two input sources
 
@@ -415,6 +417,8 @@ In runs triggered by events, routines, or follow-ups, **the steward's ordinary t
 
 Replying to a user message requires the run's final text. `harness.wait(operationId)` returns `PiOperationResult { status, reason, text }`. The approach: when submitting a user message, write `sh_run(operationId, kind=user, replyTo=<channel message ID>, status=open)`; an alarm-driven task checks every 2 seconds while unsettled `sh_run` rows exist, and on settlement writes `sh_outbound` and marks it done. This relies on the already-verified `submit` and on `PiHarness`'s alarm heartbeat; `wait` itself has only been seen in type declarations and needs prototype validation.
 
+> **Verified (issue #6).** Both `pending()` (lists unsettled operations) and `wait()` (resolves immediately for a settled one; `not_found` for a never-submitted one — which is exactly the crash-recovery resubmit path) behave as declared. The 2-second poll runs as the `pollRuns` alarm; user runs reply with the final text, every other kind discards it.
+
 ### 6.4 Report format and merging
 
 `notify_user`'s parameter structure is itself the three parts (spec §7.5), plus a `tone` (success / attention / failure): **the tone is decided by the nature of the message, independent of whether needsYou is attached** — a completion that comes with minor caveats still gets the success tone, so one glance at the color tells the user whether anything went wrong (corrected after live testing in the M1 prototype).
@@ -462,6 +466,8 @@ The `beforeTool` hook (pi-durable's `hook(ToolTask, { beforeTool })`) consults t
 | Scope expansion (dispatching beyond what the user literally said) | none | Always diverted to `ask_user` |
 
 The `provenance` rule (spec §8.3): in event-triggered runs, calling `start_worker`/`send_to_worker` requires a `provenance` that is an existing routine, follow-up, or watch ID, or a user message ID; an empty value is always rejected. This makes it impossible for the steward to decide to act "out of thin air".
+
+> **Implemented boundary (issue #6, PR #40 review #4):** in event/routine/follow-up-triggered runs the `start_worker` tool requires an explicit `provenanceRef`; `user:<msgId>` values are verified against `sh_inbound` (a message this deployment actually received), anything else — including the wake's own `evt:` id — is refused at the tool. Routine/follow-up/watch reference checks join when those tables land (#20).
 
 The autonomy switch (cautious / balanced / hands-off) = three settings of this policy table; the MVP implements only "balanced", and the table structure leaves room for swapping in the others.
 
@@ -588,12 +594,12 @@ Legend: ✓ verified in the protocol spike; ◦ seen only in docs or type declar
 | `PiHarness.submit(text, { operationId, whenBusy })` idempotent | ✓ |
 | Event-triggered `submit` resumes via alarm after the DO is reset | ✓ |
 | `PiHarness.pending()`, `messages()` | ✓ |
-| `PiHarness.wait(operationId)` returns the final text | ◦ (type declarations) |
-| `defineTool`, `section`, `hook(ToolTask, beforeTool)` in extensions | ◦ (pi-durable README, `pi-durable-edge` examples) |
-| `api.taskId` inside tools is stable across replays and usable as an idempotency key | ◦ (usage in README examples 22/23) |
-| The `beforeRequest` hook replaces only the single request and persists nothing | ◦ (README) |
-| A tool result's `control.terminate` ends the turn | ◦ (README) |
-| `input` with a custom `entry` (distinguishing user vs event) | ? `pi-durable@1.1.0` types disallow it, the repo README allows it; `PiHarness.submit` does not expose it. The MVP uses content markers |
+| `PiHarness.wait(operationId)` returns the final text | ✓ (issue #6: pending/wait/not_found all exercised by tests) |
+| `defineTool`, `section`, `hook(ToolTask, beforeTool)` in extensions | ✓ (issue #6: the shepherd-steward extension is built on them) |
+| `api.taskId` inside tools is stable across replays and usable as an idempotency key | ✓ (issue #6: `cmdId = "tool:" + api.taskId`; replays converge on the existing outbox row) |
+| The `beforeRequest` hook replaces only the single request and persists nothing | ✓ (issue #6: verified by test — see §4.1) |
+| A tool result's `control.terminate` ends the turn | ✓ (issue #6: ask_user / no_action terminate) |
+| `input` with a custom `entry` (distinguishing user vs event) | ? `pi-durable@1.1.0` types disallow it, the repo README allows it; `PiHarness.submit` does not expose it. The MVP uses content markers (§4.2) |
 | DO SQLite supports FTS5 and JSON functions | ◦ (official docs); trigger-sync behavior unverified |
 | `ctx.storage.transactionSync` | ◦ (DO storage API) |
 | `this.schedule(cron, ...)` idempotent | ◦ (Agents SDK docs) |
@@ -615,8 +621,8 @@ Not included: multi-tenancy, event sources (GitHub, CI, etc.), voice, the autono
 
 ## 15. Pending decisions
 
-1. **Whether `beforeRequest` can append the situation brief to the single request only.** If not, switch to an input prefix, at the cost of conversation growth that compaction has to absorb.
-2. **Distinguishing events from user messages.** Content markers work but are fragile (what if `⟦` happens to appear in a user message): escape the marker characters in user text on inbound. Once pi-durable is upgraded to a version supporting `input.entry`, switch to structured entries.
+1. **Whether `beforeRequest` can append the situation brief to the single request only.** **Resolved (issue #6):** yes, verified — see §4.1. The input-prefix fallback stays unused.
+2. **Distinguishing events from user messages.** Content markers work but are fragile (what if `⟦` happens to appear in a user message): escape the marker characters in user text on inbound (`⟦`→`〔`, `⟧`→`〕`, implemented in issue #6). Once pi-durable is upgraded to a version supporting `input.entry`, switch to structured entries.
 3. **The length of the 90-second window**, and the share of questions the steward answers itself within it, need real usage data.
 4. **Whether 2,400 characters (resident layer) and 1,500 (project layer)** are right depends on what notes actually look like.
 5. **Approximating a note's "use" by "assembled into context" for `lastUsedAt`** may overcount; later, the steward could annotate which notes a reply cited.

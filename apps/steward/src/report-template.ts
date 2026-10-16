@@ -16,7 +16,6 @@ export type Tone = "success" | "attention" | "failure";
 
 const TONE_BADGE = { success: "✅", attention: "⚠️", failure: "❌" } as const;
 const TONE_TEMPLATE = { success: "green", attention: "orange", failure: "red" } as const;
-const TONE_LABEL = { success: "成功", attention: "需要你", failure: "出错" } as const;
 
 export interface ReportCardInput {
   tone: Tone;
@@ -175,27 +174,31 @@ export function offlineAskCard(repoName: string, machineName: string, threadTitl
   };
 }
 
-export const HELP_TEXT = [
-  "M1 固定指令（自然语言要等 M2 的总管）：",
-  "/派发 <repo>[@<machine>] <要做的事> —— 派一个写任务并汇报",
-  "/状态 —— 所有 Thread 与机器",
-  "/加机器 —— 给新电脑发配对命令",
-  "/网页 —— 取一次性登录链接，网页里看时间线、管机器",
-].join("\n");
-
-export function statusText(threads: Array<{ title: string; state: string; unread: boolean }>, machines: Array<{ name: string; online: boolean }>): string {
-  const machineLines = machines.map((m) => `${m.online ? "🟢" : "⚫️"} ${m.name}`);
-  const threadLines = threads.map((t) => {
-    const mark = t.state === "running" ? "▶" : t.state === "waiting_you" ? "❓" : "·";
-    return `${mark} ${t.title}（${t.state}${t.unread ? "，未读" : ""}）`;
+/** The three-part card the steward's `notify_user` renders (steward.md §6.4 source 2). */
+export function notifyCard(input: {
+  tone: Tone;
+  conclusion: string;
+  did: string[];
+  needsYou?: string;
+  threadTitle?: string;
+  detailsUrl?: string;
+}) {
+  return renderReportCard({
+    tone: input.tone,
+    conclusion: input.conclusion,
+    did: input.did,
+    needsYou: input.needsYou,
+    threadTitle: input.threadTitle ?? "",
+    detailsUrl: input.detailsUrl,
+    footer: input.threadTitle
+      ? `Thread「${input.threadTitle}」 · 来自总管的主动通知 · 引用回复可继续这个 Thread`
+      : "来自总管的主动通知",
   });
-  return [
-    machineLines.length > 0 ? `机器：\n${machineLines.join("\n")}` : null,
-    threadLines.length > 0 ? `Thread：\n${threadLines.join("\n")}` : null,
-    threadLines.length === 0 ? "还没有任何 Thread。发「/派发 <repo> <要做的事>」开始。" : null,
-  ]
-    .filter((line): line is string => line !== null)
-    .join("\n\n");
 }
 
-export const TONE_LABELS = TONE_LABEL;
+/** The `ask_user` push (steward.md §4.3): plain text — answering flows back as a quote-reply. */
+export function askUserText(question: string, options: string[], threadTitle?: string): string {
+  const head = threadTitle ? `【${threadTitle}】` : "";
+  const body = options.length > 0 ? `${question}\n${options.map((o, i) => `${i + 1}. ${o}`).join("\n")}` : question;
+  return `${head}❓ ${body}\n（直接回复这句话即可；回复会带上所属 Thread。）`;
+}

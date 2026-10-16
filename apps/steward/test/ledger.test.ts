@@ -6,14 +6,11 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   configureAndBind,
   connectAndHello,
-  messageEvent,
   mockCalls,
   mockReset,
   ownerStub,
   pairDevice,
-  postEvent,
   resetLedgerState,
-  sendCalls,
   waitWhileOutboundPending,
 } from "./helpers.ts";
 
@@ -34,13 +31,14 @@ async function connectMachine() {
   });
 }
 
-/** Dispatches via the webhook and resolves the workerId from the start_worker command. */
-async function dispatchAndAwaitWorker(wsSend: { send: (data: string) => void }, reader: { nextWhere: (pred: (m: Record<string, unknown>) => boolean, t?: number) => Promise<Record<string, unknown>> }, text: string): Promise<string> {
-  const res = await postEvent(messageEvent({ msgId: `om_${crypto.randomUUID().slice(0, 8)}`, text }));
-  expect(res.status).toBe(200);
+/** Dispatches through the deterministic service (the LLM tool's code path) and resolves the
+ *  workerId from the start_worker command. The reducer tests don't script the model — the
+ *  LLM's behavior has its own test file; the ledger is deterministic. */
+async function dispatchAndAwaitWorker(reader: { nextWhere: (pred: (m: Record<string, unknown>) => boolean, t?: number) => Promise<Record<string, unknown>> }, prompt: string): Promise<string> {
+  const outcome = await ownerStub().dispatchForTest({ prompt, repoRef: "repo-a", newTitle: prompt });
+  expect(outcome.kind).toBe("dispatched");
   const cmd = await reader.nextWhere((m) => m.t === "cmd");
   expect(cmd.kind).toBe("start_worker");
-  wsSend.send(JSON.stringify({ t: "cmd_ack", re: cmd.id, status: "accepted" }));
   return String((cmd.args as Record<string, unknown>).workerId);
 }
 
@@ -97,7 +95,7 @@ describe("machine online state derives from connections (issue #5)", () => {
 describe("the reducer: derived state, unread, notification intents (steward.md §5.2-5.3)", () => {
   it("started → running; done report → sh_report + unread + green card; settled → idle with unread kept", async () => {
     const { ws, reader } = await connectMachine();
-    const workerId = await dispatchAndAwaitWorker(ws, reader, "/派发 repo-a 修复登录 bug");
+    const workerId = await dispatchAndAwaitWorker(reader, "修复登录 bug");
 
     let snap = await snapshotWhere((s) => s.threads.some((t) => t.state === "running"), "running after dispatch");
     expect(snap.threads[0]!.workers[0]).toMatchObject({ workerId, state: "starting" });
@@ -142,7 +140,7 @@ describe("the reducer: derived state, unread, notification intents (steward.md �
 
   it("a blocked report opens a question → waiting_you once the run settles, and the card is attention-toned with the question verbatim", async () => {
     const { ws, reader } = await connectMachine();
-    const workerId = await dispatchAndAwaitWorker(ws, reader, "/派发 repo-a 查一下构建为什么挂");
+    const workerId = await dispatchAndAwaitWorker(reader, "查一下构建为什么挂");
     await sendEvents(ws, [
       event(workerId, 1, { type: "started", sessionId: workerId }),
       event(workerId, 2, { type: "report", status: "blocked", summary: "被 npm 权限挡住了", question: "可以给你开 sudo 吗？" }),
@@ -165,7 +163,7 @@ describe("the reducer: derived state, unread, notification intents (steward.md �
 
   it("settled error:auth breaks the worker, opens a question, and pushes a red card (steward.md §5.3)", async () => {
     const { ws, reader } = await connectMachine();
-    const workerId = await dispatchAndAwaitWorker(ws, reader, "/派发 repo-a 再跑一次回归");
+    const workerId = await dispatchAndAwaitWorker(reader, "再跑一次回归");
     await sendEvents(ws, [
       event(workerId, 1, { type: "started", sessionId: workerId }),
       event(workerId, 2, { type: "settled", outcome: "error", errorClass: "auth" }),
@@ -181,7 +179,7 @@ describe("the reducer: derived state, unread, notification intents (steward.md �
 
   it("re-delivered batches apply exactly once (idempotent per workerId+seq, protocol §4.3)", async () => {
     const { ws, reader } = await connectMachine();
-    const workerId = await dispatchAndAwaitWorker(ws, reader, "/派发 repo-a 修个分页");
+    const workerId = await dispatchAndAwaitWorker(reader, "修个分页");
     const batch = [
       event(workerId, 1, { type: "started", sessionId: workerId }),
       event(workerId, 2, { type: "report", status: "done", summary: "修好了" }),
@@ -211,7 +209,7 @@ describe("the reducer: derived state, unread, notification intents (steward.md �
 
   it("stops at a gap and applies in order once the gap fills (resync semantics, §4.3)", async () => {
     const { ws, reader } = await connectMachine();
-    const workerId = await dispatchAndAwaitWorker(ws, reader, "/派发 repo-a 补个测试");
+    const workerId = await dispatchAndAwaitWorker(reader, "补个测试");
     await sendEvents(ws, [event(workerId, 3, { type: "report", status: "done", summary: "补好了" })]); // 1 and 2 missing
     await new Promise((resolve) => setTimeout(resolve, 150));
     let snap = await ownerStubDebug();
@@ -227,8 +225,8 @@ describe("the reducer: derived state, unread, notification intents (steward.md �
 
   it("a rejected start_worker marks the worker broken and pushes a red failure card", async () => {
     const { ws, reader } = await connectMachine();
-    const res = await postEvent(messageEvent({ msgId: "om_d1", text: "/派发 repo-a 修一下部署脚本" }));
-    expect(res.status).toBe(200);
+    const outcome = await ownerStub().dispatchForTest({ prompt: "修一下部署脚本", repoRef: "repo-a", newTitle: "修一下部署脚本" });
+    expect(outcome.kind).toBe("dispatched");
     const cmd = await reader.nextWhere((m) => m.t === "cmd");
     ws.send(JSON.stringify({ t: "cmd_ack", re: cmd.id, status: "rejected", code: "not_registered_repo" }));
 

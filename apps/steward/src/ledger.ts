@@ -6,12 +6,18 @@
 // is the M1 subset, shaped so those slot in without a rewrite.
 import { ulid } from "@shepherd/protocol";
 import type { HelloMessage } from "@shepherd/protocol";
+import { eventWakeText } from "./wake-text.ts";
 
 /** Tagged-template SQL over the DO's SQLite (same shape schema.ts migrations use). */
 export type LedgerSql = <T = Record<string, unknown>>(
   strings: TemplateStringsArray,
   ...values: (string | number | boolean | null)[]
 ) => T[];
+
+/** Thread summaries are capped (steward.md §2.6). */
+export const MAX_THREAD_SUMMARY = 600;
+/** The wake merge window (steward.md §5.1/§5.4): events within it become one steward input. */
+export const WAKE_MERGE_MS = 3_000;
 
 /** Runs a synchronous closure atomically (`ctx.storage.transactionSync`, steward.md §1). */
 export interface LedgerDeps {
@@ -30,6 +36,8 @@ export interface ThreadRow {
   threadId: string;
   title: string;
   goal: string | null;
+  summary: string | null;
+  summaryAt: number | null;
   state: ThreadState;
   unread: boolean;
   lastMachine: string | null;
@@ -126,6 +134,41 @@ export interface NotifyRow {
 export interface SilentWorker extends WorkerRow {
   machineOnline: boolean;
   machineLastSeen: number;
+}
+
+/** A durable wake_request (steward.md §5.1 step 4): one future steward input. */
+export interface WakeRow {
+  id: number;
+  operationId: string;
+  kind: "event" | "routine" | "followup";
+  dedupeKey: string;
+  text: string;
+  priority: "normal" | "high";
+  status: "pending" | "merged" | "submitted";
+  dueAt: number;
+  mergedInto: number | null;
+  createdAt: number;
+  submittedAt: number | null;
+}
+
+/** One steward run (steward.md §6.3): a submitted input and how its outcome is handled. */
+export interface RunRow {
+  operationId: string;
+  kind: "user" | "event" | "routine" | "followup";
+  replyTo: string | null;
+  channel: string | null;
+  routedThreadId: string | null;
+  text: string;
+  status: "open" | "settled";
+  resultStatus: string | null;
+  resultReason: string | null;
+  resultText: string | null;
+  replyOutboundId: string | null;
+  /** The run already produced user-facing output (notify_user/ask_user) — an empty final
+   *  text is then legitimate, not a failure (review #9). */
+  notified: boolean;
+  createdAt: number;
+  settledAt: number | null;
 }
 
 // ---- web read model (steward.md §10: pages are served from the memory module's views) -------------
@@ -250,6 +293,8 @@ export function createLedger(deps: LedgerDeps) {
     threadId: r.threadId as string,
     title: r.title as string,
     goal: (r.goal as string | null) ?? null,
+    summary: (r.summary as string | null) ?? null,
+    summaryAt: (r.summaryAt as number | null) ?? null,
     state: r.state as ThreadState,
     unread: !!r.unread,
     lastMachine: (r.lastMachine as string | null) ?? null,
@@ -350,6 +395,21 @@ export function createLedger(deps: LedgerDeps) {
     /** Reply or card click on the Thread's message = the user has seen it (§6.5). */
     markRead(threadId: string): void {
       sql`UPDATE sh_thread SET unread = 0 WHERE threadId = ${threadId}`;
+    },
+    /** The steward's bookkeeping update (§2.6): summaries capped at 600 characters. */
+    update(threadId: string, patch: { title?: string; goal?: string; summary?: string }): boolean {
+      if (patch.summary !== undefined && patch.summary.length > MAX_THREAD_SUMMARY) return false;
+      const before = sql<ThreadRow>`SELECT * FROM sh_thread WHERE threadId = ${threadId}`[0];
+      if (!before) return false;
+      sql`
+        UPDATE sh_thread SET
+          title = COALESCE(${patch.title ?? null}, title),
+          goal = COALESCE(${patch.goal ?? null}, goal),
+          summary = COALESCE(${patch.summary ?? null}, summary),
+          summaryAt = CASE WHEN ${patch.summary ?? null} IS NULL THEN summaryAt ELSE ${now()} END
+        WHERE threadId = ${threadId}
+      `;
+      return true;
     },
   };
 
@@ -674,7 +734,18 @@ export function createLedger(deps: LedgerDeps) {
       text?: string;
       card?: unknown;
       urgency?: "push" | "quiet";
+      /** Stable dedupe key (review #6): same id → same row (INSERT OR IGNORE), never a second
+       *  message; the id doubles as the provider-side uuid. Omitted: a fresh one-of message. */
+      id?: string;
     }): string {
+      if (input.id !== undefined) {
+        sql`
+          INSERT OR IGNORE INTO sh_outbound (id, channel, kind, receiveId, threadId, payload, urgency, status, attempts, nextAttemptAt, createdAt)
+          VALUES (${input.id}, 'feishu', ${input.kind}, ${input.to}, ${input.threadId ?? null},
+                  ${JSON.stringify({ text: input.text, card: input.card })}, ${input.urgency ?? "quiet"}, 'queued', 0, ${now()}, ${now()})
+        `;
+        return input.id;
+      }
       const id = ulid(); // stable across retries; doubles as the provider-side uuid
       sql`
         INSERT INTO sh_outbound (id, channel, kind, receiveId, threadId, payload, urgency, status, attempts, nextAttemptAt, createdAt)
@@ -762,6 +833,82 @@ export function createLedger(deps: LedgerDeps) {
       `[0]?.at ?? null;
       const candidates = [nextDue, nextReclaim].filter((v): v is number => v !== null);
       return candidates.length === 0 ? null : Math.min(...candidates);
+    },
+  };
+
+  // ---- steward runs and wake_requests (steward.md §5.1 step 4, §6.3) --------------------------
+
+  /** `mergeMs` is the 3-second merge window (§5.4); rows merge into a still-pending wake of
+   *  the same kind without extending its dueAt, so wake latency stays bounded. */
+  const wakes = {
+    queue(kind: WakeRow["kind"], dedupeKey: string, text: string, opts: { priority?: WakeRow["priority"]; mergeMs?: number } = {}): void {
+      const mergeMs = opts.mergeMs ?? WAKE_MERGE_MS;
+      const ts = now();
+      const open = sql<{ id: number; text: string }>`
+        SELECT id, text FROM sh_wake WHERE kind = ${kind} AND status = 'pending' AND dueAt > ${ts} ORDER BY id LIMIT 1
+      `[0];
+      if (open) {
+        // §5.4: events within the window become ONE wake-up — append this block to the
+        // pending row's text. The row keeps its operationId: one steward input, ever.
+        sql`UPDATE sh_wake SET text = ${open.text + "\n" + text} WHERE id = ${open.id}`;
+        sql`
+          INSERT OR IGNORE INTO sh_wake (operationId, kind, dedupeKey, text, priority, status, dueAt, mergedInto, createdAt)
+          VALUES (${"evt:" + ulid()}, ${kind}, ${dedupeKey}, ${text}, ${opts.priority ?? "normal"}, 'merged', ${ts + mergeMs}, ${open.id}, ${ts})
+        `;
+        return;
+      }
+      sql`
+        INSERT OR IGNORE INTO sh_wake (operationId, kind, dedupeKey, text, priority, status, dueAt, createdAt)
+        VALUES (${"evt:" + ulid()}, ${kind}, ${dedupeKey}, ${text}, ${opts.priority ?? "normal"}, 'pending', ${ts + mergeMs}, ${ts})
+      `;
+    },
+    due(nowMs: number): WakeRow[] {
+      return sql<WakeRow>`
+        SELECT * FROM sh_wake WHERE status = 'pending' AND dueAt <= ${nowMs} ORDER BY dueAt, id
+      `;
+    },
+    /** Earliest pending dueAt (the next moment the drain alarm must fire), or null. */
+    earliestDue(nowMs: number): number | null {
+      return sql<{ at: number | null }>`SELECT MIN(dueAt) AS at FROM sh_wake WHERE status = 'pending'`[0]?.at ?? null;
+    },
+    markSubmitted(id: number): void {
+      sql`UPDATE sh_wake SET status = 'submitted', submittedAt = ${now()} WHERE id = ${id} AND status = 'pending'`;
+    },
+  };
+
+  const runs = {
+    /** False when the operationId already ran/queued — the idempotency answer (§11). */
+    open(
+      operationId: string,
+      kind: RunRow["kind"],
+      text: string,
+      opts: { replyTo?: string; channel?: string; routedThreadId?: string | null } = {},
+    ): boolean {
+      const exists = sql`SELECT 1 AS one FROM sh_run WHERE operationId = ${operationId}`;
+      if (exists.length > 0) return false;
+      sql`
+        INSERT INTO sh_run (operationId, kind, replyTo, channel, routedThreadId, text, status, createdAt)
+        VALUES (${operationId}, ${kind}, ${opts.replyTo ?? null}, ${opts.channel ?? null}, ${opts.routedThreadId ?? null},
+                ${text}, 'open', ${now()})
+      `;
+      return true;
+    },
+    openRows(): RunRow[] {
+      return sql<RunRow>`SELECT * FROM sh_run WHERE status = 'open' ORDER BY createdAt, operationId`;
+    },
+    get(operationId: string): RunRow | null {
+      return (sql<RunRow>`SELECT * FROM sh_run WHERE operationId = ${operationId}`[0] ?? null);
+    },
+    rows(): RunRow[] {
+      return sql<RunRow>`SELECT * FROM sh_run ORDER BY createdAt, operationId`;
+    },
+    /** Records the outcome. For kind=user the caller already queued the reply text. */
+    settle(operationId: string, result: { status: string; reason?: string; text?: string }, replyOutboundId?: string): void {
+      sql`
+        UPDATE sh_run SET status = 'settled', resultStatus = ${result.status}, resultReason = ${result.reason ?? null},
+                          resultText = ${result.text ?? null}, replyOutboundId = ${replyOutboundId ?? null}, settledAt = ${now()}
+        WHERE operationId = ${operationId} AND status = 'open'
+      `;
     },
   };
 
@@ -894,6 +1041,29 @@ export function createLedger(deps: LedgerDeps) {
           `;
           notifications.queue(`report:${workerId}:${seq}`, "attention_report", worker.threadId, workerId);
         }
+        // §5.3: report events wake the steward for bookkeeping (summary, notes). The
+        // deterministic card above still goes out on its own — the LLM is not on its path.
+        wakes.queue(
+          "event",
+          `report:${workerId}:${seq}`,
+          eventWakeText({
+            thread: threads.get(worker.threadId),
+            worker: workers.get(workerId)!,
+            machine: machines.get(worker.deviceId),
+            report: {
+              status,
+              summary: str(event.summary) ?? "",
+              changes: Array.isArray(event.changes) ? (event.changes as string[]) : null,
+              decisions: Array.isArray(event.decisions) ? (event.decisions as string[]) : null,
+              leftovers: Array.isArray(event.leftovers) ? (event.leftovers as string[]) : null,
+              tests: (event.tests as ReportRow["tests"]) ?? null,
+              question: str(event.question),
+              git: (event.git as ReportRow["git"]) ?? null,
+            },
+            notified: true,
+          }),
+          { priority: status === "done" ? "normal" : "high" },
+        );
         break;
       }
       case "settled": {
@@ -924,6 +1094,21 @@ export function createLedger(deps: LedgerDeps) {
           sql`UPDATE sh_thread SET unread = 1 WHERE threadId = ${worker.threadId}`;
           timeline.add(worker.threadId, "question", text, { workerId, seq, errorClass });
           notifications.queue(`settled:${workerId}:${seq}`, "failure_push", worker.threadId, workerId);
+          // §5.3: failure-class settles wake the steward (it may classify, note, or add
+          // context on top of the deterministic push the user already received).
+          wakes.queue(
+            "event",
+            `settled:${workerId}:${seq}`,
+            eventWakeText({
+              thread: threads.get(worker.threadId),
+              worker: workers.get(workerId)!,
+              machine: machines.get(worker.deviceId),
+              report: null,
+              settled: { outcome, errorClass, text },
+              notified: true,
+            }),
+            { priority: "high" },
+          );
         }
         if (event.usage) {
           sql`UPDATE sh_worker SET lastProgress = ${JSON.stringify({ usage: event.usage })} WHERE workerId = ${workerId}`;
@@ -1011,6 +1196,8 @@ export function createLedger(deps: LedgerDeps) {
       machines: MachineRow[];
       threads: Array<ThreadRow & { repoIds: string[]; workers: WorkerRow[]; questions: QuestionRow[]; timeline: TimelineRow[] }>;
       pendingNotifications: NotifyRow[];
+      runs: RunRow[];
+      wakes: WakeRow[];
     } {
       return {
         machines: machines.list(),
@@ -1025,11 +1212,16 @@ export function createLedger(deps: LedgerDeps) {
           timeline: timeline.list(t.threadId),
         })),
         pendingNotifications: notifications.pending(),
+        runs: runs.rows(),
+        wakes: sql<WakeRow>`SELECT * FROM sh_wake ORDER BY id`,
       };
     },
   };
 
-  return { machines, repos, threads, workers, reports, questions, timeline, notifications, outbound, views, applyPendingEvents, recomputeThreadState, debug };
+  return {
+    machines, repos, threads, workers, reports, questions, timeline, notifications, outbound,
+    runs, wakes, views, applyPendingEvents, recomputeThreadState, debug,
+  };
 }
 
 export type Ledger = ReturnType<typeof createLedger>;
