@@ -90,6 +90,23 @@ async function setMachineOffline(minutesAgo: number): Promise<void> {
   });
 }
 
+/** Restores the production sweep knobs and drops fast-cadence sweepWorkers rows — the
+ * isolate (and its fields) outlives each test that shrinks them. */
+async function restoreSweepMaintenance(): Promise<void> {
+  await runInDurableObject(ownerStub(), async (instance: Steward) => {
+    const knobs = instance as unknown as { stallAlarmMs: number; reapOfflineMs: number; reapSilentMs: number; workerSweepIntervalS: number };
+    knobs.stallAlarmMs = 20 * 60_000;
+    knobs.reapOfflineMs = 10 * 60_000;
+    knobs.reapSilentMs = 45 * 60_000;
+    knobs.workerSweepIntervalS = 60;
+    for (const scheduleRow of await instance.listSchedules()) {
+      if ((scheduleRow as unknown as { callback?: string }).callback === "sweepWorkers") {
+        await instance.cancelSchedule(scheduleRow.id).catch(() => undefined);
+      }
+    }
+  });
+}
+
 /** A card.action trigger for the ask card's buttons (the wait_online flow). */
 function cardActionEvent(cardMsgId: string, action: string) {
   return {
@@ -217,17 +234,7 @@ describe("the §8.4 stall alarm (online machine, lastEventAt + 20 min)", () => {
       expect((await sentCards()).length).toBe(1);
     } finally {
       fake.close();
-      // Back to production thresholds, and drop the fast-cadence rows this test armed.
-      await runInDurableObject(ownerStub(), async (instance: Steward) => {
-        const knobs = instance as unknown as { stallAlarmMs: number; workerSweepIntervalS: number };
-        knobs.stallAlarmMs = 20 * 60_000;
-        knobs.workerSweepIntervalS = 60;
-        for (const scheduleRow of await instance.listSchedules()) {
-          if ((scheduleRow as unknown as { callback?: string }).callback === "sweepWorkers") {
-            await instance.cancelSchedule(scheduleRow.id).catch(() => undefined);
-          }
-        }
-      });
+      await restoreSweepMaintenance();
       void (await mockCalls());
     }
   }, 30_000);
@@ -642,6 +649,35 @@ describe("terminal start_worker verdicts close wedged starting workers (PR #41 r
     await waitWhileOutboundPending();
     expect((await sentCards()).length).toBe(0);
     void (await mockCalls());
+  }, 30_000);
+
+  it("a LONE queued worker keeps the sweep chain armed: the real alarm reaps it when the machine disappears (PR #46 review round 3, finding 1)", async () => {
+    // The holder settled long ago; this queued worker is the only active row anywhere. Its
+    // sole closure is the sweep's measured-offline reap, so the arming count must include
+    // `queued` or the chain dies and the wedge this PR exists to close returns.
+    await runInDurableObject(ownerStub(), (instance: Steward) => {
+      const knobs = instance as unknown as { workerSweepIntervalS: number; reapOfflineMs: number };
+      knobs.workerSweepIntervalS = 1;
+      knobs.reapOfflineMs = 3_000;
+    });
+    let fake: FakeConnector | null = null;
+    try {
+      const dispatched = await dispatchRunningWorker("只排队的任务");
+      fake = dispatched.fake;
+      await fake.emit("queued", dispatched.workerId, { behind: "w-other" });
+      await waitForWorkerState(dispatched.workerId, "queued");
+      fake.close();
+      await setMachineOffline(0); // drops now; the offline clock matures ~3 s later
+
+      // Deliberately NO sweep() call: the queued worker alone must keep the alarm armed and
+      // the REAL scheduled alarm must perform the reap.
+      const row = await waitForWorkerState(dispatched.workerId, "lost", 15_000);
+      expect(row!.worker.lastOutcome).toBe("reaped");
+      expect(row!.thread.state).toBe("idle");
+    } finally {
+      await restoreSweepMaintenance();
+      void (await mockCalls());
+    }
   }, 30_000);
 
   it("a done start on a machine offline for a measured 11 minutes reaps at the offline clock, not 45 (PR #46 review finding 4)", async () => {

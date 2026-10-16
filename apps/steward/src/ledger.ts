@@ -1254,9 +1254,12 @@ export function createLedger(deps: LedgerDeps) {
       case "queued": {
         // §8.2 serial repos (issue #16): the connector parked this write worker behind the
         // repo's current one; `started` follows when the slot frees. Not a failure — the
-        // Thread stays running-shaped.
+        // Thread stays running-shaped. A reaped worker that re-parks is provably alive:
+        // clear the marker like every other resume path.
         sql`
-          UPDATE sh_worker SET state = 'queued', lastEventAt = ${ts}, updatedAt = ${now()}
+          UPDATE sh_worker SET state = 'queued',
+                              lastOutcome = CASE WHEN lastOutcome = 'reaped' THEN NULL ELSE lastOutcome END,
+                              lastEventAt = ${ts}, updatedAt = ${now()}
           WHERE workerId = ${workerId}
         `;
         timeline.add(worker.threadId, "note", "排队中：等同一仓库的前一个写任务结束（serial 模式）", {

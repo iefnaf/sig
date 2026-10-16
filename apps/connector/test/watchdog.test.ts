@@ -451,6 +451,92 @@ describe("worker stalls through the manager (fake-pi)", () => {
   }, 30_000);
 });
 
+// ---- Strike-window interactions (PR #46 review round 3, finding 2) -------------------------------
+
+describe("the strike window vs sends and stops (PR #46 review round 3)", () => {
+  /** Manager + fake-pi whose stall-respawn spawn is held at a gate: the test controls the
+   *  recovering-to-running window deterministically. */
+  function setupGatedRespawn(runs: ScenarioStep[][], stallMs = 300): { releaseSpawn: () => void } {
+    const scenario = writeScenario(dir, "scenario", runs);
+    const runsFile = join(dir, "runs-shared.txt");
+    writeFileSync(runsFile, "0");
+    const adapter = fakePiAdapter(stateDir, scenario, { FAKE_PI_RUNS_FILE: runsFile });
+    let releaseSpawn!: () => void;
+    const spawnGate = new Promise<void>((resolve) => {
+      releaseSpawn = resolve;
+    });
+    const origStart = adapter.start.bind(adapter);
+    adapter.start = (spec) =>
+      spec.commandId.startsWith("stall-respawn-") ? spawnGate.then(() => origStart(spec)) : origStart(spec);
+    manager = new WorkerManager({
+      store,
+      stateDir,
+      adapter,
+      emit: (workerId, fields) => {
+        const stored = eventLog.append(workerId, fields);
+        events.push(JSON.parse(stored.payload) as EmittedEvent);
+      },
+      watchdog: { stallMs, tickMs: 60, cpuSampleGapMs: 10, sampleTreeCpu: scriptedTree, onError: (err) => errors.push(err) },
+    });
+    return { releaseSpawn };
+  }
+
+  const strikeFired = () => waitFor(() => events.find((e) => e.type === "progress" && e.tool === "stall-watchdog"), 10_000, "strike 1");
+
+  it("a send parked on the strike's recovering drains the moment the respawn lands", async () => {
+    // stallMs 5000: the strike must fire on run 0's silence, but the respawned run's own
+    // 800 ms tool delay may not be struck itself (at the default 300 ms it was).
+    const { releaseSpawn } = setupGatedRespawn(
+      [
+        stallRun(20_000),
+        // A slow first step keeps the respawned run `running` when the drain lands, so the
+        // parked message deterministically steers (a fast run would settle first and the
+        // send would legitimately prompt instead — both drain, this pins the steer cell).
+        [{ delayMs: 800 }, ...reportRun({ status: "done", summary: "resumed and finished" })],
+      ],
+      5_000,
+    );
+    store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+    treeScript = [coldTree()];
+    await manager.startWorker("cmd-window", args());
+    await strikeFired(); // state is `recovering`, the respawn's spawn is gated
+
+    const send = manager.handleCommand("cmd-window-send", "send", {
+      workerId: "w-stall-1",
+      text: "use pnpm",
+      intent: "auto",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 150)); // let it park on recovering
+    releaseSpawn();
+
+    // The respawn lands -> withTransition drains the parked send -> it steers the fresh run.
+    await expect(send).resolves.toMatchObject({ effect: "after_current_tools" });
+    await waitFor(() => settledEvent(), 15_000, "resumed run settles");
+    expect(settledEvent()).toMatchObject({ outcome: "reported" });
+    expect(resumedEvents()).toEqual([expect.objectContaining({ reason: "stall", count: 1 })]);
+  }, 30_000);
+
+  it("a stop landing mid-respawn wins: no resumed, no error:stall on top of the aborted settle", async () => {
+    const { releaseSpawn } = setupGatedRespawn([stallRun(), stallRun()]);
+    store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+    treeScript = [coldTree()];
+    await manager.startWorker("cmd-window-2", args());
+    await strikeFired();
+
+    // The user stops the wedged task while the respawn's spawn is still gated: the stop
+    // settles the run (idle + settled:aborted) and that verdict must survive.
+    await manager.handleCommand("cmd-window-2-stop", "stop_process", { workerId: "w-stall-1" });
+    releaseSpawn();
+
+    await new Promise((resolve) => setTimeout(resolve, 400)); // let the respawn lose the race
+    const settledEvents = events.filter((e) => e.type === "settled");
+    expect(settledEvents).toHaveLength(1);
+    expect(settledEvents[0]).toMatchObject({ outcome: "aborted" });
+    expect(resumedEvents()).toHaveLength(0); // the respawn never announced itself
+    expect(store.getWorker("w-stall-1")).toMatchObject({ state: "idle", lastOutcome: "stopped" });
+  }, 30_000);
+});
+
 // ---- The REAL sampler vs a CPU-bound tool child (PR #41 review finding 1) -------------------------
 
 describe("the production sampler under a busy tool child (fake-pi, real ps)", () => {

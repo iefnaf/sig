@@ -1456,10 +1456,13 @@ export class Steward extends Agent<Env> {
 
   /** Arms the maintenance alarm while any worker is in an active state. Called from every
    * point that can change that (event reduction, hello reconciliation, dispatch enqueue);
-   * sweepWorkers re-arms itself and lets the alarm lapse once nothing is active. */
+   * sweepWorkers re-arms itself and lets the alarm lapse once nothing is active. `queued`
+   * counts as active (PR #46 review round 3, finding 1): a queued worker's ONLY closure is
+   * the sweep's measured-offline reap, so an arming count that skips it would let the chain
+   * die and wedge exactly the shape the sweep exists to close. */
   private armWorkerSweeps(): void {
     const active = this.sql<{ n: number }>`
-      SELECT COUNT(*) AS n FROM sh_worker WHERE state IN ('starting', 'running', 'recovering')
+      SELECT COUNT(*) AS n FROM sh_worker WHERE state IN ('queued', 'starting', 'running', 'recovering')
     `[0]!.n;
     if (active === 0) return;
     // schedule() rows each fire once: without this guard every wake that touches a worker

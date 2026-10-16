@@ -543,6 +543,10 @@ export class WorkerManager {
     await this.cleanupOrphans(workerId);
     if (inFlight) {
       this.store.setWorkerState(workerId, "idle", "stopped");
+      // The run ended at the user's word: stall strikes and the stall-respawn prompt are
+      // void (a later strike on a fresh run of this id must start at strike 1 again).
+      this.watchdog.forget(workerId);
+      this.runPrompts.delete(workerId);
       await this.emitEvent(workerId, "settled", { outcome: "aborted" });
       // §8.2: the serial write slot freed with the runner.
       this.pumpQueuedWorkers();
@@ -1406,14 +1410,35 @@ export class WorkerManager {
       this.store.setWorkerState(workerId, "recovering", "stall");
       await this.reclaimStalledProcess(workerId); // expected exit: releases the lock, no lost/auto-resume
       try {
-        await this.respawnStalled(workerId, why);
+        // Inside withTransition (PR #46 review round 3): a send parked on `recovering` during
+        // the strike window drains the moment the respawn lands — without this the user's
+        // message would sit in pendingSends until the run settled hours later.
+        await this.withTransition(workerId, () => this.respawnStalled(workerId, why));
       } catch (err) {
+        // A stop is not a transition and can settle the run mid-respawn (idle +
+        // settled:aborted); respawnStalled also aborts itself when its `recovering` was
+        // consumed. The user's stop is the verdict then — never a terminal error:stall on
+        // top of it (two settles for one run).
+        const settled = this.store.getWorker(workerId);
+        if (err instanceof CommandError && err.code === "aborted" && settled && settled.state !== "running" && settled.state !== "recovering") {
+          this.watchdog.forget(workerId);
+          this.runPrompts.delete(workerId);
+          return;
+        }
         const message = err instanceof Error ? err.message : String(err);
         await this.breakWorker(workerId, "stall", `stall watchdog respawn failed: ${message}`, "error:stall");
       }
       return;
     }
     await this.reclaimStalledProcess(workerId);
+    // The same stop-race guard as strike 1: if a stop settled this run while the wedged
+    // process was being reclaimed, its aborted settle is the verdict — not a stall error.
+    const settled = this.store.getWorker(workerId);
+    if (!settled || (settled.state !== "running" && settled.state !== "recovering")) {
+      this.watchdog.forget(workerId);
+      this.runPrompts.delete(workerId);
+      return;
+    }
     await this.breakWorker(workerId, "stall", `${why}; still wedged after one automatic restart`, "error:stall");
   }
 
@@ -1464,6 +1489,16 @@ export class WorkerManager {
     });
     try {
       const handle = await this.adapter.start(spec);
+      // A stop is not a transition and can land while adapter.start is in flight: it settles
+      // the worker (idle + settled:aborted) and its verdict must survive (the resume path
+      // applies the same check). If this strike's `recovering` is gone the stop won the race
+      // — reclaim the just-spawned process, emit nothing, let the caller honor the stop
+      // (PR #46 review round 3, finding 2b).
+      const current = this.store.getWorker(workerId);
+      if (!current || current.state !== "recovering") {
+        await this.adapter.stopProcess(workerId).catch(() => undefined); // expected exit: no settle
+        throw new CommandError("aborted", `worker ${workerId} was stopped during the stall respawn`);
+      }
       this.store.upsertWorker({
         workerId,
         threadId: worker.threadId,
