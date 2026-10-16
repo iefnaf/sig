@@ -50,7 +50,7 @@ import {
 import { RetriableChannelError, type Brand, type InboundEvent } from "./channel/types.ts";
 import { Dispatcher } from "./dispatch.ts";
 import { createLedger, type Ledger, type LedgerSql, type NotifyRow } from "./ledger.ts";
-import { failureCard, reportCardFor } from "./report-template.ts";
+import { failureCard, reportCardFor, stallCard } from "./report-template.ts";
 import { MIGRATIONS, runMigrations } from "./schema.ts";
 import { openSecret, sealSecret } from "./secretbox.ts";
 import { renderSetupPage, type SetupView } from "./setup-page.ts";
@@ -91,6 +91,16 @@ const IDLE_SWEEP_INTERVAL_S = 60;
 // New commands default to a 10-minute expiry (protocol §4.2); callers that want "wait for it
 // to come online" pass `notAfter: null` explicitly.
 const DEFAULT_NOTAFTER_MS = 10 * 60_000;
+
+// ---- Worker maintenance sweeps (issue #13, steward.md §8.4; spike-conclusions §2) --------------
+// One alarm-driven pass every interval while any worker is in an active state: the §8.4 stall
+// alarm (one template notice per silent stall, reset by the next event) and the DO-side reap
+// sweep (running + offline 10 min, or online-but-silent 45 min → lost), so a Thread never
+// wedges in "running" when its connector died or forgot the worker.
+const STALL_ALARM_MS = 20 * 60_000;
+const REAP_OFFLINE_MS = 10 * 60_000;
+const REAP_SILENT_MS = 45 * 60_000;
+const WORKER_SWEEP_INTERVAL_S = 60;
 
 // ---- Channel: Feishu webhook inbound + outbound queue (steward.md §6.1, §9; spike bugs 1, 3) ----
 // A claim is the double-send guard (bug 1): the conditional UPDATE hands a row to exactly one
@@ -433,6 +443,9 @@ export class Steward extends Agent<Env> {
     // pending events drained first, the gate inside (lastSeq <= processedUpTo) means this only
     // fires for workers whose event stream cannot tell the story anymore. Timeline, no push.
     this.ledger.workers.reconcileFromSnapshot(auth.deviceId, hello.workers);
+    // The machine is back (or fresh workers appeared): the maintenance alarm must be live
+    // for whatever is running now (issue #13).
+    this.armWorkerSweeps();
   }
 
   // protocol §4.2 + ADR-0001 (spike bug 10): hello redelivers queued, sent, AND
@@ -553,7 +566,12 @@ export class Steward extends Agent<Env> {
   private applyLedgerEvents(): void {
     try {
       const { applied } = this.ledger.applyPendingEvents();
-      if (applied > 0) void this.drainNotifications();
+      if (applied > 0) {
+        // Any applied event can start a run (started/resumed) or end one (settled/lost) —
+        // the maintenance alarm follows suit (issue #13).
+        this.armWorkerSweeps();
+        void this.drainNotifications();
+      }
     } catch (err) {
       this.logChannel("ledger_apply_failed", errorText(err));
     }
@@ -605,6 +623,14 @@ export class Steward extends Agent<Env> {
       const report = this.ledger.workers.reportsForWorker(worker.workerId).at(-1);
       if (!report) return null;
       return reportCardFor(report, worker, machineName, thread.title, detailsUrl ?? undefined);
+    }
+
+    // stall_notice (§8.4): attention, not failure — the run may still be a very long tool
+    // call. The minutes are recomputed at render time (no event has arrived since the stall,
+    // or the intent would have been for a different, newer stall).
+    if (intent.kind === "stall_notice") {
+      const minutes = Math.max(1, Math.round((Date.now() - (worker.lastEventAt ?? worker.createdAt)) / 60_000));
+      return stallCard(minutes, worker, machineName, thread.title, footer, detailsUrl ?? undefined);
     }
 
     // failure_push: either the start never happened or the run ended in a failure class that
@@ -714,6 +740,9 @@ export class Steward extends Agent<Env> {
       INSERT INTO outbox (cmdId, deviceId, workerId, cseq, kind, payload, notAfter, state, createdAt)
       VALUES (${cmdId}, ${deviceId}, ${opts.workerId ?? null}, ${cseq}, ${kind}, ${JSON.stringify(args ?? {})}, ${notAfter}, 'queued', ${Date.now()})
     `;
+    // A dispatch registers the worker before enqueueing: the moment the row exists, the
+    // maintenance alarm (stall notice + reap) must be armed (issue #13).
+    this.armWorkerSweeps();
     this.deliver(cmdId, opts.ackTimeoutMs);
     const state = this.sql<{ state: string }>`SELECT state FROM outbox WHERE cmdId = ${cmdId}`[0]!.state;
     return { cmdId, cseq, state };
@@ -808,6 +837,59 @@ export class Steward extends Agent<Env> {
     }
     const waiting = this.sql<{ n: number }>`SELECT COUNT(*) AS n FROM outbox WHERE state = 'queued'`[0]!.n;
     if (waiting > 0) void this.schedule(IDLE_SWEEP_INTERVAL_S, "sweepIdle");
+  }
+
+  // ---- Worker maintenance: stall alarm + reap sweep (issue #13) -----------------------------------
+  // Thresholds are instance fields so tests can shrink them inside the DO (same pattern as
+  // feishuSendTimeoutMs); the cadence follows suit.
+
+  protected stallAlarmMs = STALL_ALARM_MS;
+  protected reapOfflineMs = REAP_OFFLINE_MS;
+  protected reapSilentMs = REAP_SILENT_MS;
+  protected workerSweepIntervalS = WORKER_SWEEP_INTERVAL_S;
+  /** In-memory dedupe of pending schedule() rows (the SDK fires every row; see armWorkerSweeps). */
+  private lastSweepArmAt = 0;
+
+  /** Arms the maintenance alarm while any worker is in an active state. Called from every
+   * point that can change that (event reduction, hello reconciliation, dispatch enqueue);
+   * sweepWorkers re-arms itself and lets the alarm lapse once nothing is active. */
+  private armWorkerSweeps(): void {
+    const active = this.sql<{ n: number }>`
+      SELECT COUNT(*) AS n FROM sh_worker WHERE state IN ('starting', 'running', 'recovering')
+    `[0]!.n;
+    if (active === 0) return;
+    // schedule() rows each fire once: without this guard every wake that touches a worker
+    // would add another row and the alarm would fan out. A DO reset clears the flag — the
+    // cost is at most one redundant no-op pass.
+    if (Date.now() - this.lastSweepArmAt < this.workerSweepIntervalS * 1000 * 0.9) return;
+    this.lastSweepArmAt = Date.now();
+    void this.schedule(this.workerSweepIntervalS, "sweepWorkers");
+  }
+
+  /**
+   * One maintenance pass: the §8.4 stall alarm (online machine + silence past the threshold →
+   * one template notice per stall) and the reap sweep (offline 10 min or online-silent 45 min
+   * → lost). Offline workers skip the stall notice on purpose — they are the reap sweep's
+   * territory, and "lost contact" is not news worth interrupting the user for (spec §9).
+   */
+  async sweepWorkers(): Promise<{ stalled: number; reaped: number }> {
+    let stalled = 0;
+    let reaped = 0;
+    const now = Date.now();
+    // Query with the shorter threshold and classify per worker in one pass.
+    for (const worker of this.ledger.workers.silentSince(Math.min(this.reapOfflineMs, this.stallAlarmMs))) {
+      const silentMs = now - (worker.lastEventAt ?? worker.createdAt);
+      if (silentMs >= this.reapSilentMs || (!worker.machineOnline && silentMs >= this.reapOfflineMs)) {
+        if (this.ledger.workers.reapWorker(worker.workerId, worker.machineOnline)) reaped += 1;
+        continue;
+      }
+      if (worker.machineOnline && silentMs >= this.stallAlarmMs) {
+        if (this.ledger.workers.notifyStall(worker.workerId, silentMs)) stalled += 1;
+      }
+    }
+    if (stalled > 0) void this.drainNotifications();
+    this.armWorkerSweeps();
+    return { stalled, reaped };
   }
 
   // =================================================================================================

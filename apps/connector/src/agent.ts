@@ -72,7 +72,7 @@ export interface SessionUsage {
   contextUsage?: { tokens?: number | null; contextWindow?: number; percent?: number | null };
 }
 
-export type ErrorClass = "auth" | "transient" | "context" | "unknown";
+export type ErrorClass = "auth" | "transient" | "context" | "stall" | "unknown";
 
 export type SettledOutcome = "reported" | "aborted" | "error" | "unreported";
 
@@ -124,6 +124,8 @@ export interface AgentAdapter {
   isRunning?(id: string): boolean;
   /** Live worker pids for the descendant-snapshot loop (connector-pi.md §9.3). */
   workerPids?(): Array<{ workerId: string; pid: number }>;
+  /** Live processes with their last stdout time — the stall watchdog's inputs (issue #13). */
+  workerActivity?(): Array<{ workerId: string; pid: number; lastOutputAt: number }>;
   /** Test support: emulate a hard crash of the connector (children SIGKILLed, no cleanup). */
   simulateCrash?(): void;
 }

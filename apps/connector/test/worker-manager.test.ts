@@ -343,7 +343,11 @@ describe("WorkerManager over fake-pi (connector-pi.md §4–§8, §11)", () => {
     await waitFor(() => settled(), 15_000, "settled event");
 
     const logged = readFileSync(logPath, "utf8").trim().split("\n").map((l) => JSON.parse(l) as { commandId: string | null; text: string });
-    expect(logged).toEqual([{ commandId: "cmd-marker-1", text: "Fix the login bug", at: expect.any(Number) }]);
+    // The log now also carries cwd/sessionId/pid (issue #13's watchdog tests compare the two
+    // respawned processes' cwds), so match on the fields this test cares about.
+    expect(logged).toEqual([
+      expect.objectContaining({ commandId: "cmd-marker-1", text: "Fix the login bug", at: expect.any(Number) }),
+    ]);
   }, 30_000);
 
   it("writes the shepherd extension into the state dir, not referencing the repo (§4.2)", async () => {
