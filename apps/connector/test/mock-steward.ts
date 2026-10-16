@@ -12,10 +12,10 @@ export interface MockSteward {
   listen: () => Promise<number>;
   close: () => Promise<void>;
   waitConnected: (ms?: number) => Promise<void>;
-  /** Waits until `count` hellos (default 1) have been RECORDED — waitConnected only proves
-   *  the socket opened; the hello frame trails the handshake, and reading hellos() right
-   *  after waitConnected races it on slow runners (CI: undefined.connector). */
-  waitHello: (count?: number, ms?: number) => Promise<void>;
+  /** Wait until `n` hellos (default 1) have been RECORDED. `waitConnected` only covers the
+   *  socket reaching OPEN — on slow CI runners the hello frame can still be in flight, and
+   *  reading `hellos().at(-1)` right after it races (observed as PR #44 / #13 CI flakes). */
+  waitHello: (n?: number, ms?: number) => Promise<void>;
   sendCmd: (kind: string, args: Record<string, unknown>, id?: string) => string;
   /** §6.6: push a history_req; the DO's relay role, for contract tests. */
   sendHistoryReq: (workerId: string, opts?: { since?: string; maxBytes?: number }) => string;
@@ -166,14 +166,15 @@ export function startMockSteward(): MockSteward {
       tick();
     });
 
-  const waitHello = (count = 1, ms = 5000) =>
+  // Same polling shape as waitConnected, but for recorded hello frames — see the interface.
+  const waitHello = (n = 1, ms = 5000) =>
     new Promise<void>((resolve, reject) => {
       const t0 = Date.now();
       const tick = () =>
-        hellos.length >= count
+        hellos.length >= n
           ? resolve()
           : Date.now() - t0 > ms
-            ? reject(new Error(`only ${hellos.length}/${count} hellos arrived`))
+            ? reject(new Error(`only ${hellos.length}/${n} hellos arrived`))
             : setTimeout(tick, 25);
       tick();
     });
@@ -206,6 +207,7 @@ export function startMockSteward(): MockSteward {
     },
     events: () => events,
     hellos: () => hellos,
+    waitHello,
     acksFor: (cmdId) => cmdAcks.get(cmdId),
     resultsFor: (cmdId) => cmdResults.get(cmdId),
     historyChunksFor: (reqId) => historyChunks.get(reqId) ?? [],

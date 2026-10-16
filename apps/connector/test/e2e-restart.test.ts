@@ -139,7 +139,8 @@ describe("connector restart fault injection (issue #12, connector-pi.md §9/§14
     stuck.markSending("cmd-sending-crash");
 
     await bootApp(null);
-    await mock.waitHello();
+    await mock.waitConnected();
+    await mock.waitHello(); // the frame can trail the OPEN on slow runners (CI flake)
 
     const hello = mock.hellos().at(-1) as { pendingAcks: Array<{ cmdId: string; state: string }> };
     expect(hello.pendingAcks).toContainEqual({ cmdId: "cmd-sending-crash", state: "ambiguous" });

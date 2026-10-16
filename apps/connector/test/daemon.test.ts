@@ -41,7 +41,8 @@ describe("runDaemon", () => {
       adapter: fakePiAdapter(stateDir, scenario),
     });
 
-    await mock.waitHello();
+    await mock.waitConnected();
+    await mock.waitHello(); // the frame can trail the OPEN on slow runners (CI flake)
     const hello = mock.hellos().at(-1)!;
     expect(hello.connector).toMatchObject({ version: VERSION, os: process.platform });
     expect(hello.machine).toMatchObject({ name: "test-machine" });
