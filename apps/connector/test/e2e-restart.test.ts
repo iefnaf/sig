@@ -139,7 +139,7 @@ describe("connector restart fault injection (issue #12, connector-pi.md §9/§14
     stuck.markSending("cmd-sending-crash");
 
     await bootApp(null);
-    await mock.waitConnected();
+    await mock.waitHello();
 
     const hello = mock.hellos().at(-1) as { pendingAcks: Array<{ cmdId: string; state: string }> };
     expect(hello.pendingAcks).toContainEqual({ cmdId: "cmd-sending-crash", state: "ambiguous" });

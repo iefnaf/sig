@@ -12,6 +12,10 @@ export interface MockSteward {
   listen: () => Promise<number>;
   close: () => Promise<void>;
   waitConnected: (ms?: number) => Promise<void>;
+  /** Waits until `count` hellos (default 1) have been RECORDED — waitConnected only proves
+   *  the socket opened; the hello frame trails the handshake, and reading hellos() right
+   *  after waitConnected races it on slow runners (CI: undefined.connector). */
+  waitHello: (count?: number, ms?: number) => Promise<void>;
   sendCmd: (kind: string, args: Record<string, unknown>, id?: string) => string;
   /** §6.6: push a history_req; the DO's relay role, for contract tests. */
   sendHistoryReq: (workerId: string, opts?: { since?: string; maxBytes?: number }) => string;
@@ -162,6 +166,18 @@ export function startMockSteward(): MockSteward {
       tick();
     });
 
+  const waitHello = (count = 1, ms = 5000) =>
+    new Promise<void>((resolve, reject) => {
+      const t0 = Date.now();
+      const tick = () =>
+        hellos.length >= count
+          ? resolve()
+          : Date.now() - t0 > ms
+            ? reject(new Error(`only ${hellos.length}/${count} hellos arrived`))
+            : setTimeout(tick, 25);
+      tick();
+    });
+
   return {
     token,
     deviceId,
@@ -178,6 +194,7 @@ export function startMockSteward(): MockSteward {
         server.close(() => done());
       }),
     waitConnected,
+    waitHello,
     sendCmd,
     sendHistoryReq,
     ackHistory: (reqId, n) => send({ t: "history_ack", re: reqId, n }),
