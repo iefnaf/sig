@@ -43,6 +43,9 @@ const SIMILAR_MIN = 0.25;
 /** The relay block stays readable: at most this many clauses, then a count line. */
 const MAX_RELAY_ITEMS = 10;
 const RELAY_MAX_CHARS = 600;
+/** One maintenance pass sends at most this many messages of its own (issue #19); the rest
+ *  stays pending for the next pass or the next reply — never dropped, never a burst. */
+const MAX_MAINTENANCE_BATCH = 20;
 
 export type NoteLayer = "resident" | "project" | "archive";
 export type NoteKind = "preference" | "convention" | "environment" | "fact";
@@ -101,7 +104,25 @@ export type NoteOp =
   | "pinned"
   | "unpinned"
   | "removed"
-  | "confirmed";
+  | "confirmed"
+  // issue #19 (steward.md §2.4): a user request for room the module could not honour yet;
+  // resolved at the next maintenance pass either way (made room / could not).
+  | "room_needed"
+  | "room_refused";
+
+/** How a log row reaches the owner (issue #19): `reply` rides the next user reply;
+ *  `maintenance` is the daily pass's own durable outbound (text or decision card). */
+export type NoteDelivery = "reply" | "maintenance";
+
+/** A pending log row with its bookkeeping columns (log id + delivery class). */
+export interface PendingChange {
+  id: number;
+  op: NoteOp;
+  noteId: string | null;
+  text: string;
+  reason: string | null;
+  delivery: NoteDelivery;
+}
 
 /** A change the module proactively reports; the steward relays it to the user (§2.1). */
 export interface ChangeReport {
@@ -229,9 +250,9 @@ export function renderChangeReports(changes: readonly ChangeReport[]): string {
       case "superseded":
         return `「${t}」已被新记录取代（存档）`;
       case "evicted":
-        return `为腾空间「${t}」已移入档案`;
+        return `为腾空间我忘了「${t}」（已移入档案，可搜索找回）`;
       case "demoted":
-        return `「${t}」长期未用，已移入档案`;
+        return `「${t}」长期未用，已移入档案（可搜索找回）`;
       case "suggest_demote":
         return `「${t}」已 90 天未用，建议归档`;
       case "pinned":
@@ -240,6 +261,11 @@ export function renderChangeReports(changes: readonly ChangeReport[]): string {
         return `「${t}」已取消置顶`;
       case "removed":
         return `「${t}」已删除`;
+      // issue #19: the forgetting reports, in the spec's "to make room, I forgot …" voice.
+      case "room_needed":
+        return `「${t}」所在的层已满，明天整理时我会腾出空间把它记下`;
+      case "room_refused":
+        return `「${t}」没能记下（层已满且其余条目都已置顶）`;
     }
   };
   const shown = changes.slice(0, MAX_RELAY_ITEMS).map(clause);
@@ -278,12 +304,17 @@ export function createNotes(deps: NotesDeps) {
     layer === "resident" ? RESIDENT_CAP : PROJECT_CAP_PER_REPO;
   const layerLabel = (layer: "resident" | "project") => (layer === "resident" ? "常驻层" : "项目层");
 
-  const log = (op: NoteOp, note: NoteRow, reason: string | null, supersededBy?: string | null): ChangeReport => {
+  const log = (
+    op: NoteOp,
+    note: NoteRow,
+    reason: string | null,
+    opts: { supersededBy?: string | null; delivery?: NoteDelivery } = {},
+  ): ChangeReport => {
     sql`
-      INSERT INTO sh_note_log (ts, op, noteId, text, reason, reportedAt)
-      VALUES (${now()}, ${op}, ${note.noteId}, ${note.text}, ${reason}, NULL)
+      INSERT INTO sh_note_log (ts, op, noteId, text, reason, delivery)
+      VALUES (${now()}, ${op}, ${note.noteId}, ${note.text}, ${reason}, ${opts.delivery ?? "reply"})
     `;
-    return { op, noteId: note.noteId, text: note.text, reason, ...(supersededBy !== undefined ? { supersededBy } : {}) };
+    return { op, noteId: note.noteId, text: note.text, reason, ...(opts.supersededBy !== undefined ? { supersededBy: opts.supersededBy } : {}) };
   };
 
   const findExact = (text: string, layer: "resident" | "project", scopeRepoId: string | null): NoteRow | null =>
@@ -369,6 +400,57 @@ export function createNotes(deps: NotesDeps) {
     sql`UPDATE sh_note SET useCount = useCount + 1, lastUsedAt = ${at} WHERE noteId = ${noteId}`;
   };
 
+  /** Remembers a user request the layer had no room for (one per placement — the latest
+   *  wins; an identical retry is a no-op). `kind`/`evidence` ride along so the deferred
+   * write at maintenance keeps the draft's shape and its verified provenance. Cleared by a
+   * successful write to the same placement or by the maintenance pass (§2.4, issue #19). */
+  const recordPressure = (
+    draft: NoteDraft,
+    text: string,
+    overBy: number,
+  ): void => {
+    sql`
+      INSERT INTO sh_note_pressure (layer, scope_repoId, text, chars, kind, evidence)
+      VALUES (${draft.layer}, ${draft.scopeRepoId?.trim() ?? ""}, ${text}, ${text.length}, ${draft.kind}, ${draft.evidence ?? null})
+      ON CONFLICT (layer, scope_repoId) DO UPDATE SET text = excluded.text, chars = excluded.chars,
+        kind = excluded.kind, evidence = excluded.evidence
+    `;
+    log("room_needed", pressureShadow({ layer: draft.layer, scopeRepoId: draft.scopeRepoId?.trim() ?? null, text }), `over_by:${overBy}`);
+  };
+
+  /** A write landed in this placement: whatever pressure waited for it is settled. */
+  const clearPressure = (layer: "resident" | "project", scopeRepoId: string | null): void => {
+    sql`DELETE FROM sh_note_pressure WHERE layer = ${layer} AND scope_repoId = ${scopeRepoId ?? ""}`;
+  };
+
+  /** The pressure rows, in a deterministic order (one per placement at most). */
+  const pressureRows = (): Array<{ layer: "resident" | "project"; scopeRepoId: string; text: string; kind: string; evidence: string | null }> =>
+    sql<{ layer: string; scope_repoId: string; text: string; kind: string; evidence: string | null }>`
+      SELECT layer, scope_repoId, text, kind, evidence FROM sh_note_pressure
+    `
+      .map((r) => ({ layer: r.layer as "resident" | "project", scopeRepoId: r.scope_repoId, text: r.text, kind: r.kind, evidence: r.evidence }))
+      .sort((a, b) => a.text.localeCompare(b.text));
+
+  /** A pressure row as a loggable stand-in (the log's text snapshot is what relays). */
+  const pressureShadow = (p: { layer: "resident" | "project"; scopeRepoId: string | null; text: string }): NoteRow => ({
+    noteId: "",
+    layer: p.layer,
+    scopeRepoId: p.scopeRepoId,
+    kind: "fact",
+    text: p.text,
+    bytes: p.text.length,
+    source: "user_said",
+    evidence: null,
+    confirmedBy: null,
+    confirmed: true,
+    pinned: false,
+    createdAt: now(),
+    lastUsedAt: null,
+    useCount: 0,
+    status: "active",
+    supersededBy: null,
+  });
+
   /** Resolves replace targets: active notes only (archived ones are ignored — replay-safe),
    *  duplicates dropped. Cross-layer targets are allowed: superseding a project note with a
    *  resident one is exactly the promotion path after confirmation. */
@@ -435,13 +517,37 @@ export function createNotes(deps: NotesDeps) {
       // replace (the promotion path) supersedes elsewhere and must not buy room here.
       const samePlacement = (target: NoteRow): boolean =>
         target.layer === draft.layer && (draft.layer === "resident" || target.scopeRepoId === check.scopeRepoId);
-      const freed = targets.filter(samePlacement).reduce((sum, n) => sum + n.bytes, 0);
+      const freed = targets.filter((t) => samePlacement(t) && !t.pinned).reduce((sum, n) => sum + n.bytes, 0);
       const overBy = usageOf(draft.layer, check.scopeRepoId) + check.text.length - freed - capFor(draft.layer);
       if (overBy > 0) {
         // The module enforces the cap (§2.4): a write that does not fit is refused until the
         // steward carries the evictions it was told about in `replaces`.
         const candidates = evictionCandidates(overBy, draft.layer, check.scopeRepoId, at);
         const canFree = candidates.reduce((sum, n) => sum + n.bytes, 0);
+        // Pinned entries never count as freeable room: replacing one to make space is an
+        // eviction by another name (spec §10.2 — the pin exemption), so it is refused flat.
+        const pinnedTarget = targets.find((t) => t.pinned);
+        if (pinnedTarget !== undefined) {
+          return {
+            ok: false,
+            code: "capacity",
+            message: `「${clip(pinnedTarget.text, 30)}」已置顶，不能用来腾挪或取代；先经用户同意 notes_pin(id, false) 再试。`,
+            needsEviction: candidates,
+          };
+        }
+        // A user's own request must not be silently dropped when the model ignores
+        // `needsEviction` (spec §10.3): remember the pressure; the daily maintenance pass
+        // evicts by score to honour it — and reports both halves (issue #19, §2.4/§2.5).
+        // Low-trust sources are never worth that room (steward.md §2.3) and stay refused.
+        if (draft.source === "user_said" && canFree >= overBy) {
+          recordPressure(draft, check.text, overBy);
+          return {
+            ok: false,
+            code: "capacity",
+            message: `写入会超出${layerLabel(draft.layer)}上限 ${overBy} 字（用户要求记住，已记下腾挪需求，日维护会自动腾出并告知用户）；现在想自己选，请在 replaces 里带上要腾挪/取代的旧条目。`,
+            needsEviction: candidates,
+          };
+        }
         return {
           ok: false,
           code: "capacity",
@@ -452,6 +558,10 @@ export function createNotes(deps: NotesDeps) {
           needsEviction: candidates,
         };
       }
+
+      // A successful write settles any pressure waiting on this placement: the module made
+      // room (or the draft itself satisfied the request), so the queued ask is moot.
+      clearPressure(draft.layer, check.scopeRepoId);
 
       const noteId = `n_${ulid()}`;
       sql`
@@ -475,13 +585,13 @@ export function createNotes(deps: NotesDeps) {
             UPDATE sh_note SET layer = 'archive', supersededBy = ${noteId}, lastUsedAt = ${at}
             WHERE noteId = ${target.noteId}
           `;
-          changes.push(log("evicted", target, "capacity", noteId));
+          changes.push(log("evicted", target, "capacity", { supersededBy: noteId }));
         } else {
           sql`
             UPDATE sh_note SET layer = 'archive', status = 'superseded', supersededBy = ${noteId}, lastUsedAt = ${at}
             WHERE noteId = ${target.noteId}
           `;
-          changes.push(log("superseded", target, "supersession", noteId));
+          changes.push(log("superseded", target, "supersession", { supersededBy: noteId }));
         }
       }
       return { ok: true, note, changes, bumped: false };
@@ -650,6 +760,23 @@ export function createNotes(deps: NotesDeps) {
       SELECT op, noteId, text, reason FROM sh_note_log WHERE reportedAt IS NULL ORDER BY id
     `.map((r) => ({ op: r.op as NoteOp, noteId: r.noteId, text: r.text, reason: r.reason }));
 
+  /** Pending rows the daily pass delivers itself (issue #19): id-ordered, capped so one
+   *  runaway ledger cannot open an unbounded outbound burst — the excess stays pending
+   *  for the next pass / the next reply, never silently dropped. */
+  const pendingMaintenance = (): PendingChange[] =>
+    sql<{ id: number; op: string; noteId: string; text: string; reason: string | null; delivery: string }>`
+      SELECT id, op, noteId, text, reason, delivery FROM sh_note_log
+      WHERE reportedAt IS NULL AND delivery = 'maintenance'
+      ORDER BY id LIMIT ${MAX_MAINTENANCE_BATCH}
+    `.map((r) => ({
+      id: r.id,
+      op: r.op as NoteOp,
+      noteId: r.noteId,
+      text: r.text,
+      reason: r.reason,
+      delivery: r.delivery as NoteDelivery,
+    }));
+
   /** Renders the pending relay block WITHOUT marking anything (review finding 4): the
    *  caller marks via markPendingReported(upTo) only after the reply row is durably
    *  enqueued — a crash in between then costs at most a duplicate announcement, never a
@@ -668,11 +795,52 @@ export function createNotes(deps: NotesDeps) {
     sql`UPDATE sh_note_log SET reportedAt = ${now()} WHERE reportedAt IS NULL AND id <= ${upTo}`;
   };
 
+  /** The maintenance pass's marker (issue #19): touches ONLY its own delivery class — a
+   *  pending `reply` row (e.g. a note an event-run just wrote) must still ride the owner's
+   *  next reply, never be silently marked by the daily flush. */
+  const markPendingMaintenanceReported = (upTo: number): void => {
+    if (upTo <= 0) return;
+    sql`UPDATE sh_note_log SET reportedAt = ${now()} WHERE reportedAt IS NULL AND id <= ${upTo} AND delivery = 'maintenance'`;
+  };
+
   /** Render + mark in one step (tests, and callers that have nothing to lose by marking). */
   const drainPendingForReply = (): string => {
     const { text, upTo } = renderPendingForReply();
     markPendingReported(upTo);
     return text;
+  };
+
+  /** The owner's answer on a suggestion card (issue #19, spec §10.2): archive — or keep
+   *  (renew) — a resident note. Returns what became of it. */
+  const ownerArchive = (noteId: string, fromLogId: number, decision: string): { ok: true } | { ok: false; reason: string } => {
+    const note = noteById(noteId);
+    if (!note || note.status !== "active" || note.layer !== "resident") {
+      return { ok: false, reason: "inactive" };
+    }
+    if (note.pinned) return { ok: false, reason: "pinned" };
+    return tx(() => {
+      sql`UPDATE sh_note SET layer = 'archive' WHERE noteId = ${noteId}`;
+      log("demoted", note, decision, { delivery: "reply" });
+      settleDecision(fromLogId, decision, noteId);
+      return { ok: true };
+    });
+  };
+
+  /** keep: the quiet clock restarts (this is a renewal, NOT a pin — the pin exemption stays
+   *  the owner's explicit call). Idempotent: a settled suggestion cannot be renewed twice. */
+  const renewNote = (noteId: string, fromLogId: number): void => {
+    const settled = sql<{ n: number }>`
+      SELECT COUNT(*) AS n FROM sh_note_log WHERE id = ${fromLogId} AND decision IS NOT NULL AND reportedAt IS NOT NULL
+    `[0]!.n;
+    if (settled > 0) return;
+    const at = now();
+    sql`UPDATE sh_note SET lastUsedAt = ${at} WHERE noteId = ${noteId} AND status = 'active'`;
+    settleDecision(fromLogId, "note_keep", noteId);
+  };
+
+  /** Settles a suggestion log row: decision text + delivered marker (idempotent). */
+  const settleDecision = (logId: number, decision: string, noteId: string): void => {
+    sql`UPDATE sh_note_log SET decision = ${decision}, reportedAt = COALESCE(reportedAt, ${now()}) WHERE id = ${logId} AND noteId = ${noteId}`;
   };
 
   /** Decay (60d project demotion), resident suggestions (90d), and the capacity backstop.
@@ -690,7 +858,7 @@ export function createNotes(deps: NotesDeps) {
       `.map(viewNote);
       for (const note of stale) {
         sql`UPDATE sh_note SET layer = 'archive' WHERE noteId = ${note.noteId}`;
-        changes.push(log("demoted", note, "unused_60d"));
+        changes.push(log("demoted", note, "unused_60d", { delivery: "maintenance" }));
       }
 
       // 2. Resident entries unused for 90 days: suggest, never demote on our own (§2.5 —
@@ -707,7 +875,7 @@ export function createNotes(deps: NotesDeps) {
           WHERE op = 'suggest_demote' AND noteId = ${note.noteId} AND ts > ${at - SUGGEST_QUIET_MS}
         `[0]!.n;
         if (recent > 0) continue;
-        changes.push(log("suggest_demote", note, "unused_90d"));
+        changes.push(log("suggest_demote", note, "unused_90d", { delivery: "maintenance" }));
       }
 
       // 3. Capacity backstop (drift — e.g. a lowered cap or writes from older code): evict
@@ -719,7 +887,7 @@ export function createNotes(deps: NotesDeps) {
           const [victim] = evictionCandidates(over, layer, scopeRepoId, at);
           if (!victim) return; // all pinned: leave it over rather than break a pin promise
           sql`UPDATE sh_note SET layer = 'archive', supersededBy = NULL WHERE noteId = ${victim.noteId}`;
-          changes.push(log("evicted", victim, "maintenance_cap"));
+          changes.push(log("evicted", victim, "maintenance_cap", { delivery: "maintenance" }));
         }
       };
       enforceCap("resident", null);
@@ -728,6 +896,53 @@ export function createNotes(deps: NotesDeps) {
         WHERE layer = 'project' AND status = 'active' AND scope_repoId IS NOT NULL
       `;
       for (const { repoId } of repos) enforceCap("project", repoId);
+
+      // 4. Ignored capacity pressure (issue #19, §2.4): a user asked for room, the write
+      //    was refused with needsEviction, and nobody came back. Make room now — by the
+      //    same score — then write what was asked for, and report both halves. If even
+      //    eviction cannot free enough (everything pinned), the request is honestly
+      //    reported as unmet instead of rotting in the pressure table forever.
+      for (const pressure of pressureRows()) {
+        const scopeRepoId = pressure.scopeRepoId === "" ? null : pressure.scopeRepoId;
+        if (findExact(pressure.text, pressure.layer, scopeRepoId) !== null) {
+          // The text landed anyway (the steward retried successfully): nothing to do.
+          clearPressure(pressure.layer, scopeRepoId);
+          continue;
+        }
+        const overBy = usageOf(pressure.layer, scopeRepoId) + pressure.text.length - capFor(pressure.layer);
+        if (overBy > 0) {
+          const victims = evictionCandidates(overBy, pressure.layer, scopeRepoId, at);
+          const canFree = victims.reduce((sum, n) => sum + n.bytes, 0);
+          if (canFree < overBy) {
+            clearPressure(pressure.layer, scopeRepoId);
+            const shadow = pressureShadow(pressure);
+            changes.push(log("room_refused", shadow, "all_pinned", { delivery: "maintenance" }));
+            continue;
+          }
+          const noteId = `n_${ulid()}`;
+          sql`
+            INSERT INTO sh_note (noteId, layer, scope_repoId, kind, text, bytes, source, evidence, confirmed, pinned, createdAt, lastUsedAt, useCount, status)
+            VALUES (${noteId}, ${pressure.layer}, ${scopeRepoId}, ${pressure.kind}, ${pressure.text}, ${pressure.text.length},
+                    'user_said', ${pressure.evidence}, 1, 0, ${at}, ${at}, 0, 'active')
+          `;
+          const note = noteById(noteId)!;
+          changes.push(log("noted", note, "user_said"));
+          for (const victim of victims) {
+            sql`UPDATE sh_note SET layer = 'archive', supersededBy = ${noteId} WHERE noteId = ${victim.noteId}`;
+            changes.push(log("evicted", victim, "ignored_needsEviction", { supersededBy: noteId, delivery: "maintenance" }));
+          }
+        } else {
+          // Room appeared since (a supersession, a removal): just write it.
+          const noteId = `n_${ulid()}`;
+          sql`
+            INSERT INTO sh_note (noteId, layer, scope_repoId, kind, text, bytes, source, evidence, confirmed, pinned, createdAt, lastUsedAt, useCount, status)
+            VALUES (${noteId}, ${pressure.layer}, ${scopeRepoId}, ${pressure.kind}, ${pressure.text}, ${pressure.text.length},
+                    'user_said', ${pressure.evidence}, 1, 0, ${at}, ${at}, 0, 'active')
+          `;
+          changes.push(log("noted", noteById(noteId)!, "user_said"));
+        }
+        clearPressure(pressure.layer, scopeRepoId);
+      }
 
       return changes;
     });
@@ -738,6 +953,8 @@ export function createNotes(deps: NotesDeps) {
     confirm,
     pin,
     remove,
+    demote: ownerArchive,
+    renew: renewNote,
     get: noteById,
     list,
     search,
@@ -745,8 +962,10 @@ export function createNotes(deps: NotesDeps) {
     forRepos,
     renderResidentSection,
     pendingChanges,
+    pendingMaintenance,
     renderPendingForReply,
     markPendingReported,
+    markPendingMaintenanceReported,
     drainPendingForReply,
     maintenance,
   };

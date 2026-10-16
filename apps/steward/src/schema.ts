@@ -660,4 +660,26 @@ export const MIGRATIONS: readonly Migration[] = [
       sql`CREATE INDEX IF NOT EXISTS sh_note_log_note ON sh_note_log (noteId, op, ts)`;
     },
   },
+  {
+    id: "013_notes_maintenance",
+    up: (sql) => {
+      // A refused write must not break the hard cap. Remember the latest request for room
+      // per placement instead; the daily pass can free it even if the model gives up.
+      sql`CREATE TABLE IF NOT EXISTS sh_note_pressure (
+        layer TEXT NOT NULL, scope_repoId TEXT NOT NULL, text TEXT NOT NULL, chars INTEGER NOT NULL,
+        kind TEXT NOT NULL DEFAULT 'fact', evidence TEXT,
+        PRIMARY KEY (layer, scope_repoId)
+      )`;
+      ignoringDuplicateColumn(() => {
+        sql`ALTER TABLE sh_note_log ADD COLUMN delivery TEXT NOT NULL DEFAULT 'reply'`;
+      });
+      ignoringDuplicateColumn(() => {
+        sql`ALTER TABLE sh_note_log ADD COLUMN decision TEXT`;
+      });
+      // Lifecycle reports have their own durable delivery, including actionable resident
+      // suggestions. Upgrade any unreported lifecycle rows left by #18 as well.
+      sql`UPDATE sh_note_log SET delivery = 'maintenance'
+          WHERE reportedAt IS NULL AND (op IN ('demoted', 'suggest_demote') OR reason = 'maintenance_cap')`;
+    },
+  },
 ];
