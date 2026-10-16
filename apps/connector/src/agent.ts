@@ -2,6 +2,8 @@
 // minimal set every agent implements; the rest is expressed through capability declarations
 // and the WorkerManager degrades (and tells the steward) when a capability is missing.
 
+import type { HistoryPage } from "@shepherd/protocol";
+
 export type AgentKind = "pi" | "claude-code" | "codex";
 
 export interface AgentCapabilities {
@@ -127,6 +129,12 @@ export interface AgentAdapter {
   isRunning?(id: string): boolean;
   /** Live worker pids for the descendant-snapshot loop (connector-pi.md §9.3). */
   workerPids?(): Array<{ workerId: string; pid: number }>;
+  /**
+   * On-demand raw-history read (connector-pi.md §11.4) while the process is running: the
+   * adapter fetches increments over RPC and normalizes them. The not-running fallback —
+   * parsing the session JSONL — lives with the WorkerManager, which owns the session file path.
+   */
+  history?(id: string, since: string | undefined, maxBytes: number): Promise<HistoryPage>;
   /** Test support: emulate a hard crash of the connector (children SIGKILLed, no cleanup). */
   simulateCrash?(): void;
 }

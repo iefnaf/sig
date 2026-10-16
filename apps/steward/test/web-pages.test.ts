@@ -14,11 +14,13 @@ import {
   messageEvent,
   mockReset,
   nextClose,
+  ownerDm,
   ownerStub,
   pairFakeConnector,
   postEvent,
   resetLedgerState,
   waitWhileOutboundPending,
+  webLogin,
 } from "./helpers.ts";
 
 beforeEach(async () => {
@@ -34,12 +36,6 @@ beforeEach(async () => {
   });
 });
 
-async function ownerDm(text: string): Promise<void> {
-  const res = await postEvent(messageEvent({ msgId: `om_${crypto.randomUUID().slice(0, 8)}`, text }));
-  expect(res.status).toBe(200);
-  await waitWhileOutboundPending();
-}
-
 async function sentTexts(): Promise<string[]> {
   const rows = await ownerStub().outboundRows(20);
   return rows.filter((r) => r.kind === "text" && r.status === "sent").map((r) => JSON.parse(r.payload as string).text as string);
@@ -48,15 +44,6 @@ async function sentTexts(): Promise<string[]> {
 async function sentCards(): Promise<ShOutboundRow[]> {
   const rows = await ownerStub().outboundRows(30);
   return rows.filter((r) => r.kind === "card" && r.status === "sent");
-}
-
-/** Logs in via /网页 and returns the session cookie header value. */
-async function login(): Promise<string> {
-  await ownerDm("/网页");
-  const linkUrl = (await sentTexts()).join(" ").match(/https:\/\/example\.com\/link\/\S+/)![0]!;
-  const res = await SELF.fetch(linkUrl, { redirect: "manual" });
-  expect(res.status).toBe(303);
-  return res.headers.get("set-cookie")!.split(";")[0]!;
 }
 
 async function waitForWorkerIdle(timeoutMs = 8000): Promise<string> {
@@ -152,7 +139,7 @@ describe("/加机器: chat-issued pairing (protocol §5.2)", () => {
 
 describe("the machine page: online state and revocation (protocol §5.1)", () => {
   it("lists machines with online state, and revoke bumps the epoch and closes with 4403", async () => {
-    const cookie = await login();
+    const cookie = await webLogin();
     const fake = await pairFakeConnector("mac-studio");
     await fake.connect();
     const closed = nextClose(fake.ws!);
@@ -198,7 +185,7 @@ describe("the machine page: online state and revocation (protocol §5.1)", () =>
   });
 
   it("rejects the revoke POST without a matching csrf token", async () => {
-    const cookie = await login();
+    const cookie = await webLogin();
     const fake = await pairFakeConnector("mac-studio");
     await fake.connect();
     const res = await SELF.fetch("https://example.com/app/machines/revoke", {

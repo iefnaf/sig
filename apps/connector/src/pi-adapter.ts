@@ -13,10 +13,12 @@ import type {
   WorkerHandle,
 } from "./agent.ts";
 import { adjudicate, type RunWindow } from "./adjudication.ts";
+import { normalizeSessionEntries } from "./session-history.ts";
 import { installAssets, type InstalledAssets } from "./install.ts";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { PiProcess } from "./pi-process.ts";
+import type { HistoryPage } from "@shepherd/protocol";
 
 /** Must match COMMAND_NAME in ./ext/shepherd-pi.ts (locked together by a test). */
 const SHEPHERD_COMMAND = "shepherd";
@@ -290,6 +292,21 @@ export class PiAdapter implements AgentAdapter {
       if (!runtime.process.hasExited && pid !== undefined) out.push({ workerId, pid });
     }
     return out;
+  }
+
+  /** §11.4 live path: `get_entries{since}` is pi's only incremental read (research §3). */
+  async history(id: string, since: string | undefined, maxBytes: number): Promise<HistoryPage> {
+    const runtime = this.runtimes.get(id);
+    if (!runtime || runtime.process.hasExited) {
+      throw new AdapterError("not_running", `no live pi process for worker ${id}`);
+    }
+    const response = await runtime.process.rpc(
+      { type: "get_entries", ...(since ? { since } : {}) },
+      10_000,
+    );
+    const entries = Array.isArray(response.entries) ? (response.entries as Record<string, unknown>[]) : [];
+    // `since` filtering already happened inside pi; the normalizer only budgets the bytes.
+    return normalizeSessionEntries(entries, { maxBytes });
   }
 
   /** Test support: emulate a connector crash — every child is SIGKILLed with no graceful
