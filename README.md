@@ -36,6 +36,44 @@ After deploy, open `https://<your-domain>/setup?token=<SETUP_TOKEN>`. The page o
 
 Every deployment needs a custom domain before the webhook switch: Feishu's event servers sit in mainland China and cannot reach `*.workers.dev` at all (URL verification fails with 210042 — live-tested), so no event can arrive over workers.dev. For mainland users the custom domain is additionally what makes the web app and the connector reachable — workers.dev is blocked there outright ([deploy guide](docs/deploy.md#custom-domain), [Feishu research](docs/research/feishu-channel.md) §3 and §8.2).
 
+Secrets at rest: the Feishu credentials and the model provider API key are AES-GCM sealed under `SERVER_KEY` inside the Durable Object's storage; a raw storage dump alone exposes neither. `/pair` is brute-force guarded per source IP and globally (5 failed codes lock pairing for 15 minutes), and the Feishu webhook rejects events whose verification token or app id mismatch and whose timestamp skews more than an hour.
+
+### Rotating SERVER_KEY
+
+`SERVER_KEY` is rotatable without re-pairing every machine — tokens carry the signing key's id, and `SERVER_KEY_PREVIOUS` keeps a verification window open (details in the [protocol design](docs/design/connector-do-protocol.md) §5.1):
+
+```sh
+wrangler secret put SERVER_KEY_PREVIOUS   # the OLD key
+wrangler secret put SERVER_KEY            # the NEW key (openssl rand -hex 32)
+wrangler deploy                            # evicts isolates still pinning the old secrets
+# …let every machine reconnect once (each welcome hands the connector a rekeyed token)…
+wrangler secret delete SERVER_KEY_PREVIOUS
+wrangler deploy
+```
+
+Machines that never reconnect during the window must re-pair after it closes. Why the `wrangler deploy` in between matters — a resident Durable Object isolate pins old code and old secrets for minutes after a secret change, so evict it before verifying — is explained in the [deploy guide](docs/deploy.md#secrets-and-rotation).
+
+## Installing the connector
+
+On a machine you want Shepherd to run agents from (macOS or Linux, Node ≥ 22.18):
+
+```sh
+npx @iefnaf/shepherd connect <steward-url> <pairing-code>
+```
+
+This pairs the machine (redeeming the pairing code from the steward's `/pair` endpoint), installs the connector as a background service — a launchd agent (`dev.shepherd.connector`) on macOS, a systemd user unit on Linux — and starts it now and at login. `connect --foreground` runs it attached to the terminal instead (containers, dev boxes). Then:
+
+```sh
+shepherd add-repo ~/code/my-repo   # allow start_worker in this repository (§8.1)
+shepherd status                    # service, pairing, workers, installed assets
+shepherd logs                      # tail ~/.shepherd/logs/connector.log
+shepherd stop | start | restart    # control the service
+shepherd upgrade                   # npm-install the latest package and restart the service
+shepherd uninstall                 # remove the service (keeps ~/.shepherd data)
+```
+
+State lives under `~/.shepherd/` (set `SHEPHERD_HOME` to move it): credentials in `connector.sqlite` (0600), pi sessions and the versioned extension/prompt files, worker worktrees, and logs that contain no keys or session content. The service unit runs the same `shepherd daemon` the package ships, so `upgrade` is just an npm reinstall plus a service restart.
+
 ## Talking to it (M1)
 
 The LLM steward arrives with M2; until then the Feishu bot understands fixed command phrases only, and everything else — machine choice, branch relay, the three-part done-report card — is deterministic:

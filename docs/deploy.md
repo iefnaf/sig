@@ -15,7 +15,7 @@ The deploy form asks for four things:
 | Field | What to enter |
 | --- | --- |
 | Worker name | Anything; it becomes `<name>.<your-subdomain>.workers.dev`. The default `shepherd-steward` is fine. |
-| `SERVER_KEY` | A random secret that signs connector device tokens and encrypts your Feishu credentials. Run `openssl rand -hex 32` and paste the output. Keep a copy somewhere safe. |
+| `SERVER_KEY` | A random secret that signs connector device tokens and encrypts (seals) the Feishu credentials and the model key at rest. Run `openssl rand -hex 32` and paste the output. Keep a copy somewhere safe. |
 | `SETUP_TOKEN` | A one-time password that unlocks the setup page. Run `openssl rand -hex 32` **again** (a different value) and paste it. |
 | `MODEL_KEY` | Your model provider's API key — [DeepSeek](https://platform.deepseek.com) by default. You can leave it empty for now and set it later (see [Model provider](#model-provider)). |
 
@@ -66,9 +66,9 @@ Caveats, honestly stated:
 
 ## Model provider
 
-The steward's own conversation model is **provider-configurable, default DeepSeek** (`deepseek-flash`, the routing-eval baseline — ADR-0001 #11). The `MODEL_KEY` you set at deploy (or later with `wrangler secret put MODEL_KEY`, or in the dashboard under Settings → Variables → Secrets) is stored encrypted inside your own Cloudflare account and is used only for outbound calls from your Worker to the provider — it never passes through any third party, including this project's maintainers (spec §12.2).
+The steward's own conversation model is **provider-configurable, default DeepSeek** (`deepseek-flash`, the routing-eval baseline — ADR-0001 #11). The `MODEL_KEY` you set at deploy is consumed the first time the steward reads its model config: it is **sealed (AES-GCM, under `SERVER_KEY`) inside the Durable Object's storage** — spec §12.2's "model keys stored encrypted in the user's own Cloudflare account" — and from then on the env secret is inert; you can delete it (`wrangler secret delete MODEL_KEY`) once you've confirmed or replaced the key through the app's own config step. Setting or rotating it later: `wrangler secret put MODEL_KEY` before the seal exists, or the in-app model configuration once the conversation milestone ships (`setModelConfig` is already in the Durable Object, RPC-only for now).
 
-DeepSeek is the default partly because it is cheap and reachable; any OpenAI-compatible provider works once provider config lands in the steward conversation milestone. Changing the model later means re-running the routing eval (ADR-0001 #14) — a configuration for careful users, not a form field.
+The key is used only for outbound calls from your Worker to the provider — it never passes through any third party, including this project's maintainers. Any OpenAI-compatible provider works; changing the model itself means re-running the routing eval (ADR-0001 #14).
 
 Note the boundary: `MODEL_KEY` pays for the **steward's own** thinking (routing, replies, summaries). The coding agents the steward dispatches on your machines (pi, Claude Code) use **their own logins/keys on those machines** and are never billed through this deployment.
 
@@ -86,33 +86,26 @@ If you prefer (or the QR flow fails), the manual fallback is always available on
 
 ## Connector install
 
-Each machine you want to dispatch work to runs a small daemon that holds a WebSocket to the steward and drives the local coding agents.
-
-- **The easy way** — the distribution milestone's npm package ([#26](https://github.com/iefnaf/shepherd/issues/26); not yet published):
-
-  ```sh
-  npx @iefnaf/shepherd connect https://shepherd.example.com <pairing-code>
-  ```
-
-  The pairing code is issued in the Feishu conversation once you are the bound owner (the chat command that mints it ships with the machine-management milestone, [#22](https://github.com/iefnaf/shepherd/issues/22)). `connect` installs a launchd agent (macOS) or systemd user unit (Linux) so the connector survives reboots; `shepherd status / logs / stop / uninstall` manage it.
-
-- **From source** (works today, before the package ships):
-
-  ```sh
-  git clone https://github.com/<you>/shepherd && cd shepherd
-  pnpm install
-  npx tsx apps/connector/src/cli.ts connect https://shepherd.example.com <pairing-code>
-  ```
-
-  Until the chat command lands, the deployment owner mints the pairing code over the Durable Object's `createPairing` RPC (e.g. from the Workers dashboard console or a one-off script against the `Steward` binding).
-
-Prerequisites on the machine: Node ≥ 22.18, and the coding agent you intend to use (pi first, Claude Code next) already installed and logged in — Shepherd never touches the agent's own credentials.
-
-Then allow-list the repositories the steward may work in (this is deliberately machine-local and cannot be edited remotely):
+Each machine you want to dispatch work to runs a small daemon that holds a WebSocket to the steward and drives the local coding agents. The package is `@iefnaf/shepherd` (ADR-0001 #10); on the machine (macOS or Linux, Node ≥ 22.18):
 
 ```sh
-shepherd add-repo ~/code/myproject     # or: npx tsx apps/connector/src/cli.ts add-repo ~/code/myproject
+npx @iefnaf/shepherd connect https://shepherd.example.com <pairing-code>
 ```
+
+That pairs the machine (redeeming the one-time pairing code), installs a background service — launchd agent (`dev.shepherd.connector`) on macOS, systemd user unit on Linux — and starts it now and at login. `connect --foreground` runs attached to the terminal instead (containers, dev boxes). Day-to-day:
+
+```sh
+shepherd add-repo ~/code/myproject   # allow-list a repo for start_worker (machine-local by design)
+shepherd status                       # service, pairing, workers, installed assets
+shepherd logs                         # tail ~/.shepherd/logs/connector.log (no keys, no session content)
+shepherd stop | start | restart       # control the service
+shepherd upgrade                      # npm-install the latest package and restart
+shepherd uninstall                    # remove the service (keeps ~/.shepherd data)
+```
+
+State lives under `~/.shepherd/` (`SHEPHERD_HOME` to move it). The pairing code is issued by the steward once you are the bound owner (the chat command that mints it ships with the machine-management milestone, [#22](https://github.com/iefnaf/shepherd/issues/22); until then the deployment owner mints one over the Durable Object's `createPairing` RPC).
+
+Prerequisites: the coding agent you intend to use (pi first, Claude Code next) already installed and logged in — Shepherd never touches the agent's own credentials.
 
 ## Costs
 
@@ -133,21 +126,31 @@ Shepherd is designed to be **dormant — and cost nothing — most of the time**
 
 ## Secrets and rotation
 
-| Secret | Role | Rotating it |
+| Secret | Role | Notes |
 | --- | --- | --- |
-| `SERVER_KEY` | Signs connector device tokens; encrypts (seals) the Feishu credentials in DO storage. | `wrangler secret put SERVER_KEY`. **Blast radius:** every connector token becomes invalid (machines must re-pair with new codes) and the sealed Feishu credentials become unreadable — by design the setup page reopens so you can re-enter or re-scan them. Do it when a machine is lost or a token may have leaked. |
-| `SETUP_TOKEN` | One-time gate for the setup page. | `wrangler secret put SETUP_TOKEN`. Only meaningful before onboarding completes; once the owner is bound the page is closed permanently regardless of the token. |
-| `MODEL_KEY` | Your model provider key. | `wrangler secret put MODEL_KEY` whenever the provider key changes. No other effect. |
+| `SERVER_KEY` | Signs connector device tokens; encrypts (seals) the Feishu credentials and the model key in DO storage. | Rotatable without re-pairing machines — see below. |
+| `SERVER_KEY_PREVIOUS` | Optional rotation-window key. | Exists only during a `SERVER_KEY` rotation; set and deleted within the procedure. |
+| `SETUP_TOKEN` | One-time gate for the setup page. | Only meaningful before onboarding completes; once the owner is bound the page is closed permanently regardless of the token. |
+| `MODEL_KEY` | Your model provider key (deploy form). | Sealed into DO storage on first read; the env secret is deletable afterwards ([Model provider](#model-provider)). |
 
-### Evict the resident isolate before verifying a rotation
+Secrets at rest: the Feishu credentials and the model key are AES-GCM sealed under `SERVER_KEY`; a raw storage dump exposes neither.
 
-> A Durable Object isolate that something keeps alive — an open connector WebSocket, a pending alarm — **pins the previous code and the previous secrets for minutes after `wrangler deploy` (or `secret put`, which deploys immediately) returns.** This was verified live in the spike phase ([spike conclusions](spike-conclusions.md) §2). Testing a fresh secret against such a resident isolate either proves nothing or makes a healthy rotation look broken.
+### Rotating SERVER_KEY (and why the redeploy in the middle is not optional)
 
-So the rotation procedure is:
+Rotation keeps every machine paired: tokens carry the signing key's id, and `SERVER_KEY_PREVIOUS` holds a verification window open while connectors pick up rekeyed tokens (details in the [protocol design](design/connector-do-protocol.md) §5.1):
 
-1. `wrangler secret put SERVER_KEY` (this alone deploys the new version).
-2. **Evict the resident isolate**: stop the connector on every machine (so the WebSocket drops and the DO can go idle), and let a minute pass — or force eviction by redeploying the same code (`wrangler deploy` again), which is also the recovery move for any sick isolate.
-3. *Then* verify: open `/setup?token=<new SETUP_TOKEN>` (if you rotated that too), re-enter the Feishu credentials, and pair a connector — the new `SERVER_KEY` signs the new token.
+```sh
+wrangler secret put SERVER_KEY_PREVIOUS   # the OLD key
+wrangler secret put SERVER_KEY            # the NEW key (openssl rand -hex 32)
+wrangler deploy                            # evicts isolates still pinning the old secrets
+# …let every machine reconnect once (each welcome hands the connector a rekeyed token)…
+wrangler secret delete SERVER_KEY_PREVIOUS
+wrangler deploy
+```
+
+Machines that never reconnect during the window must re-pair after it closes. Sealed secrets (Feishu credentials, model key) keep opening through the window and converge onto the new key as they are next written.
+
+> **Evict the resident isolate before verifying.** A Durable Object isolate that something keeps alive — an open connector WebSocket, a pending alarm — **pins the previous code and the previous secrets for minutes after `wrangler secret put` (or `wrangler deploy`) returns.** This was verified live in the spike phase ([spike conclusions](spike-conclusions.md) §2). The `wrangler deploy` line in the recipe above is exactly this eviction: redeploying forces resident isolates out, which is also the recovery move for any sick isolate. Without it, testing the new secret against an old isolate either proves nothing or makes a healthy rotation look broken. The quieter alternative — stopping every connector so the WebSocket drops and the DO goes idle — works too, it is just slower.
 
 The same pinning applies after ordinary code deploys: a resident isolate runs the old code until it goes idle or is evicted. If a freshly deployed fix "doesn't seem to be live", evict first, conclude second.
 

@@ -16,6 +16,7 @@ import {
 import { CommandLog, type CommandResult } from "./commands.ts";
 import { EventLog, type StoredEvent } from "./events.ts";
 import type { LocalStore } from "./store.ts";
+import { VERSION } from "./version.ts";
 
 export type CommandHandler = (cmd: CmdMessage) => Promise<CommandResult>;
 
@@ -132,7 +133,7 @@ export class ConnectorClient {
           deviceId: credentials.deviceId,
           bootId: this.bootId,
           connEpoch,
-          connector: { version: "0.1.0", os: process.platform, arch: process.arch, node: process.version },
+          connector: { version: VERSION, os: process.platform, arch: process.arch, node: process.version },
           machine: {
             name: this.options.machineName ?? os.hostname(),
             memTotalMB: Math.round(os.totalmem() / 1_000_000),
@@ -181,6 +182,12 @@ export class ConnectorClient {
       case "welcome": {
         this.backoffMs = this.minBackoffMs;
         const welcome = message as unknown as WelcomeMessage;
+        // SERVER_KEY rotation (issue #27): a welcome carrying `token` means the connection
+        // authenticated with a key the steward is rotating away from; persist the fresh
+        // primary-key token so the next reconnect uses it (no re-pairing needed).
+        if (typeof welcome.token === "string" && welcome.token) {
+          this.store.updateToken(welcome.token);
+        }
         // welcome.acks doubles as a cumulative events_ack: everything <= upTo is durably
         // persisted server-side, so truncate locally, then replay what is still unacked (§4.3).
         for (const [workerId, upTo] of Object.entries(welcome.acks ?? {})) {

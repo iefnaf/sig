@@ -17,7 +17,7 @@
   "cloudflare": {
     "bindings": {
       "SERVER_KEY": {
-        "description": "Random secret that signs connector device tokens and encrypts your Feishu credentials. Generate one now: `openssl rand -hex 32` (keep a copy; see [rotating it](docs/deploy.md#secrets-and-rotation))."
+        "description": "Random secret that signs connector device tokens and seals the Feishu credentials and model key at rest. Generate one now: `openssl rand -hex 32` (keep a copy; see [rotating it](docs/deploy.md#secrets-and-rotation))."
       },
       "SETUP_TOKEN": {
         "description": "Random one-time password that unlocks the setup page after deploy. Generate a **different** random string: `openssl rand -hex 32`. You will need it as `?token=…` to open `https://<your-worker>.workers.dev/setup`."
