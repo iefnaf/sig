@@ -237,4 +237,53 @@ export const MIGRATIONS: readonly Migration[] = [
       )`;
     },
   },
+  {
+    // The steward LLM (issue #6, steward.md §4-§6): thread summaries for bookkeeping, the
+    // durable wake_request queue with its merge window (§5.1/§5.4), and sh_run — the run
+    // bookkeeping that decides how a settled run's text is handled (reply vs discard, §6.2).
+    id: "006_steward_llm",
+    up: (sql) => {
+      ignoringDuplicateColumn(() => {
+        sql`ALTER TABLE sh_thread ADD COLUMN summary TEXT`;
+        sql`ALTER TABLE sh_thread ADD COLUMN summaryAt INTEGER`;
+      });
+      // Wake_requests: written inside the reducer's transaction, submitted by the drain alarm
+      // after the merge window. `operationId` is fixed at queue time — harness.submit
+      // deduplicates on it, so replays/crash-restarts never create a second steward input.
+      // `dedupeKey` makes the reducer's own queueing idempotent; `status='merged' rows were
+      // folded into an earlier still-pending wake's text (§5.4).
+      sql`CREATE TABLE IF NOT EXISTS sh_wake (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        operationId TEXT NOT NULL UNIQUE,
+        kind TEXT NOT NULL,
+        dedupeKey TEXT NOT NULL UNIQUE,
+        text TEXT NOT NULL,
+        priority TEXT NOT NULL DEFAULT 'normal',
+        status TEXT NOT NULL DEFAULT 'pending',
+        dueAt INTEGER NOT NULL,
+        mergedInto INTEGER,
+        createdAt INTEGER NOT NULL,
+        submittedAt INTEGER
+      )`;
+      sql`CREATE INDEX IF NOT EXISTS sh_wake_due ON sh_wake (status, dueAt)`;
+      // One row per steward input (§6.3): kind=user runs reply with the settled final text;
+      // event/routine/followup runs keep the text for audit and never send it (§6.2).
+      // routedThreadId records the quote-routed Thread (§3.1 signal 1) resolved at submit time.
+      sql`CREATE TABLE IF NOT EXISTS sh_run (
+        operationId TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        replyTo TEXT,
+        channel TEXT,
+        routedThreadId TEXT,
+        text TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'open',
+        resultStatus TEXT,
+        resultReason TEXT,
+        resultText TEXT,
+        replyOutboundId TEXT,
+        createdAt INTEGER NOT NULL,
+        settledAt INTEGER
+      )`;
+    },
+  },
 ];

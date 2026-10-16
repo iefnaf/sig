@@ -8,9 +8,18 @@
 //
 // Ledger core (issue #5, steward.md §2/§5/§6): machines/repositories from hello, online state
 // from connections, the deterministic event reducer (one transaction, derived Thread state),
-// core-template done reports with no LLM, and fixed-phrase dispatch. Every sh_ledger table is
-// reached through the memory module (ledger.ts); this class only wires it to the transports.
+// and core-template done reports with no LLM. Every sh_ledger table is reached through the
+// memory module (ledger.ts); this class only wires it to the transports.
+//
+// The steward LLM (issue #6, steward.md §4-§6): a PiHarness root session with the
+// `shepherd-steward` extension — user messages get their reply from the model (sh_run + alarm
+// poll, §6.3), worker events wake it for bookkeeping through the durable wake queue (§5.1/
+// §5.4), and in event-triggered runs its plain text is discarded by structure (§6.2): only
+// notify_user / ask_user reach the user.
 import { Agent, type Connection, type ConnectionContext, type WSMessage } from "agents";
+import { PiHarness } from "agents/harness/pi";
+import { Harness, createRegistry, type Extension, type Registry } from "@earendil-works/pi-durable";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import {
   CloseCode,
   CmdAckMessageSchema,
@@ -48,11 +57,15 @@ import {
 } from "./channel/registration.ts";
 import { RetriableChannelError, type Brand, type InboundEvent } from "./channel/types.ts";
 import { Dispatcher } from "./dispatch.ts";
-import { createLedger, type Ledger, type LedgerSql, type NotifyRow } from "./ledger.ts";
-import { failureCard, reportCardFor } from "./report-template.ts";
+import { buildSituationBrief } from "./llm/brief.ts";
+import { buildStewardExtension, type StewardExtensionContext } from "./llm/extension.ts";
+import { buildStewardModels, resolveModelConfig, type FauxRequestRecord, type StewardModels } from "./llm/models.ts";
+import { createLedger, type Ledger, type LedgerSql, type NotifyRow, type RunRow } from "./ledger.ts";
+import { failureCard, notifyCard, askUserText, reportCardFor } from "./report-template.ts";
 import { MIGRATIONS, runMigrations } from "./schema.ts";
 import { openSecret, sealSecret } from "./secretbox.ts";
 import { renderSetupPage, type SetupView } from "./setup-page.ts";
+import { escapeMarkers } from "./wake-text.ts";
 
 interface ConnState {
   deviceId: string;
@@ -100,6 +113,9 @@ const OUTBOUND_BACKOFF_CAP_MS = 15 * 60_000;
 const OUTBOUND_MAX_ATTEMPTS = 8;
 const OUTBOUND_BATCH = 20;
 const OWNER_BOUND_REPLY = "✅ 已绑定，设置完成。此后直接在这里与 Shepherd 对话即可；设置页面已永久关闭。";
+// steward.md §6.3: while any sh_run is open, an alarm-driven task polls every 2 seconds; on
+// settlement a user run's final text becomes the reply, everything else is discarded.
+const RUN_POLL_S = 2;
 // Sent when the first event lands on the webhook after the QR switch: only a delivered event
 // proves the transport actually moved (research §8.2 — the API's callback_type report stays
 // out of sync with real delivery until the console republish lands).
@@ -159,7 +175,62 @@ function versionRangesOverlap(a: { min: number; max: number }, b: { min: number;
 export class Steward extends Agent<Env> {
   onStart(): void {
     runMigrations(this.sql.bind(this), MIGRATIONS);
+    // Wakes queued by past reducers (crash between queue and submit, §11) drain now.
+    void this.drainWakes();
+    void this.pollRuns();
   }
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    this.lifecycle.use(this.piHarness);
+  }
+
+  // ---- The steward LLM (issue #6, steward.md §4) -------------------------------------------------
+  // Cache fields must be declared before `piHarness`: its initializer reads `llmModels`
+  // eagerly (defaults.model), and with class-field semantics a later `undefined` initializer
+  // would clobber what the getter wrote.
+
+  private stewardModels_?: StewardModels;
+  private piRegistry_?: Registry;
+  private stewardExtension_?: Extension;
+
+  private get llmModels(): StewardModels {
+    return (this.stewardModels_ ??= buildStewardModels(
+      resolveModelConfig(this.env.STEWARD_MODEL),
+      this.env.STEWARD_MODEL_API_KEY,
+    ));
+  }
+
+  private get stewardExtension(): Extension {
+    return (this.stewardExtension_ ??= buildStewardExtension(this.stewardToolContext()));
+  }
+
+  private get registry(): Registry {
+    if (this.piRegistry_ === undefined) {
+      const registry = createRegistry();
+      registry.install(this.stewardExtension);
+      this.piRegistry_ = registry;
+    }
+    return this.piRegistry_;
+  }
+
+  /** The root pi session — the steward conversation (steward.md §4.1). */
+  readonly piHarness = new PiHarness({
+    harness: ({ storage, context }) =>
+      Harness.open(
+        storage,
+        {
+          models: this.llmModels.models,
+          registry: this.registry,
+          // pi's report channel (listener failures, section-render errors): into the channel
+          // log, where a sick extension is diagnosable from the outside.
+          onReport: (error) => this.logChannel("pi_report", errorText(error)),
+        },
+        context,
+      ),
+    defaults: { model: { provider: this.llmModels.config.provider, id: this.llmModels.config.modelId } },
+  });
+
 
   // The memory module (steward.md §2): all sh_* ledger SQL lives behind this handle. Bound
   // lazily because `sql`/`ctx` only mean something once the DO is live.
@@ -193,6 +264,67 @@ export class Steward extends Agent<Env> {
         await this.enqueueOutbound({ kind: "card", to: owner, card, threadId, urgency: "push" });
       },
     }));
+  }
+
+  /** The tools' reach (steward.md §4.3): ledger, dispatch, outbound — nothing else. */
+  private stewardToolContext(): StewardExtensionContext {
+    return {
+      ledger: this.ledger,
+      buildBrief: () => buildSituationBrief(this.ledger),
+      currentRun: () => {
+        const run = this.ledger.runs.openRows()[0];
+        if (!run) return null;
+        // §7.1: the provenance of an event run is the wake's operationId; a user run's is
+        // `user:<msgId>` — what start_worker records as createdFromMsg.
+        return { operationId: run.operationId, kind: run.kind, provenance: run.operationId, routedThreadId: run.routedThreadId };
+      },
+      startWorker: (input) => this.dispatcher.startWorker(input),
+      notifyUser: async (input) => {
+        const owner = this.ownerOpenIdSync();
+        if (!owner) return;
+        const thread = input.threadId ? this.ledger.threads.get(input.threadId) : null;
+        await this.enqueueOutbound({
+          kind: "card",
+          to: owner,
+          card: notifyCard({
+            tone: input.tone,
+            conclusion: input.conclusion,
+            did: input.did,
+            ...(input.needsYou !== undefined ? { needsYou: input.needsYou } : {}),
+            ...(thread ? { threadTitle: thread.title } : {}),
+          }),
+          threadId: input.threadId ?? null,
+          urgency: input.urgency,
+        });
+        if (thread) this.sql`UPDATE sh_thread SET unread = 1 WHERE threadId = ${thread.threadId}`;
+      },
+      askUser: async (input) => {
+        const owner = this.ownerOpenIdSync();
+        if (!owner) return;
+        const thread = input.threadId ? this.ledger.threads.get(input.threadId) : null;
+        if (thread) {
+          // §4.3: ask_user creates the question, flips the Thread to waiting_you, and ends the
+          // turn. Answering later happens as a quote-reply routed back to the Thread.
+          const qid = `q_steward_${this.ledger.runs.openRows()[0]?.operationId ?? ulid()}`;
+          this.sql`
+            INSERT OR IGNORE INTO sh_question (qid, threadId, workerId, text, options, status, askedAt)
+            VALUES (${qid}, ${thread.threadId}, NULL, ${input.question}, ${JSON.stringify(input.options)}, 'open', ${Date.now()})
+          `;
+          this.ledger.recomputeThreadState(thread.threadId);
+          this.sql`UPDATE sh_thread SET unread = 1 WHERE threadId = ${thread.threadId}`; // news landed (§5.2)
+        }
+        await this.enqueueOutbound({
+          kind: "text",
+          to: owner,
+          text: askUserText(input.question, input.options, thread?.title),
+          threadId: thread?.threadId ?? null,
+          urgency: "push",
+        });
+      },
+      audit: (kind, detail) => {
+        this.logChannel(kind, detail);
+      },
+    };
   }
 
   private ownerOpenIdSync(): string | null {
@@ -486,7 +618,13 @@ export class Steward extends Agent<Env> {
   private applyLedgerEvents(): void {
     try {
       const { applied } = this.ledger.applyPendingEvents();
-      if (applied > 0) void this.drainNotifications();
+      if (applied > 0) {
+        void this.drainNotifications();
+        // The reducer may have queued wake_requests (§5.1 step 4): drain what is already due
+        // (the 3-second merge window keeps fresh rows waiting for their siblings) and arm the
+        // alarm for the rest.
+        void this.drainWakes();
+      }
     } catch (err) {
       this.logChannel("ledger_apply_failed", errorText(err));
     }
@@ -495,6 +633,9 @@ export class Steward extends Agent<Env> {
   // Single-flight drain, same pattern as deliverOutbound: concurrent wake sources (events,
   // hello, cmd failures) chain instead of racing, so an intent is enqueued exactly once.
   private notifyChain: Promise<void> = Promise.resolve();
+
+  // The pending drainWakes schedule's id, so a fresh earlier wake can cancel and pull it in.
+  private drainWakeScheduleId: string | undefined;
 
   drainNotifications(): Promise<void> {
     const run = this.notifyChain.then(() => this.drainNotifyPass());
@@ -542,7 +683,7 @@ export class Steward extends Agent<Env> {
     if (worker.lastOutcome?.startsWith("start_failed:")) {
       return failureCard(
         `派发失败：任务没有开始`,
-        `${worker.lastOutcome.slice("start_failed:".length)}。重新 /派发 一次即可。`,
+        `${worker.lastOutcome.slice("start_failed:".length)}。重新说一次要做什么即可。`,
         thread.title,
         footer,
       );
@@ -585,10 +726,17 @@ export class Steward extends Agent<Env> {
     deviceId: string,
     kind: string,
     args: unknown,
-    opts: { workerId?: string; notAfter?: number | null; ackTimeoutMs?: number } = {},
+    opts: { workerId?: string; notAfter?: number | null; ackTimeoutMs?: number; cmdId?: string } = {},
   ): Promise<{ cmdId: string; cseq: number; state: string }> {
     const cseq = (this.sql<{ m: number | null }>`SELECT MAX(cseq) AS m FROM outbox WHERE deviceId = ${deviceId}`[0]?.m ?? 0) + 1;
-    const cmdId = ulid();
+    // `cmdId` is the idempotency key for steward tool replays (protocol §7.1): the start_worker
+    // tool passes "tool:<taskId>" so a replayed call converges on the same command row —
+    // the primary key guarantees no second command is ever created.
+    const cmdId = opts.cmdId ?? ulid();
+    const existing = opts.cmdId
+      ? this.sql<{ cmdId: string; cseq: number; state: string }>`SELECT cmdId, cseq, state FROM outbox WHERE cmdId = ${cmdId}`[0]
+      : undefined;
+    if (existing) return { cmdId: existing.cmdId, cseq: existing.cseq, state: existing.state };
     const notAfter = opts.notAfter === undefined ? Date.now() + DEFAULT_NOTAFTER_MS : opts.notAfter;
     this.sql`
       INSERT INTO outbox (cmdId, deviceId, workerId, cseq, kind, payload, notAfter, state, createdAt)
@@ -1228,10 +1376,148 @@ export class Steward extends Agent<Env> {
       this.logChannel("ignored_message_type", `${ev.messageType} ${ev.msgId}`);
       return;
     }
-    // The owner's text: fixed-phrase dispatch and quote-reply routing (issue #5). Natural
-    // language understanding is the M2 steward's job; here everything is deterministic.
+    // The owner's text goes to the steward LLM (issue #6): sh_run(user) + harness.submit with
+    // operationId = user:<msgId> (steward.md §4.2/§6.3); the settled final text becomes the
+    // reply. Quote-routing is resolved deterministically BEFORE the model ever sees the text
+    // (§3.1 signal 1 never passes through LLM judgment).
     this.logChannel("owner_message", `${ev.msgId} parent=${ev.parentId ?? "-"} ${ev.text ?? ""}`.slice(0, 500));
-    await this.dispatcher.handleOwnerText({ text: ev.text ?? "", parentId: ev.parentId, msgId: ev.msgId });
+    await this.submitUserMessage({ msgId: ev.msgId, text: ev.text ?? "", parentId: ev.parentId });
+  }
+
+  /** A user message becomes one steward input, idempotent on the msgId (steward.md §9.1/§11). */
+  private async submitUserMessage(input: { msgId: string; text: string; parentId?: string }): Promise<void> {
+    const operationId = `user:${input.msgId}`;
+    // Signal 1 (§3.1): a quote of one of our messages routes to that Thread directly.
+    const routed = input.parentId ? this.ledger.outbound.threadIdForProviderMsg(input.parentId) : null;
+    const routedThread = routed ? this.ledger.threads.get(routed) : null;
+    if (routedThread) this.ledger.threads.markRead(routedThread.threadId); // a reply means the report was seen (§6.5)
+    // Content markers (§4.2): user text is escaped so it can never mimic a ⟦…⟧ system input;
+    // the routing note is prefixed as clearly-marked system metadata (never the ⟦ form, so
+    // the input still reads as user-originated).
+    const escaped = escapeMarkers(input.text);
+    const note = routedThread
+      ? `（系统注：这条消息是对 Thread「${routedThread.title}」（${routedThread.threadId}）消息的回复，已确定归属该 Thread。）\n`
+      : "";
+    const text = `${note}${escaped}`;
+    if (!this.ledger.runs.open(operationId, "user", text, { replyTo: input.msgId, channel: "feishu", routedThreadId: routedThread?.threadId ?? null })) {
+      return; // already submitted (sh_inbound dedup normally catches this first)
+    }
+    try {
+      await this.piHarness.submit(text, { operationId, whenBusy: "followUp" });
+    } catch (err) {
+      this.logChannel("submit_failed", `${operationId} ${errorText(err)}`);
+      // The row stays open: the poll's not_found path resubmits until it sticks (§11).
+    }
+    void this.pollRuns();
+  }
+
+  /**
+   * The alarm-driven run settler (steward.md §6.3): while sh_run rows are open, re-arm every
+   * RUN_POLL_S seconds; on settlement a user run's final text is enqueued as the reply, and
+   * every other kind's text is discarded — the structural half of "quiet by default" (§6.2).
+   */
+  async pollRuns(): Promise<void> {
+    const open = this.ledger.runs.openRows();
+    if (open.length === 0) return;
+    let stillOpen = false;
+    try {
+      const pending = new Set((await this.piHarness.pending()).map((p) => p.operationId));
+      for (const run of open) {
+        if (pending.has(run.operationId)) {
+          stillOpen = true;
+          continue;
+        }
+        const result = await this.piHarness.wait(run.operationId);
+        if (result.status === "unanswered" && result.reason === "not_found") {
+          // Crash between the sh_run write and submit (§11): resubmit — the operationId
+          // guarantees the harness treats it as one input, never two.
+          try {
+            await this.piHarness.submit(run.text, { operationId: run.operationId, whenBusy: "followUp" });
+            stillOpen = true;
+          } catch (err) {
+            this.logChannel("submit_failed", `${run.operationId} ${errorText(err)}`);
+            stillOpen = true;
+          }
+          continue;
+        }
+        this.settleRun(run, result);
+      }
+    } catch (err) {
+      this.logChannel("poll_runs_failed", errorText(err));
+      stillOpen = true;
+    }
+    // idempotent: frequent callers (submit, the test poller) dedup onto one pending job.
+    if (stillOpen) void this.schedule(RUN_POLL_S, "pollRuns", undefined, { idempotent: true });
+  }
+
+  private settleRun(run: RunRow, result: { status: string; reason?: string; text?: string }): void {
+    if (run.kind === "user") {
+      const owner = this.ownerOpenIdSync();
+      if (owner && result.status === "done" && result.text && result.text.trim().length > 0) {
+        // §6.2 source 3: the final text of a user-triggered run IS the reply. Carrying the
+        // routed thread keeps quote-reply chains on the same Thread (§3.1).
+        void this.enqueueOutbound({
+          kind: "text",
+          to: owner,
+          text: result.text,
+          threadId: run.routedThreadId,
+          urgency: "push",
+        }).then(({ id }) => this.ledger.runs.settle(run.operationId, result, id));
+        return;
+      }
+      if (owner && result.status !== "done") {
+        // No template exists for user replies; a one-line notice beats silence (the budget
+        // cap and its degradation behavior are #28's to refine).
+        void this.enqueueOutbound({
+          kind: "text",
+          to: owner,
+          text: "⚠️ 总管这轮没有跑成（模型调用失败或被中断），这条消息我没能处理；稍后再试或重发一次。",
+          threadId: run.routedThreadId,
+          urgency: "push",
+        }).then(({ id }) => this.ledger.runs.settle(run.operationId, result, id));
+        return;
+      }
+    }
+    // Event/routine/follow-up runs: the text is kept for audit and NOT sent (§6.2).
+    this.ledger.runs.settle(run.operationId, result);
+  }
+
+  /**
+   * The wake scheduler (steward.md §5.1): due wake_requests become steward inputs with
+   * `whenBusy: followUp`. Idempotent end to end — the wake's operationId is fixed at queue
+   * time and harness.submit deduplicates by it, so replays and crash-restarts never produce a
+   * second steward input.
+   */
+  async drainWakes(): Promise<void> {
+    let submitted = false;
+    try {
+      for (const wake of this.ledger.wakes.due(Date.now())) {
+        this.ledger.runs.open(wake.operationId, wake.kind, wake.text);
+        try {
+          await this.piHarness.submit(wake.text, { operationId: wake.operationId, whenBusy: "followUp" });
+          this.ledger.wakes.markSubmitted(wake.id);
+          submitted = true;
+        } catch (err) {
+          this.logChannel("wake_submit_failed", `${wake.operationId} ${errorText(err)}`);
+          // Leave the row pending: the next drain retries it.
+        }
+      }
+    } catch (err) {
+      this.logChannel("drain_wakes_failed", errorText(err));
+    }
+    const next = this.ledger.wakes.earliestDue(Date.now());
+    if (next !== null) {
+      // Idempotent on a fixed payload so repeated drains share one pending job; a fresh,
+      // earlier wake first cancels the stale job so the alarm can be pulled in.
+      const inS = Math.max(1, Math.ceil((next - Date.now()) / 1000));
+      if (this.drainWakeScheduleId !== undefined) {
+        await this.cancelSchedule(this.drainWakeScheduleId).catch(() => {});
+        this.drainWakeScheduleId = undefined;
+      }
+      const scheduled = await this.schedule(inS, "drainWakes", "due", { idempotent: true }).catch(() => undefined);
+      this.drainWakeScheduleId = scheduled?.id;
+    }
+    if (submitted) void this.pollRuns();
   }
 
   // Card button callbacks (issue #5): the Thread is resolved from the card's providerMsgId —
@@ -1290,6 +1576,68 @@ export class Steward extends Agent<Env> {
   /** Read-only ledger view for tests: threads, workers, reports, questions, timeline. */
   async debugSnapshot(): Promise<ReturnType<Steward["ledger"]["debug"]["snapshot"]>> {
     return this.ledger.debug.snapshot();
+  }
+
+  /** Test entry into the deterministic dispatch service the start_worker tool drives. */
+  async dispatchForTest(
+    input: Omit<import("./dispatch.ts").StartWorkerInput, "provenance" | "cmdId"> & { cmdId?: string },
+  ): Promise<import("./dispatch.ts").StartWorkerOutcome> {
+    return this.dispatcher.startWorker({
+      ...input,
+      provenance: "test",
+      cmdId: input.cmdId ?? `test:${ulid()}`,
+    });
+  }
+
+  // ---- Steward-LLM test surface (the `faux` provider is configured via STEWARD_MODEL) ----
+
+  /** Queues scripted model replies (FIFO); each model request consumes one step. */
+  async fauxScript(steps: AssistantMessage[]): Promise<void> {
+    if (!this.llmModels.faux) throw new Error("STEWARD_MODEL is not the faux provider");
+    this.llmModels.faux.setSteps(steps);
+  }
+
+  /** The captured model requests (after beforeRequest): input texts + injected briefs. */
+  async fauxRequests(): Promise<FauxRequestRecord[]> {
+    if (!this.llmModels.faux) throw new Error("STEWARD_MODEL is not the faux provider");
+    return this.llmModels.faux.requests();
+  }
+
+  /** The steward conversation as compact rows: every submitted input and its outcome. */
+  async llmState(): Promise<{
+    runs: RunRow[];
+    inputs: Array<{ operationId: string; kind: string; text: string }>;
+    assistantTexts: string[];
+    raw: unknown[];
+  }> {
+    const records = await this.piHarness.messages();
+    const inputs: Array<{ operationId: string; kind: string; text: string }> = [];
+    const assistantTexts: string[] = [];
+    for (const record of records) {
+      const entry = record as unknown as { kind?: string; model?: Array<{ content?: unknown }> };
+      const content = entry.model?.[0]?.content;
+      const text =
+        typeof content === "string"
+          ? content
+          : Array.isArray(content)
+            ? content.flatMap((part) => ((part as { type?: string })?.type === "text" ? [(part as { text?: string }).text ?? ""] : [])).join("")
+            : "";
+      if (entry.kind === "pi.user") inputs.push({ operationId: "", kind: "user", text });
+      if (entry.kind === "pi.assistant") assistantTexts.push(text);
+    }
+    return { runs: this.ledger.runs.rows(), inputs, assistantTexts, raw: records as unknown as unknown[] };
+  }
+
+  /** Test-only: wipes the pi conversation (dispose + drop pi_* tables) and the run/wake rows. */
+  async resetLlmStateForTests(): Promise<void> {
+    await this.piHarness.dispose();
+    const tables = this.sql<{ name: string }>`
+      SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'pi_%'
+    `.map((r) => r.name);
+    for (const table of tables) this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS "${table}"`);
+    this.ctx.storage.sql.exec("DELETE FROM sh_run");
+    this.ctx.storage.sql.exec("DELETE FROM sh_wake");
+    if (this.llmModels.faux) this.llmModels.faux.reset();
   }
 
   // Scheduled callback (also fired inline after each enqueue): claims due rows, sends them

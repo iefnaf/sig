@@ -1,0 +1,181 @@
+// Steward model configuration and provider construction (issue #6, ADR-0001 decision 11,
+// spike-conclusions bug 7): inside Workers never resolve API keys from environment variables —
+// the provider is built with an inline `auth.apiKey.resolve` closure over the deploy-config
+// secret, on a rebuilt copy of the catalog provider. The `faux` provider id is the test hook:
+// vitest binds STEWARD_MODEL accordingly and scripts replies through Steward.fauxScript.
+import {
+  createModels,
+  createProvider,
+  type MutableModels,
+  type Provider,
+} from "@earendil-works/pi-ai/models";
+import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
+import type { AssistantMessage, TranscriptContext } from "@earendil-works/pi-ai";
+import { fauxProvider, type FauxProviderHandle } from "@earendil-works/pi-ai/providers/faux";
+
+/** The deploy-config shape (`vars.STEWARD_MODEL` in wrangler.jsonc). */
+export interface StewardModelConfig {
+  provider: string;
+  modelId: string;
+  /** Overrides the provider's catalog base URL (self-hosted / proxy endpoints). */
+  baseUrl?: string;
+}
+
+/** ADR-0001 decision 11: the eval baseline. Changing it requires re-running the routing eval. */
+export const DEFAULT_MODEL_CONFIG: StewardModelConfig = { provider: "deepseek", modelId: "deepseek-flash" };
+
+/** Parses `vars.STEWARD_MODEL`; anything malformed falls back to the default. */
+export function resolveModelConfig(raw: unknown): StewardModelConfig {
+  if (typeof raw === "string") {
+    try {
+      raw = JSON.parse(raw);
+    } catch {
+      return { ...DEFAULT_MODEL_CONFIG };
+    }
+  }
+  if (raw === null || typeof raw !== "object") return { ...DEFAULT_MODEL_CONFIG };
+  const cfg = raw as { provider?: unknown; modelId?: unknown; baseUrl?: unknown };
+  if (typeof cfg.provider !== "string" || typeof cfg.modelId !== "string" || !cfg.provider || !cfg.modelId) {
+    return { ...DEFAULT_MODEL_CONFIG };
+  }
+  return {
+    provider: cfg.provider,
+    modelId: cfg.modelId,
+    ...(typeof cfg.baseUrl === "string" && cfg.baseUrl.length > 0 ? { baseUrl: cfg.baseUrl } : {}),
+  };
+}
+
+/**
+ * Rebuilds a catalog provider with an inline API-key auth (spike bug 7): the resolve closure
+ * returns the deploy-config secret directly — no ambient environment lookup happens inside
+ * the Worker. A missing key keeps the provider registered but unconfigured, so model calls
+ * fail loudly instead of silently trying `DEEPSEEK_API_KEY`.
+ */
+export function providerWithInlineKey(base: Provider, apiKey: string | undefined, baseUrl?: string): Provider {
+  return createProvider({
+    id: base.id,
+    name: base.name,
+    baseUrl: baseUrl ?? base.baseUrl,
+    headers: base.headers,
+    auth: {
+      apiKey: {
+        name: `${base.name} API key`,
+        resolve: async () => (apiKey ? { auth: { apiKey, baseUrl: baseUrl ?? base.baseUrl }, source: "deploy config" } : undefined),
+      },
+    },
+    models: [...base.getModels()],
+    api: {
+      stream: base.stream.bind(base),
+      streamSimple: base.streamSimple.bind(base),
+      ...(base.fetchDeferred ? { fetchDeferred: base.fetchDeferred.bind(base) } : {}),
+      ...(base.cancelDeferred ? { cancelDeferred: base.cancelDeferred.bind(base) } : {}),
+    },
+  });
+}
+
+/** One captured model request, as the test scaffolding sees it (after beforeRequest). */
+export interface FauxRequestRecord {
+  at: number;
+  /** The last user message's text — the exact input the model received. */
+  userText: string;
+  /** The `shepherd-situation` section of the outgoing system prompt, if the hook injected one. */
+  brief: string | null;
+  lastToolResult: string;
+}
+
+/** The test-side scripting surface over the in-DO faux provider. */
+export interface FauxScripting {
+  /** FIFO steps; each provider call consumes one. Steps run out → a plain default reply. */
+  setSteps(steps: AssistantMessage[]): void;
+  requests(): FauxRequestRecord[];
+  reset(): void;
+}
+
+export interface StewardModels {
+  models: MutableModels;
+  config: StewardModelConfig;
+  /** Present only for the `faux` test provider. */
+  faux?: FauxScripting;
+}
+
+const textOf = (content: unknown): string => {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .flatMap((part: unknown) =>
+      typeof part === "object" && part !== null && "type" in part && (part as { type: string }).type === "text"
+        ? [(part as { text?: string }).text ?? ""]
+        : [],
+    )
+    .join("");
+};
+
+/**
+ * Builds the `Models` collection for the PiHarness factory. `faux` constructs the scripted
+ * provider with a single recording response factory: every model request is captured for
+ * assertions, and the FIFO script decides the reply (a benign default when it runs dry, so an
+ * unscripted DO never wedges a run).
+ */
+export function buildStewardModels(config: StewardModelConfig, apiKey: string | undefined): StewardModels {
+  if (config.provider === "faux") {
+    const faux: FauxProviderHandle = fauxProvider({ models: [{ id: config.modelId, name: "Faux" }] });
+    const steps: AssistantMessage[] = [];
+    const requests: FauxRequestRecord[] = [];
+    const factory = (context: TranscriptContext): AssistantMessage => {
+      const messages = [...context.messages];
+      const lastUser = [...messages].reverse().find((m) => m.role === "user");
+      const lastToolResult = [...messages].reverse().find((m) => m.role === "toolResult");
+      const system = messages.find((m) => m.role === "system");
+      const sections = system && "sections" in system ? (system as { sections?: Record<string, string | null> }).sections : undefined;
+      requests.push({
+        at: Date.now(),
+        userText: textOf((lastUser as { content?: unknown } | undefined)?.content),
+        brief: sections?.["shepherd-situation"] ?? null,
+        lastToolResult: textOf((lastToolResult as { content?: unknown } | undefined)?.content),
+      });
+      if (requests.length > 50) requests.shift();
+      const step = steps.shift();
+      return (
+        step ?? {
+          role: "assistant",
+          content: [{ type: "text", text: "(faux: 未脚本化的回复)" }],
+          api: "faux",
+          provider: "faux",
+          model: config.modelId,
+          usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+          stopReason: "stop",
+          timestamp: Date.now(),
+        }
+      );
+    };
+    // Faux consumes one response entry per provider call: register many copies of the same
+    // recording factory (the spike did the same), so it never runs out mid-conversation.
+    faux.setResponses(Array.from({ length: 1000 }, () => factory));
+    const models = createModels();
+    models.setProvider(faux.provider);
+    return {
+      models,
+      config,
+      faux: {
+        setSteps: (s) => steps.push(...s),
+        requests: () => [...requests],
+        reset: () => {
+          steps.splice(0, steps.length);
+          requests.splice(0, requests.length);
+        },
+      },
+    };
+  }
+
+  const base = builtinProviders().find((p) => p.id === config.provider);
+  const models = createModels();
+  if (!base) {
+    // Unknown provider id: register nothing. The root session's model stays unresolvable and
+    // runs settle `unanswered` with `no_model` — visible in sh_run, not a silent wrong model.
+    return { models, config };
+  }
+  // An unknown model id is likewise kept as configured (it fails visibly as `no_model`);
+  // silently substituting a different model would break the eval-baseline rule.
+  models.setProvider(providerWithInlineKey(base, apiKey, config.baseUrl));
+  return { models, config };
+}

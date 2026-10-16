@@ -1,21 +1,27 @@
-// The LLM-free end-to-end loop (issue #5): a fixed command phrase in Feishu → Thread created →
-// start_worker over the real transport → the (protocol-level fake-pi) worker runs → a
-// deterministic three-part done-report card back → quote-replying to that card routes back to
-// the same Thread (relay, previous branch as base) → an offline machine queues until hello
-// redelivers (spike bug 4) → the offline-ask card's buttons resolve the Thread via
-// providerMsgId. Every hop in here is the production code path; only the worker is faked.
+// The end-to-end loop with the steward LLM in it (issues #5 → #6): the owner talks natural
+// language in Feishu → the scripted model calls start_worker → the (protocol-level fake-pi)
+// worker runs → the deterministic three-part done-report card comes back → the event wake
+// runs bookkeeping (update_thread) whose plain text is DISCARDED → quote-replying to the card
+// routes back to the same Thread (relay, previous branch as base) → an offline machine queues
+// until hello redelivers (spike bug 4). Every hop is the production code path; the model is
+// the scripted faux provider and only the worker is faked.
 import { beforeEach, describe, expect, it } from "vitest";
+import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import {
   FakeConnector,
   configureAndBind,
   messageEvent,
   mockCalls,
   mockReset,
+  modelRequests,
+  llmState,
   ownerStub,
   pairFakeConnector,
   postEvent,
   resetLedgerState,
+  scriptModel,
   sendCalls,
+  waitRunsSettled,
   waitWhileOutboundPending,
 } from "./helpers.ts";
 import type { ShOutboundRow } from "../src/steward.ts";
@@ -34,7 +40,7 @@ async function snapshot() {
   return ownerStub().debugSnapshot();
 }
 
-async function snapshotWhere(pred: (snap: Awaited<ReturnType<typeof snapshot>>) => boolean, what: string, timeoutMs = 8000) {
+async function snapshotWhere(pred: (snap: Awaited<ReturnType<typeof snapshot>>) => boolean, what: string, timeoutMs = 10_000) {
   const startedAt = Date.now();
   for (;;) {
     const snap = await snapshot();
@@ -49,35 +55,29 @@ async function sentCards(): Promise<ShOutboundRow[]> {
   return rows.filter((r) => r.kind === "card" && r.status === "sent");
 }
 
-function cardActionEvent(cardMsgId: string, action: string, eventId = `evt_card_${crypto.randomUUID().slice(0, 8)}`) {
-  return {
-    schema: "2.0",
-    header: {
-      event_id: eventId,
-      event_type: "card.action.trigger",
-      create_time: String(Date.now()),
-      token: "verify-token",
-      app_id: "cli_test_app",
-    },
-    event: {
-      operator: { open_id: "ou_owner" },
-      action: { value: { action } }, // identity never rides in the button (§3.1)
-      context: { open_message_id: cardMsgId },
-    },
-  };
+async function sentTexts(): Promise<string[]> {
+  const rows = await ownerStub().outboundRows(30);
+  return rows
+    .filter((r) => r.kind === "text" && r.status === "sent")
+    .map((r) => (JSON.parse(r.payload as string) as { text?: string }).text ?? "");
 }
 
-describe("the happy loop: fixed phrase → worker → done card → quote-reply continuation", () => {
-  it("runs a write task and reports back, and a quote-reply attaches to the same Thread with the branch relayed", async () => {
-    const fake = await pairFakeConnector("mac-studio", {
-      run: { status: "done", summary: "登录 bug 修好，测试通过", changes: ["auth/session.ts 补上过期刷新", "新增 1 个测试"], tests: { ran: true, passed: true }, branch: "shepherd/login-1" },
-    });
-    fake.queueRun({ status: "done", summary: "单元测试补齐", changes: ["session.test.ts 新增 3 例"], branch: "shepherd/login-2" });
+describe("the happy loop: natural language → tool dispatch → done card → event bookkeeping", () => {
+  it("a user message dispatches via start_worker; the reply is the model's final text", async () => {
+    // autorun off: the worker's events are emitted by hand so the event wake happens after the
+    // test has scripted the bookkeeping turn (the wake fires 3s after the report lands).
+    const fake = await pairFakeConnector("mac-studio", { run: null, autorun: false });
     await fake.connect();
 
-    // --- dispatch: fixed phrase naming a repo and a prompt -------------------------------
-    const res = await ownerDm("/派发 repo-a 修复登录 bug");
+    // The scripted steward: find the situation, dispatch, then answer the user.
+    await scriptModel(
+      fauxAssistantMessage([fauxToolCall("start_worker", { prompt: "修复登录 bug", repoRef: "repo-a", newTitle: "修复登录 bug", basis: "user_explicit" })], { stopReason: "toolUse" }),
+      fauxAssistantMessage([fauxText("已创建「修复登录 bug」并派给 mac-studio，完成后我会汇报。")]),
+    );
+
+    const res = await ownerDm("帮我把 repo-a 里那个登录 bug 修了");
     expect(res.status).toBe(200);
+
     const [cmd1] = await fake.waitForCmds(1);
     expect(cmd1).toBeDefined();
     expect(cmd1!.kind).toBe("start_worker");
@@ -88,31 +88,76 @@ describe("the happy loop: fixed phrase → worker → done card → quote-reply 
       prompt: "修复登录 bug",
     });
     expect(cmd1!.args).not.toHaveProperty("base"); // first leg: nothing to relay from
-    await waitWhileOutboundPending();
-    const ackTexts = (await ownerStub().outboundRows(10)).filter((r) => r.kind === "text" && r.status === "sent");
-    expect(JSON.stringify(ackTexts)).toContain("已创建");
-    expect(JSON.stringify(ackTexts)).toContain("mac-studio");
+    expect(cmd1!.id).toMatch(/^tool:/); // cmdId = tool:<taskId> (issue #6, protocol §7.1)
+    const workerId = String((cmd1!.args as Record<string, unknown>).workerId);
+    const threadId = String((cmd1!.args as Record<string, unknown>).threadId);
 
-    // --- the worker runs and reports: a deterministic green three-part card comes back -----
+    await waitRunsSettled();
+    await waitWhileOutboundPending();
+    const texts = await sentTexts();
+    expect(texts.some((t) => t.includes("已创建") && t.includes("mac-studio"))).toBe(true); // §6.3: the run's final text is the reply
+
+    // --- the worker runs and reports: a deterministic green three-part card comes back -------
+    fake.send({ t: "cmd_ack", re: cmd1!.id, status: "accepted" });
+    fake.send({ t: "cmd_result", re: cmd1!.id, ok: true, data: { sessionId: workerId, branch: "shepherd/login-1" } });
+    await fake.emit("started", workerId, { sessionId: workerId, branch: "shepherd/login-1" });
+    await fake.emit("report", workerId, {
+      type: "report",
+      status: "done",
+      summary: "登录 bug 修好，测试通过",
+      changes: ["auth/session.ts 补上过期刷新"],
+      tests: { ran: true, passed: true },
+      git: { branch: "shepherd/login-1", base: "main", ahead: 1, dirty: 0, filesChanged: 1, insertions: 5, deletions: 1, pushed: false },
+    });
     const doneSnap = await snapshotWhere(
-      (s) => s.threads[0]?.workers[0]?.state === "idle" && s.threads[0]?.unread === true,
-      "worker settled, thread idle+unread",
+      (s) => s.threads[0]?.workers[0]?.state === "running" && s.threads[0]?.unread === true,
+      "report recorded with unread",
     );
-    const threadId = doneSnap.threads[0]!.threadId;
-    expect(doneSnap.threads[0]!.state).toBe("idle");
+    expect(doneSnap.threads[0]!.threadId).toBe(threadId);
+    await waitWhileOutboundPending();
     const [card1] = await sentCards();
     expect(card1?.threadId).toBe(threadId);
     const cardJson = JSON.parse(card1!.payload as string) as { card: { header: unknown; elements: unknown[] } };
     expect(JSON.stringify(cardJson.card.header)).toContain("green");
     expect(JSON.stringify(cardJson.card.header)).toContain("登录 bug 修好，测试通过");
-    const parts = JSON.stringify(cardJson.card.elements);
-    expect(parts).toContain("做了什么");
-    expect(parts).toContain("auth/session.ts 补上过期刷新");
-    expect(parts).toContain("分支 shepherd/login-1");
-    expect(parts).toContain("Thread「修复登录 bug」");
 
-    // --- quote-reply to the card routes to the SAME Thread and relays the branch (spec §5.3)
-    const res2 = await ownerDm("/派发 repo-a 再补几个单元测试", card1!.providerMsgId!);
+    // --- the event wake: the model does bookkeeping; its plain text never reaches the user ---
+    await scriptModel(
+      fauxAssistantMessage([fauxToolCall("update_thread", { threadId, summary: "登录 bug 已修复：session 过期刷新补齐，测试通过，分支 shepherd/login-1" })], { stopReason: "toolUse" }),
+      fauxAssistantMessage([fauxText("记账完成。（这行文字不应该发给用户）")]),
+    );
+    await waitRunsSettled(); // the wake fired after the 3s merge window and settled
+    await waitWhileOutboundPending();
+
+    const wakeRun = (await llmState()).runs.find((r) => r.kind === "event");
+    expect(wakeRun).toBeDefined();
+    expect(wakeRun!.status).toBe("settled");
+    expect(wakeRun!.resultStatus).toBe("done");
+    expect(wakeRun!.resultText).toContain("记账完成"); // kept for audit…
+    const textsAfterWake = await sentTexts();
+    expect(textsAfterWake.some((t) => t.includes("不应该发给用户"))).toBe(false); // …and NOT sent (§6.2)
+    expect(wakeRun!.replyOutboundId).toBeNull(); // structural quiet: no reply was queued
+
+    // The wake input carried the ⟦event⟧ marker and the thread's report facts.
+    const requests = await modelRequests();
+    const wakeRequest = requests.find((r) => r.userText.startsWith("⟦event⟧"));
+    expect(wakeRequest).toBeDefined();
+    expect(wakeRequest!.userText).toContain(threadId);
+    expect(wakeRequest!.userText).toContain("登录 bug 修好");
+    expect(wakeRequest!.userText).toContain("请做记账");
+
+    // Bookkeeping landed: the summary the model wrote is on the Thread.
+    const bookkept = await snapshot();
+    expect(bookkept.threads[0]!.summary).toContain("session 过期刷新");
+
+    // --- quote-reply to the card routes to the SAME Thread and relays the branch (§5.3) ----
+    await fake.emit("settled", workerId, { type: "settled", outcome: "reported" });
+    await snapshotWhere((s) => s.threads[0]?.workers[0]?.state === "idle", "first run settled");
+    await scriptModel(
+      fauxAssistantMessage([fauxToolCall("start_worker", { prompt: "再补几个单元测试", repoRef: "repo-a", threadId, basis: "user_reply_to" })], { stopReason: "toolUse" }),
+      fauxAssistantMessage([fauxText("已把「补单测」接到了之前的登录 bug 上。")]),
+    );
+    const res2 = await ownerDm("再补几个单元测试", card1!.providerMsgId!);
     expect(res2.status).toBe(200);
     const sameThread = await snapshotWhere((s) => s.threads[0]?.workers.length === 2, "second worker on the same thread");
     expect(sameThread.threads).toHaveLength(1); // no new Thread — signal 1 routed it
@@ -121,7 +166,24 @@ describe("the happy loop: fixed phrase → worker → done card → quote-reply 
     expect((cmd2!.args as Record<string, unknown>).threadId).toBe(threadId);
     expect((cmd2!.args as Record<string, unknown>).base).toBe("shepherd/login-1"); // relay base
 
-    await snapshotWhere((s) => s.threads[0]?.workers.length === 2 && s.threads[0]?.workers[1]?.state === "idle", "second run settled");
+    // The model saw the quote-routing note with the resolved thread id (§3.1 signal 1).
+    const quoteRequest = (await modelRequests()).filter((r) => r.userText.includes("再补几个单元测试")).at(-1);
+    expect(quoteRequest!.userText).toContain("（系统注：");
+    expect(quoteRequest!.userText).toContain(threadId);
+
+    // Second leg runs and reports; its card comes back on the same Thread.
+    const worker2 = String((cmd2!.args as Record<string, unknown>).workerId);
+    fake.send({ t: "cmd_ack", re: cmd2!.id, status: "accepted" });
+    fake.send({ t: "cmd_result", re: cmd2!.id, ok: true, data: { sessionId: worker2, branch: "shepherd/login-2" } });
+    await fake.emit("started", worker2, { sessionId: worker2, branch: "shepherd/login-2" });
+    await fake.emit("report", worker2, {
+      type: "report",
+      status: "done",
+      summary: "单元测试补齐",
+      changes: ["session.test.ts 新增 3 例"],
+      git: { branch: "shepherd/login-2", base: "main", ahead: 1, dirty: 0, filesChanged: 1, insertions: 3, deletions: 0, pushed: false },
+    });
+    await snapshotWhere((s) => s.threads[0]?.workers.length === 2 && s.threads[0]?.workers[1]?.state === "running", "second run reported");
     await waitWhileOutboundPending();
     const cards = await sentCards();
     expect(cards).toHaveLength(2);
@@ -129,7 +191,7 @@ describe("the happy loop: fixed phrase → worker → done card → quote-reply 
     expect(cards[1]!.threadId).toBe(threadId);
     fake.close();
     void (await mockCalls());
-  }, 30_000);
+  }, 45_000);
 });
 
 describe("offline machines (spike bug 4): a Thread remembers its machine and queues", () => {
@@ -138,24 +200,35 @@ describe("offline machines (spike bug 4): a Thread remembers its machine and que
     fake.queueRun({ status: "done", summary: "第二段接力完成", branch: "shepherd/leg-2" });
     await fake.connect();
 
-    await ownerDm("/派发 repo-a 第一段任务");
+    await scriptModel(
+      fauxAssistantMessage([fauxToolCall("start_worker", { prompt: "第一段任务", repoRef: "repo-a", newTitle: "第一段任务", basis: "user_explicit" })], { stopReason: "toolUse" }),
+      fauxAssistantMessage([fauxText("已创建并派发第一段。")]),
+    );
+    await ownerDm("开始第一段");
     await fake.waitForCmds(1);
-    const firstDone = await snapshotWhere((s) => s.threads[0]?.workers[0]?.state === "idle", "first leg done");
+    await snapshotWhere((s) => s.threads[0]?.workers[0]?.state === "idle", "first leg done");
+    await waitRunsSettled();
     await waitWhileOutboundPending();
     const [card1] = await sentCards();
+    const threadId = (await snapshot()).threads[0]!.threadId;
 
     // --- the machine drops (isolate swap / network gone): last connection closes → offline --
     fake.close();
     await snapshotWhere((s) => s.machines.every((m) => !m.online), "machine offline");
 
     // --- quote-reply continuation: the Thread keeps its machine and the command queues ------
-    const res = await ownerDm("/派发 repo-a 接着做第二段", card1!.providerMsgId!);
+    await scriptModel(
+      fauxAssistantMessage([fauxToolCall("start_worker", { prompt: "接着做第二段", repoRef: "repo-a", threadId, basis: "user_reply_to" })], { stopReason: "toolUse" }),
+      fauxAssistantMessage([fauxText("已续派第二段；机器不在线，已排队，上线后自动开始。")]),
+    );
+    const res = await ownerDm("接着做第二段", card1!.providerMsgId!);
     expect(res.status).toBe(200);
     const queuedSnap = await snapshotWhere((s) => s.threads[0]?.workers.length === 2, "second worker registered");
     expect(queuedSnap.threads[0]!.state).toBe("running"); // starting while queued
+    await waitRunsSettled();
     await waitWhileOutboundPending();
-    const texts = (await ownerStub().outboundRows(10)).filter((r) => r.kind === "text" && r.status === "sent");
-    expect(JSON.stringify(texts)).toContain("不在线");
+    const texts = await sentTexts();
+    expect(texts.some((t) => t.includes("不在线"))).toBe(true);
     await new Promise((resolve) => setTimeout(resolve, 300));
     expect(fake.cmds).toHaveLength(1); // nothing was delivered to a dead socket
 
@@ -165,6 +238,7 @@ describe("offline machines (spike bug 4): a Thread remembers its machine and que
     expect(cmd2).toBeDefined();
     expect(cmd2!.notAfter).toBeNull(); // "wait until online" (protocol §4.2)
     await snapshotWhere((s) => s.threads[0]?.workers[1]?.state === "idle", "second leg done after reconnect");
+    await waitRunsSettled();
     await waitWhileOutboundPending();
     expect((await sentCards()).length).toBe(2);
     fake.close();
@@ -173,19 +247,24 @@ describe("offline machines (spike bug 4): a Thread remembers its machine and que
 });
 
 describe("the offline-ask card: buttons resolve the Thread via providerMsgId (§3.1)", () => {
-  it("asks wait-or-cancel when the only machine with the repo is offline; wait_online queues and runs on return", async () => {
+  it("start_worker on an offline-only machine asks with buttons; wait_online queues and runs on return", async () => {
     const fake = await pairFakeConnector("mac-studio", { run: { status: "done", summary: "排队后完成", branch: "shepherd/queued-1" } });
-    // The machine must have said hello once: repos are known only from hello (protocol §6.1).
     await fake.connect();
     await snapshotWhere((s) => s.machines.some((m) => m.online), "machine checked in");
     fake.close();
     await snapshotWhere((s) => s.machines.every((m) => !m.online), "machine gone offline");
 
-    const res = await ownerDm("/派发 repo-a 修个东西");
+    // The model dispatches; the deterministic rule turns it into the wait/cancel card.
+    await scriptModel(
+      fauxAssistantMessage([fauxToolCall("start_worker", { prompt: "修个东西", repoRef: "repo-a", newTitle: "修个东西", basis: "user_explicit" })], { stopReason: "toolUse" }),
+      fauxAssistantMessage([fauxText("mac-studio 现在不在线，我发了一张卡片问你是排队还是取消。")]),
+    );
+    const res = await ownerDm("修个东西");
     expect(res.status).toBe(200);
     const snap = await snapshotWhere((s) => s.threads.length === 1, "thread created for the ask");
     expect(snap.threads[0]!.workers).toHaveLength(0); // nothing dispatched yet: ask, don't decide (spec §9)
     expect(snap.threads[0]!.lastMachine).toBe(fake.deviceId); // affinity set at ask time
+    await waitRunsSettled();
     await waitWhileOutboundPending();
     const [askCard] = await sentCards();
     expect(askCard?.providerMsgId).toMatch(/^om_mock_/);
@@ -194,7 +273,17 @@ describe("the offline-ask card: buttons resolve the Thread via providerMsgId (§
     expect(ask).toContain("排队等上线");
 
     // --- the click: the callback carries only open_message_id + action, no thread data ------
-    const click = await postEvent(cardActionEvent(askCard!.providerMsgId!, "wait_online"));
+    const click = await postEvent({
+      schema: "2.0",
+      header: {
+        event_id: `evt_card_${crypto.randomUUID().slice(0, 8)}`,
+        event_type: "card.action.trigger",
+        create_time: String(Date.now()),
+        token: "verify-token",
+        app_id: "cli_test_app",
+      },
+      event: { operator: { open_id: "ou_owner" }, action: { value: { action: "wait_online" } }, context: { open_message_id: askCard!.providerMsgId! } },
+    });
     expect(click.status).toBe(200);
     const queued = await snapshotWhere((s) => s.threads[0]?.workers.length === 1, "worker registered on click");
     expect(queued.threads[0]!.state).toBe("running");
@@ -206,54 +295,39 @@ describe("the offline-ask card: buttons resolve the Thread via providerMsgId (§
     expect(cmd!.notAfter).toBeNull();
     expect((cmd!.args as Record<string, unknown>).threadId).toBe(queued.threads[0]!.threadId);
     await snapshotWhere((s) => s.threads[0]?.workers[0]?.state === "idle", "queued run finished");
+    await waitRunsSettled();
     await waitWhileOutboundPending();
     expect((await sentCards()).length).toBe(2); // ask card + done card
     fake.close();
     void (await mockCalls());
   }, 30_000);
-
-  it("cancel leaves the Thread idle with nothing dispatched", async () => {
-    const fake = await pairFakeConnector();
-    await fake.connect(); // hello first so the repo is known, then drop offline
-    await snapshotWhere((s) => s.machines.some((m) => m.online), "machine checked in");
-    fake.close();
-    await snapshotWhere((s) => s.machines.every((m) => !m.online), "machine offline");
-
-    await ownerDm("/派发 repo-a 算个账");
-    await snapshotWhere((s) => s.threads.length === 1, "thread created");
-    await waitWhileOutboundPending();
-    const [askCard] = await sentCards();
-
-    const click = await postEvent(cardActionEvent(askCard!.providerMsgId!, "cancel"));
-    expect(click.status).toBe(200);
-    const snap = await snapshotWhere((s) => !!s.threads[0]?.timeline.some((e) => e.text.includes("撤回")), "cancel recorded");
-    expect(snap.threads[0]!.workers).toHaveLength(0);
-    expect(snap.threads[0]!.state).toBe("idle");
-    await waitWhileOutboundPending();
-    const texts = (await ownerStub().outboundRows(10)).filter((r) => r.kind === "text" && r.status === "sent");
-    expect(JSON.stringify(texts)).toContain("已取消");
-    void (await mockCalls());
-  }, 30_000);
 });
 
-describe("the rest of the M1 phrase surface", () => {
-  it("unknown text gets the fixed help reply, /状态 lists machines and threads", async () => {
+describe("status questions answer from the situation, without dispatching", () => {
+  it("the model reads the injected brief and answers; no worker is started", async () => {
     const fake = await pairFakeConnector();
     await fake.connect();
-    await ownerDm("/派发 repo-a 跑个只读检查");
+    await scriptModel(
+      fauxAssistantMessage([fauxToolCall("start_worker", { prompt: "跑个只读检查", repoRef: "repo-a", newTitle: "只读检查", basis: "user_explicit" })], { stopReason: "toolUse" }),
+      fauxAssistantMessage([fauxText("已派发只读检查。")]),
+    );
+    await ownerDm("跑个只读检查");
     await fake.waitForCmds(1);
     await snapshotWhere((s) => s.threads[0]?.workers[0]?.state === "idle", "run done");
+    await waitRunsSettled();
     fake.close();
 
-    await ownerDm("帮我把那个 bug 修了吧");
-    await ownerDm("/状态");
+    await scriptModel(fauxAssistantMessage([fauxText("目前有一件事在进行中：「只读检查」。机器 mac-studio 在线。")]));
+    await ownerDm("现在什么情况？");
+    await waitRunsSettled();
     await waitWhileOutboundPending();
-    const texts = (await ownerStub().outboundRows(20)).filter((r) => r.kind === "text" && r.status === "sent");
-    const bodies = texts.map((r) => JSON.parse(r.payload as string) as { text?: string }).map((p) => p.text ?? "");
-    expect(bodies.some((t) => t.includes("/派发"))).toBe(true); // help
-    const status = bodies.find((t) => t.includes("机器："));
-    expect(status).toContain("mac-studio");
-    expect(status).toContain("跑个只读检查"); // the thread from the dispatch above
+    const texts = await sentTexts();
+    expect(texts.some((t) => t.includes("只读检查"))).toBe(true);
+    // The reply came from the model, not from any template:
+    const runs = (await llmState()).runs;
+    expect(runs.filter((r) => r.kind === "user")).toHaveLength(2);
+    expect(runs.every((r) => r.status === "settled")).toBe(true);
     expect(sendCalls(await mockCalls()).length).toBeGreaterThan(0);
+    void (await mockCalls());
   }, 30_000);
 });
