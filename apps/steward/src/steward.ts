@@ -134,6 +134,10 @@ const OWNER_BOUND_REPLY = "✅ 已绑定，设置完成。此后直接在这里�
 // steward.md §6.3: while any sh_run is open, an alarm-driven task polls every 2 seconds; on
 // settlement a user run's final text becomes the reply, everything else is discarded.
 const RUN_POLL_S = 2;
+// §7.2 (review #47-5): a fired once-routine / follow-up authorizes the run its fire spawned
+// — bounded in time, so a long-dead fire is not a standing authorization. Generous enough
+// for a wake queued behind a busy harness (whenBusy: followUp), short enough to revoke.
+const PROVENANCE_FIRE_FRESHNESS_MS = 10 * 60_000;
 // Sent when the first event lands on the webhook after the QR switch: only a delivered event
 // proves the transport actually moved (research §8.2 — the API's callback_type report stays
 // out of sync with real delivery until the console republish lands).
@@ -202,7 +206,9 @@ export type PairResult =
 // cast at the read/write sites instead (same tradeoff the do-protocol spike made).
 export class Steward extends Agent<Env> {
   onStart(): void {
-    runMigrations(this.sql.bind(this), MIGRATIONS);
+    // Each migration runs in one storage transaction (review #47-2): a multi-statement
+    // rebuild can never persist half of itself.
+    runMigrations(this.sql.bind(this), MIGRATIONS, (fn) => this.ctx.storage.transactionSync(fn));
     // Wakes queued by past reducers (crash between queue and submit, §11) drain now.
     void this.drainWakes();
     void this.pollRuns();
@@ -428,9 +434,11 @@ export class Steward extends Agent<Env> {
       buildBrief: () => buildSituationBrief(this.ledger),
       currentRun: () => this.currentRunBinding(),
       checkProvenanceRef: async (ref) => {
-        // §7.2 (review #4 + issue #20): a provenance reference is valid only if this
-        // deployment actually holds what it points at — a received user message, or a
-        // routine/follow-up the owner prescribed earlier (spec §8.3).
+        // §7.2 (review #4 + #47-5): a provenance reference is valid only if this deployment
+        // actually holds — and has not revoked — what it points at. Routine/follow-up ids
+        // authorize while their fire is live: an `active` routine, a `done` once-routine
+        // whose fire may still be executing (bounded by PROVENANCE_FIRE_FRESHNESS), a
+        // freshly `fired` follow-up. Paused/cancelled are the owner's revocation.
         if (ref.startsWith("user:")) {
           const msgId = ref.slice("user:".length);
           if (msgId.length === 0) return false;
@@ -438,11 +446,18 @@ export class Steward extends Agent<Env> {
         }
         if (ref.startsWith("routine:")) {
           const routineId = ref.slice("routine:".length);
-          return routineId.length > 0 && this.ledger.routines.exists(routineId);
+          if (routineId.length === 0) return false;
+          const routine = this.ledger.routines.get(routineId);
+          if (!routine) return false;
+          if (routine.status === "active") return true;
+          return routine.status === "done" && (routine.lastRunAt ?? 0) > Date.now() - PROVENANCE_FIRE_FRESHNESS_MS;
         }
         if (ref.startsWith("followup:")) {
           const followupId = ref.slice("followup:".length);
-          return followupId.length > 0 && this.ledger.followups.exists(followupId);
+          if (followupId.length === 0) return false;
+          const followup = this.ledger.followups.get(followupId);
+          // `open` has not happened yet and authorizes nothing; `fired` is live only while fresh.
+          return followup?.status === "fired" && (followup.firedAt ?? 0) > Date.now() - PROVENANCE_FIRE_FRESHNESS_MS;
         }
         return false;
       },

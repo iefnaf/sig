@@ -157,6 +157,19 @@ describe("pure helpers (routines.ts, wake-text.ts, report-template.ts)", () => {
     expect(card).toContain("等你：继续还是回滚");
   });
 
+  it("more than 4 digest lines: the overflow count survives in the footer, never a silent drop (review #47-1)", () => {
+    const mk = (i: number) => ({ threadId: `t_${i}`, title: `任务 ${i}`, machineName: "mac-studio", agent: "pi" });
+    const card = digestCard({ running: [mk(1), mk(2), mk(3), mk(4), mk(5), mk(6)], waiting: [], unreadIdle: [] }, "例行任务 r_x");
+    const cardJson = JSON.stringify(card);
+    expect(cardJson).toContain("6 个在跑");
+    expect(cardJson).toContain("另有 2 件未列出"); // 6 lines, 4 shown — the count is stated
+    const didLines = (card.elements as Array<{ text?: { content?: string } }>).flatMap((e) =>
+      (e.text?.content ?? "").split("\n"),
+    );
+    expect(didLines.filter((l) => l.startsWith("- 「任务")).length).toBe(4); // renderReportCard's cap held
+    expect(didLines.some((l) => l.includes("任务 5") || l.includes("任务 6"))).toBe(false); // …and the cut is counted
+  });
+
   it("routine/follow-up wake texts carry the marker, the provenance rule, and the context", () => {
     const routine = routineWakeText("r_9", "汇总昨晚进展", {
       schedule: "cron 0 9 * * 1-5（UTC）",
@@ -365,6 +378,73 @@ describe("instruction routines: ⟦routine⟧ wakes with provenance and no_actio
     expect(snap.routines[0]!.lastResult).toContain("done"); // the settle fallback recorded the outcome
     fake.close();
   }, 20_000);
+});
+
+describe("provenance liveness: revoked/stale routine and follow-up ids authorize nothing (§7.2, review #47-5)", () => {
+  it("a fresh once-routine fire still authorizes its own run; a cancelled routine never does", async () => {
+    const fake = await connectedMachine();
+    // A once-routine: firing flips it to `done` — the run it spawns must still be able to cite it.
+    const once = await ownerStub().createRoutineForTest({ instruction: "跑一遍构建", kind: "instruction", onceAt: Date.now() + 3_600_000 });
+    if (!once.ok) throw new Error(once.reason);
+    await scriptModel(
+      fauxAssistantMessage([fauxToolCall("start_worker", { prompt: "跑一遍构建", repoRef: "repo-a", newTitle: "例行构建", provenanceRef: `routine:${once.routineId}`, basis: "routine" })], { stopReason: "toolUse" }),
+      fauxAssistantMessage([fauxText("已派发。")]),
+    );
+    await ownerStub().fireRoutine({ routineId: once.routineId }, { id: "sched_once", time: 1760000000 });
+    const [cmd] = await fake.waitForCmds(1);
+    expect(cmd!.kind).toBe("start_worker"); // fresh done → its fire's run could dispatch
+    await waitRunsSettled();
+
+    // A cancelled routine id is the owner's revocation — refused even in another routine's run.
+    const cancelled = await ownerStub().createRoutineForTest({ instruction: "已取消的那个", kind: "instruction", cron: "0 9 * * *" });
+    if (!cancelled.ok) throw new Error(cancelled.reason);
+    const { runInDurableObject } = await import("cloudflare:test");
+    await runInDurableObject(ownerStub(), (instance: Steward) => {
+      const sql = ((instance as unknown as { sql: (s: TemplateStringsArray, ...v: unknown[]) => unknown }).sql).bind(instance);
+      sql`UPDATE sh_routine SET status = 'cancelled' WHERE routineId = ${cancelled.routineId}`;
+    });
+    const active = await ownerStub().createRoutineForTest({ instruction: "活着的例行", kind: "instruction", cron: "0 9 * * *" });
+    if (!active.ok) throw new Error(active.reason);
+    await scriptModel(
+      fauxAssistantMessage([fauxToolCall("start_worker", { prompt: "再试一次", repoRef: "repo-a", newTitle: "再试一次", provenanceRef: `routine:${cancelled.routineId}`, basis: "routine" })], { stopReason: "toolUse" }),
+      fauxAssistantMessage([fauxToolCall("no_action", { reason: "授权被拒" })], { stopReason: "toolUse" }),
+    );
+    await ownerStub().fireRoutine({ routineId: active.routineId }, { id: "sched_active", time: 1760000100 });
+    await waitRunsSettled();
+    const requests = await modelRequests();
+    expect(requests.some((r) => r.lastToolResult.includes("refused") && r.lastToolResult.includes(cancelled.routineId))).toBe(true);
+    expect((await fake.cmds).length).toBe(1); // no second dispatch ever left the DO
+    fake.close();
+  }, 25_000);
+
+  it("a stale fired follow-up and an open (never-fired) one authorize nothing", async () => {
+    await connectedMachine();
+    const outcome = await ownerStub().dispatchForTest({ prompt: "修 bug", repoRef: "repo-a", newTitle: "修 bug" });
+    if (outcome.kind !== "dispatched") throw new Error(JSON.stringify(outcome));
+    const { runInDurableObject } = await import("cloudflare:test");
+    const check = (ref: string) =>
+      runInDurableObject(ownerStub(), async (instance: Steward) => {
+        const ctx = (instance as unknown as {
+          stewardToolContext: () => { checkProvenanceRef: (r: string) => Promise<boolean> };
+        }).stewardToolContext();
+        return await ctx.checkProvenanceRef(ref);
+      });
+    const hourAgo = Date.now() - 3_600_000;
+    await runInDurableObject(ownerStub(), (instance: Steward) => {
+      const sql = ((instance as unknown as { sql: (s: TemplateStringsArray, ...v: unknown[]) => unknown }).sql).bind(instance);
+      sql`
+        INSERT INTO sh_followup (followupId, threadId, dueAt, reason, createdBy, sourceRef, status, firedAt, createdAt)
+        VALUES ('f_stale', ${outcome.threadId}, ${hourAgo}, '旧的', 'steward', 'user:om_x', 'fired', ${hourAgo}, ${hourAgo})
+      `;
+      sql`
+        INSERT INTO sh_followup (followupId, threadId, dueAt, reason, createdBy, sourceRef, status, createdAt)
+        VALUES ('f_open', ${outcome.threadId}, ${Date.now() + 3_600_000}, '没到期的', 'user', 'user:om_x', 'open', ${Date.now()})
+      `;
+    });
+    expect(await check("followup:f_stale")).toBe(false); // fired an hour ago — long dead
+    expect(await check("followup:f_open")).toBe(false); // never fired — authorizes nothing
+    expect(await check("followup:f_nope")).toBe(false);
+  });
 });
 
 describe("follow-ups: set_followup with sourceRef; due ones submit ⟦followup F⟧ (§8.3)", () => {
@@ -580,4 +660,32 @@ describe("onStart reconciliation (§11: rows ↔ SDK schedules survive crashes)"
     await ownerStub().reconcileRoutineSchedules();
     expect((await routineSchedules()).some((s) => s.payload.routineId === routineId)).toBe(false);
   });
+
+  it("a stranded overdue open follow-up (schedule lost, dueAt long past) is re-armed, not wedged open (review #47-3)", async () => {
+    await connectedMachine();
+    const outcome = await ownerStub().dispatchForTest({ prompt: "修 bug", repoRef: "repo-a", newTitle: "修 bug" });
+    if (outcome.kind !== "dispatched") throw new Error(JSON.stringify(outcome));
+    // An open follow-up whose schedule vanished and whose dueAt is an hour in the past —
+    // exactly the crash window reconcile owns. Cancel the schedule via the raw row id.
+    const { runInDurableObject } = await import("cloudflare:test");
+    await runInDurableObject(ownerStub(), async (instance: Steward) => {
+      const sql = ((instance as unknown as { sql: (s: TemplateStringsArray, ...v: unknown[]) => unknown }).sql).bind(instance);
+      sql`
+        INSERT INTO sh_followup (followupId, threadId, dueAt, reason, createdBy, sourceRef, status, createdAt)
+        VALUES ('f_stranded', ${outcome.threadId}, ${Date.now() - 3_600_000}, '回看', 'steward', 'user:om_any', 'open', ${Date.now() - 3_900_000})
+      `;
+      const schedules = await instance.routineSchedulesForTest();
+      const mine = schedules.find((s) => (s.payload as { followupId?: string }).followupId === "f_stranded");
+      if (mine) await instance.cancelSchedule(mine.id).catch(() => {});
+    });
+    expect((await routineSchedules()).some((s) => s.payload.followupId === "f_stranded")).toBe(false);
+
+    await ownerStub().reconcileRoutineSchedules();
+    // Late is better than stranded: the schedule exists again (at the past dueAt → fires now).
+    expect((await routineSchedules()).some((s) => s.payload.followupId === "f_stranded")).toBe(true);
+    const snap = await waitFor(() => ownerStub().debugSnapshot(), (s) => s.followups.some((f) => f.followupId === "f_stranded" && f.status === "fired"), "stranded follow-up fired late", 10_000);
+    // It fired as a real ⟦followup⟧ wake (the model has no steps → the faux default reply
+    // settles it harmlessly; beforeEach resets the script either way).
+    expect(snap.followups.find((f) => f.followupId === "f_stranded")!.firedAt).not.toBeNull();
+  }, 20_000);
 });

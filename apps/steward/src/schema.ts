@@ -9,12 +9,23 @@ export interface Migration {
   up: (sql: SqlExecutor) => void;
 }
 
-export function runMigrations(sql: SqlExecutor, migrations: readonly Migration[]): void {
+/**
+ * Idempotent migration runner (spike bug 2: `CREATE TABLE IF NOT EXISTS` never adds columns
+ * to an existing table; a ledger of applied migration ids plus plain ALTER statements fixes it).
+ *
+ * `tx` (when provided — the DO passes `ctx.storage.transactionSync`) wraps each migration's
+ * `up()` in one atomic transaction, so a multi-statement rebuild can never persist half of
+ * itself (review #47-2: the 010 timeline rebuild's DROP→RENAME window was the concrete case).
+ * A crash after commit but before the ledger row write merely re-runs a migration that must
+ * already be re-run-safe — every `up()` here is.
+ */
+export function runMigrations(sql: SqlExecutor, migrations: readonly Migration[], tx?: <T>(fn: () => T) => T): void {
   sql`CREATE TABLE IF NOT EXISTS _migrations (id TEXT PRIMARY KEY, appliedAt INTEGER)`;
   for (const migration of migrations) {
     const applied = sql<{ id: string }>`SELECT id FROM _migrations WHERE id = ${migration.id}`;
     if (applied.length > 0) continue;
-    migration.up(sql);
+    if (tx !== undefined) tx(() => migration.up(sql));
+    else migration.up(sql);
     sql`INSERT INTO _migrations (id, appliedAt) VALUES (${migration.id}, ${Date.now()})`;
   }
 }
@@ -404,6 +415,7 @@ export const MIGRATIONS: readonly Migration[] = [
         sourceRef TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'open',
         scheduleId TEXT,
+        firedAt INTEGER,
         lastResult TEXT,
         outcomeRecorded INTEGER NOT NULL DEFAULT 0,
         createdAt INTEGER NOT NULL
@@ -420,16 +432,37 @@ export const MIGRATIONS: readonly Migration[] = [
       )`;
       // Routine fires may be Thread-less (a digest scans everything); the timeline's
       // threadId becomes nullable so every fire still leaves an auditable entry (§8.6).
-      // Table rebuild: SQLite cannot relax NOT NULL in place. A leftover sh_timeline_new
-      // from an interrupted run is dropped first so the copy always starts clean.
-      sql`DROP TABLE IF EXISTS sh_timeline_new`;
-      sql`CREATE TABLE sh_timeline_new (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, threadId TEXT, ts INTEGER NOT NULL,
-        kind TEXT NOT NULL, text TEXT NOT NULL, refs TEXT
-      )`;
-      sql`INSERT INTO sh_timeline_new (id, threadId, ts, kind, text, refs) SELECT id, threadId, ts, kind, text, refs FROM sh_timeline`;
-      sql`DROP TABLE sh_timeline`;
-      sql`ALTER TABLE sh_timeline_new RENAME TO sh_timeline`;
+      // Table rebuild: SQLite cannot relax NOT NULL in place. Each interruption point must
+      // be recoverable even without a wrapping transaction (review #47-2) — most critically
+      // the DROP→RENAME window, where sh_timeline_new holds the ONLY copy: a rerun RENAMES
+      // it instead of dropping it. The runner's per-migration transactionSync (steward.ts)
+      // makes the window unreachable in production; this guard covers non-transactional
+      // callers (tests) and is harmless on re-runs.
+      const tables = sql<{ name: string }>`
+        SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('sh_timeline', 'sh_timeline_new')
+      `.map((r) => r.name);
+      if (tables.includes("sh_timeline_new")) {
+        if (tables.includes("sh_timeline")) {
+          sql`DROP TABLE sh_timeline_new`; // stale partial copy; the original is intact — redo
+        } else {
+          sql`ALTER TABLE sh_timeline_new RENAME TO sh_timeline`; // the copy is the only copy
+        }
+      } else if (tables.includes("sh_timeline")) {
+        sql`CREATE TABLE sh_timeline_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, threadId TEXT, ts INTEGER NOT NULL,
+          kind TEXT NOT NULL, text TEXT NOT NULL, refs TEXT
+        )`;
+        sql`INSERT INTO sh_timeline_new (id, threadId, ts, kind, text, refs) SELECT id, threadId, ts, kind, text, refs FROM sh_timeline`;
+        sql`DROP TABLE sh_timeline`;
+        sql`ALTER TABLE sh_timeline_new RENAME TO sh_timeline`;
+      } else {
+        // Neither exists (a ledger that skipped 004 — unreachable in the ordered list, but
+        // the rebuild must not be what explodes): create the nullable shape directly.
+        sql`CREATE TABLE sh_timeline (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, threadId TEXT, ts INTEGER NOT NULL,
+          kind TEXT NOT NULL, text TEXT NOT NULL, refs TEXT
+        )`;
+      }
       sql`CREATE INDEX IF NOT EXISTS sh_timeline_thread ON sh_timeline (threadId, id)`;
     },
   },

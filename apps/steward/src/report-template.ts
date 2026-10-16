@@ -209,15 +209,16 @@ export function digestCard(data: DigestData, footer: string) {
     ...data.waiting.map((w) => `「${w.title}」等你：${w.question}`),
     ...data.unreadIdle.map((u) => `「${u.title}」有未读汇报${u.summary ? `：${u.summary}` : ""}`),
   ];
-  // renderReportCard caps did at 4; fold the overflow into a count line instead of dropping it.
+  // renderReportCard caps did at 4 — so the overflow count rides the FOOTER, never a fifth
+  // did line that the cap would silently swallow (review #47-1): no omission is ever silent.
   const shown = lines.slice(0, MAX_DID_ITEMS).map((line) => clip(line, MAX_DID_ITEM));
-  if (lines.length > MAX_DID_ITEMS) shown.push(`（另有 ${lines.length - MAX_DID_ITEMS} 件未列出，问我要详情）`);
+  const overflow = lines.length - shown.length;
   return renderReportCard({
     tone: data.waiting.length > 0 ? "attention" : "success",
     conclusion: `例行汇总：${parts.join("、")}`,
     did: shown,
     threadTitle: "",
-    footer,
+    footer: overflow > 0 ? `${footer}（另有 ${overflow} 件未列出，问我要详情）` : footer,
   });
 }
 

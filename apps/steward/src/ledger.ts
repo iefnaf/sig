@@ -199,6 +199,8 @@ export interface FollowupRow {
   sourceRef: string;
   status: FollowupStatus;
   scheduleId: string | null;
+  /** When it fired — the freshness bound for using it as a provenance ref (review #47-5). */
+  firedAt: number | null;
   lastResult: string | null;
   outcomeRecorded: boolean;
   createdAt: number;
@@ -366,6 +368,7 @@ const viewFollowup = (r: Record<string, unknown>): FollowupRow => ({
   sourceRef: r.sourceRef as string,
   status: r.status as FollowupStatus,
   scheduleId: (r.scheduleId as string | null) ?? null,
+  firedAt: (r.firedAt as number | null) ?? null,
   lastResult: (r.lastResult as string | null) ?? null,
   outcomeRecorded: !!r.outcomeRecorded,
   createdAt: r.createdAt as number,
@@ -996,7 +999,7 @@ export function createLedger(deps: LedgerDeps) {
     beginFire(followupId: string, initialResult: string): boolean {
       return tx(() => {
         sql`
-          UPDATE sh_followup SET status = 'fired', lastResult = ${initialResult}, outcomeRecorded = 0
+          UPDATE sh_followup SET status = 'fired', firedAt = ${now()}, lastResult = ${initialResult}, outcomeRecorded = 0
           WHERE followupId = ${followupId} AND status = 'open'
         `;
         return sql<{ changes: number }>`SELECT changes() AS changes`[0]!.changes > 0;

@@ -153,6 +153,10 @@ export class RoutineService {
     // through providerMsgId → outbound id "offer:<offerId>" (steward.md §3.1's rule — no
     // ids stuffed into button values).
     const outboundId = `offer:${input.offerId}`;
+    // Row FIRST, card second (review #47-4): a crash between the two then leaves an offer
+    // row without a card (harmless, never tappable) — never a live card whose tap finds no
+    // row and lies "已经处理过了".
+    this.ledger.offers.create({ offerId: input.offerId, spec, sourceMsg: input.sourceMsg, outboundId });
     await this.#deps.enqueueOutbound({
       id: outboundId,
       kind: "card",
@@ -161,7 +165,6 @@ export class RoutineService {
       threadId: input.threadId ?? null,
       urgency: "push",
     });
-    this.ledger.offers.create({ offerId: input.offerId, spec, sourceMsg: input.sourceMsg, outboundId });
     return { ok: true };
   }
 
@@ -410,7 +413,10 @@ export class RoutineService {
     }
     for (const followup of this.ledger.followups.list()) {
       const ids = byFollowup.get(followup.followupId) ?? [];
-      if (followup.status === "open" && ids.length === 0 && followup.dueAt > this.now() - 60_000) {
+      if (followup.status === "open" && ids.length === 0) {
+        // Late is better than stranded (review #47-3): re-arm at the ORIGINAL dueAt — a past
+        // moment fires immediately — instead of leaving the row wedged open forever. This is
+        // exactly the crash window reconcile exists for (short afterMinutes make it certain).
         try {
           const sched = await this.#deps.schedule(new Date(followup.dueAt), "fireFollowup", { followupId: followup.followupId }, { idempotent: true });
           this.ledger.followups.setScheduleId(followup.followupId, sched.id);
