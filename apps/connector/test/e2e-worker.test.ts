@@ -1,7 +1,7 @@
 // End-to-end: a `start_worker` command arriving over the real transport (mock steward)
 // drives the WorkerManager + fake-pi, and the started → progress → report(+git) → settled
 // events come back on the same socket — issue #3's acceptance path over #30's transport.
-import { rmSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ConnectorApp } from "../src/connector-app.ts";
@@ -123,4 +123,48 @@ describe("start_worker over the real transport (issue #3 + #30)", () => {
     const result = await waitFor(() => mock.resultsFor(cmdId), 10_000, "cmd_result");
     expect(result).toMatchObject({ ok: false, error: { code: "unsupported_command" } });
   }, 30_000);
+
+  // Issue #13 end to end over the real transport: the stalled worker is detected, respawned
+  // once (resumed{reason:stall} on the wire), and the second stall settles error:stall —
+  // every event persisted through the EventLog before it hits the socket, seqs contiguous.
+  it("drives a stalled worker to one respawn and then error:stall (issue #13)", async () => {
+    const runsFile = join(dir, "runs-shared.txt");
+    writeFileSync(runsFile, "0");
+    const scenario = writeScenario(dir, "scenario", [[{ delayMs: 20_000 }], [{ delayMs: 20_000 }]]);
+    app = new ConnectorApp({
+      store,
+      stateDir,
+      adapter: fakePiAdapter(stateDir, scenario, { FAKE_PI_RUNS_FILE: runsFile }),
+      watchdog: {
+        stallMs: 400,
+        tickMs: 80,
+        cpuSampleGapMs: 10,
+        // A permanently cold, stable tree: identical members, zero accumulated CPU.
+        sampleTreeCpu: () => Promise.resolve({ totalCpuMs: 0, members: ["w-e2e-stall@t0"] }),
+      },
+    });
+    await app.start();
+    await mock.waitConnected();
+
+    const cmdId = mock.sendCmd("start_worker", {
+      workerId: "w-e2e-stall",
+      threadId: "t-stall",
+      repoId: repo,
+      mode: "write",
+      prompt: "Do the thing",
+    });
+    await waitFor(() => mock.resultsFor(cmdId), 15_000, "cmd_result");
+
+    await waitFor(
+      () => mock.events().find((e) => e.type === "settled"),
+      20_000,
+      "settled error:stall on the wire",
+    );
+    const events = mock.events().filter((e) => e.workerId === "w-e2e-stall") as Array<Record<string, unknown>>;
+    expect(events.map((e) => e.seq)).toEqual(events.map((_, i) => i + 1)); // seqs contiguous from 1
+    const stalls = events.filter((e) => e.type === "progress" && e.tool === "stall-watchdog");
+    expect(stalls).toHaveLength(2);
+    expect(events.find((e) => e.type === "resumed")).toMatchObject({ reason: "stall", count: 1 });
+    expect(events.find((e) => e.type === "settled")).toMatchObject({ outcome: "error", errorClass: "stall" });
+  }, 60_000);
 });

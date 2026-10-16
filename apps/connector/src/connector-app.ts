@@ -10,6 +10,7 @@ import type { CommandResult } from "./commands.ts";
 import type { CmdMessage } from "@shepherd/protocol";
 import { EventLog } from "./events.ts";
 import type { LocalStore } from "./store.ts";
+import type { StallWatchdogOptions } from "./watchdog.ts";
 import { CommandError, WorkerManager, type RecoveryOptions } from "./worker-manager.ts";
 
 export interface ConnectorAppOptions {
@@ -21,6 +22,8 @@ export interface ConnectorAppOptions {
   adapter?: import("./agent.ts").AgentAdapter;
   /** §9 recovery knobs (tests shrink timers and inject process I/O). */
   recovery?: RecoveryOptions;
+  /** Stall-watchdog knobs (tests shrink timers and inject CPU samples). */
+  watchdog?: StallWatchdogOptions;
   /** Coarse lifecycle logging (daemon): event names and ids only, never session content. */
   log?: (event: string, fields?: Record<string, unknown>) => void;
   /** Connection lifecycle hooks, forwarded to the client (the daemon logs these). */
@@ -48,6 +51,12 @@ export class ConnectorApp {
       stateDir: options.stateDir,
       adapter: options.adapter,
       recovery: options.recovery,
+      // Detection failures must surface in the daemon log, never as an unhandled rejection
+      // (Node's default would crash the connector over its own watchdog).
+      watchdog: {
+        ...options.watchdog,
+        onError: (err) => this.log?.("watchdog_error", { error: err instanceof Error ? err.message : String(err) }),
+      },
       emit: (workerId, fields) => {
         this.log?.("worker_event", { workerId, type: fields.type });
         this.client.emit(workerId, fields);
