@@ -1,11 +1,13 @@
 // The memory module's ledger half (issue #5, steward.md §2): every sh_* table belongs to this
 // file and callers reach it only through the returned interface — never with raw SQL. The
 // event reducer (§5.1-5.3) is deterministic, runs in one transaction, and recomputes Thread
-// derived state (`running / waiting_you / idle`) plus unread after every change. Notes,
-// retrieval, and the situation brief's character budget arrive with M3; the interface below
-// is the M1 subset, shaped so those slot in without a rewrite.
+// derived state (`running / waiting_you / idle`) plus unread after every change. Notes (the
+// knowledge half, issue #18) live in notes.ts behind the `notes` handle below — same rule:
+// sh_note* is reached only through the memory module. The situation brief's character
+// budget is brief.ts's.
 import { ulid } from "@shepherd/protocol";
 import type { HelloMessage } from "@shepherd/protocol";
+import { createNotes, type NoteRow } from "./notes.ts";
 import { eventWakeText, queueReturnedWakeText } from "./wake-text.ts";
 
 /** Tagged-template SQL over the DO's SQLite (same shape schema.ts migrations use). */
@@ -386,6 +388,10 @@ const viewOffer = (r: Record<string, unknown>): RoutineOfferRow => ({
 export function createLedger(deps: LedgerDeps) {
   const { sql, tx } = deps;
   const now = deps.now ?? Date.now;
+
+  // The notes half of the memory module (issue #18, steward.md §2.3-§2.5): layered
+  // knowledge with a two-phase write. Same SQL handle, same transaction wrapper.
+  const notes = createNotes({ sql, tx, now });
 
   const threadFromRow = (r: Record<string, unknown>): ThreadRow => ({
     threadId: r.threadId as string,
@@ -1334,12 +1340,13 @@ export function createLedger(deps: LedgerDeps) {
       pendingNotifications: NotifyRow[];
       runs: RunRow[];
       wakes: WakeRow[];
+      notes: NoteRow[];
+      noteLog: Array<{ id: number; ts: number; op: string; noteId: string; text: string; reason: string | null; reportedAt: number | null }>;
       routines: RoutineRow[];
       followups: FollowupRow[];
       offers: RoutineOfferRow[];
       /** The newest timeline entries across ALL threads — routine fires may be Thread-less. */
-      timelineRecent: Array<{ id: number; threadId: string | null; ts: number; kind: string; text: string }>;
-    } {
+      timelineRecent: Array<{ id: number; threadId: string | null; ts: number; kind: string; text: string }>;    } {
       return {
         machines: machines.list(),
         threads: threads.list().map((t) => ({
@@ -1355,6 +1362,14 @@ export function createLedger(deps: LedgerDeps) {
         pendingNotifications: notifications.pending(),
         runs: runs.rows(),
         wakes: sql<WakeRow>`SELECT * FROM sh_wake ORDER BY id`,
+        notes: sql<Record<string, unknown>>`SELECT * FROM sh_note ORDER BY createdAt, noteId`.map((r) => ({
+          ...r,
+          confirmed: !!r.confirmed,
+          pinned: !!r.pinned,
+        })) as unknown as NoteRow[],
+        noteLog: sql<{ id: number; ts: number; op: string; noteId: string; text: string; reason: string | null; reportedAt: number | null }>`
+          SELECT id, ts, op, noteId, text, reason, reportedAt FROM sh_note_log ORDER BY id
+        `,
         routines: routines.list(),
         followups: followups.list(),
         offers: sql<Record<string, unknown>>`SELECT * FROM sh_routine_offer ORDER BY createdAt`.map(viewOffer),
@@ -1367,7 +1382,7 @@ export function createLedger(deps: LedgerDeps) {
 
   return {
     machines, repos, threads, workers, reports, questions, timeline, notifications, outbound,
-    runs, wakes, routines, followups, offers, views, applyPendingEvents, recomputeThreadState, debug,
+    runs, wakes, notes, routines, followups, offers, views, applyPendingEvents, recomputeThreadState, debug,
   };
 }
 
