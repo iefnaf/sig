@@ -227,7 +227,7 @@ describe("the wake queue: merge window and replay safety (steward.md §5.1/§5.4
     const { fake, workerId } = await dispatchOne("两件事");
     // A second worker on the same thread, reporting inside the merge window.
     await scriptModel(
-      fauxAssistantMessage([fauxToolCall("start_worker", { prompt: "第二件", repoRef: "repo-a", threadId: (await ownerStub().debugSnapshot()).threads[0]!.threadId, basis: "user_explicit" })], { stopReason: "toolUse" }),
+      fauxAssistantMessage([fauxToolCall("start_worker", { prompt: "第二件", repoRef: "repo-a", threadId: (await ownerStub().debugSnapshot()).threads[0]!.threadId, basis: "user_explicit", routing: { confidence: "high", reason: "用户说接着这个 Thread" } })], { stopReason: "toolUse" }),
       fauxAssistantMessage([fauxText("已续派。")]),
     );
     await dm("再来第二件");
@@ -404,8 +404,16 @@ describe("the tools (steward.md §4.3)", () => {
     const thread = snap.threads[0]!;
     expect(thread.state).toBe("waiting_you");
     expect(thread.questions[0]).toMatchObject({ status: "open", text: "用哪个方案？" });
-    const texts = await sentTexts();
-    expect(texts.some((t) => t.includes("用哪个方案") && t.includes("1. A 回滚"))).toBe(true);
+    // Issue #7: the ask is an interactive card whose buttons carry only opaque action ids —
+    // no thread data stuffed into the value, and no option text masquerading as a message.
+    const askCards = (await ownerStub().outboundRows(30)).filter(
+      (r) => r.kind === "card" && r.status === "sent" && JSON.stringify(r.payload).includes("用哪个方案"),
+    );
+    expect(askCards).toHaveLength(1);
+    expect(askCards[0]!.threadId).toBe(threadId);
+    const card = JSON.parse(askCards[0]!.payload as string) as { card?: { elements?: Array<{ tag?: string; actions?: Array<{ value?: { action?: string } }> }> } };
+    const actions = (card.card?.elements ?? []).flatMap((e) => e.actions ?? []);
+    expect(actions.map((a) => a.value?.action?.startsWith("ask:"))).toEqual([true, true]);
     // control.terminate ended the turn: no second model request happened after ask_user.
     const requests = await modelRequests();
     expect(requests.filter((r) => r.userText.includes("接下来怎么办")).length).toBeLessThanOrEqual(1);

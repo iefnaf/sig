@@ -95,12 +95,19 @@ export interface GitFacts {
 
 export interface QuestionRow {
   qid: string;
-  threadId: string;
+  /** Null for ask_user's threadless routing questions (issue #7, steward.md §3.3). */
+  threadId: string | null;
   workerId: string | null;
   text: string;
   status: "open" | "answered";
   askedAt: number;
   answeredAt: number | null;
+}
+
+/** The ask_user question's button mapping (issue #7): what each card button means. */
+export interface AskCandidates {
+  options: string[];
+  candidates: Array<{ threadId: string; label: string }>;
 }
 
 export interface TimelineRow {
@@ -149,7 +156,7 @@ export interface WakeRow {
 /** One steward run (steward.md §6.3): a submitted input and how its outcome is handled. */
 export interface RunRow {
   operationId: string;
-  kind: "user" | "event" | "routine" | "followup";
+  kind: "user" | "event" | "routine" | "followup" | "verify";
   replyTo: string | null;
   channel: string | null;
   routedThreadId: string | null;
@@ -162,8 +169,96 @@ export interface RunRow {
   /** The run already produced user-facing output (notify_user/ask_user) — an empty final
    *  text is then legitimate, not a failure (review #9). */
   notified: boolean;
+  /** Real dispatches inside this run (settle-time verification, issue #7). */
+  dispatchCount: number;
   createdAt: number;
   settledAt: number | null;
+}
+
+// ---- routing (steward.md §3, issue #7) -----------------------------------------------------------
+
+/** One row of findCandidates' answer. */
+export interface RouteCandidate {
+  threadId: string;
+  title: string;
+  /** One-line summary (null when the thread has none yet). */
+  summary: string | null;
+  repos: string[];
+  state: ThreadState;
+  lastActivityAt: number;
+  /** Why this candidate is here: 进行中 / 等你拍板 / 关键词命中 / 最近活跃 / 回复指向. */
+  matchReason: string;
+  /** Below the recall cutoff's confidence band — attach on it alone is exactly the guess
+   *  the confidence gate exists to stop (spike eval tuning). */
+  weak: boolean;
+}
+
+/** §3.2's answer: an explicit short-circuit, or the assembled candidate set. */
+export interface RouteCandidates {
+  confidence: "explicit" | "candidates";
+  /** Set iff confidence is "explicit": the one thread signals 1–2 resolved to. */
+  explicitThread: RouteCandidate | null;
+  candidates: RouteCandidate[];
+}
+
+/** How many threads each recall bucket contributes (§3.2). */
+export const FTS_RECALL_LIMIT = 8;
+export const RECENT_RECALL_LIMIT = 5;
+/** The assembled set never exceeds this (§3.2). */
+export const CANDIDATE_CAP = 12;
+/** Bigram overlap at or above this counts as a real match (the spike eval's cutoff). */
+export const RECALL_SCORE_CUTOFF = 2;
+/** Weak below this — informative, but never attachable alone. */
+export const RECALL_WEAK_BELOW = 5;
+
+const routeSummaryOf = (summary: string | null): string | null =>
+  summary && summary.length > 0 ? (summary.length > 120 ? `${summary.slice(0, 119)}…` : summary) : null;
+
+/**
+ * The recall scorer behind findCandidates (spike-final's eval-tuned algorithm, ported):
+ * CJK has no spaces, so overlap is scored by character-bigram hits plus latin word matches —
+ * 「依赖升级…」 finds 「升级依赖」, and 「文档补完」 finds 「补 API 文档」. It covers the
+ * 2-character queries the trigram FTS index cannot match, and ranks the FTS-recalled bucket.
+ */
+export function recallScore(query: string, haystack: string): number {
+  const q = query.toLowerCase();
+  const hay = haystack.toLowerCase();
+  const gramSet = (text: string): Set<string> => {
+    const set = new Set<string>();
+    const chars = [...text];
+    for (let i = 0; i < chars.length - 1; i++) {
+      if (!/\s/.test(chars[i]!) && !/\s/.test(chars[i + 1]!)) set.add(chars[i]! + chars[i + 1]!);
+    }
+    return set;
+  };
+  const grams = gramSet(q);
+  const hayGrams = gramSet(hay);
+  const gramHits = [...grams].filter((g) => hayGrams.has(g)).length;
+  const latin = q.match(/[a-z0-9_./-]{2,}/g) ?? [];
+  const latinHits = latin.filter((t) => hay.includes(t)).length;
+  return gramHits + latinHits * 2;
+}
+
+/** The FTS5 MATCH expression for findCandidates: latin segments ≥3 chars stay whole (word
+ *  matches), CJK text contributes every 3-character window (the trigram index matches
+ *  substrings, so a whole long phrase would never hit). Quotes are stripped so user text can
+ *  never inject FTS operators; terms dedupe; the count stays bounded for long inputs. */
+export function ftsMatchExpression(text: string): string | null {
+  const terms = new Set<string>();
+  for (const segment of text.split(/[\s\p{P}\p{S}]+/u)) {
+    const clean = segment.replace(/"/g, "").trim();
+    if (clean.length === 0) continue;
+    if (/^[a-z0-9_./-]+$/i.test(clean)) {
+      if ([...clean].length >= 3) terms.add(clean.toLowerCase());
+      continue;
+    }
+    const chars = [...clean];
+    for (let i = 0; i + 2 < chars.length; i++) terms.add(chars.slice(i, i + 3).join(""));
+    if (chars.length === 3) terms.add(clean);
+  }
+  const ordered = [...terms].slice(0, 24);
+  if (ordered.length === 0) return null;
+  return ordered.map((term) => `"${term}"`).join(" OR ");
 }
 
 // ---- proactive behavior (issue #20, steward.md §8) ----------------------------------------------
@@ -248,6 +343,8 @@ export interface ThreadListEntry {
 export interface NewThreadInput {
   title: string;
   goal: string;
+  /** Stable id for eval/world seeding; generated when omitted. */
+  threadId?: string;
   createdFromMsg?: string;
   repoIds?: string[];
 }
@@ -334,7 +431,7 @@ const viewReport = (r: Record<string, unknown>): ReportRow => ({
 
 const viewQuestion = (r: Record<string, unknown>): QuestionRow => ({
   qid: r.qid as string,
-  threadId: r.threadId as string,
+  threadId: (r.threadId as string | null) ?? null,
   workerId: (r.workerId as string | null) ?? null,
   text: r.text as string,
   status: r.status as QuestionRow["status"],
@@ -463,13 +560,21 @@ export function createLedger(deps: LedgerDeps) {
         ORDER BY repoId
       `;
     },
+    /** All registered repos (the brief's repos line, issue #7). */
+    list(): Array<{ repoId: string; deviceId: string; name: string; online: boolean }> {
+      return sql<{ repoId: string; deviceId: string; name: string; online: boolean }>`
+        SELECT r.repoId, r.deviceId, r.name, COALESCE(m.online, 0) AS online
+        FROM sh_repo r LEFT JOIN sh_machine m ON m.deviceId = r.deviceId
+        ORDER BY r.name, r.repoId
+      `;
+    },
   };
 
   // ---- threads / workers -----------------------------------------------------------------------
 
   const threads = {
     create(input: NewThreadInput): ThreadRow {
-      const threadId = `t_${ulid()}`;
+      const threadId = input.threadId ?? `t_${ulid()}`;
       const ts = now();
       sql`
         INSERT INTO sh_thread (threadId, title, goal, state, unread, lastActivityAt, createdFromMsg, createdAt)
@@ -514,6 +619,142 @@ export function createLedger(deps: LedgerDeps) {
         WHERE threadId = ${threadId}
       `;
       return true;
+    },
+
+    /**
+     * threads.findCandidates (§3.2, issue #7): routing candidates for one utterance.
+     *
+     * 1. Signal 1 (reply-to / card click) never reaches here in production — the input is
+     *    routed before the model — but `explicitThreadId` short-circuits the same way when
+     *    the caller knows it. Signal 2 (explicit mention): the text contains exactly one
+     *    thread's title or a thread id (or `hints` name repos/machines that pin one thread).
+     *    A unique hit returns as `confidence: "explicit"` with just that thread.
+     * 2. Otherwise: all running + waiting-you threads, then the FTS-recalled top 8 over the
+     *    text (trigram index, ranked by the bigram scorer so 2-char queries count too), then
+     *    the 5 most recent — deduped, capped at 12, each with a match reason.
+     */
+    findCandidates(input: { text: string; hints?: string[]; explicitThreadId?: string | null }): RouteCandidates {
+      const all = sql<Record<string, unknown>>`
+        SELECT * FROM sh_thread WHERE archived = 0 ORDER BY lastActivityAt DESC, threadId
+      `.map(threadFromRow);
+      const reposOf = (threadId: string): string[] =>
+        sql<{ repoId: string }>`SELECT repoId FROM sh_thread_repo WHERE threadId = ${threadId}`.map((r) => r.repoId);
+      const toCandidate = (thread: ThreadRow, matchReason: string, weak = false): RouteCandidate => ({
+        threadId: thread.threadId,
+        title: thread.title,
+        summary: routeSummaryOf(thread.summary),
+        repos: reposOf(thread.threadId),
+        state: thread.state,
+        lastActivityAt: thread.lastActivityAt,
+        matchReason,
+        weak,
+      });
+
+      // ---- signal 1: the caller already resolved the thread (reply / card click) ----
+      if (input.explicitThreadId) {
+        const routed = all.find((t) => t.threadId === input.explicitThreadId);
+        if (routed) {
+          return {
+            confidence: "explicit",
+            explicitThread: toCandidate(routed, "回复/按钮显式指向"),
+            candidates: [toCandidate(routed, "回复/按钮显式指向")],
+          };
+        }
+      }
+
+      // ---- signal 2: explicit mention — the text names exactly one thread ----
+      const lower = input.text.toLowerCase();
+      const mentioned = all.filter((t) => t.title.length > 1 && lower.includes(t.title.toLowerCase()));
+      const byId = all.filter((t) => lower.includes(t.threadId.toLowerCase()));
+      // Hints (§3.1 signal 2): repo or machine names pin the thread set.
+      const hintThreads = new Set<string>();
+      for (const hint of input.hints ?? []) {
+        for (const row of repos.machinesHaving(hint)) {
+          for (const t of all) if (reposOf(t.threadId).includes(row.repoId)) hintThreads.add(t.threadId);
+        }
+        for (const machine of machines.list()) {
+          if (machine.name === hint || machine.deviceId === hint) {
+            for (const w of sql<{ threadId: string }>`SELECT DISTINCT threadId FROM sh_worker WHERE deviceId = ${machine.deviceId}`) {
+              hintThreads.add(w.threadId);
+            }
+          }
+        }
+      }
+      const explicitPicks = [...new Set([...mentioned, ...byId].map((t) => t.threadId))];
+      const explicitUnique =
+        explicitPicks.length === 1
+          ? (all.find((t) => t.threadId === explicitPicks[0]) ?? null)
+          : hintThreads.size === 1
+            ? (all.find((t) => t.threadId === [...hintThreads][0]) ?? null)
+            : null;
+      if (explicitUnique) {
+        const reason = mentioned.some((t) => t.threadId === explicitUnique.threadId)
+          ? "消息里点名了它的标题"
+          : byId.some((t) => t.threadId === explicitUnique.threadId)
+            ? "消息里带了它的 id"
+            : "仓库/机器指向它";
+        const candidate = toCandidate(explicitUnique, reason);
+        return { confidence: "explicit", explicitThread: candidate, candidates: [candidate] };
+      }
+
+      // ---- assembly (§3.2 step 2) ----
+      const active = all.filter((t) => t.state === "running" || t.state === "waiting_you");
+      const picked = new Set<string>(active.map((t) => t.threadId));
+      const candidates: RouteCandidate[] = active
+        .sort((a, b) => (a.state === b.state ? b.lastActivityAt - a.lastActivityAt : a.state === "running" ? -1 : 1))
+        .map((t) => toCandidate(t, t.state === "running" ? "进行中" : "等你拍板"));
+
+      // Recall: FTS over the text (trigram index), ranked by the bigram scorer; the scorer
+      // alone stands in when the index has no ≥3-char segment to match (or the runtime's
+      // SQLite lacks FTS5 — findCandidates must never throw over recall).
+      const scored = all
+        .map((thread) => {
+          const report = sql<{ summary: string | null }>`
+            SELECT summary FROM sh_report WHERE threadId = ${thread.threadId} ORDER BY receivedAt DESC, seq DESC LIMIT 1
+          `[0]?.summary;
+          const hay = `${thread.title} ${thread.goal ?? ""} ${thread.summary ?? ""} ${report ?? ""}`;
+          return { thread, score: recallScore(input.text, hay) + (thread.state !== "idle" ? 1 : 0) };
+        })
+        .filter((entry) => entry.score >= RECALL_SCORE_CUTOFF)
+        .sort((a, b) => b.score - a.score || b.thread.lastActivityAt - a.thread.lastActivityAt);
+
+      let ftsIds: string[] = [];
+      const match = ftsMatchExpression(input.text);
+      if (match !== null) {
+        try {
+          ftsIds = sql<{ threadId: string }>`
+            SELECT threadId FROM sh_thread_fts WHERE sh_thread_fts MATCH ${match} ORDER BY bm25(sh_thread_fts) LIMIT 32
+          `.map((r) => r.threadId);
+        } catch {
+          ftsIds = []; // no FTS5 / tokenizer in this runtime: the scorer above is the recall
+        }
+      }
+      const recallOrder = new Map<string, number>();
+      ftsIds.forEach((id, index) => recallOrder.set(id, index));
+      const recalled = [...scored]
+        .sort((a, b) => {
+          // The bigram scorer ranks (spike-eval-tuned); FTS presence is the recall net and
+          // bm25 order only breaks scorer ties — bm25 over OR'd trigrams is too noisy to lead.
+          const sa = recallOrder.has(a.thread.threadId) ? recallOrder.get(a.thread.threadId)! : 999;
+          const sb = recallOrder.has(b.thread.threadId) ? recallOrder.get(b.thread.threadId)! : 999;
+          return b.score - a.score || sa - sb || b.thread.lastActivityAt - a.thread.lastActivityAt;
+        })
+        .slice(0, FTS_RECALL_LIMIT);
+      for (const entry of recalled) {
+        if (picked.has(entry.thread.threadId)) continue;
+        if (candidates.length >= CANDIDATE_CAP) break;
+        picked.add(entry.thread.threadId);
+        candidates.push(toCandidate(entry.thread, `关键词命中（${entry.score}）`, entry.score < RECALL_WEAK_BELOW));
+      }
+
+      for (const thread of all.slice(0, RECENT_RECALL_LIMIT)) {
+        if (picked.has(thread.threadId)) continue;
+        if (candidates.length >= CANDIDATE_CAP) break;
+        picked.add(thread.threadId);
+        candidates.push(toCandidate(thread, "最近活跃", true));
+      }
+
+      return { confidence: "candidates", explicitThread: null, candidates };
     },
   };
 
@@ -646,6 +887,42 @@ export function createLedger(deps: LedgerDeps) {
         ORDER BY askedAt DESC LIMIT 1
       `[0];
       return row ? viewQuestion(row) : null;
+    },
+    get(qid: string): QuestionRow | null {
+      return (sql<Record<string, unknown>>`SELECT * FROM sh_question WHERE qid = ${qid}`[0] ?? null) as QuestionRow | null;
+    },
+    /** The ask_user button mapping (issue #7): plain options + routing candidates. */
+    payload(qid: string): AskCandidates | null {
+      const row = sql<{ options: string | null; candidates: string | null }>`
+        SELECT options, candidates FROM sh_question WHERE qid = ${qid}
+      `[0];
+      if (!row) return null;
+      return {
+        options: jsonOrNull<string[]>(row.options) ?? [],
+        candidates: jsonOrNull<AskCandidates["candidates"]>(row.candidates) ?? [],
+      };
+    },
+    /** ask_user's insert (issue #7): threadId null for a threadless routing ask. */
+    insert(input: { qid: string; threadId: string | null; workerId?: string | null; text: string; options?: string[]; candidates?: AskCandidates["candidates"] }): void {
+      sql`
+        INSERT OR IGNORE INTO sh_question (qid, threadId, workerId, text, options, candidates, status, askedAt)
+        VALUES (${input.qid}, ${input.threadId}, ${input.workerId ?? null}, ${input.text},
+                ${JSON.stringify(input.options ?? [])}, ${JSON.stringify(input.candidates ?? [])}, 'open', ${now()})
+      `;
+    },
+    /** Marks one question answered with what settled it (a click's chosen label). */
+    close(qid: string, answer: string): boolean {
+      sql`
+        UPDATE sh_question SET status = 'answered', answeredAt = ${now()}
+        WHERE qid = ${qid} AND status = 'open'
+      `;
+      const changed = sql<{ changes: number }>`SELECT changes() AS changes`[0]!.changes > 0;
+      const row = changed ? questions.get(qid) : null;
+      if (row?.threadId) {
+        timeline.add(row.threadId, "note", `问题已回答：${answer.slice(0, 120)}`, { qid });
+        recomputeThreadState(row.threadId);
+      }
+      return changed;
     },
     /** A fresh dispatch supersedes what the Thread was waiting on (the user moved on). */
     closeOpen(threadId: string, reason: string): void {
@@ -883,6 +1160,10 @@ export function createLedger(deps: LedgerDeps) {
     },
     get(operationId: string): RunRow | null {
       return (sql<RunRow>`SELECT * FROM sh_run WHERE operationId = ${operationId}`[0] ?? null);
+    },
+    /** One more real dispatch happened inside this run (settle-time verification, issue #7). */
+    countDispatch(operationId: string): void {
+      sql`UPDATE sh_run SET dispatchCount = dispatchCount + 1 WHERE operationId = ${operationId}`;
     },
     rows(): RunRow[] {
       return sql<RunRow>`SELECT * FROM sh_run ORDER BY createdAt, operationId`;
@@ -1337,6 +1618,8 @@ export function createLedger(deps: LedgerDeps) {
     snapshot(): {
       machines: MachineRow[];
       threads: Array<ThreadRow & { repoIds: string[]; workers: WorkerRow[]; questions: QuestionRow[]; timeline: TimelineRow[] }>;
+      /** Every question row, threadless routing asks included (issue #7). */
+      questions: QuestionRow[];
       pendingNotifications: NotifyRow[];
       runs: RunRow[];
       wakes: WakeRow[];
@@ -1359,6 +1642,10 @@ export function createLedger(deps: LedgerDeps) {
           `,
           timeline: timeline.list(t.threadId),
         })),
+        questions: sql<QuestionRow>`
+          SELECT qid, threadId, workerId, text, status, askedAt, answeredAt
+          FROM sh_question ORDER BY askedAt
+        `,
         pendingNotifications: notifications.pending(),
         runs: runs.rows(),
         wakes: sql<WakeRow>`SELECT * FROM sh_wake ORDER BY id`,

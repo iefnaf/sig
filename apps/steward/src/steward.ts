@@ -82,11 +82,11 @@ import {
 } from "./llm/models.ts";
 import { createLedger, type Ledger, type LedgerSql, type NotifyRow, type RunRow } from "./ledger.ts";
 import { RoutineService } from "./routines.ts";
-import { failureCard, notifyCard, askUserText, reportCardFor } from "./report-template.ts";
+import { failureCard, notifyCard, askUserCard, reportCardFor, type AskCardButton } from "./report-template.ts";
 import { MIGRATIONS, runMigrations } from "./schema.ts";
 import { openSecret, sealSecret } from "./secretbox.ts";
 import { renderSetupPage, type SetupView } from "./setup-page.ts";
-import { escapeMarkers } from "./wake-text.ts";
+import { escapeMarkers, verifyWakeText } from "./wake-text.ts";
 import { WebApp, linkTargetForThread, parseSessionCookie } from "./web.ts";
 
 interface ConnState {
@@ -147,13 +147,19 @@ const OWNER_BOUND_REPLY = "✅ 已绑定，设置完成。此后直接在这里�
 // steward.md §6.3: while any sh_run is open, an alarm-driven task polls every 2 seconds; on
 // settlement a user run's final text becomes the reply, everything else is discarded.
 const RUN_POLL_S = 2;
-// steward.md §2.5 (issue #18): notes maintenance (decay, demotion suggestions, capacity
-// backstop) runs once a day via alarm; its ChangeReports relay with the next user reply.
-const NOTES_MAINTENANCE_DAY_S = 86_400;
+/** Settle-time verification (issue #7, spike-conclusions §2): reply phrases that claim a
+ *  dispatch. Zero false positives observed live in the spike; keep the set tight — an
+ *  over-broad pattern would spam corrective runs. */
+const DISPATCH_CLAIM_RE = /已派活|已重派|已派出|已派发|派给了|已经派出|新 worker|worker 会|worker 将/;
+export const claimsDispatch = (text: string): boolean => DISPATCH_CLAIM_RE.test(text);
 // §7.2 (review #47-5): a fired once-routine / follow-up authorizes the run its fire spawned
 // — bounded in time, so a long-dead fire is not a standing authorization. Generous enough
 // for a wake queued behind a busy harness (whenBusy: followUp), short enough to revoke.
-const PROVENANCE_FIRE_FRESHNESS_MS = 10 * 60_000;// Sent when the first event lands on the webhook after the QR switch: only a delivered event
+const PROVENANCE_FIRE_FRESHNESS_MS = 10 * 60_000;
+// steward.md §2.5 (issue #18): notes maintenance (decay, demotion suggestions, capacity
+// backstop) runs once a day via alarm; its ChangeReports relay with the next user reply.
+const NOTES_MAINTENANCE_DAY_S = 86_400;
+// Sent when the first event lands on the webhook after the QR switch: only a delivered event
 // proves the transport actually moved (research §8.2 — the API's callback_type report stays
 // out of sync with real delivery until the console republish lands).
 const QR_SETUP_DONE_REPLY = "✅ 事件已切换为 webhook 投递，设置全部完成。此后直接在这里与 Shepherd 对话即可；设置页面已永久关闭。";
@@ -226,8 +232,9 @@ export type PairResult =
 // cast at the read/write sites instead (same tradeoff the do-protocol spike made).
 export class Steward extends Agent<Env> {
   onStart(): void {
-    // Each migration runs in one storage transaction (review #47-2): a multi-statement
-    // rebuild can never persist half of itself.
+    // Each migration commits atomically WITH its ledger row (reviews #47-2 + #48 finding 3):
+    // a multi-statement rebuild can never persist half of itself, and the ledger write
+    // cannot lag the commit (the copy-drop-rename migrations are not re-runnable).
     runMigrations(this.sql.bind(this), MIGRATIONS, (fn) => this.ctx.storage.transactionSync(fn));
     // Notes maintenance is daily and idempotent (steward.md §2.5): arming at boot covers a
     // fresh deployment; the handler re-arms itself with the review-#1 cancel-then-schedule
@@ -501,15 +508,18 @@ export class Steward extends Agent<Env> {
         );
       },
       startWorker: async (input) => {
+        const run = await this.currentRunBinding();
         const outcome = await this.dispatcher.startWorker(input);
         // Review #8: a dispatch in this run picks/creates the Thread the conversation is now
         // about — backfill it onto the run so the run's reply (and quote-replies to it)
         // route to that Thread, exactly like an explicit quote-route does.
         if (outcome.kind === "dispatched" || outcome.kind === "asked_offline") {
-          const run = await this.currentRunBinding();
           if (run && run.routedThreadId === null) {
             this.sql`UPDATE sh_run SET routedThreadId = ${outcome.threadId} WHERE operationId = ${run.operationId} AND routedThreadId IS NULL`;
           }
+          // Issue #7: count the real dispatch for the settle-time verification — a reply
+          // claiming "dispatched" with dispatchCount 0 gets the corrective follow-up.
+          if (run) this.ledger.runs.countDispatch(run.operationId);
         }
         return outcome;
       },
@@ -551,24 +561,47 @@ export class Steward extends Agent<Env> {
         const owner = this.ownerOpenIdSync();
         if (!owner) return;
         const thread = input.threadId ? this.ledger.threads.get(input.threadId) : null;
+        // §4.3 (issue #7): ask_user creates the sh_question — thread-scoped when it belongs
+        // to one Thread (flipping it to waiting_you), threadless for routing asks, where the
+        // candidates column carries the button mapping a click resolves against. One
+        // question per call: a unique id (review #3 — a per-run id collided and INSERT OR
+        // IGNORE silently swallowed repeats).
+        const qid = `q_steward_${ulid()}`;
+        this.ledger.questions.insert({
+          qid,
+          threadId: thread?.threadId ?? null,
+          workerId: null,
+          text: input.question,
+          options: input.options,
+          candidates: input.candidates,
+        });
         if (thread) {
-          // §4.3: ask_user creates the question, flips the Thread to waiting_you, and ends the
-          // turn. Answering later happens as a quote-reply routed back to the Thread (which
-          // closes it — see submitUserMessage). One question per call: unique id (review #3 —
-          // a per-run id collided and INSERT OR IGNORE silently swallowed repeats).
-          const qid = `q_steward_${ulid()}`;
-          this.sql`
-            INSERT OR IGNORE INTO sh_question (qid, threadId, workerId, text, options, status, askedAt)
-            VALUES (${qid}, ${thread.threadId}, NULL, ${input.question}, ${JSON.stringify(input.options)}, 'open', ${Date.now()})
-          `;
           this.ledger.recomputeThreadState(thread.threadId);
           this.sql`UPDATE sh_thread SET unread = 1 WHERE threadId = ${thread.threadId}`; // news landed (§5.2)
         }
+        // The card (issue #7): ≤3 candidate buttons + 「新开一件事」 for routing asks; plain
+        // option buttons otherwise; no buttons for open questions (answer via quote-reply,
+        // which the outbound row's threadId routes). Button values carry only the opaque
+        // action string — Thread identity resolves server-side (§3.1, spike bug list).
+        const buttons: AskCardButton[] =
+          input.candidates.length > 0
+            ? [
+                ...input.candidates.map((candidate, index) => ({
+                  label: candidate.label,
+                  action: `ask:${qid}:${index}`,
+                })),
+                { label: "新开一件事", action: `asknew:${qid}`, primary: true },
+              ]
+            : input.options.map((option, index) => ({ label: option, action: `ask:${qid}:${index}` }));
         await this.enqueueOutbound({
           id: input.dedupeId,
-          kind: "text",
+          kind: "card",
           to: owner,
-          text: askUserText(input.question, input.options, thread?.title),
+          card: askUserCard({
+            question: input.question,
+            ...(thread ? { threadTitle: thread.title } : {}),
+            buttons,
+          }),
           threadId: thread?.threadId ?? null,
           urgency: "push",
         });
@@ -597,6 +630,9 @@ export class Steward extends Agent<Env> {
    * the oldest unsettled sh_run, is what tools are executing inside (a queued followUp starts
    * the moment the previous run answers, while sh_run only settles at the next 2s poll).
    * Falls back to the oldest open run between runs (passive entry writes, wake drains).
+   *
+   * The provenance (§7.1): a user run is its own message id; a verify run (#7) is authorized
+   * by the user message it corrects (replyTo), so its provenance is `user:<msgId>` too.
    */
   private async currentRunBinding(): Promise<{
     operationId: string;
@@ -607,15 +643,21 @@ export class Steward extends Agent<Env> {
     const running = (await this.piHarness.pending()).find((p) => p.status === "running");
     if (running) {
       const row = this.ledger.runs.get(running.operationId);
-      if (row) {
-        // §7.1: the provenance of an event run is the wake's operationId; a user run's is
-        // `user:<msgId>` — what start_worker records as createdFromMsg.
-        return { operationId: row.operationId, kind: row.kind, provenance: row.operationId, routedThreadId: row.routedThreadId };
-      }
+      if (row) return this.runBindingOf(row);
     }
     const open = this.ledger.runs.openRows()[0];
     if (!open) return null;
-    return { operationId: open.operationId, kind: open.kind, provenance: open.operationId, routedThreadId: open.routedThreadId };
+    return this.runBindingOf(open);
+  }
+
+  private runBindingOf(row: RunRow): {
+    operationId: string;
+    kind: string;
+    provenance: string;
+    routedThreadId: string | null;
+  } {
+    const provenance = row.kind === "verify" && row.replyTo !== null ? `user:${row.replyTo}` : row.operationId;
+    return { operationId: row.operationId, kind: row.kind, provenance, routedThreadId: row.routedThreadId };
   }
 
   /** Records that the *executing* run already produced user-facing output (review #9). */
@@ -2068,8 +2110,12 @@ export class Steward extends Agent<Env> {
     await this.submitUserMessage({ msgId: ev.msgId, text: ev.text ?? "", parentId: ev.parentId });
   }
 
-  /** A user message becomes one steward input, idempotent on the msgId (steward.md §9.1/§11). */
-  private async submitUserMessage(input: { msgId: string; text: string; parentId?: string }): Promise<void> {
+  /** A user message becomes one steward input, idempotent on the msgId (steward.md §9.1/§11).
+   * `prefilledNote`/`routedThreadId` serve the ask-card clicks (#7): the click's choice is
+   * submitted as a system-noted user action already routed to the picked Thread. */
+  private async submitUserMessage(
+    input: { msgId: string; text: string; parentId?: string; prefilledNote?: string; routedThreadId?: string | null },
+  ): Promise<void> {
     const operationId = `user:${input.msgId}`;
     // Signal 1 (§3.1): a quote of one of our messages routes to that Thread directly.
     const routed = input.parentId ? this.ledger.outbound.threadIdForProviderMsg(input.parentId) : null;
@@ -2085,11 +2131,15 @@ export class Steward extends Agent<Env> {
     // the routing note is prefixed as clearly-marked system metadata (never the ⟦ form, so
     // the input still reads as user-originated).
     const escaped = escapeMarkers(input.text);
-    const note = routedThread
-      ? `（系统注：这条消息是对 Thread「${routedThread.title}」（${routedThread.threadId}）消息的回复，已确定归属该 Thread。）\n`
-      : "";
+    const note =
+      input.prefilledNote !== undefined
+        ? input.prefilledNote
+        : routedThread
+          ? `（系统注：这条消息是对 Thread「${escapeMarkers(routedThread.title)}」（${routedThread.threadId}）消息的回复，已确定归属该 Thread。）\n`
+          : "";
     const text = `${note}${escaped}`;
-    if (!this.ledger.runs.open(operationId, "user", text, { replyTo: input.msgId, channel: "feishu", routedThreadId: routedThread?.threadId ?? null })) {
+    const routedId = input.routedThreadId ?? routedThread?.threadId ?? null;
+    if (!this.ledger.runs.open(operationId, "user", text, { replyTo: input.msgId, channel: "feishu", routedThreadId: routedId })) {
       return; // already submitted (sh_inbound dedup normally catches this first)
     }
     try {
@@ -2193,7 +2243,19 @@ export class Steward extends Agent<Env> {
         }
       };
       if (owner && result.status === "done" && hasText) {
+        // §6.2 source 3: the final text of a user-triggered run IS the reply; the notes
+        // module's pending ChangeReport rides on it (spec §10.3), and the outbound id is
+        // keyed to the run (review #6) so concurrent polls and interrupted settle windows
+        // converge on one message.
         void reply(withRelay(result.text!));
+        // Settle-time dispatch verification (issue #7, spike-conclusions §2): the reply
+        // claims a dispatch but dispatchCount says none happened — a corrective follow-up
+        // makes the steward actually dispatch or visibly correct itself. The claim phrase
+        // set is the spike's (zero false positives observed there); it is tested on the
+        // raw final text, not the notes-relay rendering appended to the reply.
+        if (run.dispatchCount === 0 && claimsDispatch(result.text!)) {
+          void this.queueVerifyRun(run, result.text!);
+        }
         return;
       }
       if (owner && result.status !== "done") {
@@ -2226,6 +2288,32 @@ export class Steward extends Agent<Env> {
     }
     const routine = /^routine:(r_.+):\d+$/.exec(run.operationId);
     if (routine) this.ledger.routines.recordOutcome(routine[1]!, summary);
+  }
+
+  /**
+   * The corrective ⟦verify⟧ follow-up (issue #7): submitted with whenBusy=followUp so it runs
+   * right after the flawed reply; its kind carries the original user message as replyTo, so
+   * start_worker inside it is authorized by that message (§7.1) without a provenanceRef.
+   * routedThreadId rides along too (review #48 finding 2): a corrective attach to the
+   * quote-routed thread is then explicit for the confidence gate — without the copy the
+   * verify run would hit the very gate the original run passed, and the wake text's “现在
+   * 真正调用 start_worker” could never succeed.
+   */
+  private async queueVerifyRun(run: RunRow, claimed: string): Promise<void> {
+    const operationId = `verify:${run.operationId}`;
+    const text = verifyWakeText(claimed);
+    if (!this.ledger.runs.open(operationId, "verify", text, { replyTo: run.replyTo ?? undefined, channel: run.channel ?? undefined, routedThreadId: run.routedThreadId })) {
+      return; // already queued by a racing poll
+    }
+    this.logChannel("verify_dispatch_claim", `${run.operationId} "${claimed.slice(0, 80)}"`);
+    try {
+      await this.ensureRootModel();
+      await this.piHarness.submit(text, { operationId, whenBusy: "followUp" });
+    } catch (err) {
+      this.logChannel("submit_failed", `${operationId} ${errorText(err)}`);
+      // Row stays open: the poll's not_found path resubmits (§11).
+    }
+    void this.pollRuns();
   }
 
   /**
@@ -2289,7 +2377,9 @@ export class Steward extends Agent<Env> {
   }
 
   // Card button callbacks (issue #5): the Thread is resolved from the card's providerMsgId —
-  // never from data stuffed into the button (steward.md §3.1, spike bug list).
+  // never from data stuffed into the button (steward.md §3.1, spike bug list). The ask-card
+  // buttons (#7) are answered here instead: the click closes its question and routes back
+  // into the steward as a user action with basis=user_reply_to.
   private async dispatchCardAction(ev: InboundEvent, ownerOpenId: string | null): Promise<void> {
     if (ownerOpenId === null || !ev.operatorId || !ev.cardMsgId) {
       this.logChannel("ignored_card_no_owner", `${ev.eventId}`);
@@ -2299,7 +2389,81 @@ export class Steward extends Agent<Env> {
       this.logChannel("ignored_card_not_owner", `${ev.operatorId} ${ev.eventId}`);
       return;
     }
-    await this.dispatcher.handleCardAction({ operatorId: ev.operatorId, action: ev.action ?? "", cardMsgId: ev.cardMsgId });
+    const action = ev.action ?? "";
+    if (action.startsWith("ask:") || action.startsWith("asknew:")) {
+      await this.handleAskCardAction(ev, action, ev.cardMsgId);
+      return;
+    }
+    await this.dispatcher.handleCardAction({ operatorId: ev.operatorId, action, cardMsgId: ev.cardMsgId });
+  }
+
+  /**
+   * An ask-card button click (#7, steward.md §9.1): the action string is `ask:<qid>:<idx>`
+   * (a candidate or plain option) or `asknew:<qid>`. The click closes the question, then
+   * becomes one steward input — a routing candidate submits already-routed to that Thread
+   * (basis=user_reply_to; start_worker attaches without further confidence), 「新开一件事」
+   * submits unrouted, and a plain option submits the chosen text as the answer. The steward
+   * conversation remembers its own question; the note gives it everything else.
+   */
+  private async handleAskCardAction(ev: InboundEvent, action: string, cardMsgId: string): Promise<void> {
+    const [verb, qid, idxRaw] = action.split(":");
+    const question = this.ledger.questions.get(qid ?? "");
+    if (!question) {
+      await this.dispatcher.replyToCard(cardMsgId, "这张提问卡片关联的问题已不存在。");
+      return;
+    }
+    const payload = this.ledger.questions.payload(question.qid);
+    const isNew = verb === "asknew";
+    const idx = Number(idxRaw);
+    const candidate = !isNew && payload ? payload.candidates[idx] ?? null : null;
+    const option = !isNew && !candidate && payload ? payload.options[idx] ?? null : null;
+    if (!isNew && !candidate && !option) {
+      await this.dispatcher.replyToCard(cardMsgId, "这个选项已经失效，直接回复文字说明即可。");
+      return;
+    }
+
+    const chosenThread = candidate ? this.ledger.threads.get(candidate.threadId) : null;
+    // Answered already (a racing click or a quote-reply got here first): say so, no second run.
+    if (question.status === "answered") {
+      await this.dispatcher.replyToCard(cardMsgId, "这个问题已经回答过了。", chosenThread?.threadId);
+      return;
+    }
+    this.ledger.questions.close(question.qid, candidate?.label ?? option ?? "新开一件事");
+
+    if (candidate && chosenThread) {
+      this.ledger.threads.markRead(chosenThread.threadId); // a click is both read and a reply (§6.5)
+      this.ledger.timeline.add(chosenThread.threadId, "note", `用户在提问卡片上选择了它（${question.text.slice(0, 80)}）`, {
+        qid: question.qid,
+        eventId: ev.eventId,
+      });
+    }
+
+    const label = candidate?.label ?? option ?? "新开一件事";
+    // Review #48 finding 5: every model/user-authored fragment embedded in a system note is
+    // marker-escaped (only input.text was before) — a question or option containing ⟦…⟧
+    // must never smuggle a fake system wake into the input the model reads.
+    const q = escapeMarkers(question.text.slice(0, 80));
+    const picked = escapeMarkers(label);
+    // Review #48 finding 4: an option click answers that Thread's question — route the run
+    // there (question.threadId), symmetric with quote-replying the same card, which the
+    // outbound row's threadId already routes. Candidate clicks route to the picked thread;
+    // 「新开一件事」 stays unrouted.
+    const routedThreadId = candidate ? (chosenThread?.threadId ?? null) : isNew ? null : question.threadId;
+    const note = candidate
+      ? chosenThread
+        ? `（系统注：用户在提问卡片「${q}」上选择了「${picked}」——归属已定为 Thread「${escapeMarkers(chosenThread.title)}」（${chosenThread.threadId}），basis=user_reply_to，可直接接续派发。）\n`
+        : `（系统注：用户在提问卡片上选择的 Thread 已不存在，请如实告知并用 ask_user 重新确认。）\n`
+      : isNew
+        ? `（系统注：用户在提问卡片「${q}」上选择了「新开一件事」——请按之前的话语新建 Thread 继续处理。）\n`
+        : question.threadId
+          ? `（系统注：用户在提问卡片「${q}」上选择了「${picked}」——这是对你提问的回答，已确定归属该 Thread（${question.threadId}）。）\n`
+          : `（系统注：用户在提问卡片「${q}」上选择了「${picked}」——这是对你提问的回答。）\n`;
+    await this.submitUserMessage({
+      msgId: ev.eventId,
+      text: label,
+      prefilledNote: note,
+      routedThreadId,
+    });
   }
 
   private logChannel(reason: string, detail: string): void {
@@ -2360,6 +2524,11 @@ export class Steward extends Agent<Env> {
       cmdId: input.cmdId ?? `test:${ulid()}`,
     });
   }
+
+  /** Test-only: pushes a thread's lastActivityAt back `days` — the idle-attach band (#7). */
+  async ageThreadForTest(threadId: string, days: number): Promise<void> {
+    this.sql`UPDATE sh_thread SET lastActivityAt = ${Date.now() - days * 86_400_000} WHERE threadId = ${threadId}`;
+}
 
   /** Test entry into the intervention half of the dispatch service (send/interrupt). */
   async sendForTest(

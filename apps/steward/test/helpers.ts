@@ -59,7 +59,7 @@ export async function resetLedgerState(): Promise<void> {
 /** llmState's shape, declared locally: through the RPC stub's inferred type the class method's
  *  return collapses to `never`, so tests read it through this view instead. */
 export interface LlmStateView {
-  runs: Array<{ operationId: string; kind: string; status: string; text: string; resultStatus: string | null; resultReason: string | null; resultText: string | null; replyOutboundId: string | null; routedThreadId: string | null }>;
+  runs: Array<{ operationId: string; kind: string; status: string; text: string; resultStatus: string | null; resultReason: string | null; resultText: string | null; replyOutboundId: string | null; replyTo: string | null; routedThreadId: string | null; dispatchCount: number }>;
   inputs: Array<{ operationId: string; kind: string; text: string }>;
   assistantTexts: string[];
   raw: unknown[];
