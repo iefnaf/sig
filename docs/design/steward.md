@@ -380,6 +380,7 @@ Workers in the `lost` / `broken` states do not count as running; `broken` produc
 | `settled` error:auth | Create a question | Push immediately (the user must fix credentials on the machine) | yes |
 | `settled` error:transient | timeline | none (the connector resumes automatically) | no |
 | `settled` error:context | Create a question suggesting a fresh session | push | yes |
+| `settled` error:stall | Create a question (the connector already auto-restarted once) | push | yes |
 | `settled` unreported | Create a question | none | yes (the steward reads the last utterance and classifies it) |
 | `lost` / `resumed` | timeline | none | no |
 | `broken` | Create a question | push | yes |

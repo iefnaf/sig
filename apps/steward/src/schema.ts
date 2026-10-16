@@ -660,4 +660,23 @@ export const MIGRATIONS: readonly Migration[] = [
       sql`CREATE INDEX IF NOT EXISTS sh_note_log_note ON sh_note_log (noteId, op, ts)`;
     },
   },
+  {
+    // Issue #13 review: when hello.workers reconciliation is gated behind undelivered events
+    // (snap.lastSeq > processedUpTo), the DO remembers the pending verdict for a reaped
+    // worker and applies it once the event stream catches up — otherwise a worker reaped
+    // while its machine was offline stays `lost` forever even though it is alive (the events
+    // that would prove it are exactly the ones that blocked the reconcile). Numbered 013:
+    // main's #23 took 009/010, #20 took 011, #7 kept 010_routing, #18 took 012_notes; ids
+    // are unique, which is what the ledger keys on — the number keeps the order readable.
+    id: "013_reap_reconcile",
+    up: (sql) => {
+      sql`CREATE TABLE IF NOT EXISTS sh_reap_pending (
+        workerId TEXT PRIMARY KEY,
+        threadId TEXT NOT NULL,
+        snapState TEXT NOT NULL,
+        lastSeq INTEGER NOT NULL,
+        createdAt INTEGER NOT NULL
+      )`;
+    },
+  },
 ];
