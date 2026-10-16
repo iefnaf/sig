@@ -313,7 +313,9 @@ export const MIGRATIONS: readonly Migration[] = [
     // reaches this table (or any other): it passes through DO memory between sockets.
     id: "009_history_relay",
     up: (sql) => {
-      // state lives in SQLite because the DO may sleep between chunks (§6.6).
+      // state lives in SQLite because the DO may sleep between chunks (§6.6). `cursor` is the
+      // last entry id forwarded — an id, not content — so a DO-side cap cut can still tell
+      // the browser where it stopped and how to continue.
       sql`CREATE TABLE IF NOT EXISTS history_relay (
         reqId TEXT PRIMARY KEY,
         webConnId TEXT NOT NULL,
@@ -321,6 +323,7 @@ export const MIGRATIONS: readonly Migration[] = [
         deviceId TEXT NOT NULL,
         maxBytes INTEGER NOT NULL,
         sentBytes INTEGER NOT NULL DEFAULT 0,
+        cursor TEXT,
         expiresAt INTEGER NOT NULL,
         createdAt INTEGER NOT NULL
       )`;

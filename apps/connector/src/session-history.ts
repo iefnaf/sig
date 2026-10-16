@@ -14,6 +14,7 @@ import {
   HISTORY_ENTRY_TEXT_MAX_CHARS,
   HISTORY_MAX_BYTES,
   HISTORY_TOOL_ARGS_MAX_CHARS,
+  HISTORY_TOOLS_MAX,
   type HistoryEntry,
   type HistoryPage,
 } from "@shepherd/protocol";
@@ -128,16 +129,25 @@ function normalizeContent(content: unknown): { text: string; tools: NonNullable<
   if (!Array.isArray(content)) return { text: "", tools: [] };
   let text = "";
   const tools: NonNullable<HistoryEntry["tools"]> = [];
+  let toolCalls = 0;
   for (const block of content) {
     if (typeof block !== "object" || block === null) continue;
     const b = block as { type?: unknown; text?: unknown; name?: unknown; arguments?: unknown };
     if (b.type === "text" && typeof b.text === "string") {
       text += b.text;
     } else if (b.type === "toolCall" && typeof b.name === "string") {
-      const args = summarizeArgs(b.arguments);
-      tools.push(args === undefined ? { name: b.name } : { name: b.name, args });
+      toolCalls += 1;
+      if (tools.length < HISTORY_TOOLS_MAX) {
+        const args = summarizeArgs(b.arguments);
+        tools.push(args === undefined ? { name: b.name } : { name: b.name, args });
+      }
     }
-    // toolResult/image blocks: shown through the assistant's tool-call summary, not verbatim
+    // toolResult/image blocks: shown through the assistant's tool-call summary, not verbatim.
+    // toolCalls past HISTORY_TOOLS_MAX are summarized below — the point of the cap is that
+    // one entry can never outgrow the 256 KiB chunk limit (protocol §3.6).
+  }
+  if (toolCalls > HISTORY_TOOLS_MAX) {
+    tools.push({ name: `+${toolCalls - HISTORY_TOOLS_MAX} more tool calls` });
   }
   return { text, tools };
 }

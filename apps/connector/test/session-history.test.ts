@@ -71,6 +71,21 @@ describe("readSessionHistory (JSONL along the current branch)", () => {
     ]);
   });
 
+  it("caps tool-call summaries at 50 with a count marker (one entry can never outgrow a chunk)", () => {
+    const blocks = Array.from({ length: 5000 }, (_, i) => ({ type: "toolCall", id: `c${i}`, name: "bash", arguments: { command: `echo ${i}` } }));
+    const file = writeFixture("w-tools", [
+      entry("e1", null, userMessage("go")),
+      entry("e2", "e1", assistantMessage([{ type: "text", text: "working" }, ...blocks])),
+    ]);
+    const page = readSessionHistory(file);
+    const tools = page.entries[1]!.tools!;
+    expect(tools).toHaveLength(51); // 50 summaries + the count marker
+    expect(tools[49]).toEqual({ name: "bash", args: "echo 49" });
+    expect(tools[50]).toEqual({ name: "+4950 more tool calls" });
+    // The normalized entry stays far below the 256 KiB chunk cap.
+    expect(Buffer.byteLength(JSON.stringify(page.entries[1]))).toBeLessThan(16 * 1024);
+  });
+
   it("truncates overly long text to 4000 chars and tool args to 80", () => {
     const long = "x".repeat(10_000);
     const deepPath = `${"d/".repeat(60)}file.ts`;

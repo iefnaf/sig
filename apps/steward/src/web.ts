@@ -559,12 +559,39 @@ function rawProcessScript(workerId: string): string {
   var cursor = null;
   var ws = null;
   var waiting = false;
-  var received = 0;
+  var total = 0;
+  // The relay ends some streams silently (DO TTL sweep, connector idle sweep): anything
+  // silent past ~65 s is dead by protocol (the relay row's 60 s TTL + schedule granularity),
+  // so stop waiting and say so instead of parking on 连接中… forever.
+  var SILENCE_MS = 65000;
+  var watchdog = null;
 
   function say(text) { statusEl.textContent = text; }
 
+  function stopWatchdog() {
+    if (watchdog !== null) { clearTimeout(watchdog); watchdog = null; }
+  }
+
+  function armWatchdog() {
+    stopWatchdog();
+    watchdog = setTimeout(function () {
+      waiting = false;
+      say("连接超时：流式连接中断，请刷新重试。");
+      try { ws.close(); } catch (e) {}
+    }, SILENCE_MS);
+  }
+
+  function endStream(message, offerMore) {
+    waiting = false;
+    stopWatchdog();
+    say(message);
+    if (moreBtn) moreBtn.hidden = !(offerMore && cursor);
+    try { ws.close(); } catch (e) {}
+  }
+
   function offline() {
     waiting = false;
+    stopWatchdog();
     say("");
     var box = document.createElement("div");
     box.className = "offline";
@@ -617,34 +644,37 @@ function rawProcessScript(workerId: string): string {
     ws.onmessage = function (ev) {
       var m;
       try { m = JSON.parse(ev.data); } catch (e) { return; }
+      armWatchdog();
       if (m.t === "history_chunk") {
-        received += ev.data.length;
+        total += m.entries.length;
         for (var i = 0; i < m.entries.length; i++) addEntry(m.entries[i]);
         ws.send(JSON.stringify({ t: "history_ack", re: m.re, n: m.n }));
         if (m.cursor) cursor = m.cursor;
         if (m.done) {
-          waiting = false;
-          if (received < maxBytes || m.entries.length === 0) {
-            say(m.entries.length === 0 && cursor ? "没有更多内容。" : "已加载全部内容。");
+          // The connector says whether the page was budget-cut (truncated) — never guess from
+          // byte counts: the budget is UTF-8 while string lengths are UTF-16, so CJK cuts
+          // would read as "everything loaded" and strand the tail.
+          if (m.truncated) {
+            endStream(cursor ? "已达单次加载上限（2 MB）；可以继续加载后面的内容。" : "已达单次加载上限（2 MB）。", true);
+          } else if (total === 0) {
+            endStream("还没有任何对话内容。", false);
           } else {
-            say("已达单次加载上限（2 MB）；可以继续加载后面的内容。");
-            if (moreBtn && cursor) moreBtn.hidden = false;
+            endStream("已加载全部内容。", false);
           }
-          ws.close();
         }
       } else if (m.t === "machine_offline") {
+        stopWatchdog();
         try { ws.close(); } catch (e) {}
         offline();
       } else if (m.t === "error") {
-        waiting = false;
-        say("读取失败：" + (m.message || m.code || "未知错误"));
-        try { ws.close(); } catch (e) {}
+        endStream("读取失败：" + (m.message || m.code || "未知错误"), false);
       }
     };
     ws.onclose = function () {
       if (waiting) offline(); // died mid-stream without done: treat as unavailable
     };
     ws.onerror = function () { say(""); };
+    armWatchdog();
   }
 
   window.loadMore = function () {

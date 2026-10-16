@@ -142,18 +142,27 @@ describe("chunkPage", () => {
       expect(Buffer.byteLength(JSON.stringify(chunk))).toBeLessThanOrEqual(8 * 1024);
     }
     expect(chunks.map((c) => c.n)).toEqual(chunks.map((_, i) => i));
-    // Every non-final chunk is open; the final one terminates and carries the resume cursor.
+    // Every non-final chunk is open; the final one terminates and carries the resume cursor
+    // plus the budget verdict (truncated) — the browser never guesses it from byte counts.
     for (const chunk of chunks.slice(0, -1)) expect(chunk.done).toBe(false);
     const last = chunks[chunks.length - 1]!;
     expect(last.done).toBe(true);
     expect(last.cursor).toBe("e40");
+    expect(last.truncated).toBe(true);
     // No entry lost or duplicated across the split.
     const ids = chunks.flatMap((c) => c.entries.map((e) => e.id));
     expect(ids).toEqual(big.entries.map((e) => e.id));
   });
 
-  it("a single-entry page is a single done chunk", () => {
+  it("a complete page terminates without the truncated flag", () => {
     const chunks = chunkPage("req-1", { entries: [{ id: "e1", role: "user", text: "hi" }], cursor: "e1", done: true });
-    expect(chunks).toEqual([{ t: "history_chunk", re: "req-1", n: 0, entries: [{ id: "e1", role: "user", text: "hi" }], cursor: "e1", done: true }]);
+    expect(chunks).toEqual([
+      { t: "history_chunk", re: "req-1", n: 0, entries: [{ id: "e1", role: "user", text: "hi" }], cursor: "e1", done: true },
+    ]);
+  });
+
+  it("an empty budget-cut page (nothing fit) terminates without a continue cursor", () => {
+    const chunks = chunkPage("req-0", { entries: [], cursor: null, done: false });
+    expect(chunks).toEqual([{ t: "history_chunk", re: "req-0", n: 0, entries: [], cursor: null, done: true }]);
   });
 });

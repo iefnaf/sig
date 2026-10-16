@@ -169,16 +169,18 @@ export function chunkPage(reqId: string, page: HistoryPage, maxChunkBytes = HIST
   if (entries.length > 0) flush();
   if (chunks.length === 0) {
     // Nothing fit the budget at all: terminate rather than leaving the browser paging on a
-    // null cursor forever.
+    // null cursor forever (re-opening would produce the same empty result).
     chunks.push({ t: "history_chunk", re: reqId, n: 0, entries: [], cursor: null, done: true });
     return chunks;
   }
   // The final chunk always carries done=true — that is the stream terminator for the relay
-  // row and the browser. Its cursor says where the page stopped: re-opening with
-  // since=cursor continues after a maxBytes cut, or answers "nothing more" when the page was
-  // complete.
+  // row and the browser. `truncated` preserves the page's own budget verdict: true means the
+  // page stopped at maxBytes and re-opening with since=cursor continues (or reports "nothing
+  // more"); the browser must not guess this from byte counts (they differ between UTF-8
+  // budgets and UTF-16 string lengths, so a character heuristic misreads CJK cuts).
   const last = chunks[chunks.length - 1]!;
   last.done = true;
   last.cursor = page.cursor;
+  if (!page.done && page.cursor !== null) last.truncated = true;
   return chunks;
 }

@@ -15,6 +15,9 @@ export const HISTORY_RELAY_TTL_MS = 60_000;
 export const HISTORY_ENTRY_TEXT_MAX_CHARS = 4000;
 /** Tool-argument summaries carry a path/command only, first 80 chars (connector-pi.md §11.2). */
 export const HISTORY_TOOL_ARGS_MAX_CHARS = 80;
+/** Tool-call summaries per entry: bounds a single normalized entry far below the chunk cap
+ * even for a message with thousands of tool calls. */
+export const HISTORY_TOOLS_MAX = 50;
 
 /** One normalized transcript entry: role, text, tool-call summaries (connector-pi.md §11.4). */
 export const HistoryEntrySchema = z.object({
@@ -66,6 +69,9 @@ export const HistoryChunkMessageSchema = z.object({
   entries: z.array(HistoryEntrySchema),
   cursor: z.string().nullable().optional(),
   done: z.boolean(),
+  /** The page this chunk ends was cut by the maxBytes budget: re-opening with
+   * `since=cursor` continues (or reports "nothing more"). Absent on complete pages. */
+  truncated: z.boolean().optional(),
 });
 
 export type HistoryChunkMessage = z.infer<typeof HistoryChunkMessageSchema>;

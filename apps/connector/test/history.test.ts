@@ -162,9 +162,38 @@ describe("history_req over the real transport (§6.6)", () => {
     const last = chunks[3]!;
     expect(last.done).toBe(true);
     expect(last.cursor).toBe("b199");
+    expect(last.truncated).toBeUndefined(); // the whole transcript fit the 2 MB budget
     // Nothing lost across the split.
     const ids = chunks.flatMap((c) => (c.entries as Array<{ id: string }>).map((e) => e.id));
     expect(ids).toEqual(Array.from({ length: 200 }, (_, i) => `b${i}`));
+  }, 90_000);
+
+  it("marks a budget-cut page truncated and resumes from the cursor on the next request", async () => {
+    const scenario = writeScenario(dir, "scenario", [bulkConversationRun(20)]);
+    await startWorker(scenario);
+
+    // A budget far below the whole transcript: the page cuts mid-way.
+    const reqId = mock.sendHistoryReq(WORKER, { maxBytes: 20_000 });
+    const chunks = await waitFor(() => {
+      const got = mock.historyChunksFor(reqId);
+      return got.length > 0 && got[got.length - 1]!.done === true ? got : undefined;
+    }, 20_000, "budget-cut page");
+    const last = chunks[chunks.length - 1]!;
+    expect(last.truncated).toBe(true);
+    expect(typeof last.cursor).toBe("string");
+    const delivered = chunks.flatMap((c) => (c.entries as Array<{ id: string }>).map((e) => e.id));
+    expect(delivered.length).toBeGreaterThan(0);
+    expect(delivered.length).toBeLessThan(20);
+
+    // Continuing from the reported cursor serves the tail.
+    const tailReq = mock.sendHistoryReq(WORKER, { since: last.cursor as string, maxBytes: 2 * 1024 * 1024 });
+    const tail = await waitFor(() => {
+      const got = mock.historyChunksFor(tailReq);
+      return got.length > 0 && got[got.length - 1]!.done === true ? got : undefined;
+    }, 20_000, "tail page");
+    const tailIds = tail.flatMap((c) => (c.entries as Array<{ id: string }>).map((e) => e.id));
+    expect(tailIds).toEqual(Array.from({ length: 20 }, (_, i) => `b${i}`).slice(delivered.length));
+    expect(tail[tail.length - 1]!.truncated).toBeUndefined();
   }, 90_000);
 
   it("answers an unknown worker with error{not_found} on the same reqId", async () => {

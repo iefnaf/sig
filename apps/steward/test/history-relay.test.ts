@@ -47,6 +47,14 @@ async function relayRowCount(): Promise<number> {
   });
 }
 
+/** The live relay row's reqId (DO-minted; only the machine's connector ever sees it). */
+async function relayReqId(): Promise<string | null> {
+  return runInDurableObject(ownerStub(), (instance: Steward) => {
+    const sql = (instance as unknown as { sql: <T>(s: TemplateStringsArray) => T[] }).sql.bind(instance);
+    return sql<{ reqId: string }>`SELECT reqId FROM history_relay`[0]?.reqId ?? null;
+  });
+}
+
 /** Scans every DO table (and thus every log row) for a string that must never be persisted. */
 async function findMarkerInStorage(marker: string): Promise<string[]> {
   return runInDurableObject(ownerStub(), (_instance: Steward, state: { storage: { sql: { exec: (q: string) => Iterable<Record<string, unknown>> } } }) => {
@@ -174,14 +182,42 @@ describe("the §6.6 relay: browser ↔ DO ↔ connector", () => {
 
     const { ws, reader } = await connectWeb(cookie);
     await openStream(ws, workerId, { maxBytes: 64 }); // no real chunk can fit
-    // The DO's own cap answers first: one synthesized done chunk, nothing forwarded.
+    // The DO's own cap answers first: one synthesized done chunk, nothing forwarded. The cut
+    // carries the budget verdict (truncated) and no cursor — nothing was ever forwarded.
     const cut = await reader.nextWhere((m) => m.t === "history_chunk");
     expect(cut.done).toBe(true);
+    expect(cut.truncated).toBe(true);
     expect(cut.entries).toEqual([]);
+    expect(cut.cursor).toBeNull();
     await expect(reader.nextWhere((m) => m.t === "history_chunk" && (m.entries as unknown[]).length > 0, 400)).rejects.toThrow();
     await expect(relayRowCount()).resolves.toBe(0);
     ws.close();
   });
+
+  it("drops a chunk arriving on a different machine's connection (relay belongs to one device)", async () => {
+    const machineA = await pairFakeConnector("mac-a");
+    machineA.historySilent = true; // A gets the request but never answers
+    await machineA.connect();
+    const { workerId } = await dispatchOneWorker(machineA);
+    const machineB = await pairFakeConnector("mac-b");
+    await machineB.connect();
+
+    const cookie = await webLogin();
+    const { ws, reader } = await connectWeb(cookie);
+    await openStream(ws, workerId);
+    const reqId = await relayReqId();
+    expect(reqId).toBeTruthy();
+
+    // B guesses/knows the reqId and tries to inject content into A's relay: dropped, the
+    // relay row survives (A may still answer), the browser hears nothing.
+    machineB.ws!.send(
+      JSON.stringify({ t: "history_chunk", re: reqId, n: 0, entries: [{ id: "x1", role: "assistant", text: "injected" }], cursor: "x1", done: false }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await expect(reader.nextWhere((m) => m.t === "history_chunk", 300)).rejects.toThrow();
+    await expect(relayRowCount()).resolves.toBe(1);
+    ws.close();
+  }, 15_000);
 
   it("an unanswered relay is swept by the TTL alarm", async () => {
     await runInDurableObject(ownerStub(), (instance: Steward) => {
@@ -203,10 +239,11 @@ describe("the §6.6 relay: browser ↔ DO ↔ connector", () => {
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     expect(await relayRowCount()).toBe(0);
-    // The browser heard nothing: no chunks, no errors — just silence (its JS times out).
+    // The browser heard nothing: no chunks, no errors — just silence (its JS watchdog
+    // ends the view; the page no longer parks on 连接中… forever).
     await expect(reader.nextWhere(() => true, 300)).rejects.toThrow();
     ws.close();
-  });
+  }, 15_000);
 });
 
 describe("role fence (protocol §5.3)", () => {

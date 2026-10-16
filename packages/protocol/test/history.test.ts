@@ -39,6 +39,7 @@ describe("history relay messages", () => {
         entries: [{ id: "e1", role: "assistant", text: "…", tools: [] }],
         cursor: "e91",
         done: false,
+        truncated: true,
       }).success,
     ).toBe(true);
     expect(

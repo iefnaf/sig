@@ -290,7 +290,13 @@ export class WorkerManager {
     const worker = this.store.getWorker(workerId);
     if (!worker) throw new CommandError("not_found", `worker ${workerId} is unknown on this machine`);
     if (typeof this.adapter.history === "function" && this.adapter.isRunning?.(workerId)) {
-      return this.adapter.history(workerId, since, maxBytes);
+      try {
+        return await this.adapter.history(workerId, since, maxBytes);
+      } catch (err) {
+        // The process died between the isRunning check and the RPC: the run is over, so the
+        // session file is now the truth — fall through instead of surfacing the race.
+        if ((err as { code?: string }).code !== "not_running") throw err;
+      }
     }
     if (!worker.sessionFile) {
       throw new CommandError("no_history", `worker ${workerId} has no session file to read`);

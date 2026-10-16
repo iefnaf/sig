@@ -359,8 +359,13 @@ export class Steward extends Agent<Env> {
       return;
     }
     if (!state.deviceId) return;
-    // Every relay through this machine dies with its connection — the browser hears why
-    // (§6.6 machine_offline) instead of waiting out its own timeout.
+    // A superseded old connection closes after its replacement is live: only the last
+    // connection for the device takes the machine offline.
+    const remaining = [...this.getConnections<ConnState>(`dev:${state.deviceId}`)].filter((c) => c.id !== connection.id);
+    if (remaining.length > 0) return; // superseded, not offline — its relays die with the
+    // connector-side reset; the browser's silence watchdog ends the view.
+    // The machine really went offline: every relay through it dies with the connection, and
+    // each browser hears why (§6.6 machine_offline) instead of waiting out its own timeout.
     const orphaned = this.sql<{ reqId: string; webConnId: string }>`
       SELECT reqId, webConnId FROM history_relay WHERE deviceId = ${state.deviceId}
     `;
@@ -368,10 +373,7 @@ export class Steward extends Agent<Env> {
       this.sql`DELETE FROM history_relay WHERE reqId = ${relay.reqId}`;
       this.getConnection(relay.webConnId)?.send(JSON.stringify({ t: "machine_offline", re: relay.reqId } satisfies MachineOfflineMessage));
     }
-    // A superseded old connection closes after its replacement is live: only the last
-    // connection for the device takes the machine offline.
-    const remaining = [...this.getConnections<ConnState>(`dev:${state.deviceId}`)].filter((c) => c.id !== connection.id);
-    if (remaining.length === 0) this.ledger.machines.setOnline(state.deviceId, false);
+    this.ledger.machines.setOnline(state.deviceId, false);
   }
 
   async onMessage(connection: Connection, raw: WSMessage): Promise<void> {
@@ -434,12 +436,12 @@ export class Steward extends Agent<Env> {
         EventsGapMessageSchema.safeParse(message);
         return;
       case "history_chunk":
-        this.handleHistoryChunk(message);
+        this.handleHistoryChunk(connection, message);
         return;
       case "error":
         // A connector reply to something the DO itself sent. The only DO-originated requests
         // are history pulls (§6.6): relay a failure to the waiting browser and end its stream.
-        this.relayHistoryError(message);
+        this.relayHistoryError(connection, message);
         return;
       default:
         break;
@@ -512,14 +514,17 @@ export class Steward extends Agent<Env> {
   }
 
   /** connector → DO → browser: forward one chunk, meter the bytes, end finished streams. */
-  private handleHistoryChunk(raw: unknown): void {
+  private handleHistoryChunk(connection: Connection, raw: unknown): void {
     const parsed = HistoryChunkMessageSchema.safeParse(raw);
     if (!parsed.success) return;
     const chunk = parsed.data;
-    const relay = this.sql<{ webConnId: string; maxBytes: number; sentBytes: number; expiresAt: number }>`
-      SELECT webConnId, maxBytes, sentBytes, expiresAt FROM history_relay WHERE reqId = ${chunk.re}
+    const relay = this.sql<{ webConnId: string; deviceId: string; maxBytes: number; sentBytes: number; cursor: string | null; expiresAt: number }>`
+      SELECT webConnId, deviceId, maxBytes, sentBytes, cursor, expiresAt FROM history_relay WHERE reqId = ${chunk.re}
     `[0];
     if (!relay) return; // swept/timed out/done: nothing is waiting for this chunk
+    // The relay belongs to one machine: only its connection's chunks travel on. reqIds are
+    // unguessable ULIDs, so this is defense in depth against a confused connector, not auth.
+    if ((connection.state as unknown as ConnState | null)?.deviceId !== relay.deviceId) return;
     if (relay.expiresAt <= Date.now()) {
       this.sql`DELETE FROM history_relay WHERE reqId = ${chunk.re}`;
       return;
@@ -532,8 +537,11 @@ export class Steward extends Agent<Env> {
     const bytes = jsonByteLength(raw);
     if (relay.sentBytes + bytes > relay.maxBytes) {
       // Defense in depth (the connector budgets maxBytes first): cut the stream here rather
-      // than forward past the cap, and tell the browser it ended.
-      webConn.send(JSON.stringify({ t: "history_chunk", re: chunk.re, n: chunk.n, entries: [], cursor: null, done: true }));
+      // than forward past the cap, and tell the browser it ended — continuing from the last
+      // FORWARDED cursor, never the dropped chunk's (the browser never saw its entries).
+      webConn.send(
+        JSON.stringify({ t: "history_chunk", re: chunk.re, n: chunk.n, entries: [], cursor: relay.cursor, done: true, truncated: true }),
+      );
       this.sql`DELETE FROM history_relay WHERE reqId = ${chunk.re}`;
       return;
     }
@@ -541,16 +549,22 @@ export class Steward extends Agent<Env> {
     if (chunk.done) {
       this.sql`DELETE FROM history_relay WHERE reqId = ${chunk.re}`;
     } else {
-      this.sql`UPDATE history_relay SET sentBytes = ${relay.sentBytes + bytes} WHERE reqId = ${chunk.re}`;
+      this.sql`
+        UPDATE history_relay SET sentBytes = ${relay.sentBytes + bytes}, cursor = ${chunk.cursor ?? null}
+        WHERE reqId = ${chunk.re}
+      `;
     }
   }
 
   /** A connector `error` replying to a history_req: forward the reason, end the stream. */
-  private relayHistoryError(raw: unknown): void {
+  private relayHistoryError(connection: Connection, raw: unknown): void {
     const re = (raw as { re?: unknown }).re;
     if (typeof re !== "string") return;
-    const relay = this.sql<{ webConnId: string }>`SELECT webConnId FROM history_relay WHERE reqId = ${re}`[0];
+    const relay = this.sql<{ webConnId: string; deviceId: string }>`
+      SELECT webConnId, deviceId FROM history_relay WHERE reqId = ${re}
+    `[0];
     if (!relay) return; // not a history reply; nothing else to do with connector errors today
+    if ((connection.state as unknown as ConnState | null)?.deviceId !== relay.deviceId) return;
     this.sql`DELETE FROM history_relay WHERE reqId = ${re}`;
     this.getConnection(relay.webConnId)?.send(JSON.stringify(raw));
   }
