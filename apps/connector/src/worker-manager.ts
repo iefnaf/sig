@@ -436,18 +436,35 @@ export class WorkerManager {
     }
     // idle: prompt starts the next run in the same session. State flips first so a
     // concurrent send cannot double-prompt; on failure it rolls back to idle.
-    if (hot) {
-      this.store.setWorkerState(workerId, "running");
-      try {
-        await this.adapter.send(workerId, { text: input.text, images: input.images, commandId }, "prompt");
-      } catch (err) {
-        this.store.setWorkerState(workerId, "idle");
-        throw err;
-      }
-      await this.emitEvent(workerId, "started", { sessionId: worker.sessionId ?? workerId, cwd: worker.worktree ?? undefined });
-      return { delivery: "prompt" };
+    if (hot) return this.deliverHotPrompt(worker, commandId, input);
+    // idle-cold relaunch is a tracked transition exactly like a resume: a send racing the
+    // cold-start window queues on the `starting` row and drains when the relaunch settles
+    // — success *or* failure — instead of hanging until some later interrupt supersedes it
+    // (PR #45 review #1); an interrupt arriving mid-relaunch waits it out (§6.2 "stop right
+    // after dispatch").
+    return this.withTransition(workerId, () => this.relaunchForSend(worker, commandId, input));
+  }
+
+  /** The idle-hot prompt cell: the state flips to `running` before the RPC so a concurrent
+   *  send cannot double-prompt. A failed RPC rolls back to idle and re-arms §4.1 idle
+   *  reclamation — the timer was cancelled when the send was accepted, and without the
+   *  re-arm a failed prompt would strand the process hot forever (PR #45 review #3). */
+  private async deliverHotPrompt(
+    worker: WorkerRow,
+    commandId: string,
+    input: { text: string; images?: SendArgs["images"] },
+  ): Promise<SendResult> {
+    const { workerId } = worker;
+    this.store.setWorkerState(workerId, "running");
+    try {
+      await this.adapter.send(workerId, { text: input.text, images: input.images, commandId }, "prompt");
+    } catch (err) {
+      this.store.setWorkerState(workerId, "idle");
+      this.armIdleReclaim(workerId);
+      throw err;
     }
-    return this.relaunchForSend(worker, commandId, input);
+    await this.emitEvent(workerId, "started", { sessionId: worker.sessionId ?? workerId, cwd: worker.worktree ?? undefined });
+    return { delivery: "prompt" };
   }
 
   /** §6.2 idle-cold row: relaunch the process with the same `--session-id` and deliver the
@@ -504,6 +521,7 @@ export class WorkerManager {
       releaseLock(this.stateDir, workerId);
       this.active.delete(workerId);
       this.store.setWorkerState(workerId, "idle");
+      this.armIdleReclaim(workerId); // no live process → the reclaim no-ops; keeps the idle paths symmetric
       const code = (err as { code?: string }).code ?? "startup_failed";
       const message = err instanceof Error ? err.message : String(err);
       throw new CommandError(code, `cold-start send failed: ${message}`);
@@ -525,26 +543,62 @@ export class WorkerManager {
     if (transition) await transition.catch(() => undefined);
     let returned: string[] = [];
     let aborted = false;
-    if (this.adapter.isRunning?.(args.workerId)) {
-      const result = await this.adapter.interrupt(args.workerId);
-      returned = result.returned;
-      if (returned.length > 0) {
-        await this.emitEvent(args.workerId, "queue_returned", { texts: returned });
-      }
-      aborted = true;
-      // Wait out the abort only when a run window is open — an interrupt on an idle-hot
-      // worker has nothing settling, and the wait must not stall the command (§6.2).
-      if (this.adapter.isStreaming?.(args.workerId)) await this.waitForAbortSettle(args.workerId);
-    }
     let then: SendResult | undefined;
-    if (args.then !== undefined) {
-      const worker = this.requireWorker(args.workerId);
-      if (worker.state === "broken") {
-        throw new CommandError("broken_worker", `worker ${args.workerId} is broken and needs a human decision`);
+    try {
+      if (this.adapter.isRunning?.(args.workerId)) {
+        const result = await this.adapter.interrupt(args.workerId);
+        returned = result.returned;
+        if (returned.length > 0) {
+          await this.emitEvent(args.workerId, "queue_returned", { texts: returned });
+        }
+        aborted = true;
+        // Wait out the abort only when a run window is open — an interrupt on an idle-hot
+        // worker has nothing settling, and the wait must not stall the command (§6.2).
+        if (this.adapter.isStreaming?.(args.workerId)) await this.waitForAbortSettle(args.workerId);
       }
-      then = await this.deliverSend(worker, commandId, { text: args.then, intent: "auto" });
+      if (args.then !== undefined) {
+        const worker = await this.awaitSettleBeforeThen(args.workerId);
+        if (worker.state === "broken") {
+          throw new CommandError("broken_worker", `worker ${args.workerId} is broken and needs a human decision`);
+        }
+        const runWindowOpen = this.adapter.isStreaming?.(args.workerId) ?? false;
+        const storeSettled = worker.state !== "running" && worker.state !== "recovering";
+        if (!runWindowOpen && !storeSettled) {
+          // PR #45 review #2: the settle pipeline stalled past the bound while pi's run window
+          // is observably closed. §6.2 says then = prompt — force the idle-hot prompt cell (a
+          // prompt into an idle process is safe); a steer would park the then-text in pi's
+          // queue with no run left to apply it.
+          then = await this.deliverHotPrompt(worker, commandId, { text: args.then });
+        } else {
+          then = await this.deliverSend(worker, commandId, { text: args.then, intent: "auto" });
+        }
+      }
+    } finally {
+      // §4.1 (PR #45 review #3): paths that leave the worker idle without a settle of their
+      // own (an interrupt on an idle-hot worker has nothing aborting; a failed then-prompt
+      // rolls back) must re-arm the idle window — the timer was cancelled on entry and
+      // nothing else would bring it back.
+      this.rearmIdleReclaimIfIdle(args.workerId);
     }
     return { aborted, queueReturned: returned.length, ...(then !== undefined ? { then } : {}) };
+  }
+
+  /**
+   * A fresh worker row for the `then` delivery, after waiting out the settle lag: pi's run
+   * window closes the moment `agent_settled` arrives, but the store's `running` lags that by
+   * the settle pipeline (`get_session_stats` RPC + report/git facts). §6.2 says then =
+   * prompt, so when no run window is open while the store still says running we wait
+   * (bounded by abortSettleTimeoutMs) for the settle to land before applying the state
+   * table — otherwise the then-text would be steered into a run that already ended (PR #45
+   * review #2). With a run window still open (an abort that outlived its settle timeout),
+   * the state table applies as-is: a steer pi queues and never loses.
+   */
+  private async awaitSettleBeforeThen(workerId: string): Promise<WorkerRow> {
+    const worker = this.requireWorker(workerId);
+    if (this.adapter.isStreaming?.(workerId)) return worker; // a run window is open: §6.2's table applies
+    if (worker.state !== "running" && worker.state !== "recovering") return worker; // store already caught up
+    await this.waitForAbortSettle(workerId); // the settle is in flight; bounded by abortSettleTimeoutMs
+    return this.requireWorker(workerId);
   }
 
   /** Resolved by the worker's next `settled` adapter event, or the timeout — whichever first. */
@@ -620,6 +674,12 @@ export class WorkerManager {
       clearTimeout(timer);
       this.idleTimers.delete(workerId);
     }
+  }
+
+  /** Re-arm the idle window when an intervention ends with the worker idle: no-op unless
+   *  the store actually says idle (a live run's settle arms its own timer, §4.1). */
+  private rearmIdleReclaimIfIdle(workerId: string): void {
+    if (this.store.getWorker(workerId)?.state === "idle") this.armIdleReclaim(workerId);
   }
 
   /** §4.1: past the idle window the process is closed and the session stays on disk. The

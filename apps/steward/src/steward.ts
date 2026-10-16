@@ -1990,6 +1990,20 @@ export class Steward extends Agent<Env> {
     });
   }
 
+  /** Test entry into the intervention half of the dispatch service (send/interrupt). */
+  async sendForTest(
+    input: Omit<import("./dispatch.ts").SendToWorkerInput, "provenance" | "cmdId"> & { cmdId?: string },
+  ): Promise<import("./dispatch.ts").SendToWorkerOutcome> {
+    return this.dispatcher.sendToWorker({ ...input, provenance: "test", cmdId: input.cmdId ?? `test:${ulid()}` });
+  }
+
+  /** Test entry into the intervention half of the dispatch service (send/interrupt). */
+  async interruptForTest(
+    input: Omit<import("./dispatch.ts").InterruptWorkerInput, "provenance" | "cmdId"> & { cmdId?: string },
+  ): Promise<import("./dispatch.ts").InterruptWorkerOutcome> {
+    return this.dispatcher.interruptWorker({ ...input, provenance: "test", cmdId: input.cmdId ?? `test:${ulid()}` });
+  }
+
   // ---- Steward-LLM test surface (the `faux` provider is configured via STEWARD_MODEL) ----
 
   /** Queues scripted model replies (FIFO); each model request consumes one step. */

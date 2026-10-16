@@ -84,8 +84,13 @@ afterEach(async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-function setup(runs: ScenarioStep[][], recovery: RecoveryOptions = {}, startup?: Record<string, unknown>): void {
-  const scenario = writeScenario(dir, "scenario", runs, startup);
+function setup(
+  runs: ScenarioStep[][],
+  recovery: RecoveryOptions = {},
+  startup?: Record<string, unknown>,
+  extra?: Record<string, unknown>,
+): void {
+  const scenario = writeScenario(dir, "scenario", runs, startup, extra);
   adapter = fakePiAdapter(stateDir, scenario, {
     FAKE_PI_LOG: piLog,
     FAKE_PI_SESSIONS_DIR: join(dir, "sessions"),
@@ -116,6 +121,109 @@ async function startWorker1(): Promise<void> {
 }
 
 const settledEvents = () => events.filter((e) => e.type === "settled");
+
+// PR #45 review round 1: the three confirmed connector races — a send parked on a send-
+// triggered cold relaunch that nothing drained, an interrupt {then} steered into a run that
+// had already ended (the store lagging pi's closed run window), and interventions that
+// killed the §4.1 idle timer with no settle to re-arm it.
+describe("review round 1 regressions (races around the cold start and the settle lag)", () => {
+  it("a send racing the idle-cold relaunch queues and drains when the relaunch settles (review #1)", async () => {
+    // startup delayMs widens every spawn's get_state window — the cold relaunch included.
+    setup(
+      [reportRun({ status: "done", summary: "第一段完成" }), reportRun({ status: "done", summary: "第二段完成" })],
+      {},
+      { delayMs: 600 },
+    );
+    await startWorker1();
+    await waitFor(() => settledEvents().length === 1, 15_000, "first run settled");
+    await manager.handleCommand("cmd-stop-1", "stop_process", { workerId: "w-interv-1" });
+    await waitFor(() => !existsSync(lockPath(stateDir, "w-interv-1")), 10_000, "lock released");
+
+    // Send A hits the idle-cold row and starts the relaunch (state → `starting`)…
+    const sendA = manager.handleCommand("cmd-send-a", "send", {
+      workerId: "w-interv-1",
+      text: "冷启动期间的第一条",
+      intent: "auto",
+    });
+    await waitFor(() => store.getWorker("w-interv-1")?.state === "starting", 5000, "relaunch in flight");
+    // …send B lands inside the cold-start window: it must queue on the starting row (§6.2),
+    // not error and not hang — the old code parked it forever: no transition drained it.
+    const sendB = manager.handleCommand("cmd-send-b", "send", {
+      workerId: "w-interv-1",
+      text: "冷启动期间的第二条",
+      intent: "now",
+    });
+
+    // The relaunch settles: A prompted the relaunched process, B drained as a steer into
+    // the now-running worker (the state table applies at delivery time, §6.2).
+    await expect(sendA).resolves.toEqual({ delivery: "prompt", relaunched: true });
+    await expect(sendB).resolves.toEqual({ delivery: "steer", effect: "after_current_tools" });
+    const log = readPiLog(piLog);
+    expect(log.find((e) => e.commandId === "cmd-send-a")).toMatchObject({ text: "冷启动期间的第一条" });
+    expect(log.find((e) => e.type === "steer")).toMatchObject({ text: "冷启动期间的第二条" });
+    await waitFor(() => settledEvents().length === 2, 15_000, "relaunched run settled");
+  }, 30_000);
+
+  it("interrupt {then} in the settle-lag window prompts instead of steering a dead run (review #2)", async () => {
+    // statsDelayMs holds get_session_stats back: pi's run window closed on agent_settled,
+    // but the connector's store still says running — exactly the lag window in which the
+    // old code delivered the then-text as a steer into a run that had already ended.
+    setup(
+      [reportRun({ status: "done", summary: "第一段完成" }), reportRun({ status: "done", summary: "停后重做完成" })],
+      {},
+      undefined,
+      { statsDelayMs: 1500 },
+    );
+    await startWorker1();
+    await waitFor(() => readPiLog(piLog).some((e) => e.type === "agent_settled"), 15_000, "pi-side settle");
+    expect(store.getWorker("w-interv-1")!.state).toBe("running"); // the store lags behind
+
+    const result = (await manager.handleCommand("cmd-interv-1", "interrupt", {
+      workerId: "w-interv-1",
+      then: { text: "停；改按新方案重做" },
+    })) as { then?: { delivery: string; effect?: string } };
+    // §6.2: then = prompt. A steer here would park the text in pi's queue with no run left
+    // to apply it, while the outcome claimed after_current_tools.
+    expect(result.then).toEqual({ delivery: "prompt" });
+    const log = readPiLog(piLog);
+    expect(log.filter((e) => e.type === "steer")).toHaveLength(0);
+    expect(log.find((e) => e.commandId === "cmd-interv-1")).toMatchObject({ text: "停；改按新方案重做" });
+    await waitFor(() => settledEvents().length === 2, 15_000, "then-run settled");
+  }, 30_000);
+
+  it("an interrupt on an idle-hot worker leaves the idle window armed — the process is still reclaimed (review #3)", async () => {
+    setup([reportRun({ status: "done", summary: "完成" })], { idleReclaimMs: 400 });
+    await startWorker1();
+    await waitFor(() => settledEvents().length === 1, 15_000, "run settled");
+
+    // Nothing is running: the interrupt has no run to abort, so no settle will follow to
+    // re-arm the timer cancelled on entry — the old code left the process hot forever.
+    const result = (await manager.handleCommand("cmd-interv-1", "interrupt", {
+      workerId: "w-interv-1",
+    })) as { aborted: boolean; queueReturned: number };
+    expect(result).toEqual({ aborted: true, queueReturned: 0 });
+    await waitFor(() => !existsSync(lockPath(stateDir, "w-interv-1")), 10_000, "process reclaimed after idle window");
+    expect(store.getWorker("w-interv-1")!.state).toBe("idle"); // session kept (§4.1)
+  }, 30_000);
+
+  it("a failed prompt-send on an idle-hot worker rolls back to idle and re-arms reclamation (review #3)", async () => {
+    setup(
+      [reportRun({ status: "done", summary: "完成" }), [{ fail: "pi is sad" }]],
+      { idleReclaimMs: 400 },
+    );
+    await startWorker1();
+    await waitFor(() => settledEvents().length === 1, 15_000, "run settled");
+
+    // The idle-hot prompt RPC fails at the pi boundary: the send rejects, the state rolls
+    // back to idle, and the idle window re-arms (the timer was cancelled at accept-time).
+    await expect(
+      manager.handleCommand("cmd-send-1", "send", { workerId: "w-interv-1", text: "会让 pi 报错的指令", intent: "auto" }),
+    ).rejects.toThrow(/pi is sad/);
+    expect(store.getWorker("w-interv-1")!.state).toBe("idle");
+    await waitFor(() => !existsSync(lockPath(stateDir, "w-interv-1")), 10_000, "process reclaimed after idle window");
+    expect(events.some((e) => e.type === "process_exit")).toBe(true);
+  }, 30_000);
+});
 
 describe("send: the §6.2 state table", () => {
   it("running + intent=now/auto → steer with effect after_current_tools", async () => {

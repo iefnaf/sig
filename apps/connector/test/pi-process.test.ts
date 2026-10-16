@@ -121,6 +121,20 @@ describe("PiProcess (rpc.md framing + spike-conclusions §2)", () => {
     await expect(proc.rpc({ type: "get_state" }, 500)).rejects.toThrow(/not running|exited/);
   });
 
+  it("applies a default timeout when a call passes none: a wedged peer fails the rpc instead of parking it (PR #45 review #8)", async () => {
+    const proc = new PiProcess({
+      command: [process.execPath, "-e", "process.stdin.setEncoding('utf8'); process.stdin.on('data', () => {}); setInterval(() => {}, 1000);"],
+      args: [],
+      cwd: dir,
+      onEvent: () => {},
+      onExit: () => {},
+      defaultRpcTimeoutMs: 200,
+    });
+    proc.spawn();
+    processes.push(proc);
+    await expect(proc.rpc({ type: "abort" })).rejects.toThrow(/rpc timed out after 200ms/);
+  });
+
   it("close() ends stdin and resolves on graceful exit; kill is the fallback", async () => {
     const proc = peer(`
       process.stdin.setEncoding("utf8");

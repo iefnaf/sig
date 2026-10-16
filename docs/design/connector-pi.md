@@ -196,6 +196,14 @@ Key points:
 - Images are passed as base64 in `images`; the connector checks size at the entrance (4 MB base64 per image by default) and rejects and reports anything larger rather than letting pi handle it.
 
 > **Implementation note (issue #9):** the queue rows' "prompt once startup completes" is applied through the state table at *delivery* time: when a queued send drains, the worker is `running`, so it is delivered as `steer`/`follow_up` by intent. Measured against pi 1.2's RPC, a bare `prompt` into a streaming agent is rejected ("Agent is already processing. Specify streamingBehavior…"), so mid-run deliveries are always `steer`/`follow_up` — which pi queues and never loses. A `send` that lands on an idle worker (hot or cold) is a `prompt` as written.
+>
+> **Implementation note (issue #9, review round 1):**
+>
+> 1. The idle-cold relaunch runs as a tracked transition exactly like a resume: a `send` racing the ~350 ms+ cold-start window queues on the `starting` row and drains when the relaunch settles — success *or* failure — so it can never hang; an `interrupt` arriving mid-relaunch waits it out ("stop right after dispatch").
+> 2. `interrupt {then}` waits out the settle lag before delivering: pi's run window closes the instant `agent_settled` arrives, but the store's `running` lags that by the settle pipeline (`get_session_stats` + report/git facts), so the connector waits (bounded by the abort-settle timeout) for the store to catch up and then delivers `then` as the prompt §6.2 prescribes; if the store still claims `running` with the run window observably closed, the idle-hot prompt cell is forced. When the abort-settle wait itself times out with the run window still open (a tool that outlives the abort), the then-text is delivered per the state table — a steer pi queues and never loses.
+> 3. Command-driven cold relaunches (`send` on idle-cold, `interrupt {then}` on `lost`) deliberately do not consume the §9.2 automatic-resume budget: that budget bounds *automatic* crash-loop resumes; each command-driven relaunch is at-most-once per command and bounded by the user's command rate, and every unexpected exit still arms exactly one budgeted auto-resume. Charging healthy cold starts against the crash budget would starve genuine crash recovery (2/hour).
+> 4. Interventions that leave the worker idle without a settle of their own (an interrupt on an idle-hot worker — nothing is aborting; a prompt RPC that fails and rolls back) re-arm the §4.1 idle window instead of stranding the process hot forever.
+> 5. Control RPCs (`steer`/`follow_up`/`clear_queue`/`abort`, prompt deliveries) carry a 15 s default timeout: pi answers them in milliseconds, so a response that never comes means a wedged process, and a failed command beats a parked one (the steward's outbox row settles `failed` instead of hanging).
 
 ### 6.3 Idempotency and "at most once"
 

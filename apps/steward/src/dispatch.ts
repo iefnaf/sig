@@ -287,6 +287,15 @@ export class Dispatcher {
     }
     const machine = this.ledger.machines.get(worker.deviceId);
     const offline = !(machine?.online ?? false);
+    // PR #45 review #6: the connector rejects a broken worker's sends (broken_worker) —
+    // refuse here, before the enqueue, so the tool reply cannot claim a delivery (「已发送」)
+    // the connector is guaranteed to reject.
+    if (worker.state === "broken") {
+      return {
+        kind: "refused",
+        reason: `worker ${input.workerId} 已损坏（需要人工决定），指令不会被送达。先和用户确认下一步。`,
+      };
+    }
     const delivery =
       worker.state === "running" || worker.state === "recovering"
         ? input.intent === "after"
@@ -294,7 +303,7 @@ export class Dispatcher {
           : "steer"
         : worker.state === "starting" || worker.state === "lost"
           ? "queued"
-          : "prompt"; // idle — and a broken worker's sends fail loudly at the connector
+          : "prompt"; // idle — broken was refused above
     // Replay dedup (protocol §7.1): the same tool task re-running after a crash converges on
     // the existing outbox row instead of writing a second timeline entry.
     if (this.#deps.commandExists(input.cmdId)) {
@@ -328,6 +337,11 @@ export class Dispatcher {
     }
     const machine = this.ledger.machines.get(worker.deviceId);
     const offline = !(machine?.online ?? false);
+    // PR #45 review #6: nothing runs on a broken worker — refuse before the enqueue so the
+    // model cannot promise「会尽快停下」for a command the connector will reject.
+    if (worker.state === "broken") {
+      return { kind: "refused", reason: `worker ${input.workerId} 已损坏（需要人工决定），没有运行中的任务可停。` };
+    }
     if (this.#deps.commandExists(input.cmdId)) {
       return { kind: "interrupted", threadId: worker.threadId, machineOffline: offline };
     }

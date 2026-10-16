@@ -278,10 +278,13 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
     name: "interrupt_worker",
     description:
       "中断一个正在运行的 worker（停下它手头的事）。仅当用户明确要求停下时才用（basis 必须是 user_explicit 或 user_reply_to，" +
-      "否则用 ask_user 先问）。可选 then：「停，然后改用 pnpm」这类停后跟进的新指令。转向（不停下）用 send_to_worker。",
+      "否则用 ask_user 先问）。事件触发的运行里（⟦…⟧ 输入）必须另外给 provenanceRef：一条真实存在的用户消息 id（user:<om_…>，来自时间线/汇报的 refs），" +
+      "否则会被拒绝——停下运行中的任务必须用户明示，系统输入自身不构成授权（设计 §7.2）。" +
+      "可选 then：「停，然后改用 pnpm」这类停后跟进的新指令。转向（不停下）用 send_to_worker。",
     parameters: Type.Object({
       workerId: Type.String({ description: "如 w_01J…" }),
       then: Type.Optional(Type.String({ description: "停下后紧接着交给 worker 的新指令（可省）" })),
+      provenanceRef: Type.Optional(Type.String({ description: "授权来源：user:<msgId>（仅事件触发的运行里必填）" })),
       basis: Type.Union([
         Type.Literal("user_explicit"),
         Type.Literal("user_reply_to"),
@@ -294,10 +297,23 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
     replay: "unsafe",
     execute: async (args, api) => {
       const run = await ctx.currentRun();
+      // PR #45 review #4: an abort is at least as destructive as a steer, and `basis` labels
+      // are model-claimed — event-triggered runs need a verifiable reference to the user
+      // message that said stop, exactly like send_to_worker (§7.2).
+      let provenance = run?.provenance ?? "unknown";
+      if (run && run.kind !== "user") {
+        if (args.provenanceRef === undefined) {
+          return err("refused: 事件触发的运行不能自行中断 worker（设计 §7.2）。停下运行中的任务必须用户明示：给出 provenanceRef=user:<msgId>（用户真正说过这条话的消息 id），或改用 ask_user。");
+        }
+        if (!(await ctx.checkProvenanceRef(args.provenanceRef))) {
+          return err(`refused: provenanceRef ${args.provenanceRef} 不存在（必须是本部署真实收到的用户消息 id）。`);
+        }
+        provenance = args.provenanceRef;
+      }
       const outcome = await ctx.interruptWorker({
         workerId: args.workerId,
         ...(args.then !== undefined ? { then: args.then } : {}),
-        provenance: run?.provenance ?? "unknown",
+        provenance,
         cmdId: `tool:${api.taskId}`,
       });
       if (outcome.kind === "refused") return err(`refused: ${outcome.reason}`);

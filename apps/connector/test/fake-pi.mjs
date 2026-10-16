@@ -17,6 +17,9 @@
 //   {
 //     "startup": { "exit": 9, "delayMs": 300 },  // optional: exit before answering get_state,
 //                                               // or hold the get_state answer (a `starting` window)
+//     "statsDelayMs": 1500,                 // optional: hold get_session_stats back — models the
+//                                             // settle lag where pi's run window is closed but the
+//                                             // connector still says running
 //     "runs": [ [ <step>, ... ], ... ]     // runs[k] plays on the k-th prompt
 //   }
 // Step:
@@ -25,11 +28,13 @@
 //   { "raw": "..." }                       // verbatim stdout chunk (framing tests)
 //   { "shell": "git add -A" }              // run in cwd, ignore failures
 //   { "session": { ... } }                 // append one entry to the session JSONL
+//   { "fail": "reason" }                   // fail that prompt's RPC with `reason` (no run plays)
 //   { "exit": 7 }                          // crash the fake pi process
 //
 // steer/follow_up messages queue like real pi ( disposition "queued"); clear_queue hands
 // them back; abort stops the scripted run and emits agent_settled{aborted:true} — the
-// §6.2 intervention surface the connector drives.
+// §6.2 intervention surface the connector drives. An abort with no run in flight is a
+// no-op (real pi has nothing to abort on an idle process); the next prompt runs normally.
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { exec } from "node:child_process";
 import { join } from "node:path";
@@ -86,21 +91,35 @@ function logPrompt(entry) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** True while a scripted run is playing — aborts only take effect inside a run (PR #45
+ *  review #7: an abort on an idle process must not derail the next prompt's run). */
+let runInFlight = false;
+
 async function playRun(steps) {
-  for (const step of steps ?? []) {
-    if (step.delayMs) await sleep(step.delayMs);
-    // abort() takes effect between steps: the run ends and agent_settled{aborted:true}
-    // fires (research #3: abort responds in ~3 ms and the process accepts new commands).
-    if (aborting) break;
-    if (step.emit) writeLine(step.emit);
-    if (step.raw) process.stdout.write(step.raw);
-    if (step.session) appendSessionEntry(step.session);
-    if (step.shell) await new Promise((r) => exec(step.shell, () => r(undefined)));
-    if (step.exit !== undefined) process.exit(step.exit);
-  }
-  if (aborting) {
-    aborting = false;
-    writeLine({ type: "agent_settled", aborted: true });
+  runInFlight = true;
+  try {
+    for (const step of steps ?? []) {
+      if (step.delayMs) await sleep(step.delayMs);
+      // abort() takes effect between steps: the run ends and agent_settled{aborted:true}
+      // fires (research #3: abort responds in ~3 ms and the process accepts new commands).
+      if (aborting) break;
+      if (step.emit) {
+        writeLine(step.emit);
+        // Tests synchronize on pi-side settles (the settle-lag window): log it like the
+        // intervention commands so a test can wait for exactly this moment.
+        if (step.emit.type === "agent_settled") logPrompt({ type: "agent_settled", aborted: step.emit.aborted === true, at: Date.now() });
+      }
+      if (step.raw) process.stdout.write(step.raw);
+      if (step.session) appendSessionEntry(step.session);
+      if (step.shell) await new Promise((r) => exec(step.shell, () => r(undefined)));
+      if (step.exit !== undefined) process.exit(step.exit);
+    }
+    if (aborting) {
+      aborting = false;
+      writeLine({ type: "agent_settled", aborted: true });
+    }
+  } finally {
+    runInFlight = false;
   }
 }
 
@@ -155,9 +174,15 @@ async function handle(command) {
         text = text.slice(nl + 1);
       }
       logPrompt({ commandId, text, at: Date.now() });
-      respond(id, "prompt", { disposition: commandId !== null ? "handled" : "started" });
       const run = scenario.runs?.[promptCount] ?? [];
       promptCount += 1;
+      const failure = run.find((step) => typeof step.fail === "string");
+      if (failure) {
+        // The prompt RPC fails at the pi boundary (a wedged/broken pi): no run plays.
+        respondError(id, "prompt", failure.fail);
+        return;
+      }
+      respond(id, "prompt", { disposition: commandId !== null ? "handled" : "started" });
       await playRun(run);
       return;
     }
@@ -170,7 +195,9 @@ async function handle(command) {
       return;
     }
     case "abort": {
-      aborting = true;
+      // Real pi only aborts an in-flight run; on an idle process the RPC succeeds as a
+      // no-op and a later prompt runs normally (review #7) — the dangling-abort model.
+      if (runInFlight) aborting = true;
       logPrompt({ type: "abort", at: Date.now() });
       respond(id, "abort", {});
       return;
@@ -184,6 +211,7 @@ async function handle(command) {
       return;
     }
     case "get_session_stats": {
+      if (scenario.statsDelayMs) await sleep(scenario.statsDelayMs);
       respond(id, "get_session_stats", {
         sessionId,
         tokens: { input: 1200, output: 300, totalTokens: 1500 },

@@ -147,6 +147,43 @@ describe("send_to_worker (steward.md §4.3, connector-pi.md §6.2)", () => {
 });
 
 describe("interrupt_worker (steward.md §7.2: basis ∈ {user_explicit, user_reply_to})", () => {
+  it("an event-triggered run cannot interrupt without a verifiable provenanceRef (§7.2, PR #45 review #4)", async () => {
+    const { fake, workerId } = await dispatchRunning();
+    // A report wakes the steward; the scripted model claims the user's hand without a
+    // verifiable reference — the basis label alone is model-claimed and must not carry an abort.
+    await scriptModel(
+      fauxAssistantMessage([fauxToolCall("interrupt_worker", { workerId, basis: "user_explicit" })], { stopReason: "toolUse" }),
+      fauxAssistantMessage([fauxToolCall("interrupt_worker", { workerId, basis: "user_explicit", provenanceRef: "user:om_nonexistent" })], { stopReason: "toolUse" }),
+      fauxAssistantMessage([fauxText("好，先不动它。")]),
+    );
+    await fake.emit("report", workerId, { type: "report", status: "done", summary: "完成" });
+    await waitRunsSettled();
+    const results = await toolResults();
+    expect(results.some((r) => r.includes("refused") && r.includes("provenanceRef"))).toBe(true); // no ref
+    expect(results.some((r) => r.includes("refused") && r.includes("om_nonexistent"))).toBe(true); // bogus ref
+    expect(fake.cmds).toHaveLength(1); // only the original start_worker — no interrupt left the DO
+    fake.close();
+    void (await mockCalls());
+  }, 30_000);
+
+  it("an event-triggered interrupt with a real user message id passes the gate", async () => {
+    const { fake, workerId } = await dispatchRunning();
+    // A standing user instruction the ref can point at (§7.2: verified against sh_inbound).
+    await scriptModel(
+      fauxAssistantMessage([fauxText("好，记住了：回头说停就停干净。")]), // replies to the DM below
+      fauxAssistantMessage([fauxToolCall("interrupt_worker", { workerId, basis: "user_reply_to", provenanceRef: "user:om_stopauth1" })], { stopReason: "toolUse" }),
+      fauxAssistantMessage([fauxText("已停下。")]),
+    );
+    await dm("记住：回头我说停，就把它停干净", "om_stopauth1");
+    await fake.emit("report", workerId, { type: "report", status: "done", summary: "完成" });
+    const [, cmd] = await fake.waitForCmds(2);
+    expect(cmd).toMatchObject({ kind: "interrupt", workerId });
+    await waitRunsSettled();
+    expect((await toolResults()).some((r) => r.includes("已发出中断"))).toBe(true);
+    fake.close();
+    void (await mockCalls());
+  }, 30_000);
+
   it("blocks inferred/other bases at the hook; a user-explicit basis enqueues the interrupt", async () => {
     const { fake, workerId } = await dispatchRunning();
 
