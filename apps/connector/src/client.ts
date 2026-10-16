@@ -1,21 +1,52 @@
-// Connector WebSocket client: connect, hello/welcome, and reconnect per protocol §3.3/§3.5.
+// Connector WebSocket client: connect, hello/welcome, reconnect (protocol §3.3/§3.5), the
+// reliable command/event exchange (§4), and the bidirectional application-level heartbeat
+// (ADR-0001 correction to §3.2): uplink `ping` with a pong timeout, plus an inter-frame
+// timeout, so a half-dead TCP link is torn down and reconnected instead of buffering silently.
 import { randomUUID } from "node:crypto";
 import os from "node:os";
 import WebSocket from "ws";
-import { CloseCode, PROTOCOL_VERSION, reconnectOn, ulid } from "@shepherd/protocol";
+import {
+  CloseCode,
+  PROTOCOL_VERSION,
+  reconnectOn,
+  ulid,
+  type CmdMessage,
+  type WelcomeMessage,
+} from "@shepherd/protocol";
+import { CommandLog, type CommandResult } from "./commands.ts";
+import { EventLog, type StoredEvent } from "./events.ts";
 import type { LocalStore } from "./store.ts";
+
+export type CommandHandler = (cmd: CmdMessage) => Promise<CommandResult>;
 
 export interface ClientOptions {
   store: LocalStore;
   machineName?: string;
   WebSocketImpl?: typeof WebSocket;
-  onWelcome?: (welcome: Record<string, unknown>) => void;
+  onWelcome?: (welcome: WelcomeMessage) => void;
   onClose?: (code: number, reason: string) => void;
   minBackoffMs?: number;
   maxBackoffMs?: number;
+  // Real command execution arrives with the connector-pi integration; without a handler the
+  // connector rejects every kind so the DO's outbox row settles immediately.
+  handleCommand?: CommandHandler;
+  workersSnapshot?: () => Array<Record<string, unknown>>;
+  pingIntervalMs?: number;
+  pongTimeoutMs?: number;
+  deadAfterMs?: number;
+  batchMs?: number;
+  batchEvents?: number;
+  batchBytes?: number;
 }
 
 const CREDENTIALS_CLEARING_CODES: ReadonlySet<number> = new Set([CloseCode.UNAUTHORIZED, CloseCode.REVOKED]);
+
+const DEFAULT_PING_INTERVAL_MS = 25_000;
+const DEFAULT_PONG_TIMEOUT_MS = 60_000;
+const DEFAULT_DEAD_AFTER_MS = 90_000;
+const DEFAULT_BATCH_MS = 250;
+const DEFAULT_BATCH_EVENTS = 50;
+const DEFAULT_BATCH_BYTES = 64 * 1024;
 
 export class ConnectorClient {
   private readonly store: LocalStore;
@@ -23,10 +54,23 @@ export class ConnectorClient {
   private readonly minBackoffMs: number;
   private readonly maxBackoffMs: number;
   private readonly bootId = randomUUID();
+  private readonly commands: CommandLog;
+  private readonly events: EventLog;
+  private readonly options: ClientOptions;
+  private readonly pingIntervalMs: number;
+  private readonly pongTimeoutMs: number;
+  private readonly deadAfterMs: number;
+  private readonly batchMs: number;
+  private readonly batchEvents: number;
+  private readonly batchBytes: number;
   private backoffMs: number;
   private stopped = true;
   private ws?: WebSocket;
-  private readonly options: ClientOptions;
+  private pingTimer?: NodeJS.Timeout;
+  private pendingPing?: { id: string; sentAt: number };
+  private lastFrameAt = 0;
+  private sendQueue: StoredEvent[] = [];
+  private flushTimer?: NodeJS.Timeout;
 
   constructor(options: ClientOptions) {
     this.options = options;
@@ -35,6 +79,17 @@ export class ConnectorClient {
     this.minBackoffMs = options.minBackoffMs ?? 1000;
     this.maxBackoffMs = options.maxBackoffMs ?? 60_000;
     this.backoffMs = this.minBackoffMs;
+    this.commands = new CommandLog(options.store.database);
+    this.events = new EventLog(options.store.database);
+    this.pingIntervalMs = options.pingIntervalMs ?? DEFAULT_PING_INTERVAL_MS;
+    this.pongTimeoutMs = options.pongTimeoutMs ?? DEFAULT_PONG_TIMEOUT_MS;
+    this.deadAfterMs = options.deadAfterMs ?? DEFAULT_DEAD_AFTER_MS;
+    this.batchMs = options.batchMs ?? DEFAULT_BATCH_MS;
+    this.batchEvents = options.batchEvents ?? DEFAULT_BATCH_EVENTS;
+    this.batchBytes = options.batchBytes ?? DEFAULT_BATCH_BYTES;
+    // A crash mid-`sending` left undecidable commands; they become `ambiguous` and ride the
+    // next hello's pendingAcks so the DO can settle its outbox rows (protocol §6.1).
+    this.commands.reconcileCrashed();
   }
 
   start(): void {
@@ -47,6 +102,14 @@ export class ConnectorClient {
     this.ws?.close(1000, "stopping");
   }
 
+  // Appends an event to the durable log and queues it for the next batch (protocol §3.6).
+  emit(workerId: string, fields: Record<string, unknown>): number {
+    const stored = this.events.append(workerId, fields);
+    this.enqueue([stored]);
+    this.scheduleFlush();
+    return stored.seq;
+  }
+
   private connectOnce(): void {
     const credentials = this.store.getCredentials();
     if (!credentials) throw new Error("no credentials saved; pair with `connect <url> <code>` first");
@@ -57,6 +120,8 @@ export class ConnectorClient {
     this.ws = ws;
 
     ws.on("open", () => {
+      this.lastFrameAt = Date.now();
+      this.pendingPing = undefined;
       ws.send(
         JSON.stringify({
           t: "hello",
@@ -74,10 +139,11 @@ export class ConnectorClient {
           agents: [],
           repos: [],
           limits: { maxWorkers: 1, running: 0 },
-          workers: [],
-          pendingAcks: [],
+          workers: this.options.workersSnapshot?.() ?? [],
+          pendingAcks: this.commands.pendingAcks(),
         }),
       );
+      this.startPingTimer(ws);
     });
 
     ws.on("message", (data: unknown) => {
@@ -87,13 +153,13 @@ export class ConnectorClient {
       } catch {
         return;
       }
-      if (message.t === "welcome") {
-        this.backoffMs = this.minBackoffMs;
-        this.options.onWelcome?.(message);
-      }
+      this.lastFrameAt = Date.now();
+      this.handleMessage(ws, message);
     });
 
     ws.on("close", (code: number, reasonBuf: unknown) => {
+      this.clearConnectionTimers();
+      this.sendQueue = []; // unsent events stay in the durable log and are replayed after welcome
       const reason = reasonBuf ? String(reasonBuf) : "";
       this.options.onClose?.(code, reason);
       if (CREDENTIALS_CLEARING_CODES.has(code)) this.store.clearCredentials();
@@ -106,6 +172,165 @@ export class ConnectorClient {
 
     // "close" always follows "error" on the `ws` client; reconnect decisions live there.
     ws.on("error", () => {});
+  }
+
+  private handleMessage(ws: WebSocket, message: Record<string, unknown>): void {
+    switch (message.t) {
+      case "welcome": {
+        this.backoffMs = this.minBackoffMs;
+        const welcome = message as unknown as WelcomeMessage;
+        // welcome.acks doubles as a cumulative events_ack: everything <= upTo is durably
+        // persisted server-side, so truncate locally, then replay what is still unacked (§4.3).
+        for (const [workerId, upTo] of Object.entries(welcome.acks ?? {})) {
+          this.events.truncate(workerId, upTo);
+        }
+        for (const workerId of this.events.workers()) {
+          this.enqueue(this.events.pending(workerId));
+        }
+        this.scheduleFlush();
+        this.options.onWelcome?.(welcome);
+        return;
+      }
+      case "pong":
+        this.pendingPing = undefined;
+        return;
+      case "events_ack":
+        this.events.truncate(String(message.workerId), Number(message.upTo));
+        return;
+      case "resync": {
+        const workerId = String(message.workerId);
+        const from = Number(message.from);
+        const { replay, gapFrom, gapTo } = this.events.rangeAvailable(from, workerId);
+        if (gapFrom !== null && gapTo !== null) {
+          // The local log already evicted the requested range (size cap): report the gap; the
+          // DO marks it on the timeline and reconciles (protocol §4.3).
+          this.send(ws, { t: "events_gap", workerId, from: gapFrom, to: gapTo });
+        }
+        this.enqueue(replay);
+        this.scheduleFlush();
+        return;
+      }
+      case "cmd":
+        this.handleCmd(ws, message as unknown as CmdMessage);
+        return;
+      default:
+        return;
+    }
+  }
+
+  private handleCmd(ws: WebSocket, cmd: CmdMessage): void {
+    const known = this.commands.get(cmd.id);
+    if (known) {
+      if (known.state === "done" || known.state === "failed") {
+        this.send(ws, { t: "cmd_ack", re: cmd.id, status: "duplicate", result: known.result ?? undefined });
+      } else if (known.state === "ambiguous") {
+        this.send(ws, { t: "cmd_ack", re: cmd.id, status: "ambiguous" });
+      } else {
+        // accepted/sending: already in flight; the result will arrive separately.
+        this.send(ws, { t: "cmd_ack", re: cmd.id, status: "accepted" });
+      }
+      return;
+    }
+    this.commands.begin(cmd.id);
+    const handler = this.options.handleCommand;
+    if (!handler) {
+      this.commands.settle(cmd.id, { ok: false, error: { code: "unsupported" } });
+      this.send(ws, { t: "cmd_ack", re: cmd.id, status: "rejected", code: "unsupported" });
+      return;
+    }
+    this.send(ws, { t: "cmd_ack", re: cmd.id, status: "accepted" });
+    void this.runHandler(ws, handler, cmd);
+  }
+
+  private async runHandler(ws: WebSocket, handler: CommandHandler, cmd: CmdMessage): Promise<void> {
+    this.commands.markSending(cmd.id);
+    let result: CommandResult;
+    try {
+      result = await handler(cmd);
+    } catch (err) {
+      result = { ok: false, error: { code: "internal", message: err instanceof Error ? err.message : String(err) } };
+    }
+    this.commands.settle(cmd.id, result);
+    this.send(ws, { t: "cmd_result", re: cmd.id, ok: result.ok, data: result.data, error: result.error });
+  }
+
+  // ---- heartbeat ----
+
+  private startPingTimer(ws: WebSocket): void {
+    this.clearConnectionTimers();
+    this.pingTimer = setInterval(() => this.pingTick(ws), this.pingIntervalMs);
+  }
+
+  private pingTick(ws: WebSocket): void {
+    if (this.ws !== ws || this.stopped || ws.readyState !== this.WebSocketImpl.OPEN) return;
+    const now = Date.now();
+    const pongOverdue = this.pendingPing && now - this.pendingPing.sentAt > this.pongTimeoutMs;
+    const dead = now - this.lastFrameAt > this.deadAfterMs;
+    if (pongOverdue || dead) {
+      // Half-dead link (spike bug 10): terminate forces an immediate TCP teardown so the
+      // reconnect loop builds a fresh connection instead of buffering into a black hole.
+      try {
+        ws.terminate();
+      } catch {
+        // already closed; the close handler drives reconnection
+      }
+      return;
+    }
+    if (this.pendingPing) return; // still waiting for the previous pong
+    this.pendingPing = { id: ulid(), sentAt: now };
+    this.send(ws, { t: "ping", id: this.pendingPing.id });
+  }
+
+  private clearConnectionTimers(): void {
+    if (this.pingTimer) clearInterval(this.pingTimer);
+    this.pingTimer = undefined;
+    if (this.flushTimer) clearTimeout(this.flushTimer);
+    this.flushTimer = undefined;
+    this.pendingPing = undefined;
+  }
+
+  // ---- event batching (protocol §3.6: 250ms | 50 items | 64KiB, whichever first) ----
+
+  private enqueue(events: StoredEvent[]): void {
+    if (events.length === 0) return;
+    const queued = new Set(this.sendQueue.map((e) => `${e.workerId}:${e.seq}`));
+    for (const event of events) {
+      const key = `${event.workerId}:${event.seq}`;
+      if (!queued.has(key)) {
+        this.sendQueue.push(event);
+        queued.add(key);
+      }
+    }
+  }
+
+  private scheduleFlush(): void {
+    if (this.flushTimer || this.sendQueue.length === 0) return;
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = undefined;
+      this.flush();
+    }, this.batchMs);
+  }
+
+  private flush(): void {
+    const ws = this.ws;
+    if (!ws || ws.readyState !== this.WebSocketImpl.OPEN) return; // stays queued; retried after welcome
+    const batch: StoredEvent[] = [];
+    let bytes = 0;
+    while (this.sendQueue.length > 0 && batch.length < this.batchEvents) {
+      const next = this.sendQueue[0]!;
+      const size = next.payload.length;
+      if (batch.length > 0 && bytes + size > this.batchBytes) break;
+      batch.push(this.sendQueue.shift()!);
+      bytes += size;
+    }
+    if (batch.length === 0) return;
+    this.send(ws, { t: "events", id: ulid(), batch: batch.map((e) => JSON.parse(e.payload)) });
+    if (this.sendQueue.length > 0) this.scheduleFlush();
+  }
+
+  private send(ws: WebSocket, message: Record<string, unknown>): void {
+    if (ws.readyState !== this.WebSocketImpl.OPEN) return;
+    ws.send(JSON.stringify(message));
   }
 
   private scheduleReconnect(): void {

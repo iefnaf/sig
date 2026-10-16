@@ -8,8 +8,11 @@ import { ConnectorClient } from "../src/client.ts";
 import { LocalStore } from "../src/store.ts";
 
 class FakeWebSocket extends EventEmitter {
+  static readonly OPEN = 1;
   static instances: FakeWebSocket[] = [];
   sent: string[] = [];
+  readyState = 0;
+  terminated = false;
   closed: { code?: number; reason?: string } | null = null;
 
   constructor(
@@ -25,11 +28,18 @@ class FakeWebSocket extends EventEmitter {
   }
 
   close(code?: number, reason?: string): void {
+    if (this.closed) return;
     this.closed = { code, reason };
     this.emit("close", code ?? 1000, reason ?? "");
   }
 
+  terminate(): void {
+    this.terminated = true;
+    this.close(1006, "heartbeat");
+  }
+
   simulateOpen(): void {
+    this.readyState = FakeWebSocket.OPEN;
     this.emit("open");
   }
 
