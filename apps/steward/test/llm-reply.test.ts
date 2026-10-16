@@ -106,7 +106,7 @@ describe("input markers (steward.md §4.2, §15.2)", () => {
     const text = eventWakeText({
       thread: { threadId: "t_1", title: "登录 bug", goal: null, summary: null, summaryAt: null, state: "idle", unread: true, lastMachine: null, lastActivityAt: 0, archived: false, createdFromMsg: null, createdAt: 0 },
       worker: { workerId: "w_a", threadId: "t_1", deviceId: "dev_1", repoId: "/srv/repo-a", agent: "pi", mode: "write", state: "idle", sessionId: null, branch: "shepherd/x-1", cmdId: null, lastOutcome: "reported:done", lastEventAt: null, lastProgress: null, createdAt: 0 },
-      machine: { deviceId: "dev_1", name: "mac-studio", online: true, lastSeen: null, agents: [], maxWorkers: 4 },
+      machine: { deviceId: "dev_1", name: "mac-studio", online: true, lastSeen: null, agents: [], maxWorkers: 4, bootId: "boot-1" },
       report: { status: "done", summary: "修好了", changes: ["a.ts"], decisions: ["用 session 方案"], leftovers: null, tests: { ran: true, passed: true }, question: null, git: { branch: "shepherd/x-1", base: "main", ahead: 2, dirty: 0, filesChanged: 1, insertions: 5, deletions: 1, pushed: false } },
       notified: true,
     });
@@ -122,15 +122,20 @@ describe("input markers (steward.md §4.2, §15.2)", () => {
 describe("model configuration (ADR-0001 decision 11, spike bug 7)", () => {
   it("defaults to deepseek-flash and accepts deploy config in object or JSON form", () => {
     expect(resolveModelConfig(undefined)).toEqual(DEFAULT_MODEL_CONFIG);
-    expect(DEFAULT_MODEL_CONFIG).toEqual({ provider: "deepseek", modelId: "deepseek-flash" });
-    expect(resolveModelConfig(JSON.stringify({ provider: "anthropic", modelId: "claude-x" }))).toEqual({ provider: "anthropic", modelId: "claude-x" });
+    expect(DEFAULT_MODEL_CONFIG).toEqual({ provider: "deepseek", modelId: "deepseek-flash", explicit: false });
+    expect(resolveModelConfig(JSON.stringify({ provider: "anthropic", modelId: "claude-x" }))).toEqual({ provider: "anthropic", modelId: "claude-x", explicit: true });
     expect(resolveModelConfig({ provider: "deepseek", modelId: "deepseek-v4-pro", baseUrl: "https://proxy.example" })).toEqual({
       provider: "deepseek",
       modelId: "deepseek-v4-pro",
       baseUrl: "https://proxy.example",
+      explicit: true,
     });
     expect(resolveModelConfig({ provider: "", modelId: "x" })).toEqual(DEFAULT_MODEL_CONFIG); // malformed → default
     expect(resolveModelConfig("not json")).toEqual(DEFAULT_MODEL_CONFIG);
+    // `explicit` is the precedence marker: unset/malformed → the sealed sh_model row's
+    // provider wins; an explicit deploy config wins over the sealed row.
+    expect(resolveModelConfig(undefined).explicit).toBe(false);
+    expect(resolveModelConfig({ provider: "deepseek", modelId: "deepseek-flash" }).explicit).toBe(true);
   });
 
   it("builds the provider with an inline auth.apiKey.resolve — no ambient env lookup", async () => {
@@ -151,8 +156,28 @@ describe("model configuration (ADR-0001 decision 11, spike bug 7)", () => {
   });
 
   it("an unknown provider registers no models — runs fail visibly, never with a wrong model", () => {
-    const built = buildStewardModels({ provider: "no-such-provider", modelId: "whatever" }, "k");
+    const built = buildStewardModels({ provider: "no-such-provider", modelId: "whatever", explicit: true }, "k");
     expect(built.models.getModel("no-such-provider", "whatever")).toBeUndefined();
+  });
+
+  it("the merged selection: explicit deploy config wins; the sealed row (MODEL_KEY-seeded) supplies provider + key only when vars are unset", async () => {
+    // The test environment binds vars = faux and the MODEL_KEY deploy secret; the first read
+    // seeds the sealed sh_model row (provider deepseek — the deploy-form default).
+    const varsWins = await ownerStub().llmSelection();
+    expect(varsWins).toMatchObject({ provider: "faux", modelId: "faux-1", explicitVars: true, sealedProvider: "deepseek" });
+    expect(varsWins.apiKey).toBe(false); // a deepseek key is never sent to the faux provider
+
+    // Unset vars: the sealed row's provider becomes the selection (deepseek + the seeded key).
+    const sealedWins = await ownerStub().llmSelection(null);
+    expect(sealedWins).toMatchObject({ provider: "deepseek", modelId: "deepseek-flash", explicitVars: false, apiKey: true });
+
+    // Reconfigure through the app's own step (upstream #27): a sealed anthropic row with
+    // unset vars selects anthropic — and setModelConfig dropped the cached collection.
+    await ownerStub().setModelConfig("anthropic", "sk-ant-test");
+    const reconfigured = await ownerStub().llmSelection(null);
+    expect(reconfigured).toMatchObject({ provider: "anthropic", modelId: "deepseek-flash", apiKey: true });
+    // …but the explicit deploy config still wins over the resealed row.
+    expect(await ownerStub().llmSelection()).toMatchObject({ provider: "faux", apiKey: false });
   });
 });
 
@@ -244,10 +269,11 @@ describe("the wake queue: merge window and replay safety (steward.md §5.1/§5.4
     await scriptModel(fauxAssistantMessage([fauxText("记账。")]));
     const batch = { workerId, seq: 2, ts: Date.now(), type: "report" as const, status: "done" as const, summary: "修好了" };
     await fake.emit("report", workerId, batch);
-    let snap = await ownerStub().debugSnapshot();
-    expect(snap.wakes).toHaveLength(1);
+    let snap = await waitFor(() => ownerStub().debugSnapshot(), (s) => s.wakes.length === 1);
     // The connector retransmits the same batch (reconnect replay): dedup at (workerId, seq).
+    // No observable state changes when it works, so give the DO a moment to (not) write.
     await fake.emit("report", workerId, batch);
+    await new Promise((resolve) => setTimeout(resolve, 300));
     snap = await ownerStub().debugSnapshot();
     expect(snap.wakes).toHaveLength(1);
 

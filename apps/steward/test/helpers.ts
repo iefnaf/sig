@@ -412,6 +412,10 @@ export class FakeConnector {
   readonly token: string;
   readonly machineName: string;
   readonly repos: FakeRepo[];
+  /** Carried in hello (protocol §6.1): set per simulated connector boot. */
+  bootId = "boot-1";
+  /** Full workers snapshot for hello.workers (reconciliation input, issue #12). */
+  workers: Array<Record<string, unknown>> = [];
   ws: WebSocket | null = null;
   reader: MessageReader | null = null;
   /** Every `cmd` frame received so far; assert with `waitForCmds`. */
@@ -445,6 +449,8 @@ export class FakeConnector {
 
   helloOverrides(): Record<string, unknown> {
     return {
+      bootId: this.bootId,
+      workers: this.workers,
       machine: { name: this.machineName, memTotalMB: 65536, memFreeMB: 31000 },
       agents: [
         {
@@ -542,7 +548,11 @@ export class FakeConnector {
   }
 
   /** Sends one worker event with the next seq for that worker (connector-persisted seqs). */
-  async emit(kind: "started" | "progress" | "report" | "settled", workerId: string, fields: Record<string, unknown>): Promise<void> {
+  async emit(
+    kind: "started" | "progress" | "report" | "settled" | "lost" | "resumed",
+    workerId: string,
+    fields: Record<string, unknown>,
+  ): Promise<void> {
     const seq = (this.seqs.get(workerId) ?? 0) + 1;
     this.seqs.set(workerId, seq);
     this.send({ t: "events", id: `evt-${workerId}-${seq}`, batch: [{ workerId, seq, ts: Date.now(), type: kind, ...fields }] });

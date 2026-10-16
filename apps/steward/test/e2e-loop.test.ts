@@ -50,9 +50,15 @@ async function snapshotWhere(pred: (snap: Awaited<ReturnType<typeof snapshot>>) 
   }
 }
 
-async function sentCards(): Promise<ShOutboundRow[]> {
-  const rows = await ownerStub().outboundRows(30);
-  return rows.filter((r) => r.kind === "card" && r.status === "sent");
+async function sentCards(minCount = 1, timeoutMs = 8000): Promise<ShOutboundRow[]> {
+  // The worker flips to idle before the outbound queue finishes sending the card, so a
+  // single read races the sender on slow runners — poll like snapshotWhere does.
+  const startedAt = Date.now();
+  for (;;) {
+    const rows = (await ownerStub().outboundRows(30)).filter((r) => r.kind === "card" && r.status === "sent");
+    if (rows.length >= minCount || Date.now() - startedAt > timeoutMs) return rows; // caller asserts on timeout
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
 }
 
 async function sentTexts(): Promise<string[]> {
@@ -185,7 +191,7 @@ describe("the happy loop: natural language → tool dispatch → done card → e
     });
     await snapshotWhere((s) => s.threads[0]?.workers.length === 2 && s.threads[0]?.workers[1]?.state === "running", "second run reported");
     await waitWhileOutboundPending();
-    const cards = await sentCards();
+    const cards = await sentCards(2);
     expect(cards).toHaveLength(2);
     expect(JSON.stringify(JSON.parse(cards[1]!.payload as string))).toContain("单元测试补齐");
     expect(cards[1]!.threadId).toBe(threadId);

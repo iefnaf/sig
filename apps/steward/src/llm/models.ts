@@ -13,34 +13,39 @@ import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import type { AssistantMessage, TranscriptContext } from "@earendil-works/pi-ai";
 import { fauxProvider, type FauxProviderHandle } from "@earendil-works/pi-ai/providers/faux";
 
-/** The deploy-config shape (`vars.STEWARD_MODEL` in wrangler.jsonc). */
+/** The deploy-config shape (`vars.STEWARD_MODEL` in the root wrangler.jsonc). */
 export interface StewardModelConfig {
   provider: string;
   modelId: string;
   /** Overrides the provider's catalog base URL (self-hosted / proxy endpoints). */
   baseUrl?: string;
+  /** True when the deploy config actually named a provider/model — the sealed sh_model row's
+   *  provider only wins when this is false (see llmModelsAsync in steward.ts). */
+  explicit: boolean;
 }
 
 /** ADR-0001 decision 11: the eval baseline. Changing it requires re-running the routing eval. */
-export const DEFAULT_MODEL_CONFIG: StewardModelConfig = { provider: "deepseek", modelId: "deepseek-flash" };
+export const DEFAULT_MODEL_CONFIG: StewardModelConfig = { provider: "deepseek", modelId: "deepseek-flash", explicit: false };
 
 /** Parses `vars.STEWARD_MODEL`; anything malformed falls back to the default. */
 export function resolveModelConfig(raw: unknown): StewardModelConfig {
-  if (typeof raw === "string") {
+  let parsed: unknown = raw;
+  if (typeof parsed === "string") {
     try {
-      raw = JSON.parse(raw);
+      parsed = JSON.parse(parsed);
     } catch {
       return { ...DEFAULT_MODEL_CONFIG };
     }
   }
-  if (raw === null || typeof raw !== "object") return { ...DEFAULT_MODEL_CONFIG };
-  const cfg = raw as { provider?: unknown; modelId?: unknown; baseUrl?: unknown };
+  if (parsed === null || typeof parsed !== "object") return { ...DEFAULT_MODEL_CONFIG };
+  const cfg = parsed as { provider?: unknown; modelId?: unknown; baseUrl?: unknown };
   if (typeof cfg.provider !== "string" || typeof cfg.modelId !== "string" || !cfg.provider || !cfg.modelId) {
     return { ...DEFAULT_MODEL_CONFIG };
   }
   return {
     provider: cfg.provider,
     modelId: cfg.modelId,
+    explicit: true,
     ...(typeof cfg.baseUrl === "string" && cfg.baseUrl.length > 0 ? { baseUrl: cfg.baseUrl } : {}),
   };
 }
@@ -96,6 +101,19 @@ export interface StewardModels {
   config: StewardModelConfig;
   /** Present only for the `faux` test provider. */
   faux?: FauxScripting;
+}
+
+/**
+ * Installs/updates the configured provider on an existing (mutable) Models collection —
+ * the PiHarness factory hands pi one collection for the isolate's lifetime, and the sealed
+ * key (readable only after migrations) is installed onto that same object later. Idempotent;
+ * the faux provider is never touched (its in-memory script is per-isolate state).
+ */
+export function installModel(models: MutableModels, config: StewardModelConfig, apiKey: string | undefined): void {
+  if (config.provider === "faux") return;
+  const base = builtinProviders().find((p) => p.id === config.provider);
+  if (!base) return; // unknown provider: registers nothing — runs fail visibly as no_model
+  models.setProvider(providerWithInlineKey(base, apiKey, config.baseUrl));
 }
 
 const textOf = (content: unknown): string => {

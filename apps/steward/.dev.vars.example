@@ -1,4 +1,0 @@
-# Copy to .dev.vars for local `wrangler dev`. In production these are secrets:
-#   wrangler secret put SERVER_KEY && wrangler secret put SETUP_TOKEN
-SERVER_KEY=dev-server-key-change-me
-SETUP_TOKEN=dev-setup-token-change-me

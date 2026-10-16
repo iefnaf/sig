@@ -104,7 +104,7 @@ cwd = worktree path (write tasks) or repository path (read-only tasks)
 - `workerId`: `w` plus a lowercase ULID, satisfying `--session-id`'s character restrictions (letters, digits, `.`, `_`, `-`, first and last character a letter or digit). The session id is the worker id, so there is no need to look up the file path afterwards. The connector still records `sessionFile` (returned by `get_state`) for validation and history reads.
 - **Sessions live in pi's default directory** (grouped by cwd), not a private one. Rationale: when the user returns to the computer, they can continue this very session with pi's own `--session`/`--resume` — the most natural path to "taking over". The cost is that external changes must be detected (§10).
 - The extension and system-prompt files are written into `~/.shepherd/` by the connector with each version and never reference in-repo files, so project content cannot swap them out.
-- Environment variables: inherit the user's environment; the connector's own credentials are **not** passed through.
+- Environment variables: inherit the user's environment; the connector's own credentials are **not** passed through — every `SHEPHERD_*` variable is stripped from the child env (issue #27), so the agent cannot find `SHEPHERD_HOME` (which points at the SQLite file holding the device token) or any other connector state in its environment.
 
 ### 4.3 The one-file-one-process invariant
 

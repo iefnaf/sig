@@ -116,6 +116,8 @@ export interface MachineRow {
   lastSeen: number | null;
   agents: string[];
   maxWorkers: number;
+  /** The connector process generation (protocol §6.1): changes on every connector restart. */
+  bootId: string | null;
 }
 
 /** A notification intent persisted by the reducer (steward.md §5.1 step 4). */
@@ -211,6 +213,7 @@ const viewMachine = (r: Record<string, unknown>): MachineRow => ({
   lastSeen: (r.lastSeen as number | null) ?? null,
   agents: jsonOrNull<string[]>(r.agents as string | null) ?? [],
   maxWorkers: (r.maxWorkers as number | null) ?? 1,
+  bootId: (r.bootId as string | null) ?? null,
 });
 
 const viewWorker = (r: Record<string, unknown>): WorkerRow => ({
@@ -281,11 +284,11 @@ export function createLedger(deps: LedgerDeps) {
     upsertFromHello(hello: HelloMessage): void {
       const ts = now();
       sql`
-        INSERT INTO sh_machine (deviceId, name, online, lastSeen, agents, maxWorkers)
-        VALUES (${hello.deviceId}, ${hello.machine.name}, 1, ${ts}, ${JSON.stringify(hello.agents)}, ${hello.limits.maxWorkers})
+        INSERT INTO sh_machine (deviceId, name, online, lastSeen, agents, maxWorkers, bootId)
+        VALUES (${hello.deviceId}, ${hello.machine.name}, 1, ${ts}, ${JSON.stringify(hello.agents)}, ${hello.limits.maxWorkers}, ${hello.bootId})
         ON CONFLICT (deviceId) DO UPDATE SET
           name = excluded.name, online = 1, lastSeen = excluded.lastSeen,
-          agents = excluded.agents, maxWorkers = excluded.maxWorkers
+          agents = excluded.agents, maxWorkers = excluded.maxWorkers, bootId = excluded.bootId
       `;
       // hello.repos is a full snapshot: replace this machine's rows so removals stick.
       sql`DELETE FROM sh_repo WHERE deviceId = ${hello.deviceId}`;
@@ -418,6 +421,64 @@ export function createLedger(deps: LedgerDeps) {
     setCmdId(workerId: string, cmdId: string): void {
       sql`UPDATE sh_worker SET cmdId = ${cmdId}, updatedAt = ${now()} WHERE workerId = ${workerId}`;
     },
+
+    /**
+     * Reconciles this device's workers against the hello.workers snapshot (issue #12,
+     * connector-pi.md §9.1 step 4 / protocol §6.1): the backstop for states the event stream
+     * never delivered (events lost beyond the connector's retention, or never emitted).
+     *
+     * Gated per worker on `lastSeq <= processedUpTo`: while events are still in flight the
+     * stream is authoritative and reconciliation must not write under it. Transitions land
+     * on the timeline but NEVER push — lost/resumed are facts, not interruptions of the
+     * user's day (spec §9: “lost contact, not failed”). Idempotent by construction: once the
+     * ledger matches the snapshot, later hellos take no branch.
+     */
+    reconcileFromSnapshot(deviceId: string, snapshots: HelloMessage["workers"]): void {
+      const rows = sql<{ workerId: string; threadId: string; state: string }>`
+        SELECT workerId, threadId, state FROM sh_worker WHERE deviceId = ${deviceId}
+      `;
+      for (const worker of rows) {
+        const snap = snapshots.find((s) => s.workerId === worker.workerId);
+        if (!snap) continue; // not this deployment's business (pruned / other device)
+        const processed =
+          sql<{ processedUpTo: number }>`SELECT processedUpTo FROM worker_ack WHERE workerId = ${worker.workerId}`[0]
+            ?.processedUpTo ?? 0;
+        if (snap.lastSeq > processed) continue; // the event stream is still telling the story
+        const ledgerActive = (ACTIVE_WORKER_STATES as readonly string[]).includes(worker.state);
+        const snapActive = (ACTIVE_WORKER_STATES as readonly string[]).includes(snap.state);
+        if (ledgerActive && !snapActive) {
+          sql`UPDATE sh_worker SET state = ${snap.state}, updatedAt = ${now()} WHERE workerId = ${worker.workerId}`;
+          timeline.add(
+            worker.threadId,
+            snap.state === "lost" ? "lost" : "note",
+            snap.state === "lost"
+              ? "失去联系（连接器重启后对账）"
+              : snap.state === "broken"
+                ? "自动恢复未成功（连接器对账）"
+                : "运行已结束（连接器重启后对账）",
+            { workerId: worker.workerId, reconciled: true },
+          );
+          recomputeThreadState(worker.threadId);
+        } else if (worker.state === "lost" && snapActive) {
+          sql`UPDATE sh_worker SET state = ${snap.state}, updatedAt = ${now()} WHERE workerId = ${worker.workerId}`;
+          timeline.add(worker.threadId, "resumed", "已恢复运行（连接器重启后对账）", {
+            workerId: worker.workerId,
+            reconciled: true,
+          });
+          recomputeThreadState(worker.threadId);
+        } else if (worker.state === "lost" && (snap.state === "broken" || snap.state === "idle")) {
+          sql`UPDATE sh_worker SET state = ${snap.state}, updatedAt = ${now()} WHERE workerId = ${worker.workerId}`;
+          timeline.add(
+            worker.threadId,
+            "note",
+            snap.state === "broken" ? "自动恢复未成功（对账），需要你决定下一步" : "运行已结束（对账）",
+            { workerId: worker.workerId, reconciled: true },
+          );
+          recomputeThreadState(worker.threadId);
+        }
+      }
+    },
+
     /**
      * A start_worker the connector rejected or that failed (cmd_ack rejected / cmd_result
      * ok:false). Marks the worker broken, records it on the timeline, and queues a failure
@@ -942,16 +1003,21 @@ function str(value: unknown): string | null {
 
 /** The deterministic question text for failure-class settled events (steward.md §5.3). */
 function settledQuestionText(outcome: string, errorClass: string | null, event: Record<string, unknown>): string {
+  const lastText = typeof event.lastText === "string" && event.lastText.length > 0 ? event.lastText : "";
+  const detail = lastText ? `（${lastText.slice(0, 160)}）` : "";
   if (outcome === "unreported") {
-    const lastText = typeof event.lastText === "string" && event.lastText.length > 0 ? event.lastText : "";
     return `worker 结束时没有产出汇报。${lastText ? `最后说：${lastText.slice(0, 120)}` : ""}`;
   }
   switch (errorClass) {
     case "auth":
-      return "机器上的模型凭据失效（401/403），需要你在那台机器上修复后重新派发。";
+      // §9.2: auth never auto-resumes — the detail says what the connector saw (e.g. a
+      // failed resume), the base says what the user must do.
+      return `机器上的模型凭据失效（401/403），需要你在那台机器上修复后重新派发。${detail}`;
     case "context":
       return "上下文超长，这个会话装不下了；建议开一个新会话接续（M2 的交接简报）。";
     default:
-      return `运行出错（${errorClass ?? "未知"}），需要你决定下一步。`;
+      // error:unknown — includes the connector's terminal §9.2 outcomes (resume failed /
+      // budget exhausted / startup interrupted), whose reason rides in lastText.
+      return `运行出错（${errorClass ?? "未知"}），需要你决定下一步。${detail}`;
   }
 }
