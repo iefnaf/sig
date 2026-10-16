@@ -195,6 +195,7 @@ export function startMockSteward(): MockSteward {
         server.close(() => done());
       }),
     waitConnected,
+    waitHello,
     sendCmd,
     sendHistoryReq,
     ackHistory: (reqId, n) => send({ t: "history_ack", re: reqId, n }),
@@ -206,7 +207,6 @@ export function startMockSteward(): MockSteward {
     },
     events: () => events,
     hellos: () => hellos,
-    waitHello,
     acksFor: (cmdId) => cmdAcks.get(cmdId),
     resultsFor: (cmdId) => cmdResults.get(cmdId),
     historyChunksFor: (reqId) => historyChunks.get(reqId) ?? [],

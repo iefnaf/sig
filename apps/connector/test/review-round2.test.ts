@@ -141,7 +141,7 @@ beforeEach(() => {
 afterEach(() => {
   manager?.stop();
   store?.close();
-  rmSync(dir, { recursive: true, force: true });
+  rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
 });
 
 describe("review round 2 regressions (R2-1..R2-3)", () => {

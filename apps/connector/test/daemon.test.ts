@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { runDaemon, type DaemonHandle } from "../src/daemon.ts";
 import { LocalStore } from "../src/store.ts";
 import { VERSION } from "../src/version.ts";
-import { fakePiAdapter, tmpDir, writeScenario } from "./helpers.ts";
+import { fakePiAdapter, tmpDir, waitFor, writeScenario } from "./helpers.ts";
 import { startMockSteward, type MockSteward } from "./mock-steward.ts";
 
 let dir: string;
@@ -29,7 +29,7 @@ afterEach(async () => {
   await handle?.stop();
   handle = null;
   await mock.close();
-  rmSync(dir, { recursive: true, force: true });
+  rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
 });
 
 describe("runDaemon", () => {
@@ -53,6 +53,16 @@ describe("runDaemon", () => {
 
     const logPath = join(stateDir, "logs", "connector.log");
     expect(existsSync(logPath)).toBe(true);
+    // 'welcomed' is written when the welcome frame lands — strictly after the hello we
+    // waited for. Poll for the line instead of reading the log the instant hellos() has an
+    // entry: on a slow runner the welcome trails, the assert fires early, and teardown's
+    // store.close() then races the in-flight welcome handler (unhandled 'database is not
+    // open').
+    await waitFor(
+      () => (existsSync(logPath) ? readFileSync(logPath, "utf8").includes("welcomed") : undefined),
+      5000,
+      "welcomed log line",
+    );
     const log = readFileSync(logPath, "utf8");
     expect(log).toContain("daemon_start");
     expect(log).toContain("welcomed");

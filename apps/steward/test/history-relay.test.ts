@@ -221,7 +221,10 @@ describe("the §6.6 relay: browser ↔ DO ↔ connector", () => {
 
   it("an unanswered relay is swept by the TTL alarm", async () => {
     await runInDurableObject(ownerStub(), (instance: Steward) => {
-      (instance as unknown as { historyRelayTtlMs: number }).historyRelayTtlMs = 700;
+      // 2s, not sub-second: the sanity assert below must land before the ceil(TTL)-granularity
+      // sweep alarm can fire — under a loaded runner (parallel test processes) the assert's
+      // RPC can queue behind >1s of DO work and a 700ms TTL gets the row swept first.
+      (instance as unknown as { historyRelayTtlMs: number }).historyRelayTtlMs = 2000;
     });
     const fake = await pairFakeConnector("mac-studio");
     fake.historySilent = true; // the machine never answers
@@ -231,7 +234,16 @@ describe("the §6.6 relay: browser ↔ DO ↔ connector", () => {
 
     const { ws, reader } = await connectWeb(cookie);
     await openStream(ws, workerId);
-    await expect(relayRowCount()).resolves.toBe(1);
+    // The relay row appears when the DO digests the fire-and-forget history_open — poll for
+    // it instead of asserting instantly (the ws frame and this RPC are different input
+    // channels; under load creation can trail the send, and the ceil(TTL)-granularity sweep
+    // must never race this first observation either).
+    const rowDeadline = Date.now() + 1500;
+    for (;;) {
+      if ((await relayRowCount()) === 1) break;
+      if (Date.now() > rowDeadline) throw new Error("relay row never appeared after history_open");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
 
     const deadline = Date.now() + 8000;
     while (Date.now() < deadline) {

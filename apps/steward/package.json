@@ -8,7 +8,7 @@
     "deploy": "wrangler deploy --config ../../wrangler.jsonc",
     "cf-typegen": "wrangler types --config ../../wrangler.jsonc worker-configuration.d.ts",
     "typecheck": "wrangler types --config ../../wrangler.jsonc worker-configuration.d.ts && tsc --noEmit",
-    "test": "vitest run",
+    "test": "node scripts/test-groups.mjs",
     "eval:routing": "node eval/run-eval.ts",
     "eval:routing:selftest": "node eval/run-eval.ts --selftest"
   },
