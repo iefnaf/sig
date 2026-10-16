@@ -53,6 +53,20 @@ export interface InterruptResult {
   returned: string[];
 }
 
+/** Thrown by an adapter whose `clear_queue` succeeded but the subsequent `abort` failed
+ *  (PR #45 review round 2, R2-3): the agent already handed its queued texts back and
+ *  emptied its queue, so the texts ride the error — the manager surfaces them as
+ *  `queue_returned` before failing the command, or they are lost (the agent has no copy). */
+export class PartialInterruptError extends Error {
+  constructor(
+    readonly returned: string[],
+    readonly causeErr: Error,
+  ) {
+    super(`interrupt failed after clear_queue: ${causeErr.message}`);
+    this.name = "PartialInterruptError";
+  }
+}
+
 /** Report tool payload, connector-pi.md §7.2 (v1 fields). */
 export interface ReportPayload {
   status: "done" | "blocked" | "needs_decision";

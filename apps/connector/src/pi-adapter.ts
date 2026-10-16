@@ -13,6 +13,7 @@ import type {
   StartSpec,
   WorkerHandle,
 } from "./agent.ts";
+import { PartialInterruptError } from "./agent.ts";
 import { adjudicate, type RunWindow } from "./adjudication.ts";
 import { installAssets, type InstalledAssets } from "./install.ts";
 import { mkdirSync } from "node:fs";
@@ -252,7 +253,9 @@ export class PiAdapter implements AgentAdapter {
   }
 
   /** §6.2: `clear_queue` first — the returned texts ride the `queue_returned` event so the
-   *  steward can decide whether to resend — then `abort`. */
+   *  steward can decide whether to resend — then `abort`. If `abort` fails after
+   *  `clear_queue` already emptied pi's queue, the retrieved texts ride a
+   *  PartialInterruptError so the manager can still surface them (R2-3: pi has no copy). */
   async interrupt(id: string): Promise<InterruptResult> {
     const runtime = this.require(id);
     const queue = (await runtime.process.rpc({ type: "clear_queue" })) as {
@@ -260,7 +263,11 @@ export class PiAdapter implements AgentAdapter {
       followUp?: unknown;
     };
     const returned = [...queueTexts(queue.steering), ...queueTexts(queue.followUp)];
-    await runtime.process.rpc({ type: "abort" });
+    try {
+      await runtime.process.rpc({ type: "abort" });
+    } catch (err) {
+      throw new PartialInterruptError(returned, err instanceof Error ? err : new Error(String(err)));
+    }
     return { returned };
   }
 

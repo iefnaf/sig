@@ -168,9 +168,10 @@ describe("review round 1 regressions (races around the cold start and the settle
     // statsDelayMs holds get_session_stats back: pi's run window closed on agent_settled,
     // but the connector's store still says running — exactly the lag window in which the
     // old code delivered the then-text as a steer into a run that had already ended.
+    // abortSettleTimeoutMs is pinned so the lag wait stays well inside it (round-2 nit).
     setup(
       [reportRun({ status: "done", summary: "第一段完成" }), reportRun({ status: "done", summary: "停后重做完成" })],
-      {},
+      { abortSettleTimeoutMs: 5000 },
       undefined,
       { statsDelayMs: 1500 },
     );

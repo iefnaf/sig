@@ -5,6 +5,7 @@
 // descendant snapshots (§9.3), startup reconciliation with the session-tail check (§9.1),
 // and automatic resume with the fixed prompt, 30 s backoff, and the ≤2/hour budget (§9.2).
 import type { AgentAdapter, Delivery, ErrorClass, RawAdapterEvent, StartSpec, WorkerMode } from "./agent.ts";
+import { PartialInterruptError } from "./agent.ts";
 import { classifyError } from "./adjudication.ts";
 import { killOrphans, listDescendants, type ProcRef } from "./descendants.ts";
 import { collectGitFacts } from "./git-facts.ts";
@@ -358,15 +359,23 @@ export class WorkerManager {
   // --- §6.1/§6.2: send and interrupt -----------------------------------------------------------
 
   /** Tracks an in-flight start/resume so an interrupt can wait it out and the send queue
-   *  drains exactly once when the transition settles (success or failure). */
+   *  drains exactly once when the transition settles (success or failure). Transitions on
+   *  one worker chain — the second runs only after the first settles — so the map keeps its
+   *  "one live transition per worker" invariant for interrupt-waiting, and two transitions
+   *  can never race the process or the lock (PR #45 review round 2, R2-1). */
   private async withTransition<T>(workerId: string, fn: () => Promise<T>): Promise<T> {
-    const transition = (async () => {
-      try {
-        return await fn();
-      } finally {
-        this.transitions.delete(workerId);
-      }
+    const previous = this.transitions.get(workerId);
+    const run = (async () => {
+      // Serialize: fn starts only after the previous transition settles, so the map's
+      // "one live transition per worker" invariant holds for interrupt-waiting and no two
+      // transitions race the process or the lock (PR #45 review round 2, R2-1).
+      await previous?.catch(() => undefined);
+      return fn();
     })();
+    const transition = run.finally(() => {
+      // Identity-keyed: never delete a *later* transition's registration.
+      if (this.transitions.get(workerId) === transition) this.transitions.delete(workerId);
+    });
     this.transitions.set(workerId, transition);
     try {
       return await transition;
@@ -546,8 +555,19 @@ export class WorkerManager {
     let then: SendResult | undefined;
     try {
       if (this.adapter.isRunning?.(args.workerId)) {
-        const result = await this.adapter.interrupt(args.workerId);
-        returned = result.returned;
+        let interruptResult: Awaited<ReturnType<AgentAdapter["interrupt"]>>;
+        try {
+          interruptResult = await this.adapter.interrupt(args.workerId);
+        } catch (err) {
+          // R2-3: clear_queue may already have emptied the agent's queue — the retrieved
+          // texts ride a PartialInterruptError; surface them as queue_returned before
+          // failing, or they are lost (the agent holds no copy either).
+          if (err instanceof PartialInterruptError && err.returned.length > 0) {
+            await this.emitEvent(args.workerId, "queue_returned", { texts: err.returned });
+          }
+          throw err;
+        }
+        returned = interruptResult.returned;
         if (returned.length > 0) {
           await this.emitEvent(args.workerId, "queue_returned", { texts: returned });
         }
@@ -568,7 +588,19 @@ export class WorkerManager {
           // is observably closed. §6.2 says then = prompt — force the idle-hot prompt cell (a
           // prompt into an idle process is safe); a steer would park the then-text in pi's
           // queue with no run left to apply it.
-          then = await this.deliverHotPrompt(worker, commandId, { text: args.then });
+          try {
+            then = await this.deliverHotPrompt(worker, commandId, { text: args.then });
+          } catch (err) {
+            if ((err as { code?: string }).code !== "not_running") throw err;
+            // R2-2: the process died during the settle wait — fall through to the state
+            // table, whose fresh row now reads idle-cold and cold-relaunches with the
+            // then-text instead of failing the command.
+            const fresh = this.requireWorker(args.workerId);
+            if (fresh.state === "broken") {
+              throw new CommandError("broken_worker", `worker ${args.workerId} is broken and needs a human decision`);
+            }
+            then = await this.deliverSend(fresh, commandId, { text: args.then, intent: "auto" });
+          }
         } else {
           then = await this.deliverSend(worker, commandId, { text: args.then, intent: "auto" });
         }
