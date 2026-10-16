@@ -1,12 +1,27 @@
 // The deterministic dispatch service (ADR-0001 decision 6, spike bug 4): machine choice,
 // Thread create/attach, worker registration, and the `start_worker` command — everything the
-// steward's `start_worker` tool (issue #6) and the M1 card callbacks drive. The fixed M1
-// command phrases are gone: natural language reaches the LLM, whose tool calls land here.
-// Card button callbacks stay deterministic (steward.md §3.1 signal 1): the Thread is resolved
-// from the card's providerMsgId, never from data stuffed into the button.
+// steward's `start_worker` tool (issue #6) and the card callbacks drive. The M1 command
+// phrases are gone: natural language reaches the LLM, whose tool calls land here. Two chat
+// commands stay deterministic (issue #22): `/加机器` and `/网页` mint credentials and one-time
+// links — security-sensitive, and they must work without the model. Card button callbacks
+// stay deterministic too (steward.md §3.1 signal 1): the Thread is resolved from the card's
+// providerMsgId, never from data stuffed into the button.
 import { ulid } from "@shepherd/protocol";
 import type { Ledger, ThreadRow } from "./ledger.ts";
 import { offlineAskCard } from "./report-template.ts";
+
+const ADD_MACHINE_RE = /^\/(?:加机器|添加机器|add-machine|addmachine)\s*$/;
+const WEB_RE = /^\/(?:网页|web|login)\s*$/;
+
+export type OwnerCommand = { kind: "add_machine" } | { kind: "web_link" };
+
+/** Parses `/加机器` and `/网页` (exact phrases). Everything else → null, i.e. the LLM's. */
+export function parseOwnerCommand(text: string): OwnerCommand | null {
+  const trimmed = text.trim();
+  if (ADD_MACHINE_RE.test(trimmed)) return { kind: "add_machine" };
+  if (WEB_RE.test(trimmed)) return { kind: "web_link" };
+  return null;
+}
 
 export interface MachineCandidate {
   deviceId: string;
@@ -100,6 +115,12 @@ export interface DispatcherDeps {
   cancelQueuedCommand: (cmdId: string) => boolean;
   sendText: (text: string, threadId?: string | null) => Promise<void>;
   sendCard: (card: unknown, threadId: string) => Promise<void>;
+  /** Issues a one-time pairing code (protocol §5.2) for `/加机器`. */
+  createPairing: () => Promise<{ code: string }>;
+  /** The deployment's public origin for the connect command; null until a request revealed it. */
+  deployOrigin: () => string | null;
+  /** Mints an absolute one-time web URL, or null when no origin is known yet. */
+  webLinkUrl: (target: string) => Promise<string | null>;
 }
 
 const AGENT = "pi"; // the only agent the connector drives in the MVP (ADR-0001 decision 3)
@@ -212,6 +233,42 @@ export class Dispatcher {
         };
       }
     }
+  }
+
+  /**
+   * The two chat commands that never reach the LLM (issue #22): they mint a pairing code and
+   * a one-time login link — deterministic by design, and available even without a model.
+   */
+  async handleOwnerCommand(command: OwnerCommand): Promise<void> {
+    if (command.kind === "add_machine") {
+      await this.addMachine();
+      return;
+    }
+    const url = await this.#deps.webLinkUrl("home");
+    await this.#deps.sendText(
+      url
+        ? `一次性登录链接（15 分钟内有效，只能打开一次）：\n${url}`
+        : "暂时不知道本部署的对外地址，发过一条消息后再试。",
+    );
+  }
+
+  /** `/加机器` (protocol §5.2): mint a one-time code, reply with the connect command. */
+  private async addMachine(): Promise<void> {
+    const origin = this.#deps.deployOrigin();
+    if (!origin) {
+      // Unreachable in practice — this reply itself rides a webhook that revealed the origin —
+      // but never hand out a code whose command cannot be built.
+      await this.#deps.sendText("暂时不知道本部署的对外地址，发过一条消息后再试。");
+      return;
+    }
+    const { code } = await this.#deps.createPairing();
+    await this.#deps.sendText(
+      [
+        "在要接入的那台电脑的终端里运行：",
+        `npx @iefnaf/shepherd connect ${origin} ${code}`,
+        "（配对码 10 分钟内有效，只能使用一次；接好后它会自动上线，直接问我就能看到。）",
+      ].join("\n"),
+    );
   }
 
   /** A card button callback (already deduped); the Thread comes from the card's message id. */

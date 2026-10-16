@@ -45,6 +45,7 @@ export async function resetLedgerState(): Promise<void> {
     for (const table of [
       "sh_machine", "sh_repo", "sh_thread", "sh_thread_repo", "sh_worker", "sh_report",
       "sh_timeline", "sh_question", "sh_notify", "event_inbox", "worker_ack", "outbox",
+      "sh_web_link", "sh_web_session", "sh_deploy", "device", "pairing",
     ]) {
       storage.sql.exec(`DELETE FROM ${table}`);
     }

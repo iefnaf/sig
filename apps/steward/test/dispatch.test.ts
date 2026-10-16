@@ -1,9 +1,10 @@
 // Deterministic machine choice and the dispatch service (issue #5 → #6): ADR-0001 decision 6
 // as a pure function, and — through the DO — the service the steward's start_worker tool calls:
-// thread create/attach, refusal texts, and the offline ask card. The fixed M1 phrases are gone
-// (natural language reaches the LLM); what stays deterministic stays tested deterministically.
+// thread create/attach, refusal texts, and the offline ask card. The M1 phrases are gone
+// (natural language reaches the LLM); the two that remain (issue #22) and everything else
+// deterministic stay tested deterministically.
 import { beforeEach, describe, expect, it } from "vitest";
-import { chooseMachine, type MachineCandidate } from "../src/dispatch.ts";
+import { chooseMachine, parseOwnerCommand, type MachineCandidate } from "../src/dispatch.ts";
 import {
   configureAndBind,
   mockReset,
@@ -12,6 +13,27 @@ import {
   resetLedgerState,
   waitWhileOutboundPending,
 } from "./helpers.ts";
+
+describe("parseOwnerCommand: the two deterministic chat commands (issue #22)", () => {
+  it("parses the add-machine and web-link phrases", () => {
+    expect(parseOwnerCommand("/加机器")).toEqual({ kind: "add_machine" });
+    expect(parseOwnerCommand("/添加机器 ")).toEqual({ kind: "add_machine" });
+    expect(parseOwnerCommand("/add-machine")).toEqual({ kind: "add_machine" });
+    expect(parseOwnerCommand("/addmachine")).toEqual({ kind: "add_machine" });
+    expect(parseOwnerCommand("/网页")).toEqual({ kind: "web_link" });
+    expect(parseOwnerCommand("/web ")).toEqual({ kind: "web_link" });
+    expect(parseOwnerCommand("/login")).toEqual({ kind: "web_link" });
+    // Trailing content means it is not the fixed phrase — it falls through to the LLM.
+    expect(parseOwnerCommand("/加机器 现在")).toBeNull();
+    expect(parseOwnerCommand("/网页 login.html")).toBeNull();
+  });
+
+  it("everything else is the steward LLM's, including the retired M1 phrases", () => {
+    expect(parseOwnerCommand("帮我把登录 bug 修一下")).toBeNull();
+    expect(parseOwnerCommand("/派发 repo-a 修复登录 bug")).toBeNull();
+    expect(parseOwnerCommand("/状态")).toBeNull();
+  });
+});
 
 function candidate(deviceId: string, overrides: Partial<MachineCandidate> = {}): MachineCandidate {
   return { deviceId, name: deviceId, online: true, freeSlots: 2, ...overrides };

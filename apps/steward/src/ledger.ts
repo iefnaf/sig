@@ -161,6 +161,23 @@ export interface RunRow {
   settledAt: number | null;
 }
 
+// ---- web read model (steward.md §10: pages are served from the memory module's views) -------------
+
+/** L2 Timeline view: thread header, its summary events, its workers with machine names. */
+export interface TimelineView {
+  thread: ThreadRow;
+  entries: TimelineRow[];
+  workers: Array<WorkerRow & { machineName: string }>;
+  openQuestion: QuestionRow | null;
+}
+
+/** L1 Thread-list row: the thread plus the situation bits the index page shows (spec §7.4). */
+export interface ThreadListEntry {
+  thread: ThreadRow;
+  lastWorker: (WorkerRow & { machineName: string }) | null;
+  workerCount: number;
+}
+
 export interface NewThreadInput {
   title: string;
   goal: string;
@@ -285,7 +302,7 @@ export function createLedger(deps: LedgerDeps) {
       const ts = now();
       sql`
         INSERT INTO sh_machine (deviceId, name, online, lastSeen, agents, maxWorkers, bootId)
-        VALUES (${hello.deviceId}, ${hello.machine.name}, 1, ${ts}, ${JSON.stringify(hello.agents)}, ${hello.limits.maxWorkers}, ${hello.bootId})
+        VALUES (${hello.deviceId}, ${hello.machine.name}, 1, ${ts}, ${JSON.stringify(hello.agents.map((a) => a.kind))}, ${hello.limits.maxWorkers}, ${hello.bootId})
         ON CONFLICT (deviceId) DO UPDATE SET
           name = excluded.name, online = 1, lastSeen = excluded.lastSeen,
           agents = excluded.agents, maxWorkers = excluded.maxWorkers, bootId = excluded.bootId
@@ -960,6 +977,35 @@ export function createLedger(deps: LedgerDeps) {
     `;
   }
 
+  // ---- views: the web read model (steward.md §10) ------------------------------------------------
+
+  const withMachineName = (worker: WorkerRow): WorkerRow & { machineName: string } => ({
+    ...worker,
+    machineName: machines.get(worker.deviceId)?.name ?? worker.deviceId,
+  });
+
+  const views = {
+    /** `views.timeline` — the L2 page: thread, summary events, workers, the open question. */
+    timeline(threadId: string): TimelineView | null {
+      const thread = threads.get(threadId);
+      if (!thread) return null;
+      return {
+        thread,
+        entries: timeline.list(threadId),
+        workers: workers.listByThread(threadId).map(withMachineName),
+        openQuestion: questions.openForThread(threadId),
+      };
+    },
+    /** The L1 index: threads.list plus each one's latest worker and situation bits. */
+    threadList(): ThreadListEntry[] {
+      return threads.list().map((thread) => ({
+        thread,
+        lastWorker: (worker => (worker ? withMachineName(worker) : null))(workers.latestOnThread(thread.threadId)),
+        workerCount: workers.listByThread(thread.threadId).length,
+      }));
+    },
+  };
+
   // ---- whole-ledger debug view for tests (read-only) ---------------------------------------------
 
   const debug = {
@@ -991,7 +1037,7 @@ export function createLedger(deps: LedgerDeps) {
 
   return {
     machines, repos, threads, workers, reports, questions, timeline, notifications, outbound,
-    runs, wakes, applyPendingEvents, recomputeThreadState, debug,
+    runs, wakes, views, applyPendingEvents, recomputeThreadState, debug,
   };
 }
 
