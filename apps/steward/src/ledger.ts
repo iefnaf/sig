@@ -20,6 +20,8 @@ export type LedgerSql = <T = Record<string, unknown>>(
 export const MAX_THREAD_SUMMARY = 600;
 /** The wake merge window (steward.md §5.1/§5.4): events within it become one steward input. */
 export const WAKE_MERGE_MS = 3_000;
+/** Blocked reports give the steward this long before the core forwards the question. */
+export const QUESTION_WINDOW_MS = 90_000;
 
 /** Runs a synchronous closure atomically (`ctx.storage.transactionSync`, steward.md §1). */
 export interface LedgerDeps {
@@ -102,6 +104,9 @@ export interface QuestionRow {
   status: "open" | "answered";
   askedAt: number;
   answeredAt: number | null;
+  kind: "steward" | "report" | "failure" | "unreported";
+  fallbackDueAt: number | null;
+  handledAt: number | null;
 }
 
 /** The ask_user question's button mapping (issue #7): what each card button means. */
@@ -136,6 +141,7 @@ export interface NotifyRow {
   kind: "done_report" | "attention_report" | "failure_push" | "stall_notice";
   threadId: string;
   workerId: string | null;
+  questionId: string | null;
 }
 
 /** A worker in an active state, plus its machine's connection state (issue #13 review: the
@@ -444,6 +450,9 @@ const viewQuestion = (r: Record<string, unknown>): QuestionRow => ({
   status: r.status as QuestionRow["status"],
   askedAt: r.askedAt as number,
   answeredAt: (r.answeredAt as number | null) ?? null,
+  kind: (r.kind as QuestionRow["kind"]) ?? "steward",
+  fallbackDueAt: (r.fallbackDueAt as number | null) ?? null,
+  handledAt: (r.handledAt as number | null) ?? null,
 });
 
 const viewRoutine = (r: Record<string, unknown>): RoutineRow => ({
@@ -815,8 +824,8 @@ export function createLedger(deps: LedgerDeps) {
      * ledger matches the snapshot, later hellos take no branch.
      */
     reconcileFromSnapshot(deviceId: string, snapshots: HelloMessage["workers"]): void {
-      const rows = sql<{ workerId: string; threadId: string; state: string; lastOutcome: string | null }>`
-        SELECT workerId, threadId, state, lastOutcome FROM sh_worker WHERE deviceId = ${deviceId}
+      const rows = sql<WorkerRow>`
+        SELECT * FROM sh_worker WHERE deviceId = ${deviceId}
       `;
       for (const worker of rows) {
         const snap = snapshots.find((s) => s.workerId === worker.workerId);
@@ -836,6 +845,9 @@ export function createLedger(deps: LedgerDeps) {
             `;
           }
           continue;
+        }
+        if (snap.state === 'broken' && worker.state !== 'broken') {
+          recordBrokenQuestion(worker, `q_broken_${worker.workerId}_${processed}`, '自动恢复未成功（连接器对账），需要你决定下一步。');
         }
         const ledgerActive = (ACTIVE_WORKER_STATES as readonly string[]).includes(worker.state);
         const snapActive = (ACTIVE_WORKER_STATES as readonly string[]).includes(snap.state);
@@ -893,7 +905,7 @@ export function createLedger(deps: LedgerDeps) {
       `;
       timeline.add(worker.threadId, "note", `派发失败（${reason}）`, { workerId, cmdId });
       sql`UPDATE sh_thread SET unread = 1, lastActivityAt = ${now()} WHERE threadId = ${worker.threadId}`;
-      notifications.queue(`start_failed:${cmdId ?? workerId}`, "failure_push", worker.threadId, workerId);
+      recordBrokenQuestion(worker, `q_start_${cmdId ?? workerId}`, `派发失败：${reason}。需要你决定下一步。`);
       recomputeThreadState(worker.threadId);
       return true;
     },
@@ -1001,6 +1013,9 @@ export function createLedger(deps: LedgerDeps) {
               reconciled: true,
             });
           }
+          if (pending.snapState === 'broken') {
+            recordBrokenQuestion(worker, `q_broken_${worker.workerId}_${processed}`, '自动恢复未成功（回收后对账），需要你决定下一步。');
+          }
           recomputeThreadState(pending.threadId);
         });
       }
@@ -1042,7 +1057,61 @@ export function createLedger(deps: LedgerDeps) {
       return row ? viewQuestion(row) : null;
     },
     get(qid: string): QuestionRow | null {
-      return (sql<Record<string, unknown>>`SELECT * FROM sh_question WHERE qid = ${qid}`[0] ?? null) as QuestionRow | null;
+      const row = sql<Record<string, unknown>>`SELECT * FROM sh_question WHERE qid = ${qid}`[0];
+      return row ? viewQuestion(row) : null;
+    },
+    openForWorker(workerId: string): QuestionRow[] {
+      return sql<Record<string, unknown>>`
+        SELECT * FROM sh_question WHERE workerId = ${workerId} AND status = 'open' ORDER BY askedAt, qid
+      `.map(viewQuestion);
+    },
+    /** Never guess between several workers/questions on the same Thread. */
+    forCommunication(threadId?: string, questionId?: string): QuestionRow | null {
+      if (questionId) {
+        const q = questions.get(questionId);
+        if (!q || q.status !== 'open' || (threadId && q.threadId !== threadId)) throw new Error('问题不存在、已回答或不属于这个 Thread。');
+        return q;
+      }
+      if (!threadId) return null;
+      const rows = sql<Record<string, unknown>>`
+        SELECT * FROM sh_question WHERE threadId = ${threadId} AND workerId IS NOT NULL AND status = 'open'
+      `.map(viewQuestion);
+      if (rows.length > 1) throw new Error('有多个 worker 问题，请指定 questionId。');
+      return rows[0] ?? null;
+    },
+    markHandled(qid: string): void {
+      sql`UPDATE sh_question SET handledAt = COALESCE(handledAt, ${now()}) WHERE qid = ${qid}`;
+    },
+    setOptions(qid: string, options: string[]): void {
+      sql`UPDATE sh_question SET options = ${JSON.stringify(options)} WHERE qid = ${qid} AND status = 'open'`;
+    },
+    /** Atomic timeout → intent. A reset can only replay the same durable intent. */
+    queueFallbacks(): void {
+      tx(() => {
+        for (const q of sql<QuestionRow>`
+          SELECT * FROM sh_question WHERE status = 'open' AND handledAt IS NULL AND fallbackDueAt <= ${now()}
+        `) {
+          if (q.threadId) notifications.queue(`question:${q.qid}`, 'attention_report', q.threadId, q.workerId, q.qid);
+          questions.markHandled(q.qid);
+        }
+      });
+    },
+    nextFallback(): number | null {
+      return sql<{ at: number | null }>`
+        SELECT MIN(fallbackDueAt) AS at FROM sh_question WHERE status = 'open' AND handledAt IS NULL
+      `[0]?.at ?? null;
+    },
+    /** Open, unhandled questions — the sweep's working set (§5.3). */
+    unhandled(): QuestionRow[] {
+      return sql<Record<string, unknown>>`
+        SELECT * FROM sh_question WHERE status = 'open' AND handledAt IS NULL AND fallbackDueAt IS NOT NULL ORDER BY fallbackDueAt, qid
+      `.map(viewQuestion);
+    },
+    /** Test seam: shrink/extend the window of an already-open question (mirrors the reducer). */
+    setFallbackWindow(qid: string, ms: number): void {
+      const q = questions.get(qid);
+      if (!q) return;
+      sql`UPDATE sh_question SET fallbackDueAt = ${q.askedAt + ms} WHERE qid = ${qid} AND status = 'open'`;
     },
     /** The ask_user button mapping (issue #7): plain options + routing candidates. */
     payload(qid: string): AskCandidates | null {
@@ -1056,12 +1125,14 @@ export function createLedger(deps: LedgerDeps) {
       };
     },
     /** ask_user's insert (issue #7): threadId null for a threadless routing ask. */
-    insert(input: { qid: string; threadId: string | null; workerId?: string | null; text: string; options?: string[]; candidates?: AskCandidates["candidates"] }): void {
+    insert(input: { qid: string; threadId: string | null; workerId?: string | null; text: string; options?: string[]; candidates?: AskCandidates["candidates"]; kind?: QuestionRow["kind"]; fallbackDueAt?: number }): void {
       sql`
-        INSERT OR IGNORE INTO sh_question (qid, threadId, workerId, text, options, candidates, status, askedAt)
+        INSERT OR IGNORE INTO sh_question (qid, threadId, workerId, text, options, candidates, status, askedAt, kind, fallbackDueAt)
         VALUES (${input.qid}, ${input.threadId}, ${input.workerId ?? null}, ${input.text},
-                ${JSON.stringify(input.options ?? [])}, ${JSON.stringify(input.candidates ?? [])}, 'open', ${now()})
+                ${JSON.stringify(input.options ?? [])}, ${JSON.stringify(input.candidates ?? [])}, 'open', ${now()},
+                ${input.kind ?? 'steward'}, ${input.fallbackDueAt ?? null})
       `;
+      if (input.threadId) recomputeThreadState(input.threadId);
     },
     /** Marks one question answered with what settled it (a click's chosen label). */
     close(qid: string, answer: string): boolean {
@@ -1109,10 +1180,10 @@ export function createLedger(deps: LedgerDeps) {
 
   const notifications = {
     /** INSERT OR IGNORE on dedupeKey: the reducer transaction may be re-entered after a crash. */
-    queue(dedupeKey: string, kind: NotifyRow["kind"], threadId: string, workerId: string | null): void {
+    queue(dedupeKey: string, kind: NotifyRow["kind"], threadId: string, workerId: string | null, questionId: string | null = null): void {
       sql`
-        INSERT OR IGNORE INTO sh_notify (dedupeKey, kind, threadId, workerId, createdAt)
-        VALUES (${dedupeKey}, ${kind}, ${threadId}, ${workerId}, ${now()})
+        INSERT OR IGNORE INTO sh_notify (dedupeKey, kind, threadId, workerId, createdAt, questionId)
+        VALUES (${dedupeKey}, ${kind}, ${threadId}, ${workerId}, ${now()}, ${questionId})
       `;
     },
     /** Whether a row with this dedupeKey exists (sent or pending) — "already notified". */
@@ -1120,7 +1191,7 @@ export function createLedger(deps: LedgerDeps) {
       return sql`SELECT 1 AS one FROM sh_notify WHERE dedupeKey = ${dedupeKey}`.length > 0;
     },
     pending(): NotifyRow[] {
-      return sql<NotifyRow>`SELECT id, dedupeKey, kind, threadId, workerId FROM sh_notify WHERE sentAt IS NULL ORDER BY id`;
+      return sql<NotifyRow>`SELECT id, dedupeKey, kind, threadId, workerId, questionId FROM sh_notify WHERE sentAt IS NULL ORDER BY id`;
     },
     markSent(id: number): void {
       sql`UPDATE sh_notify SET sentAt = ${now()} WHERE id = ${id} AND sentAt IS NULL`;
@@ -1134,6 +1205,7 @@ export function createLedger(deps: LedgerDeps) {
       kind: "text" | "card";
       to: string;
       threadId?: string | null;
+      questionId?: string | null;
       text?: string;
       card?: unknown;
       urgency?: "push" | "quiet";
@@ -1143,16 +1215,16 @@ export function createLedger(deps: LedgerDeps) {
     }): string {
       if (input.id !== undefined) {
         sql`
-          INSERT OR IGNORE INTO sh_outbound (id, channel, kind, receiveId, threadId, payload, urgency, status, attempts, nextAttemptAt, createdAt)
-          VALUES (${input.id}, 'feishu', ${input.kind}, ${input.to}, ${input.threadId ?? null},
+          INSERT OR IGNORE INTO sh_outbound (id, channel, kind, receiveId, threadId, questionId, payload, urgency, status, attempts, nextAttemptAt, createdAt)
+          VALUES (${input.id}, 'feishu', ${input.kind}, ${input.to}, ${input.threadId ?? null}, ${input.questionId ?? null},
                   ${JSON.stringify({ text: input.text, card: input.card })}, ${input.urgency ?? "quiet"}, 'queued', 0, ${now()}, ${now()})
         `;
         return input.id;
       }
       const id = ulid(); // stable across retries; doubles as the provider-side uuid
       sql`
-        INSERT INTO sh_outbound (id, channel, kind, receiveId, threadId, payload, urgency, status, attempts, nextAttemptAt, createdAt)
-        VALUES (${id}, 'feishu', ${input.kind}, ${input.to}, ${input.threadId ?? null},
+        INSERT INTO sh_outbound (id, channel, kind, receiveId, threadId, questionId, payload, urgency, status, attempts, nextAttemptAt, createdAt)
+        VALUES (${id}, 'feishu', ${input.kind}, ${input.to}, ${input.threadId ?? null}, ${input.questionId ?? null},
                 ${JSON.stringify({ text: input.text, card: input.card })}, ${input.urgency ?? "quiet"}, 'queued', 0, ${now()}, ${now()})
       `;
       return id;
@@ -1167,9 +1239,9 @@ export function createLedger(deps: LedgerDeps) {
     },
     /** The full routing row behind a provider message: id (button actions key off it — e.g.
      *  `offer:` ids resolve a routine suggestion) plus its Thread, when bound. */
-    rowForProviderMsg(providerMsgId: string): { id: string; threadId: string | null } | null {
-      return sql<{ id: string; threadId: string | null }>`
-        SELECT id, threadId FROM sh_outbound WHERE providerMsgId = ${providerMsgId}
+    rowForProviderMsg(providerMsgId: string): { id: string; threadId: string | null; questionId: string | null } | null {
+      return sql<{ id: string; threadId: string | null; questionId: string | null }>`
+        SELECT id, threadId, questionId FROM sh_outbound WHERE providerMsgId = ${providerMsgId}
       `[0] ?? null;
     },
     row(id: string): Record<string, unknown> | null {
@@ -1255,6 +1327,7 @@ export function createLedger(deps: LedgerDeps) {
   const wakes = {
     queue(kind: WakeRow["kind"], dedupeKey: string, text: string, opts: { priority?: WakeRow["priority"]; mergeMs?: number; operationId?: string; dueAt?: number } = {}): void {
       const ts = now();
+      if (sql`SELECT 1 FROM sh_wake WHERE dedupeKey = ${dedupeKey}`.length > 0) return;
       if (opts.operationId !== undefined) {
         sql`
           INSERT OR IGNORE INTO sh_wake (operationId, kind, dedupeKey, text, priority, status, dueAt, createdAt)
@@ -1269,7 +1342,9 @@ export function createLedger(deps: LedgerDeps) {
       if (open) {
         // §5.4: events within the window become ONE wake-up — append this block to the
         // pending row's text. The row keeps its operationId: one steward input, ever.
-        sql`UPDATE sh_wake SET text = ${open.text + "\n" + text} WHERE id = ${open.id}`;
+        sql`UPDATE sh_wake SET text = ${open.text + "\n" + text},
+          priority = CASE WHEN ${opts.priority ?? 'normal'} = 'high' THEN 'high' ELSE priority END,
+          dueAt = MIN(dueAt, ${ts + mergeMs}) WHERE id = ${open.id}`;
         sql`
           INSERT OR IGNORE INTO sh_wake (operationId, kind, dedupeKey, text, priority, status, dueAt, mergedInto, createdAt)
           VALUES (${"evt:" + ulid()}, ${kind}, ${dedupeKey}, ${text}, ${opts.priority ?? "normal"}, 'merged', ${ts + mergeMs}, ${open.id}, ${ts})
@@ -1283,7 +1358,7 @@ export function createLedger(deps: LedgerDeps) {
     },
     due(nowMs: number): WakeRow[] {
       return sql<WakeRow>`
-        SELECT * FROM sh_wake WHERE status = 'pending' AND dueAt <= ${nowMs} ORDER BY dueAt, id
+        SELECT * FROM sh_wake WHERE status = 'pending' AND dueAt <= ${nowMs} ORDER BY CASE priority WHEN 'high' THEN 0 ELSE 1 END, dueAt, id
       `;
     },
     /** Earliest pending dueAt (the next moment the drain alarm must fire), or null. */
@@ -1616,14 +1691,11 @@ export function createLedger(deps: LedgerDeps) {
         if (status === "done") {
           notifications.queue(`report:${workerId}:${seq}`, "done_report", worker.threadId, workerId);
         } else {
-          // M1 has no steward LLM, so the §5.3 90-second window is skipped: the deterministic
-          // fallback push (worker's question, verbatim) is the only path. M2 adds the window.
-          const qid = `q_${workerId}_${seq}`;
-          sql`
-            INSERT OR IGNORE INTO sh_question (qid, threadId, workerId, text, status, askedAt)
-            VALUES (${qid}, ${worker.threadId}, ${workerId}, ${str(event.question) ?? str(event.summary) ?? ""}, 'open', ${now()})
-          `;
-          notifications.queue(`report:${workerId}:${seq}`, "attention_report", worker.threadId, workerId);
+          questions.insert({
+            qid: `q_${workerId}_${seq}`, threadId: worker.threadId, workerId,
+            text: str(event.question) ?? str(event.summary) ?? '', kind: 'report',
+            fallbackDueAt: now() + QUESTION_WINDOW_MS,
+          });
         }
         // §5.3: report events wake the steward for bookkeeping (summary, notes). The
         // deterministic card above still goes out on its own — the LLM is not on its path.
@@ -1644,7 +1716,8 @@ export function createLedger(deps: LedgerDeps) {
               question: str(event.question),
               git: (event.git as ReportRow["git"]) ?? null,
             },
-            notified: true,
+            notified: status === 'done',
+            questionId: status === 'done' ? undefined : `q_${workerId}_${seq}`,
           }),
           { priority: status === "done" ? "normal" : "high" },
         );
@@ -1664,20 +1737,18 @@ export function createLedger(deps: LedgerDeps) {
           // the Thread's point of view — state stays, nothing is sent.
           timeline.add(worker.threadId, "settled", "瞬时错误，连接器将自动重试", { workerId, seq, errorClass });
         } else {
-          // error:auth / error:context / error:unknown / unreported — all need a human.
           const text = settledQuestionText(outcome, errorClass, event);
           const qid = `q_${workerId}_${seq}`;
+          const unreported = outcome === 'unreported';
+          questions.insert({ qid, threadId: worker.threadId, workerId, text, kind: unreported ? 'unreported' : 'failure' });
           sql`
-            INSERT OR IGNORE INTO sh_question (qid, threadId, workerId, text, status, askedAt)
-            VALUES (${qid}, ${worker.threadId}, ${workerId}, ${text}, 'open', ${now()})
-          `;
-          sql`
-            UPDATE sh_worker SET state = 'broken', lastOutcome = ${`error:${errorClass ?? outcome}`}, lastEventAt = ${ts}, updatedAt = ${now()}
+            UPDATE sh_worker SET state = ${unreported || errorClass === 'context' ? 'idle' : 'broken'},
+              lastOutcome = ${unreported ? 'unreported' : `error:${errorClass ?? outcome}`}, lastEventAt = ${ts}, updatedAt = ${now()}
             WHERE workerId = ${workerId}
           `;
           sql`UPDATE sh_thread SET unread = 1 WHERE threadId = ${worker.threadId}`;
           timeline.add(worker.threadId, "question", text, { workerId, seq, errorClass });
-          notifications.queue(`settled:${workerId}:${seq}`, "failure_push", worker.threadId, workerId);
+          if (!unreported) notifications.queue(`settled:${workerId}:${seq}`, "failure_push", worker.threadId, workerId, qid);
           // §5.3: failure-class settles wake the steward (it may classify, note, or add
           // context on top of the deterministic push the user already received).
           wakes.queue(
@@ -1689,7 +1760,8 @@ export function createLedger(deps: LedgerDeps) {
               machine: machines.get(worker.deviceId),
               report: null,
               settled: { outcome, errorClass, text },
-              notified: true,
+              notified: !unreported,
+              questionId: qid,
             }),
             { priority: "high" },
           );
@@ -1697,6 +1769,11 @@ export function createLedger(deps: LedgerDeps) {
         if (event.usage) {
           sql`UPDATE sh_worker SET lastProgress = ${JSON.stringify({ usage: event.usage })} WHERE workerId = ${workerId}`;
         }
+        break;
+      }
+      case "broken": {
+        sql`UPDATE sh_worker SET state = 'broken', lastOutcome = 'broken', lastEventAt = ${ts}, updatedAt = ${now()} WHERE workerId = ${workerId}`;
+        recordBrokenQuestion(worker, `q_${workerId}_${seq}`, str(event.reason) ?? '自动恢复未成功，需要你决定下一步。');
         break;
       }
       case "lost":
@@ -1747,6 +1824,20 @@ export function createLedger(deps: LedgerDeps) {
 
     sql`UPDATE worker_ack SET processedUpTo = ${seq} WHERE workerId = ${workerId}`;
     recomputeThreadState(worker.threadId);
+  }
+
+  /** The terminal broken paths (event, rejected start, and snapshot reconciliation) agree. */
+  function recordBrokenQuestion(worker: WorkerRow, qid: string, text: string): void {
+    // A cmd_result and its failure event can describe the same terminal transition.
+    if (questions.openForWorker(worker.workerId).some(q => q.kind === 'failure')) return;
+    questions.insert({ qid, threadId: worker.threadId, workerId: worker.workerId, text, kind: 'failure' });
+    timeline.add(worker.threadId, 'question', text, { qid, workerId: worker.workerId });
+    sql`UPDATE sh_thread SET unread = 1 WHERE threadId = ${worker.threadId}`;
+    notifications.queue(`question:${qid}`, 'failure_push', worker.threadId, worker.workerId, qid);
+    wakes.queue('event', `question:${qid}`, eventWakeText({
+      thread: threads.get(worker.threadId), worker, machine: machines.get(worker.deviceId),
+      report: null, settled: { outcome: 'broken', errorClass: null, text }, notified: true, questionId: qid,
+    }), { priority: 'high' });
   }
 
   /**
@@ -1822,14 +1913,12 @@ export function createLedger(deps: LedgerDeps) {
           repoIds: threads.repoIds(t.threadId),
           workers: workers.listByThread(t.threadId),
           questions: sql<QuestionRow>`
-            SELECT qid, threadId, workerId, text, status, askedAt, answeredAt
-            FROM sh_question WHERE threadId = ${t.threadId} ORDER BY askedAt
+            SELECT * FROM sh_question WHERE threadId = ${t.threadId} ORDER BY askedAt
           `,
           timeline: timeline.list(t.threadId),
         })),
         questions: sql<QuestionRow>`
-          SELECT qid, threadId, workerId, text, status, askedAt, answeredAt
-          FROM sh_question ORDER BY askedAt
+          SELECT * FROM sh_question ORDER BY askedAt
         `,
         pendingNotifications: notifications.pending(),
         runs: runs.rows(),
@@ -1876,7 +1965,7 @@ function settledQuestionText(outcome: string, errorClass: string | null, event: 
   const lastText = typeof event.lastText === "string" && event.lastText.length > 0 ? event.lastText : "";
   const detail = lastText ? `（${lastText.slice(0, 160)}）` : "";
   if (outcome === "unreported") {
-    return `worker 结束时没有产出汇报。${lastText ? `最后说：${lastText.slice(0, 120)}` : ""}`;
+    return `worker 结束时没有产出汇报。${lastText ? `最后说：${lastText}` : ""}`;
   }
   switch (errorClass) {
     case "auth":
@@ -1884,7 +1973,7 @@ function settledQuestionText(outcome: string, errorClass: string | null, event: 
       // failed resume), the base says what the user must do.
       return `机器上的模型凭据失效（401/403），需要你在那台机器上修复后重新派发。${detail}`;
     case "context":
-      return "上下文超长，这个会话装不下了；建议开一个新会话接续（M2 的交接简报）。";
+      return "上下文超长，这个会话装不下了；建议开一个新会话，带上交接简报继续。";
     case "stall":
       // The connector's watchdog already gave the run one automatic restart (issue #13);
       // a stall reaching the user means even that did not bring it back.

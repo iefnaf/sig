@@ -138,7 +138,7 @@ describe("the reducer: derived state, unread, notification intents (steward.md �
     expect(snap.threads[0]!.unread).toBe(true); // unread clears only when the user replies
   });
 
-  it("a blocked report opens a question → waiting_you once the run settles, and the card is attention-toned with the question verbatim", async () => {
+  it("a blocked report opens a question, holds the card for the 90-second window, then the fallback forwards it verbatim (§5.3, issue #10)", async () => {
     const { ws, reader } = await connectMachine();
     const workerId = await dispatchAndAwaitWorker(reader, "查一下构建为什么挂");
     await sendEvents(ws, [
@@ -150,11 +150,25 @@ describe("the reducer: derived state, unread, notification intents (steward.md �
     let snap = await snapshotWhere((s) => s.threads[0]?.questions.length === 1, "question recorded");
     expect(snap.threads[0]!.state).toBe("running");
     expect(snap.threads[0]!.questions[0]!.text).toBe("可以给你开 sudo 吗？");
+    expect(snap.threads[0]!.questions[0]).toMatchObject({ kind: "report", status: "open" });
     expect(snap.threads[0]!.unread).toBe(true);
+    // §5.3: the push is HELD — the steward gets the first shot (answer_worker / ask_user);
+    // nothing reaches the user while the window is open.
+    await waitWhileOutboundPending();
+    expect((await cardPayloads())).toHaveLength(0);
+    // The wake is high-priority (AC #1) and carries the questionId.
+    expect(snap.wakes.some((w) => w.priority === "high" && w.text.includes("questionId="))).toBe(true);
+
+    // The window expires with nothing handling it → the core forwards the question verbatim.
+    await ownerStub().shrinkQuestionWindowForTest(0);
+    await ownerStub().sweepQuestionFallbackForTest();
     await waitWhileOutboundPending();
     const card = JSON.stringify((await cardPayloads())[0]);
     expect(card).toContain("可以给你开 sudo 吗？");
     expect(card).toContain('"orange"');
+    // The fallback card binds the question: a quote-reply routes the answer back to the worker.
+    const rows = await ownerStub().outboundRows(10);
+    expect(rows.some((r) => r.kind === "card" && (r as { questionId?: string | null }).questionId !== null)).toBe(true);
 
     await sendEvents(ws, [event(workerId, 3, { type: "settled", outcome: "reported" })]);
     snap = await snapshotWhere((s) => s.threads[0]?.state === "waiting_you", "waiting_you after settle");
@@ -247,7 +261,10 @@ describe("the reducer: derived state, unread, notification intents (steward.md �
     ws.send(JSON.stringify({ t: "cmd_ack", re: cmd.id, status: "rejected", code: "not_registered_repo" }));
 
     const snap = await snapshotWhere((s) => s.threads[0]?.workers[0]?.state === "broken", "worker broken");
-    expect(snap.threads[0]!.state).toBe("idle"); // broken does not count as running and no question was asked
+    // Issue #10: a broken worker opens a "how to handle it" question (rules table) — the
+    // Thread is waiting on the user, not silently idle.
+    expect(snap.threads[0]!.state).toBe("waiting_you");
+    expect(snap.threads[0]!.questions[0]).toMatchObject({ status: "open", kind: "failure" });
     expect(snap.threads[0]!.unread).toBe(true);
     await waitWhileOutboundPending();
     const card = JSON.stringify((await cardPayloads())[0]);

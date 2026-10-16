@@ -196,6 +196,31 @@ export function notifyCard(input: {
   });
 }
 
+/**
+ * The §5.3 fallback card (issue #10): a blocked/needs_decision question nothing handled in
+ * the window. The worker's question is forwarded VERBATIM — `needsYou` carries it unchanged
+ * (a fixed cap would violate "verbatim"), the summary/did lines stay what the worker
+ * reported. No LLM anywhere on this path.
+ */
+export function workerQuestionCard(input: {
+  question: string;
+  summary?: string;
+  did?: string[];
+  threadTitle: string;
+  footer: string;
+  detailsUrl?: string;
+}) {
+  return renderReportCard({
+    tone: "attention",
+    conclusion: `❓ ${input.threadTitle}：worker 需要你的回答`,
+    did: input.did ?? [],
+    needsYou: input.question,
+    threadTitle: input.threadTitle,
+    footer: input.footer,
+    detailsUrl: input.detailsUrl,
+  });
+}
+
 /** The `ask_user` push (steward.md §4.3): plain text — answering flows back as a quote-reply. */
 export function askUserText(question: string, options: string[], threadTitle?: string): string {
   const head = threadTitle ? `【${threadTitle}】` : "";

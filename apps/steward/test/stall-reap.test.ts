@@ -566,7 +566,9 @@ describe("terminal start_worker verdicts close wedged starting workers (PR #41 r
     // The timeline records a failed dispatch, NOT a user withdrawal (finding 1's lie).
     expect(row!.thread.timeline.some((e) => e.text.includes("派发失败"))).toBe(true);
     expect(row!.thread.timeline.some((e) => e.text.includes("已撤回"))).toBe(false);
-    expect(row!.thread.state).toBe("idle"); // nothing is running; re-dispatch is open
+    // Issue #10: the broken worker opens a question → waiting_you (nothing is running;
+    // re-dispatch stays open once the question is answered).
+    expect(row!.thread.state).toBe("waiting_you");
     await waitWhileOutboundPending();
     const [card] = await sentCards();
     expect(JSON.stringify(JSON.parse(card!.payload as string))).toContain("命令过期未送达");
@@ -603,7 +605,8 @@ describe("terminal start_worker verdicts close wedged starting workers (PR #41 r
 
     const row = await waitForWorkerState(workerId, "broken");
     expect(row!.worker.lastOutcome).toMatch(/^start_failed:派发命令未能创建/);
-    expect(row!.thread.state).toBe("idle");
+    // Issue #10: the failure opens a question (rules table) → waiting_you, one push card.
+    expect(row!.thread.state).toBe("waiting_you");
     await waitWhileOutboundPending();
     expect((await sentCards()).length).toBe(1);
     fake.close();

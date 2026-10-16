@@ -179,7 +179,10 @@ describe("hello.workers reconciliation (issue #12, connector-pi.md §9.1 step 4)
 
     const snap = await snapshotWhere((s) => workerIn(s, workerId)?.state === "broken", "worker reconciled broken");
     expect(threadOf(snap, workerId).timeline.some((t) => t.text.includes("自动恢复未成功"))).toBe(true);
-    expect(snap.pendingNotifications).toHaveLength(0); // still no push from reconcile itself
+    // Issue #10 (rules table): a broken verdict asks the user how to handle it — reconcile
+    // now routes the push instead of leaving it timeline-only.
+    expect(snap.pendingNotifications.some((n) => n.kind === "failure_push")).toBe(true);
+    expect(threadOf(snap, workerId).questions.some((q) => q.status === "open" && q.kind === "failure")).toBe(true);
   });
 });
 

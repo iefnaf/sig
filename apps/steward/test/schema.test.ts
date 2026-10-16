@@ -206,6 +206,41 @@ describe("migration 010 (routing, issue #7)", () => {
     });
   });
 
+  it("014_worker_questions: pre-#10 open questions are marked handled — the upgrade never re-pushes them", async () => {
+    const id = env.Steward.idFromName(`test-migrations-${crypto.randomUUID()}`);
+    const stub = env.Steward.get(id);
+    await runInDurableObject(stub, async (instance: Steward) => {
+      const sql = (instance as unknown as { sql: SqlExecutor }).sql.bind(instance);
+      const tx = <T>(fn: () => T): T =>
+        (instance as unknown as { ctx: DurableObjectState }).ctx.storage.transactionSync(fn);
+
+      // A deployment that predates #10, with the two question shapes it could hold open.
+      const pre = MIGRATIONS.filter((m) => m.id !== "014_worker_questions");
+      runMigrations(sql, pre, tx);
+      sql`INSERT INTO sh_thread (threadId, title, state, unread, lastActivityAt, archived, createdAt) VALUES ('t_1', '旧任务', 'idle', 0, 1, 0, 1)`;
+      sql`INSERT INTO sh_worker (workerId, threadId, deviceId, agent, mode, state, createdAt, updatedAt) VALUES ('w_1', 't_1', 'd', 'pi', 'write', 'broken', 1, 1)`;
+      sql`INSERT INTO sh_report (workerId, seq, threadId, status, summary, receivedAt) VALUES ('w_1', 3, 't_1', 'blocked', '卡住', 1)`;
+      // A blocked-report question (qid matches q_<worker>_<seq> of a real report row) and a
+      // failure-class one (no matching report) — both already pushed by the M1 core.
+      sql`INSERT INTO sh_question (qid, threadId, workerId, text, status, askedAt) VALUES ('q_w_1_3', 't_1', 'w_1', '旧提问', 'open', 1)`;
+      sql`INSERT INTO sh_question (qid, threadId, workerId, text, status, askedAt) VALUES ('q_w_1_9', 't_1', 'w_1', '凭据失效', 'open', 1)`;
+      // A steward question (no worker): must NOT be touched.
+      sql`INSERT INTO sh_question (qid, threadId, text, options, status, askedAt) VALUES ('q_steward_x', 't_1', '指哪件事？', '[]', 'open', 1)`;
+
+      runMigrations(sql, MIGRATIONS, tx);
+      const rows = sql<{ qid: string; kind: string; fallbackDueAt: number | null; handledAt: number | null }>`
+        SELECT qid, kind, fallbackDueAt, handledAt FROM sh_question ORDER BY qid
+      `;
+      expect(rows.find((r) => r.qid === "q_w_1_3")).toMatchObject({ kind: "report", handledAt: 1 });
+      expect(rows.find((r) => r.qid === "q_w_1_9")).toMatchObject({ kind: "failure", handledAt: 1 });
+      // Handled at ask time ⇒ no fallback deadline in play, and the sweep skips them.
+      for (const r of rows) if (r.qid !== "q_steward_x") expect(r.handledAt).toBe(1);
+      expect(rows.find((r) => r.qid === "q_steward_x")).toMatchObject({ kind: "steward", handledAt: null });
+      // Re-run is a no-op.
+      expect(() => runMigrations(sql, MIGRATIONS, tx)).not.toThrow();
+    });
+  });
+
   it("upgrades a pre-#7 database inside one transaction: old questions survive the rebuild with candidates NULL", async () => {
     const id = env.Steward.idFromName(`test-migrations-${crypto.randomUUID()}`);
     const stub = env.Steward.get(id);
