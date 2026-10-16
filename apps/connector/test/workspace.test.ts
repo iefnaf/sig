@@ -3,7 +3,7 @@
 // main checkout via the local CLI; approveProject is a connector-local setting that a command
 // must never set; cleanup_worktree refuses dirty or unpushed worktrees unless forced, and
 // nothing is ever auto-deleted.
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { installAssets } from "../src/install.ts";
@@ -498,6 +498,128 @@ describe("CommandError surface for the new paths", () => {
     await new Promise((resolve) => setTimeout(resolve, 300));
     expect(startedOf("w-sq-victim")).toBeUndefined();
   }, 30_000);
+
+  it("a stop landing in the started-event window leaves no stale abort marker (review N1)", async () => {
+    // The emit hook fires the stop exactly in the N1 window: the running upsert happened,
+    // the launch's last marker check has passed, the finally has not. The stop must settle
+    // the worker itself, and the marker must not outlive the launch to trap the next start
+    // of the same workerId at `starting`.
+    const scenario = writeScenario(dir, "scenario-n1", [reportRun({ status: "done", summary: "done" })]);
+    const id = "w-n1";
+    workerIds.add(id);
+    let stopFired = false;
+    const hooked = new WorkerManager({
+      store,
+      stateDir,
+      adapter: fakePiAdapter(stateDir, scenario),
+      emit: (workerId, fields) => {
+        const stored = eventLog.append(workerId, fields);
+        events.push(JSON.parse(stored.payload) as EmittedEvent);
+        if (fields.type === "started" && workerId === id && !stopFired) {
+          stopFired = true;
+          void hooked.stopProcess(id).catch(() => undefined);
+        }
+      },
+    });
+    manager = hooked;
+    registerRepo("serial");
+
+    const first = await hooked.startWorker("cmd-n1", args({ workerId: id }));
+    expect(first.queued).toBeUndefined(); // the launch itself succeeded; the window-stop ended it after
+    await waitFor(
+      () => events.some((e) => e.workerId === id && e.type === "settled" && e.outcome === "aborted"),
+      10_000,
+      "window-stop settled the run",
+    );
+    expect(store.getWorker(id)).toMatchObject({ state: "idle", lastOutcome: "stopped" });
+    // N3 post-start side: the worktree stayed reachable — cleanup_worktree(force) clears it.
+    const worktree = store.getWorker(id)!.worktree;
+    expect(worktree).toBeTruthy();
+    await hooked.cleanupWorktree(id, true);
+    expect(existsSync(worktree!)).toBe(false);
+
+    // N1 core: the same workerId starts again; a stale marker would abort it silently and
+    // strand the row (and the serial slot) at `starting` forever.
+    const second = await hooked.startWorker("cmd-n1-again", args({ workerId: id }));
+    expect(second.queued).toBeUndefined();
+    await waitFor(() => store.getWorker(id)?.state === "running", 15_000, "same-id restart reached running");
+  }, 45_000);
+
+  it("a stop interrupting an in-flight automatic resume is the stop, not a resume failure (review N2)", async () => {
+    // The run crashes mid-flight → lost → fast auto-resume; stop it while the resume is
+    // relaunching. The stop's settle must be the final word — no broken row, no error event.
+    const scenario = writeScenario(dir, "scenario-n2", [
+      [
+        { emit: { type: "agent_start" } },
+        { emit: { type: "turn_start" } },
+        { delayMs: 50 },
+        { exit: 7 },
+      ],
+      reportRun({ status: "done", summary: "resumed" }),
+    ]);
+    const id = "w-n2";
+    workerIds.add(id);
+    const mgr = new WorkerManager({
+      store,
+      stateDir,
+      adapter: fakePiAdapter(stateDir, scenario),
+      recovery: { autoResumeBackoffMs: 120 },
+      emit: (workerId, fields) => {
+        const stored = eventLog.append(workerId, fields);
+        events.push(JSON.parse(stored.payload) as EmittedEvent);
+      },
+    });
+    manager = mgr;
+    registerRepo();
+    await mgr.startWorker("cmd-n2", args({ workerId: id }));
+    await waitFor(() => store.getWorker(id)?.state === "lost", 15_000, "worker lost after crash");
+    // Catch the resume while it is relaunching (state flips to recovering synchronously,
+    // before the process handshake completes) — 5 ms polling keeps us inside the window.
+    await waitFor(() => store.getWorker(id)?.state === "recovering", 15_000, "auto-resume in flight");
+    await mgr.stopProcess(id);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    const row = store.getWorker(id)!;
+    expect(row).toMatchObject({ state: "idle", lastOutcome: "stopped" });
+    const settles = events.filter((e) => e.workerId === id && e.type === "settled");
+    expect(settles.length).toBeGreaterThan(0);
+    expect(settles.every((e) => e.outcome !== "error")).toBe(true); // no resume_failed fabrication
+  }, 45_000);
+
+  it("an abort before the process ever spawns undoes the allocated worktree (review N3)", async () => {
+    const scenario = writeScenario(dir, "scenario-n3", [reportRun({ status: "done", summary: "done" })]);
+    manager = new WorkerManager({
+      store,
+      stateDir,
+      adapter: fakePiAdapter(stateDir, scenario),
+      emit: (workerId, fields) => {
+        const stored = eventLog.append(workerId, fields);
+        events.push(JSON.parse(stored.payload) as EmittedEvent);
+      },
+    });
+    registerRepo("serial");
+    const id = "w-n3-pre";
+    workerIds.add(id);
+
+    // The stop's synchronous chunk (marker + settle) lands while the launch is still in its
+    // first await — the worktree creation. The launch must bail AND undo the allocation.
+    const launch = manager.startWorker("cmd-n3-pre", args({ workerId: id }));
+    const expectation = expect(launch).rejects.toMatchObject({ code: "aborted" });
+    await manager.stopProcess(id);
+    await expectation;
+
+    expect(store.getWorker(id)).toMatchObject({ state: "idle", lastOutcome: "stopped" });
+    expect(store.getWorker(id)?.worktree).toBeNull();
+    // No orphan worktree directory remains under the connector's root (the repo-hash parent
+    // may linger empty; a live worktree would carry its .git marker file).
+    const root = join(stateDir, "worktrees");
+    const entries = existsSync(root) ? (readdirSync(root, { recursive: true }) as string[]) : [];
+    expect(entries.filter((entry) => entry === ".git" || entry.endsWith("/.git"))).toHaveLength(0);
+    // And the serial slot is free again: a new write task launches instead of queueing.
+    const next = await manager.startWorker("cmd-n3-next", args({ workerId: "w-n3-next", threadId: "n3-thread" }));
+    expect(next.queued).toBeUndefined();
+    await waitFor(() => startedOf("w-n3-next"), 15_000, "next write task launched");
+  }, 45_000);
 
   it("resume on a queued worker explains the queue instead of resuming nothing", async () => {
     setup([[]]);

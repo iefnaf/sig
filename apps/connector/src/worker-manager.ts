@@ -267,22 +267,23 @@ export class WorkerManager {
       state: "starting",
     });
 
+    let handle: WorkerHandle | undefined;
+    let worktree: string | undefined;
+    let branch: string | undefined;
+    let base: string | undefined;
     try {
       // --- §8.2 workspace resolution. Write + worktree/serial → a dedicated worktree; write +
       // main, and every readonly run (§8.3) → the repository's own checkout, no worktree.
       const useWorktree = args.mode === "write" && repo.workspace !== "main";
       let cwd = repo.path;
-      let branch: string | undefined;
-      let base: string | undefined;
-      let worktree: string | undefined;
       if (useWorktree) {
         try {
           const created = await this.worktrees.create({ repoPath: repo.path, threadId: args.threadId, base: args.base });
-          if (this.stopRequested.has(args.workerId)) throw new CommandError("aborted", "worker was stopped during startup");
           cwd = created.path;
           branch = created.branch;
           base = created.base;
           worktree = created.path;
+          if (this.stopRequested.has(args.workerId)) throw new CommandError("aborted", "worker was stopped during startup");
         } catch (err) {
           if (err instanceof CommandError) throw err;
           const message = err instanceof Error ? err.message : String(err);
@@ -310,7 +311,6 @@ export class WorkerManager {
         model: args.model,
       };
 
-      let handle: WorkerHandle;
       try {
         handle = await this.adapter.start(spec);
       } catch (err) {
@@ -360,6 +360,7 @@ export class WorkerManager {
         // A stop settled this worker (idle + settled:aborted) while the launch was in
         // flight; the launch must not overwrite that with broken/running state or events.
         this.stopRequested.delete(args.workerId);
+        await this.discardLaunchArtifacts(args.workerId, repo, { worktree, branch, base }, handle !== undefined);
         throw err;
       }
       this.store.setWorkerState(args.workerId, "broken");
@@ -368,7 +369,39 @@ export class WorkerManager {
       throw new CommandError(code, message);
     } finally {
       this.launching.delete(args.workerId);
+      // PR #43 review N1: a stop can land between the launch's last marker check and this
+      // finally (it saw `running` + `launching` and had to assume a launch in flight). Past
+      // this point every stop settles itself through the adapter, so the marker must never
+      // outlive the launch — a stale one would abort-and-strand the NEXT start of this
+      // workerId at `starting`, deadlocking a serial repo all over again.
+      this.stopRequested.delete(args.workerId);
     }
+  }
+
+  /** PR #43 review N3: a launch that aborts before `started` leaves its just-allocated
+   * worktree behind. Before the process ever ran, the allocation is undone on the spot —
+   * the directory holds only the base checkout, no agent ever touched it, so this is
+   * undoing our own allocation, not an automatic delete of anyone's work. After a process
+   * ran in it, the columns are backfilled on the row (without touching state — the stop's
+   * settle stands) so the explicit cleanup_worktree command can deal with what's there. */
+  private async discardLaunchArtifacts(
+    workerId: string,
+    repo: RegisteredRepo,
+    created: { worktree?: string; branch?: string; base?: string },
+    processRan: boolean,
+  ): Promise<void> {
+    if (!created.worktree) return;
+    if (!processRan) {
+      await this.worktrees.cleanup(repo.path, created.worktree, { force: true }).catch((err) => {
+        console.error(`[shepherd] could not undo the allocated worktree ${created.worktree}:`, err);
+      });
+      return;
+    }
+    this.store.setWorkerWorktree(workerId, {
+      worktree: created.worktree,
+      branch: created.branch ?? null,
+      base: created.base ?? null,
+    });
   }
 
   /** stop_process (§6.1): reclaim the process, keep the session on disk.
@@ -659,6 +692,12 @@ export class WorkerManager {
     try {
       await this.resumeWorker(workerId, reason, count);
     } catch (err) {
+      if (err instanceof CommandError && err.code === "aborted") {
+        // PR #43 review N2: a stop_process settled this worker while the resume relaunch was
+        // in flight. That is the user's stop, not a resume failure — write nothing here (the
+        // stop owns the row and its settled:aborted) and let it be.
+        return;
+      }
       const message = err instanceof Error ? err.message : String(err);
       const errorClass: ErrorClass = classifyError(message) === "auth" ? "auth" : "unknown";
       await this.breakWorker(workerId, errorClass, `Automatic resume failed: ${message}`, "resume_failed");
@@ -758,7 +797,9 @@ export class WorkerManager {
       }
       throw err;
     } finally {
+      // N1, same invariant as launchWorker: markers never outlive their launch window.
       this.launching.delete(workerId);
+      this.stopRequested.delete(workerId);
     }
   }
 

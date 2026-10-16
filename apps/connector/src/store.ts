@@ -281,6 +281,20 @@ export class LocalStore {
       .run(Date.now(), Date.now(), workerId);
   }
 
+  /** Backfills the worktree columns on a row whose launch aborted around the spawn (PR #43
+   * review N3: the stop's settle already wrote state/lastOutcome — this must touch ONLY the
+   * worktree columns, never state, or the stop's bookkeeping gets clobbered). */
+  setWorkerWorktree(
+    workerId: string,
+    fields: { worktree: string; branch: string | null; base: string | null },
+  ): void {
+    this.db
+      .prepare(
+        "UPDATE worker SET worktree = ?, branch = ?, base = ?, worktreeCleanedAt = NULL, updatedAt = ? WHERE workerId = ?",
+      )
+      .run(fields.worktree, fields.branch, fields.base, Date.now(), workerId);
+  }
+
   // --- Serial write queue (connector-pi.md §8.2, issue #16) ----------------------------
 
   saveQueuedStart(workerId: string, commandId: string, args: unknown): void {
