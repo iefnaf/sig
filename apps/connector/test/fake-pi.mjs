@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // fake-pi: a deterministic `pi --mode rpc` stand-in for connector tests (connector-pi.md §14).
 // Implements the RPC subset the connector uses — get_state, prompt, steer, follow_up, abort,
-// clear_queue, get_session_stats — and plays a scripted event sequence per prompt, with
-// deliberate delays, shells, raw lines, and deliberate crashes.
+// clear_queue, get_session_stats, get_entries — and plays a scripted event sequence per
+// prompt, with deliberate delays, shells, raw lines, and deliberate crashes.
 //
 // Env:
 //   FAKE_PI_SCRIPT       path to the JSON scenario file (required)
@@ -61,6 +61,16 @@ function appendSessionEntry(entry) {
   }
   const id = typeof entry.id === "string" ? entry.id : `e${++entrySeq}`;
   appendFileSync(sessionFile, JSON.stringify({ id, parentId: null, timestamp: new Date().toISOString(), ...entry }) + "\n");
+  return id;
+}
+
+/** Reads the session file's entries (header included) in file order — real get_entries shape. */
+function readSessionEntries() {
+  if (!existsSync(sessionFile)) return [];
+  return readFileSync(sessionFile, "utf8")
+    .split("\n")
+    .filter((line) => line.trim())
+    .map((line) => JSON.parse(line));
 }
 
 function writeLine(record) {
@@ -163,6 +173,14 @@ async function handle(command) {
         cost: 0.0042,
         contextUsage: { tokens: 4000, contextWindow: 200000, percent: 2 },
       });
+      return;
+    }
+    case "get_entries": {
+      // Research §3: `since` = "everything after a given entry"; the response is the session's
+      // entries in file order. Like real pi, `limit` is ignored.
+      const entries = readSessionEntries();
+      const sinceIdx = typeof command.since === "string" ? entries.findIndex((e) => e.id === command.since) : -1;
+      respond(id, "get_entries", { sessionId, sessionFile, entries: sinceIdx === -1 ? entries : entries.slice(sinceIdx + 1) });
       return;
     }
     default: {

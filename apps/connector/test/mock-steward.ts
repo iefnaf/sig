@@ -13,11 +13,17 @@ export interface MockSteward {
   close: () => Promise<void>;
   waitConnected: (ms?: number) => Promise<void>;
   sendCmd: (kind: string, args: Record<string, unknown>, id?: string) => string;
+  /** §6.6: push a history_req; the DO's relay role, for contract tests. */
+  sendHistoryReq: (workerId: string, opts?: { since?: string; maxBytes?: number }) => string;
+  /** §6.6: relay a browser ack for chunk `n`. */
+  ackHistory: (reqId: string, n: number) => void;
   dropConn: () => void;
   events: () => Array<Record<string, unknown>>;
   hellos: () => Array<Record<string, unknown>>;
   acksFor: (cmdId: string) => Record<string, unknown> | undefined;
   resultsFor: (cmdId: string) => Record<string, unknown> | undefined;
+  historyChunksFor: (reqId: string) => Array<Record<string, unknown>>;
+  errorsFor: (re: string) => Record<string, unknown> | undefined;
   pings: () => number;
   upgrades: () => number;
   setSwallowAcks: (v: boolean) => void;
@@ -33,6 +39,8 @@ export function startMockSteward(): MockSteward {
   const hellos: Array<Record<string, unknown>> = [];
   const cmdAcks = new Map<string, Record<string, unknown>>();
   const cmdResults = new Map<string, Record<string, unknown>>();
+  const historyChunks = new Map<string, Array<Record<string, unknown>>>();
+  const errorReplies = new Map<string, Record<string, unknown>>();
   const ackedUpTo = new Map<string, number>();
   let welcomeAcks: Record<string, number> = {};
   let swallowAcks = false;
@@ -108,6 +116,15 @@ export function startMockSteward(): MockSteward {
           case "cmd_result":
             cmdResults.set(String(m.re), m);
             break;
+          case "history_chunk": {
+            const list = historyChunks.get(String(m.re)) ?? [];
+            list.push(m);
+            historyChunks.set(String(m.re), list);
+            break;
+          }
+          case "error":
+            if (typeof m.re === "string") errorReplies.set(m.re, m);
+            break;
           default:
             break;
         }
@@ -121,6 +138,15 @@ export function startMockSteward(): MockSteward {
   };
   const sendCmd = (kind: string, args: Record<string, unknown>, id: string = randomUUID()): string => {
     send({ t: "cmd", id, cseq: ackSeq++, kind, args });
+    return id;
+  };
+  const sendHistoryReq = (
+    workerId: string,
+    opts: { since?: string; maxBytes?: number } = {},
+    id: string = randomUUID(),
+  ): string => {
+    // Same wire as cmd but outside the outbox semantics (§6.6): no cseq, no re-send.
+    send({ t: "history_req", id, workerId, since: opts.since, maxBytes: opts.maxBytes });
     return id;
   };
 
@@ -153,6 +179,8 @@ export function startMockSteward(): MockSteward {
       }),
     waitConnected,
     sendCmd,
+    sendHistoryReq,
+    ackHistory: (reqId, n) => send({ t: "history_ack", re: reqId, n }),
     dropConn: () => {
       try {
         conn?.close();
@@ -163,6 +191,8 @@ export function startMockSteward(): MockSteward {
     hellos: () => hellos,
     acksFor: (cmdId) => cmdAcks.get(cmdId),
     resultsFor: (cmdId) => cmdResults.get(cmdId),
+    historyChunksFor: (reqId) => historyChunks.get(reqId) ?? [],
+    errorsFor: (re) => errorReplies.get(re),
     pings: () => pingCount,
     upgrades: () => upgradeCount,
     setSwallowAcks: (v) => {
