@@ -34,6 +34,7 @@ const COST = {
   "e2e-loop.test.ts": 19,
   "llm-reply.test.ts": 19,
   "routines.test.ts": 14,
+  "notes.test.ts": 11,
   "history-relay.test.ts": 9,
   "outbound-queue.test.ts": 6,
   "ledger.test.ts": 5,
