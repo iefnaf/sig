@@ -35,6 +35,9 @@ export async function resetChannelState(): Promise<void> {
 export async function resetLedgerState(): Promise<void> {
   await resetChannelState();
   await runInDurableObject(ownerStub(), async (instance: Steward) => {
+    // Routines/follow-ups own SDK schedules that outlive table rows — cancel them first
+    // (issue #20), or a stray fire lands in whichever test runs next.
+    await instance.resetRoutineStateForTests();
     // The steward conversation must not leak between tests: dispose pi, drop its tables,
     // and clear the run/wake bookkeeping (sh_run/sh_wake are ledger-owned but reset here as
     // part of the LLM state, together with the pi tables they mirror).

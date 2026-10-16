@@ -188,6 +188,26 @@ describe("the dispatch service (Dispatcher.startWorker)", () => {
     fake.close();
   });
 
+  it("dispatch carries the steward's mode choice; the default is write (spec §11)", async () => {
+    const fake = await pairFakeConnector("mac-studio", { run: null });
+    await fake.connect();
+
+    // Readonly: research/Q&A/review — runs in the repo's own checkout, no relay base.
+    const ro = await ownerStub().dispatchForTest({ prompt: "梳理一下认证流程", repoRef: "repo-a", newTitle: "梳理认证", mode: "readonly" });
+    expect(ro).toMatchObject({ kind: "dispatched" });
+    // Write (default when the model omits mode or is unsure): a worktree task.
+    const wr = await ownerStub().dispatchForTest({ prompt: "修个 bug", repoRef: "repo-a", newTitle: "修 bug" });
+    expect(wr).toMatchObject({ kind: "dispatched" });
+
+    const [roCmd, wrCmd] = await fake.waitForCmds(2);
+    expect(roCmd!.args).toMatchObject({ mode: "readonly" });
+    expect(roCmd!.args).not.toHaveProperty("base"); // readonly never relays a branch
+    expect(wrCmd!.args).toMatchObject({ mode: "write" });
+    const snap = await ownerStub().debugSnapshot();
+    expect(snap.threads.map((t) => t.workers[0]!.mode)).toEqual(["readonly", "write"]);
+    fake.close();
+  });
+
   it("a duplicate cmdId converges on the same command row (replay idempotency)", async () => {
     const fake = await pairFakeConnector("mac-studio", { run: null });
     await fake.connect();

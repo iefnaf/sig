@@ -67,6 +67,8 @@ This pairs the machine (redeeming the pairing code from the steward's `/pair` en
 
 ```sh
 shepherd add-repo ~/code/my-repo   # allow start_worker in this repository (§8.1)
+shepherd repo-config ~/code/my-repo --workspace serial   # worktree (default) | serial | main checkout
+shepherd repo-config ~/code/my-repo --approve            # trust the repo's local pi extensions (machine-local only)
 shepherd status                    # service, pairing, workers, installed assets
 shepherd logs                      # tail ~/.shepherd/logs/connector.log
 shepherd stop | start | restart    # control the service
