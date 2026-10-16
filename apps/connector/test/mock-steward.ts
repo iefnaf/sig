@@ -207,7 +207,6 @@ export function startMockSteward(): MockSteward {
     },
     events: () => events,
     hellos: () => hellos,
-    waitHello,
     acksFor: (cmdId) => cmdAcks.get(cmdId),
     resultsFor: (cmdId) => cmdResults.get(cmdId),
     historyChunksFor: (reqId) => historyChunks.get(reqId) ?? [],
