@@ -32,6 +32,7 @@ const COST = {
   "qr-setup.test.ts": 26,
   "intervention.test.ts": 24,
   "review-regressions.test.ts": 21,
+  "stall-reap.test.ts": 12,
   "e2e-loop.test.ts": 19,
   "llm-reply.test.ts": 19,
   "routines.test.ts": 14,
