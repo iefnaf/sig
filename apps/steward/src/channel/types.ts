@@ -5,6 +5,9 @@
 
 export type Channel = "feishu";
 
+/** Feishu tenant brand: picks both the accounts domain (device flow) and the open-API domain. */
+export type Brand = "feishu" | "lark";
+
 /** An accepted inbound event; `msgId` is the caller's dedup key (§9.1, §11). */
 export interface InboundEvent {
   kind: "message" | "other";

@@ -5,14 +5,21 @@ import {
   MessageTooLargeError,
   RetriableChannelError,
   type AttachmentRef,
+  type Brand,
   type ChannelAdapter,
   type InboundEvent,
   type OutboundMessage,
 } from "./types.ts";
 
-// Mainland Feishu domain. Lark international accounts would need open.larksuite.com; the
-// manual-credential MVP targets Feishu (ADR-0001 decision 9) and keeps this a constant.
+// Mainland Feishu domain. Lark international accounts (tenant_brand=lark, learned during
+// QR onboarding) use open.larksuite.com instead; the brand is part of the stored channel
+// config and selects the base per deployment (feishu-channel.md §1, §8.1).
 export const FEISHU_API_BASE = "https://open.feishu.cn";
+export const LARK_API_BASE = "https://open.larksuite.com";
+
+export function apiBaseFor(brand: Brand): string {
+  return brand === "lark" ? LARK_API_BASE : FEISHU_API_BASE;
+}
 
 // feishu-channel.md §4: serialized message cap 30 KB. Keep a margin for JSON quoting.
 export const MAX_SERIALIZED_BYTES = 30_000;
@@ -33,6 +40,26 @@ export interface FeishuCredentials {
   verificationToken: string;
 }
 
+/** Body of the v7 application-config PATCH (schema per the official SDK's `application.ts`). */
+export interface ApplicationConfigPatch {
+  event?: {
+    subscription_type: "webhook" | "websocket";
+    request_url?: string;
+    add_events?: string[];
+    remove_events?: string[];
+  };
+  callback?: {
+    callback_type: "webhook" | "websocket";
+    request_url?: string;
+    add_callbacks?: string[];
+    remove_callbacks?: string[];
+  };
+  event_and_callback_encrypt_strategy?: {
+    encryption_key?: string;
+    verification_token?: string;
+  };
+}
+
 /** Minimal cache surface the DO implements (sh_channel_token + the refresh alarm). */
 export interface TokenStore {
   getCachedToken(): { token: string; expiresAt: number } | null;
@@ -45,6 +72,16 @@ export interface FeishuAdapterOptions {
   fetcher?: typeof fetch;
   sendTimeoutMs?: number;
   now?: () => number;
+  /** Brand-selected open-API base; defaults to the Feishu (mainland) domain. */
+  apiBase?: string;
+  /**
+   * Accept `url_verification` handshakes regardless of the presented token. Set only inside
+   * the QR-switch window (issue #24): the PATCH that points the app at our webhook may have
+   * Feishu's URL check signed with the app's *previous* console token, which a QR-created
+   * app never told us. Echoing a challenge leaks nothing (it is Feishu that must reach the
+   * URL); real events always require the stored token to match.
+   */
+  looseHandshake?: boolean;
 }
 
 interface FeishuEnvelope {
@@ -68,6 +105,8 @@ export class FeishuAdapter implements ChannelAdapter {
   readonly #fetcher: typeof fetch;
   readonly #sendTimeoutMs: number;
   readonly #now: () => number;
+  readonly #apiBase: string;
+  readonly #looseHandshake: boolean;
 
   constructor(opts: FeishuAdapterOptions) {
     this.#creds = opts.credentials;
@@ -75,6 +114,8 @@ export class FeishuAdapter implements ChannelAdapter {
     this.#fetcher = opts.fetcher ?? fetch;
     this.#sendTimeoutMs = opts.sendTimeoutMs ?? SEND_TIMEOUT_MS;
     this.#now = opts.now ?? Date.now;
+    this.#apiBase = opts.apiBase ?? FEISHU_API_BASE;
+    this.#looseHandshake = opts.looseHandshake ?? false;
   }
 
   async verifyAndParse(req: Request): Promise<InboundEvent | Response> {
@@ -86,9 +127,12 @@ export class FeishuAdapter implements ChannelAdapter {
     }
     const envelope = (body ?? {}) as Record<string, unknown>;
 
-    // The console's URL check handshake: echo the challenge only for the right token.
+    // The console's URL check handshake: echo the challenge only for the right token
+    // (looseHandshake widens this to any token — see FeishuAdapterOptions).
     if (envelope.type === "url_verification") {
-      if (envelope.token !== this.#creds.verificationToken) return new Response("invalid token", { status: 401 });
+      if (envelope.token !== this.#creds.verificationToken && !this.#looseHandshake) {
+        return new Response("invalid token", { status: 401 });
+      }
       return Response.json({ challenge: envelope.challenge });
     }
 
@@ -202,6 +246,21 @@ export class FeishuAdapter implements ChannelAdapter {
     return data.tenant_access_token;
   }
 
+  /**
+   * PATCH /open-apis/application/v7/applications/:app_id/config — the webhook switch
+   * (feishu-channel.md §2.1/§8.2). Requires the `application:application:patch` scope (the
+   * second scan). The event subscription URL takes effect immediately; the transport switch
+   * itself only lands after a console republish — verified by event arrival, not this 200.
+   */
+  async applicationConfigPatch(appId: string, body: ApplicationConfigPatch): Promise<void> {
+    const token = await this.getTenantAccessToken();
+    await this.#api(`/open-apis/application/v7/applications/${encodeURIComponent(appId)}/config`, {
+      method: "PATCH",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+
   /** JSON POST/GET with the shared timeout and error classification; returns the parsed body. */
   async #api(path: string, init: RequestInit): Promise<unknown> {
     const res = await this.#apiRaw(path, init);
@@ -211,7 +270,7 @@ export class FeishuAdapter implements ChannelAdapter {
   async #apiRaw(path: string, init: RequestInit): Promise<Response> {
     let res: Response;
     try {
-      res = await this.#fetcher(`${FEISHU_API_BASE}${path}`, {
+      res = await this.#fetcher(`${this.#apiBase}${path}`, {
         ...init,
         signal: AbortSignal.timeout(this.#sendTimeoutMs),
       });

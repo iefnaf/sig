@@ -118,4 +118,41 @@ export const MIGRATIONS: readonly Migration[] = [
       )`;
     },
   },
+  {
+    // QR-code onboarding (issue #24, steward.md §9.0): the device-flow state machine lives in
+    // `sh_qr_setup` (one row — a deployment runs one onboarding); the resulting per-app facts
+    // (brand, source, webhook-switch progress) extend the `sh_channel` row.
+    id: "004_qr_onboarding",
+    up: (sql) => {
+      ignoringDuplicateColumn(() => {
+        // `source` distinguishes the QR flow (owner bound at scan time; setup stays open until
+        // webhook delivery is verified) from the manual flow (closed on the owner's first DM).
+        // NULL reads as 'manual' — the pre-#24 rows and SERVER_KEY-rotation recoveries.
+        sql`ALTER TABLE sh_channel ADD COLUMN source TEXT`;
+        sql`ALTER TABLE sh_channel ADD COLUMN brand TEXT NOT NULL DEFAULT 'feishu'`;
+        sql`ALTER TABLE sh_channel ADD COLUMN webhookStatus TEXT`;
+        sql`ALTER TABLE sh_channel ADD COLUMN webhookPatchedAt INTEGER`;
+        sql`ALTER TABLE sh_channel ADD COLUMN webhookVerifiedAt INTEGER`;
+      });
+      // phase: awaiting_scan (QR #1) -> awaiting_scope_scan (QR #2) -> scope_added (PATCH
+      // pending/failed) -> webhook_patched (console republish + first event awaited) -> done;
+      // failed is terminal for the create flow (restart offered), created = scan #1 done but
+      // scan #2 not begun. `origin` is the setup page's origin — the source of the PATCH's
+      // request_url and of the prefilled, deployment-distinguishing bot name.
+      sql`CREATE TABLE IF NOT EXISTS sh_qr_setup (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        phase TEXT NOT NULL,
+        flow TEXT NOT NULL,
+        deviceCode TEXT NOT NULL,
+        brand TEXT NOT NULL DEFAULT 'feishu',
+        intervalS INTEGER NOT NULL,
+        expiresAt INTEGER NOT NULL,
+        qrUrl TEXT NOT NULL,
+        userCode TEXT,
+        origin TEXT,
+        lastError TEXT,
+        updatedAt INTEGER NOT NULL
+      )`;
+    },
+  },
 ];

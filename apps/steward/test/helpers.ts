@@ -21,6 +21,7 @@ export async function resetChannelState(): Promise<void> {
       instance as unknown as { sql: (strings: TemplateStringsArray, ...values: unknown[]) => unknown }
     ).sql.bind(instance);
     sql`DELETE FROM sh_channel`;
+    sql`DELETE FROM sh_qr_setup`;
     sql`DELETE FROM sh_inbound`;
     sql`DELETE FROM sh_outbound`;
     sql`DELETE FROM sh_channel_log`;
@@ -40,6 +41,7 @@ export interface MockReply {
 export interface RecordedCall {
   method: string;
   path: string;
+  url: string;
   body: string | null;
   at: number;
 }
@@ -60,6 +62,11 @@ export async function mockQueue(...replies: MockReply[]): Promise<void> {
   await feishuMock().fetch(`${MOCK}/__control/queue`, { method: "POST", body: JSON.stringify(replies) });
 }
 
+/** Scripts the device flow (see vitest.config.ts): `begin`/`polls` are FIFO arrays whose last entry repeats. */
+export async function mockRegistration(script: { begin?: unknown[]; polls?: unknown[] }): Promise<void> {
+  await feishuMock().fetch(`${MOCK}/__control/registration`, { method: "POST", body: JSON.stringify(script) });
+}
+
 export async function mockCalls(): Promise<RecordedCall[]> {
   const res = await feishuMock().fetch(`${MOCK}/__control/calls`, { method: "POST" });
   return res.json();
@@ -71,6 +78,14 @@ export function sendCalls(calls: RecordedCall[]): RecordedCall[] {
 
 export function tokenCalls(calls: RecordedCall[]): RecordedCall[] {
   return calls.filter((c) => c.path.startsWith("/open-apis/auth/v3/tenant_access_token"));
+}
+
+export function registrationCalls(calls: RecordedCall[]): RecordedCall[] {
+  return calls.filter((c) => c.path === "/oauth/v1/app/registration");
+}
+
+export function configPatchCalls(calls: RecordedCall[]): RecordedCall[] {
+  return calls.filter((c) => c.method === "PATCH" && /\/open-apis\/application\/v7\/applications\/[^/]+\/config$/.test(c.path));
 }
 
 // The credentials every helper below uses; the webhook's verification token must match
@@ -85,11 +100,49 @@ export async function submitSetupCredentials(
   appSecret = TEST_APP_SECRET,
   verificationToken = TEST_VERIFY_TOKEN,
 ): Promise<Response> {
-  const body = new URLSearchParams({ appId, appSecret, verificationToken });
+  const body = new URLSearchParams({ action: "manual", appId, appSecret, verificationToken });
   return SELF.fetch(SETUP_URL, {
     method: "POST",
     body,
     headers: { "content-type": "application/x-www-form-urlencoded" },
+  });
+}
+
+/** Posts a setup-page action (QR flow start / scope scan / webhook PATCH). */
+export function postSetupAction(action: string): Promise<Response> {
+  return SELF.fetch(SETUP_URL, {
+    method: "POST",
+    body: new URLSearchParams({ action }),
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+  });
+}
+
+/** Polls the QR state machine until the given phase appears (alarm-driven, so async). */
+export async function waitForQrPhase(phase: string | string[], timeoutMs = 20_000): Promise<void> {
+  const wanted = Array.isArray(phase) ? phase : [phase];
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const row = await ownerStub().qrSetupState();
+    if (row && wanted.includes(row.phase)) return;
+    if (Date.now() > deadline) throw new Error(`qr phase ${wanted.join("|")} not reached; now: ${row?.phase ?? "none"} err=${row?.lastError ?? "-"}`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+/** The decrypted channel config, read inside the DO — tests need the QR-generated verification token. */
+export interface ChannelConfigView {
+  appId: string;
+  appSecret: string;
+  verificationToken: string;
+  ownerOpenId: string | null;
+  brand: "feishu" | "lark";
+  source: "manual" | "qr";
+  webhookStatus: string | null;
+}
+export async function readChannelConfig(): Promise<ChannelConfigView | null> {
+  return runInDurableObject(ownerStub(), async (instance: Steward) => {
+    const load = (instance as unknown as { loadFeishuConfig: () => Promise<ChannelConfigView | null> }).loadFeishuConfig;
+    return await load.call(instance);
   });
 }
 
