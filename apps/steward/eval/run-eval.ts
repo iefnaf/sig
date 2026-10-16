@@ -271,6 +271,23 @@ async function selftest(): Promise<void> {
     high.observation.dispatches.length === 1 && high.observation.dispatches[0]!.threadId === "t_login_bug",
   );
 
+  // Review #48 finding 1: signal 2 — find_threads' explicit short-circuit (a deterministic
+  // title/id/hint hit) must exempt the attach exactly like a reply/button route does;
+  // before the fix the prompt promised this and the gate rejected it (0 dispatches).
+  const signal2 = await gateCheck(
+    [
+      fauxAssistantMessage([fauxToolCall("find_threads", { query: "把「定时清理临时文件」的保留期改成 7 天" })], { stopReason: "toolUse" }),
+      fauxAssistantMessage([fauxToolCall("start_worker", { prompt: "保留期改成 7 天", repoRef: "repo-eval", threadId: "t_cron", basis: "user_explicit" })], { stopReason: "toolUse" }),
+      fauxAssistantMessage([fauxText("已挂上。")]),
+    ],
+    "把「定时清理临时文件」的保留期改成 7 天",
+  );
+  check(
+    "gate: find_threads explicit (signal 2) attaches without routing",
+    signal2.observation.dispatches.length === 1 && signal2.observation.dispatches[0]!.threadId === "t_cron",
+    signal2.observation.dispatches.length === 1 ? "dispatched, gate exempt" : "BLOCKED — the gate rejected the explicit hit",
+  );
+
   // 5. scoring
   check("scoring: wrong route", score({ kind: "attach", threadId: "t_a" }, { kind: "attach", threadId: "t_b", isNew: false }, "") === "wrong_route");
   check("scoring: missed ask", score({ kind: "ask" }, { kind: "chat" }, "好的我明白了") === "missed_ask");

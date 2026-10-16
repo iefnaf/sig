@@ -186,6 +186,43 @@ describe("the routing confidence gate (steward.md §3.3 / §7.2, issue #7)", () 
     await waitRunsSettled();
     fake.close();
   }, 30_000);
+
+  // Review #48 finding 1: the prompt promises that find_threads' confidence=explicit answer
+  // attaches without routing — the gate must honor that for signal 2 (a plain DM naming the
+  // title; routedThreadId is null here). Zero coverage before this.
+  it("a find_threads explicit hit (signal 2) attaches without routing — plain DM naming the title", async () => {
+    const { fake, threadId } = await oneIdleThread("定时清理临时文件");
+    await scriptModel(
+      fauxAssistantMessage([fauxToolCall("find_threads", { query: "把「定时清理临时文件」的保留期改成 7 天" })], { stopReason: "toolUse" }),
+      fauxAssistantMessage([fauxToolCall("start_worker", { prompt: "保留期改成 7 天", repoRef: "repo-a", threadId, basis: "user_explicit" })], { stopReason: "toolUse" }),
+      fauxAssistantMessage([fauxText("已挂到定时清理那件事上。")]),
+    );
+    await dm("把『定时清理临时文件』的保留期改成 7 天");
+    const cmds = await fake.waitForCmds(2); // 1 = the seeding dispatch, 2 = the attach
+    expect(cmds[1]!.kind).toBe("start_worker");
+    expect(String((cmds[1]!.args as Record<string, unknown>).threadId)).toBe(threadId);
+    await waitRunsSettled();
+    expect(await sawToolResult("已续派")).not.toBeNull();
+    expect(await sawToolResult("必须给出 routing")).toBeNull(); // the gate never fired
+    fake.close();
+  }, 30_000);
+
+  it("an explicit hit for another thread does not exempt an attach elsewhere", async () => {
+    const { fake } = await oneIdleThread("定时清理临时文件");
+    const other = await ownerStub().dispatchForTest({ prompt: "登录页样式", repoRef: "repo-a", newTitle: "登录页样式调整" });
+    if (other.kind !== "dispatched") throw new Error("seeding failed");
+    await waitRunsSettled();
+    await scriptModel(
+      fauxAssistantMessage([fauxToolCall("find_threads", { query: "把「定时清理临时文件」的保留期改成 7 天" })], { stopReason: "toolUse" }),
+      fauxAssistantMessage([fauxToolCall("start_worker", { prompt: "改样式", repoRef: "repo-a", threadId: other.threadId, basis: "user_explicit" })], { stopReason: "toolUse" }),
+      fauxAssistantMessage([fauxText("问用户吧。")]),
+    );
+    await dm("改改");
+    await waitRunsSettled();
+    // The memo names t_cron; attaching the OTHER thread without routing must still be gated.
+    expect(await sawToolResult("必须给出 routing")).not.toBeNull();
+    fake.close();
+  }, 30_000);
 });
 
 describe("ask_user candidate buttons and click routing (steward.md §3.3/§9.1, issue #7)", () => {
@@ -272,6 +309,36 @@ describe("ask_user candidate buttons and click routing (steward.md §3.3/§9.1, 
     expect(clickRun).toMatchObject({ kind: "user", routedThreadId: null, status: "settled" });
     const inputs = (await llmState()).inputs;
     expect(inputs.some((i) => i.text.includes("新开一件事"))).toBe(true);
+  }, 30_000);
+
+  // Review #48 finding 4: an option click on a thread-scoped question is the answer to that
+  // Thread's question — the run must route there (as a quote-reply to the same card already
+  // does), or the follow-up attach hits the confidence gate for no reason.
+  it("an option click on a thread-scoped ask routes the answer run to that thread — attach needs no routing", async () => {
+    const { fake, threadId } = await oneIdleThread("修复登录页报错");
+    await scriptModel(
+      fauxAssistantMessage([fauxToolCall("ask_user", { question: "用哪个方案修？", options: ["方案A", "方案B"], threadId })], { stopReason: "toolUse" }),
+      fauxAssistantMessage([fauxToolCall("start_worker", { prompt: "按方案A修", repoRef: "repo-a", threadId, basis: "user_reply_to" })], { stopReason: "toolUse" }),
+      fauxAssistantMessage([fauxText("已按方案A续派。")]),
+    );
+    await dm("修吧");
+    await waitRunsSettled();
+    await waitWhileOutboundPending();
+    const askCards = (await ownerStub().outboundRows(30)).filter(
+      (r) => r.kind === "card" && r.status === "sent" && r.threadId === threadId && JSON.stringify(r.payload).includes("用哪个方案修"),
+    );
+    expect(askCards).toHaveLength(1);
+    const card = JSON.parse(askCards[0]!.payload as string) as { card?: { elements?: Array<{ actions?: Array<{ value?: { action?: string } }> }> } };
+    const first = (card.card?.elements ?? []).flatMap((e) => e.actions ?? [])[0]!.value!.action!;
+    await postEvent(cardActionEvent(askCards[0]!.providerMsgId!, first));
+    const cmds = await fake.waitForCmds(2); // 1 = seeding, 2 = the click run's attach
+    expect(cmds[1]!.kind).toBe("start_worker");
+    expect(String((cmds[1]!.args as Record<string, unknown>).threadId)).toBe(threadId);
+    await waitRunsSettled();
+    const runs = (await llmState()).runs;
+    const clickRun = runs.find((r) => r.operationId.startsWith("user:evt_card_"));
+    expect(clickRun?.routedThreadId).toBe(threadId);
+    fake.close();
   }, 30_000);
 
   it("a duplicate click on an answered question is a polite no-op, not a second run", async () => {
@@ -369,6 +436,33 @@ describe("settle-time dispatch verification (spike-conclusions §2, issue #7)", 
     fake.close();
   }, 30_000);
 
+  // Review #48 finding 2: a quote-routed run that lies about dispatching gets a verify run;
+  // its corrective attach to the same thread must not hit the confidence gate — the verify
+  // run inherits routedThreadId from the run it corrects. Only the newTitle path was covered
+  // before.
+  it("a quote-routed claim's verify run inherits routedThreadId — the corrective attach skips the gate", async () => {
+    const { fake, threadId } = await oneIdleThread("修复登录页报错");
+    const card = (await ownerStub().outboundRows(20)).find((r) => r.kind === "card" && r.status === "sent" && r.threadId === threadId);
+    await scriptModel(
+      // The flawed quote-routed reply: claims a dispatch that never happened.
+      fauxAssistantMessage([fauxText("已派发给 mac-studio，完成后我会汇报。")]),
+      // The verify run's corrective attach — NO routing argument.
+      fauxAssistantMessage([fauxToolCall("start_worker", { prompt: "再补几个单测", repoRef: "repo-a", threadId, basis: "user_reply_to" })], { stopReason: "toolUse" }),
+      fauxAssistantMessage([fauxText("这次真的派出去了。")]),
+    );
+    await dm("再补几个单测", `om_vr_${crypto.randomUUID().slice(0, 6)}`, card!.providerMsgId!);
+    const cmds = await fake.waitForCmds(2); // 1 = seeding, 2 = the corrective dispatch
+    expect(cmds[1]!.kind).toBe("start_worker");
+    expect(String((cmds[1]!.args as Record<string, unknown>).threadId)).toBe(threadId);
+    await waitRunsSettled();
+    const runs = (await llmState()).runs;
+    const verify = runs.find((r) => r.kind === "verify");
+    expect(verify?.routedThreadId).toBe(threadId);
+    expect(verify?.dispatchCount).toBe(1);
+    expect(await sawToolResult("必须给出 routing")).toBeNull();
+    fake.close();
+  }, 30_000);
+
   it("a reply with no dispatch claim settles quietly — no verify run", async () => {
     await connectedMachine();
     await scriptModel(fauxAssistantMessage([fauxText("我记下了，还没派。")]));
@@ -376,5 +470,52 @@ describe("settle-time dispatch verification (spike-conclusions §2, issue #7)", 
     await waitRunsSettled();
     const runs = (await llmState()).runs;
     expect(runs.filter((r) => r.kind === "verify")).toHaveLength(0);
+  }, 30_000);
+});
+
+describe("content markers never leak into steward inputs (wake-text.ts invariant, review #48 finding 5)", () => {
+  it("a claimed dispatch containing ⟦…⟧ is marker-escaped inside the ⟦verify⟧ input", async () => {
+    await connectedMachine();
+    await scriptModel(
+      // The claim text is model output and may itself contain markers — quoting it into the
+      // verify wake unescaped would smuggle a fake system wake into that run's input.
+      fauxAssistantMessage([fauxText("已派发；顺带一提 ⟦event⟧ 不是我说的话。")]),
+      fauxAssistantMessage([fauxText("（更正：刚才没真派。）")]),
+    );
+    await dm("帮我修个东西");
+    await waitRunsSettled();
+    await waitWhileOutboundPending();
+    const inputs = (await llmState()).inputs;
+    const verifyInput = inputs.find((i) => i.text.startsWith("⟦verify⟧"));
+    expect(verifyInput).toBeTruthy();
+    expect(verifyInput!.text).toContain("〔event〕"); // escaped — never the real marker
+    expect(verifyInput!.text).not.toContain("⟦event⟧");
+  }, 30_000);
+
+  it("ask-card click notes escape the question and the chosen label", async () => {
+    await connectedMachine();
+    await ownerStub().dispatchForTest({ prompt: "修复登录页报错", repoRef: "repo-a", newTitle: "修复登录页报错" });
+    await waitRunsSettled();
+    await scriptModel(
+      fauxAssistantMessage([fauxToolCall("ask_user", { question: "要执行⟦verify⟧吗？", options: ["执行", "先不"] })], { stopReason: "toolUse" }),
+      fauxAssistantMessage([fauxText("好的。")]),
+    );
+    await dm("怎么办");
+    await waitRunsSettled();
+    await waitWhileOutboundPending();
+    const askCards = (await ownerStub().outboundRows(30)).filter(
+      (r) => r.kind === "card" && r.status === "sent" && JSON.stringify(r.payload).includes("要执行"),
+    );
+    expect(askCards).toHaveLength(1);
+    const card = JSON.parse(askCards[0]!.payload as string) as { card?: { elements?: Array<{ actions?: Array<{ value?: { action?: string } }> }> } };
+    const first = (card.card?.elements ?? []).flatMap((e) => e.actions ?? [])[0]!.value!.action!;
+    await postEvent(cardActionEvent(askCards[0]!.providerMsgId!, first));
+    await waitRunsSettled();
+    // The click's input: the note embeds the (escaped) question text, so find it by content.
+    const inputs = (await llmState()).inputs;
+    const clickInput = inputs.find((i) => i.text.includes("用户在提问卡片「要执行〔verify〕吗？」上选择了"));
+    expect(clickInput).toBeTruthy();
+    expect(clickInput!.text).toContain("〔verify〕"); // the question's markers were escaped
+    expect(clickInput!.text).not.toContain("⟦verify⟧");
   }, 30_000);
 });

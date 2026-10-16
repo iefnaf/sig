@@ -42,6 +42,63 @@ describe("runMigrations", () => {
       expect(() => runMigrations(sql, [v1, v2])).not.toThrow();
     });
   });
+
+  it("a migration that dies mid-flight rolls back completely when wrapped in a transaction (review #48 finding 3)", async () => {
+    const id = env.Steward.idFromName(`test-migrations-${crypto.randomUUID()}`);
+    const stub = env.Steward.get(id);
+
+    await runInDurableObject(stub, async (instance: Steward) => {
+      const sql = (instance as unknown as { sql: SqlExecutor }).sql.bind(instance);
+      // The same wrapping onStart uses: each migration + its ledger row in one commit.
+      const tx = (fn: () => void): void => {
+        (instance as unknown as { ctx: DurableObjectState }).ctx.storage.transactionSync(fn);
+      };
+
+      const v1: Migration = {
+        id: "r001_create_widget",
+        up: (sql) => {
+          sql`CREATE TABLE IF NOT EXISTS widget (id TEXT PRIMARY KEY, name TEXT)`;
+        },
+      };
+      runMigrations(sql, [v1], tx);
+      sql`INSERT INTO widget (id, name) VALUES ('w1', 'gadget')`;
+
+      // Crash between the copy-drop-rename statements — exactly migration 010's sh_question
+      // shape. Unwrapped, this strands the schema where neither a re-run (INSERT … FROM
+      // widget after the DROP) nor the ledger row can ever land; the transaction must roll
+      // the whole migration back instead.
+      const dies: Migration = {
+        id: "r002_rebuild_widget",
+        up: (sql) => {
+          sql`CREATE TABLE IF NOT EXISTS widget_v2 (id TEXT PRIMARY KEY, name TEXT, extra TEXT)`;
+          sql`INSERT INTO widget_v2 SELECT id, name, NULL FROM widget`;
+          sql`DROP TABLE widget`;
+          sql`ALTER TABLE widget_v2 RENAME TO widget`;
+          throw new Error("isolate died mid-migration");
+        },
+      };
+      expect(() => runMigrations(sql, [v1, dies], tx)).toThrow("isolate died mid-migration");
+      expect(sql<{ id: string; name: string }>`SELECT id, name FROM widget`).toEqual([{ id: "w1", name: "gadget" }]);
+      expect(sql`SELECT 1 AS one FROM sqlite_master WHERE name = 'widget_v2'`).toEqual([]);
+      expect(sql`SELECT 1 AS one FROM _migrations WHERE id = 'r002_rebuild_widget'`).toEqual([]);
+
+      // The restart re-runs the (now healthy) migration and it applies cleanly.
+      const heals: Migration = {
+        id: "r002_rebuild_widget",
+        up: (sql) => {
+          sql`CREATE TABLE IF NOT EXISTS widget_v2 (id TEXT PRIMARY KEY, name TEXT, extra TEXT)`;
+          sql`INSERT INTO widget_v2 SELECT id, name, NULL FROM widget`;
+          sql`DROP TABLE widget`;
+          sql`ALTER TABLE widget_v2 RENAME TO widget`;
+        },
+      };
+      expect(() => runMigrations(sql, [v1, heals], tx)).not.toThrow();
+      expect(sql<{ id: string; name: string; extra: string | null }>`SELECT id, name, extra FROM widget`).toEqual([
+        { id: "w1", name: "gadget", extra: null },
+      ]);
+      expect(() => runMigrations(sql, [v1, heals], tx)).not.toThrow(); // ledger row landed with the commit
+    });
+  });
 });
 
 describe("migration 010 (routing, issue #7)", () => {
@@ -74,6 +131,37 @@ describe("migration 010 (routing, issue #7)", () => {
       // Runs carry the dispatch counter.
       sql`INSERT INTO sh_run (operationId, kind, text, status, createdAt) VALUES ('r_1', 'user', 'x', 'open', 1)`;
       expect(sql<{ dispatchCount: number }>`SELECT dispatchCount FROM sh_run WHERE operationId = 'r_1'`[0]!.dispatchCount).toBe(0);
+    });
+  });
+
+  it("upgrades a pre-#7 database inside one transaction: old questions survive the rebuild with candidates NULL", async () => {
+    const id = env.Steward.idFromName(`test-migrations-${crypto.randomUUID()}`);
+    const stub = env.Steward.get(id);
+    await runInDurableObject(stub, async (instance: Steward) => {
+      const sql = (instance as unknown as { sql: SqlExecutor }).sql.bind(instance);
+      const tx = (fn: () => void): void => {
+        (instance as unknown as { ctx: DurableObjectState }).ctx.storage.transactionSync(fn);
+      };
+
+      // A deployment that predates #7: everything through 009 applied, real rows present.
+      const pre = MIGRATIONS.filter((m) => m.id !== "010_routing");
+      runMigrations(sql, pre, tx);
+      sql`INSERT INTO sh_thread (threadId, title, state, unread, lastActivityAt, archived, createdAt) VALUES ('t_old', '旧任务', 'idle', 0, 1, 0, 1)`;
+      sql`INSERT INTO sh_question (qid, threadId, text, options, status, askedAt) VALUES ('q_old', 't_old', '旧问题', '["A"]', 'open', 1)`;
+      sql`INSERT INTO sh_run (operationId, kind, text, status, createdAt) VALUES ('r_old', 'user', 'x', 'settled', 1)`;
+
+      // The restart after deploy: onStart applies 010 in one transaction.
+      runMigrations(sql, MIGRATIONS, tx);
+      expect(
+        sql<{ threadId: string | null; candidates: string | null }>`SELECT threadId, candidates FROM sh_question WHERE qid = 'q_old'`,
+      ).toEqual([{ threadId: "t_old", candidates: null }]);
+      expect(sql<{ dispatchCount: number }>`SELECT dispatchCount FROM sh_run WHERE operationId = 'r_old'`[0]!.dispatchCount).toBe(0);
+      // The pre-existing thread was backfilled into the FTS index (not only trigger-synced).
+      expect(sql<{ threadId: string }>`SELECT threadId FROM sh_thread_fts WHERE sh_thread_fts MATCH '旧任务'`).toEqual([{ threadId: "t_old" }]);
+
+      // Another restart is a no-op — the ledger row committed with the rebuild.
+      expect(() => runMigrations(sql, MIGRATIONS, tx)).not.toThrow();
+      expect(sql<{ n: number }>`SELECT COUNT(*) AS n FROM sh_question`[0]!.n).toBe(1);
     });
   });
 });

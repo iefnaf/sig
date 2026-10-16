@@ -106,6 +106,24 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
   // "explicit" — the one thread, attachable without further justification. Everything else
   // is the §3.2 assembly (active + FTS-recalled + recent, weak-flagged), and attaching to it
   // needs the routing confidence the policy gate demands.
+  //
+  // Run-scoped routing memo (review #48 finding 1): the confidence gate exempts an attach
+  // when the run was routed to that thread (signal 1) OR find_threads just answered
+  // confidence=explicit for it (signal 2 — a deterministic title/id/hint hit, exactly as
+  // decisive as the quote-route). All three reset together when the run's provenance
+  // changes (spike bug 9's guard-reset rule); findThreads and the gate both sync through
+  // syncRunScope so the order of tool calls cannot matter.
+  let explicitFindThreadId: string | undefined;
+  let guardProvenance: string | undefined;
+  let dispatchedTarget: string | undefined;
+  const syncRunScope = (run: { provenance: string } | null): void => {
+    if (run && run.provenance !== guardProvenance) {
+      guardProvenance = run.provenance;
+      dispatchedTarget = undefined;
+      explicitFindThreadId = undefined;
+    }
+  };
+
   const findThreads = defineTool({
     name: "find_threads",
     description:
@@ -118,12 +136,15 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
     replay: "safe",
     execute: async (args) => {
       const run = await ctx.currentRun();
+      syncRunScope(run);
       const result = ctx.ledger.threads.findCandidates({
         text: args.query,
         ...(args.hints !== undefined ? { hints: args.hints } : {}),
         explicitThreadId: run?.routedThreadId ?? null,
       });
+      explicitFindThreadId = undefined; // a new answer supersedes an earlier explicit hit
       if (result.confidence === "explicit" && result.explicitThread) {
+        explicitFindThreadId = result.explicitThread.threadId;
         return ok(
           JSON.stringify({
             confidence: "explicit",
@@ -210,7 +231,8 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
     name: "start_worker",
     description:
       "派发一个编码任务到用户的机器。要么接续（threadId，来自 find_threads / get_thread），要么新开（newTitle + 可选 goal）。" +
-      "非显式路由的接续必须带 routing: {confidence: 'high', reason}（政策硬性要求，把握不足改用 ask_user）。" +
+      "只有显式路由的接续可免 routing：系统注已定归属（回复/按钮指向它），或本轮 find_threads 对它返回了 confidence=explicit；" +
+      "其余接续必须带 routing: {confidence: 'high', reason}（政策硬性要求，把握不足改用 ask_user）。" +
       "机器由确定性规则挑选；工具会让你知道结果（已派发 / 已用按钮问用户 / 需要你转问用户）。basis 是你派发的依据。" +
       "事件触发的运行里（⟦…⟧ 输入）必须另外给 provenanceRef：一条真实存在的用户消息 id（user:<om_…>，来自时间线/汇报的 refs），" +
       "否则会被拒绝——系统输入自身不构成派发授权（设计 §7.2）。",
@@ -222,8 +244,9 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
       goal: Type.Optional(Type.String()),
       machineHint: Type.Optional(Type.String({ description: "用户点名的机器名（没点名就别填）" })),
       /** §3.3 (issue #7): a non-explicit attach must state its confidence and reason; the
-       *  policy hook enforces high-or-ask. Omit entirely when the input's system note says
-       *  the message is already routed (that is the explicit signal). */
+       *  policy hook enforces high-or-ask. Omit when the run is already routed to this thread
+       *  (system note / card click) or find_threads just answered confidence=explicit for
+       *  it — those are the two explicit signals; everything else needs it. */
       routing: Type.Optional(
         Type.Object({
           confidence: Type.Union([Type.Literal("high"), Type.Literal("medium"), Type.Literal("low")]),
@@ -367,11 +390,11 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
   // and exactly one per run (a second start_worker for another target means the model is
   // second-guessing itself; observed live in the spike). The guard resets when the run's
   // provenance changes, never mid-run (spike bug 9). New in #7: a NON-EXPLICIT attach (the
-  // run was not routed to this thread by a reply/button) requires routing.confidence "high";
-  // anything less is blocked with the demand to ask_user — a deterministic gate in front of
-  // the model's self-assessed certainty, so a guess can never become a dispatch.
-  let dispatchedTarget: string | undefined;
-  let guardProvenance: string | undefined;
+  // run was routed neither to this thread by a reply/button nor deterministically by
+  // find_threads' explicit short-circuit — review #48 finding 1 made signal 2 count) requires
+  // routing.confidence "high"; anything less is blocked with the demand to ask_user — a
+  // deterministic gate in front of the model's self-assessed certainty, so a guess can never
+  // become a dispatch.
   const guard = hook(ToolTask, {
     beforeTool: async (call) => {
       const args = (call as { arguments?: Record<string, unknown> }).arguments ?? {};
@@ -383,18 +406,15 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
           return { block: "派发需要 threadId（接续）或 newTitle（新开）。先 find_threads / 读态势简报。" };
         }
         const run = await ctx.currentRun();
-        if (run && run.provenance !== guardProvenance) {
-          guardProvenance = run.provenance;
-          dispatchedTarget = undefined;
-        }
+        syncRunScope(run);
         if (typeof args.threadId === "string" && args.threadId.length > 0) {
-          const explicitlyRouted = run?.routedThreadId === args.threadId;
+          const explicitlyRouted = run?.routedThreadId === args.threadId || explicitFindThreadId === args.threadId;
           if (!explicitlyRouted) {
             const routing = args.routing as { confidence?: unknown; reason?: unknown } | undefined;
             if (routing === undefined || typeof routing.confidence !== "string") {
               return {
                 block:
-                  `接续到 ${args.threadId} 不是显式路由（这条消息不是对它的回复/按钮），必须给出 routing: {confidence, reason}。` +
+                  `接续到 ${args.threadId} 不是显式路由（这条消息不是对它的回复/按钮，本轮 find_threads 也没给出它的显式命中），必须给出 routing: {confidence, reason}。` +
                   "确信唯一就给 high；把握不足不要硬给——改用 ask_user（带 candidates）让用户点。",
               };
             }

@@ -201,7 +201,9 @@ export type PairResult =
 // cast at the read/write sites instead (same tradeoff the do-protocol spike made).
 export class Steward extends Agent<Env> {
   onStart(): void {
-    runMigrations(this.sql.bind(this), MIGRATIONS);
+    // Each migration commits atomically with its ledger row (review #48 finding 3): a crash
+    // mid-migration rolls back instead of stranding the schema half-applied.
+    runMigrations(this.sql.bind(this), MIGRATIONS, (fn) => this.ctx.storage.transactionSync(fn));
     // Wakes queued by past reducers (crash between queue and submit, §11) drain now.
     void this.drainWakes();
     void this.pollRuns();
@@ -1783,7 +1785,7 @@ export class Steward extends Agent<Env> {
       input.prefilledNote !== undefined
         ? input.prefilledNote
         : routedThread
-          ? `（系统注：这条消息是对 Thread「${routedThread.title}」（${routedThread.threadId}）消息的回复，已确定归属该 Thread。）\n`
+          ? `（系统注：这条消息是对 Thread「${escapeMarkers(routedThread.title)}」（${routedThread.threadId}）消息的回复，已确定归属该 Thread。）\n`
           : "";
     const text = `${note}${escaped}`;
     const routedId = input.routedThreadId ?? routedThread?.threadId ?? null;
@@ -1914,11 +1916,15 @@ export class Steward extends Agent<Env> {
    * The corrective ⟦verify⟧ follow-up (issue #7): submitted with whenBusy=followUp so it runs
    * right after the flawed reply; its kind carries the original user message as replyTo, so
    * start_worker inside it is authorized by that message (§7.1) without a provenanceRef.
+   * routedThreadId rides along too (review #48 finding 2): a corrective attach to the
+   * quote-routed thread is then explicit for the confidence gate — without the copy the
+   * verify run would hit the very gate the original run passed, and the wake text's “现在
+   * 真正调用 start_worker” could never succeed.
    */
   private async queueVerifyRun(run: RunRow, claimed: string): Promise<void> {
     const operationId = `verify:${run.operationId}`;
     const text = verifyWakeText(claimed);
-    if (!this.ledger.runs.open(operationId, "verify", text, { replyTo: run.replyTo ?? undefined, channel: run.channel ?? undefined })) {
+    if (!this.ledger.runs.open(operationId, "verify", text, { replyTo: run.replyTo ?? undefined, channel: run.channel ?? undefined, routedThreadId: run.routedThreadId })) {
       return; // already queued by a racing poll
     }
     this.logChannel("verify_dispatch_claim", `${run.operationId} "${claimed.slice(0, 80)}"`);
@@ -2037,18 +2043,30 @@ export class Steward extends Agent<Env> {
     }
 
     const label = candidate?.label ?? option ?? "新开一件事";
+    // Review #48 finding 5: every model/user-authored fragment embedded in a system note is
+    // marker-escaped (only input.text was before) — a question or option containing ⟦…⟧
+    // must never smuggle a fake system wake into the input the model reads.
+    const q = escapeMarkers(question.text.slice(0, 80));
+    const picked = escapeMarkers(label);
+    // Review #48 finding 4: an option click answers that Thread's question — route the run
+    // there (question.threadId), symmetric with quote-replying the same card, which the
+    // outbound row's threadId already routes. Candidate clicks route to the picked thread;
+    // 「新开一件事」 stays unrouted.
+    const routedThreadId = candidate ? (chosenThread?.threadId ?? null) : isNew ? null : question.threadId;
     const note = candidate
       ? chosenThread
-        ? `（系统注：用户在提问卡片「${question.text.slice(0, 80)}」上选择了「${label}」——归属已定为 Thread「${chosenThread.title}」（${chosenThread.threadId}），basis=user_reply_to，可直接接续派发。）\n`
+        ? `（系统注：用户在提问卡片「${q}」上选择了「${picked}」——归属已定为 Thread「${escapeMarkers(chosenThread.title)}」（${chosenThread.threadId}），basis=user_reply_to，可直接接续派发。）\n`
         : `（系统注：用户在提问卡片上选择的 Thread 已不存在，请如实告知并用 ask_user 重新确认。）\n`
       : isNew
-        ? `（系统注：用户在提问卡片「${question.text.slice(0, 80)}」上选择了「新开一件事」——请按之前的话语新建 Thread 继续处理。）\n`
-        : `（系统注：用户在提问卡片「${question.text.slice(0, 80)}」上选择了「${label}」——这是对你提问的回答。）\n`;
+        ? `（系统注：用户在提问卡片「${q}」上选择了「新开一件事」——请按之前的话语新建 Thread 继续处理。）\n`
+        : question.threadId
+          ? `（系统注：用户在提问卡片「${q}」上选择了「${picked}」——这是对你提问的回答，已确定归属该 Thread（${question.threadId}）。）\n`
+          : `（系统注：用户在提问卡片「${q}」上选择了「${picked}」——这是对你提问的回答。）\n`;
     await this.submitUserMessage({
       msgId: ev.eventId,
       text: label,
       prefilledNote: note,
-      routedThreadId: chosenThread?.threadId ?? null,
+      routedThreadId,
     });
   }
 

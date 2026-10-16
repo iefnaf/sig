@@ -92,11 +92,15 @@ export function followupWakeText(followupId: string, reason: string): string {
  * ⟦verify⟧ inputs (issue #7, spike-conclusions §2 “post-dispatch settle-time verification”):
  * the corrective follow-up when a user run claimed a dispatch that never happened. The
  * original user message's provenance rides on the run (replyTo), so the steward may still
- * dispatch — or must correct itself to the user via notify_user.
+ * dispatch — or must correct itself to the user via notify_user. The claimed phrase is
+ * marker-escaped (review #48 finding 5): the model wrote it, so it may itself contain ⟦…⟧,
+ * and an unescaped embed would smuggle a fake system wake into this input. The routing
+ * hint (finding 2): only an explicitly-routed attach skips routing — the same §3.3 policy
+ * holds inside a verify run, or the corrective dispatch just hits the same gate.
  */
 export function verifyWakeText(claim: string): string {
   return [
-    `${MARK_OPEN}verify${MARK_CLOSE} 你上一条回复声称已派发任务（“${claim.slice(0, 80)}”），但这次运行中没有发生任何 start_worker 调用。`,
-    "请现在真正调用 start_worker 完成派发；如果其实不该派发，用 notify_user 向用户发一句更正。",
+    `${MARK_OPEN}verify${MARK_CLOSE} 你上一条回复声称已派发任务（“${escapeMarkers(claim).slice(0, 80)}”），但这次运行中没有发生任何 start_worker 调用。`,
+    "请现在真正调用 start_worker 完成派发（接续非显式路由的 Thread 时同样要带 routing: {confidence: 'high', reason}；系统注已定归属或 find_threads 给了 explicit 的除外）；如果其实不该派发，用 notify_user 向用户发一句更正。",
   ].join("\n");
 }

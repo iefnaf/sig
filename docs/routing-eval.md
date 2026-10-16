@@ -56,8 +56,18 @@ below used a local OpenAI-compatible router (`--endpoint`), same world, same pro
 | Run (file in `eval/results/`) | pass | wrong-route | missed-ask | unnecessary-ask |
 |---|---|---|---|---|
 | `baseline-group-never-stuck.json` (strongest local model) | 98/106 (92.5%) | 1.9% ✓ | 2/11 (18.2%) ✗ | 4.2% ✓ |
-| `glm-5.3-full.json` | 95+2/106 (91.5%) | 2.8% ✗ | 2/11 (18.2%) ✗ | 6.3% ✓ |
-| `glm-5.3-flash-full-v2.json` | 95+2/106 (91.5%) | 3.8% ✗ | 2/11 (18.2%) ✗ | 5.3% ✓ |
+| `glm-5.3-full.json` | 95/106 (89.6%) | 2.8% ✗ | 2/11 (18.2%) ✗ | 6.3% ✓ |
+| `glm-5.3-flash-full-v2.json` | 95/106 (89.6%) | 3.8% ✗ | 2/11 (18.2%) ✗ | 5.3% ✓ |
+
+The runner's headline counts `pass + pass_text_ask` (the two glm runs are 93 + 2 — the 2 are
+文字反问, listed separately in each JSON's `summary`); an earlier revision of this table
+double-counted them as "95+2".
+
+**No in-tree baseline passes the gate as configured**: the missed-ask threshold (< 3%) is
+failed by every recorded run (2/11 = 18.2%, the persistent cluster below), and both glm runs
+additionally miss the wrong-route bar. The exit code is therefore red on all three files —
+the default-model baseline (deepseek-flash, with a valid key) is the run that decides the
+gate, per ADR-0001 decision 14.
 
 Spike baseline for comparison (deepseek-flash, 2026-10-14): 94.3% pass, wrong-route 1.9%,
 missed asks 0%, unnecessary 4.2% — with documented run-to-run variance of 88–93% (the spike
@@ -86,5 +96,6 @@ the strongest model sits under the bar with zero misattachments to an unrelated 
 `pnpm eval:routing:selftest` asserts the deterministic layers: the world seeds every dataset
 thread with the right derived states, strong scorers never miss the candidate set, explicit
 signals (reply routing, a titled mention) short-circuit, the confidence gate blocks attaches
-without `routing`/with `medium` and dispatches on `high` (in-process, scripted faux model),
-and the scorer's verdict table.
+without `routing`/with `medium` and dispatches on `high` — including the signal-2 exemption:
+an attach right after find_threads answered `explicit` for that thread needs no `routing`
+(review #48 finding 1) — and the scorer's verdict table.

@@ -9,13 +9,28 @@ export interface Migration {
   up: (sql: SqlExecutor) => void;
 }
 
-export function runMigrations(sql: SqlExecutor, migrations: readonly Migration[]): void {
+export function runMigrations(
+  sql: SqlExecutor,
+  migrations: readonly Migration[],
+  /** Wraps each migration — its statements AND the `_migrations` ledger write — in one
+   *  atomic commit (review #48 finding 3). Crash-safety for the copy-drop-rename shapes
+   * (migration 010's `sh_question` rebuild): without it a crash mid-migration strands the
+   * schema between statements that can neither re-run (`INSERT … FROM sh_question` after
+   * the `DROP`) nor roll forward, and onStart then fails on every restart. The DO passes
+   * `ctx.storage.transactionSync`; plain-SQL runtimes without one (node:sqlite eval worlds)
+   * may omit it. */
+  tx?: (fn: () => void) => void,
+): void {
   sql`CREATE TABLE IF NOT EXISTS _migrations (id TEXT PRIMARY KEY, appliedAt INTEGER)`;
   for (const migration of migrations) {
     const applied = sql<{ id: string }>`SELECT id FROM _migrations WHERE id = ${migration.id}`;
     if (applied.length > 0) continue;
-    migration.up(sql);
-    sql`INSERT INTO _migrations (id, appliedAt) VALUES (${migration.id}, ${Date.now()})`;
+    const apply = (): void => {
+      migration.up(sql);
+      sql`INSERT INTO _migrations (id, appliedAt) VALUES (${migration.id}, ${Date.now()})`;
+    };
+    if (tx === undefined) apply();
+    else tx(apply);
   }
 }
 
@@ -410,6 +425,10 @@ export const MIGRATIONS: readonly Migration[] = [
       // ask_user's routing questions belong to no particular Thread (steward.md §3.3): the
       // question row is rebuilt with a nullable threadId, and `candidates` stores the button
       // mapping ({threadId, label}[] JSON) the card-action handler resolves clicks against.
+      // The copy-drop-rename below is the one non-reentrant stretch in this migration — the
+      // runner wraps each migration in the caller's transaction (storage.transactionSync in
+      // the DO), so a crash rolls the whole rebuild back instead of stranding the deployment
+      // between the DROP and the RENAME (review #48 finding 3).
       sql`CREATE TABLE IF NOT EXISTS sh_question_v2 (
         qid TEXT PRIMARY KEY, threadId TEXT, workerId TEXT,
         text TEXT NOT NULL, options TEXT, candidates TEXT,
