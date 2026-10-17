@@ -49,6 +49,17 @@ export function safeUrl(href) {
   }
 }
 
+/** One plain line for previews: markers out, link labels kept, whitespace collapsed. */
+export function plainText(text) {
+  return String(text ?? '')
+    .replace(/\[([^\]\n]+)\]\(https?:\/\/[^)\s]+\)/g, '$1')
+    .replace(/(\*\*|~~|`)/g, '')
+    .replace(/^\s{0,3}#{1,6}\s+/gm, '')
+    .replace(/^\s{0,3}>\s?/gm, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 // ---- text with a little markup -----------------------------------------------------------------
 // Agents write plain text with the odd list, `code`, **bold** or link, and the card templates use
 // the same small subset. Parsing gives structure (never HTML); the DOM layer decides how to draw it.
@@ -72,9 +83,15 @@ export function trimOpenMarkup(text) {
   return out.replace(/\[([^\]\n]*)\]\([^)\n]*$/, '$1');
 }
 
-const INLINE = /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)|(\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\))|(https?:\/\/[^\s<>()]*[^\s<>().,;:!?'"，。；：！？、])/g;
+const INLINE = /(?<code>`[^`\n]+`)|(?<strong>\*\*[^*\n]+\*\*)|(?<strike>~~[^~\n]+~~)|(?<em>\*(?!\s)(?:[^*\n]*[^\s*])\*)|(?<link>\[(?<label>[^\]\n]+)\]\((?<href>https?:\/\/[^)\s]+)\))|(?<url>https?:\/\/[^\s<>()]*[^\s<>().,;:!?'"，。；：！？、])/g;
 const BULLET = /^\s*[-*•]\s+(.*)$/;
 const ORDERED = /^\s*\d+[.)]\s+(.*)$/;
+/** A heading, with or without the bold the models like to wrap it in (`**## 标题**`). */
+const HEADING_BOLD = /^\s{0,3}\*\*\s*(#{1,6})\s+(.+?)\s*\*\*\s*$/;
+const HEADING_PLAIN = /^\s{0,3}(#{1,6})\s+(.+?)\s*$/;
+/** Three or more of -, * or _ alone on a line. Checked before bullets: `* * *` is a rule. */
+const RULE = /^\s{0,3}(?:[-*_]\s*){3,}$/;
+const QUOTE = /^\s{0,3}>\s?(.*)$/;
 
 export function parseInline(text) {
   const out = [];
@@ -83,14 +100,17 @@ export function parseInline(text) {
   for (const match of text.matchAll(INLINE)) {
     push({ t: 'text', text: text.slice(last, match.index) });
     last = match.index + match[0].length;
-    if (match[1]) push({ t: 'code', text: match[1].slice(1, -1) });
-    else if (match[2]) push({ t: 'strong', text: match[2].slice(2, -2) });
-    else if (match[3]) {
-      const href = safeUrl(match[5]);
-      push(href ? { t: 'link', href, text: match[4] } : { t: 'text', text: match[0] });
-    } else {
-      const href = safeUrl(match[6]);
-      push(href ? { t: 'link', href, text: match[6] } : { t: 'text', text: match[0] });
+    const g = match.groups;
+    if (g.code) push({ t: 'code', text: g.code.slice(1, -1) });
+    else if (g.strong) push({ t: 'strong', text: g.strong.slice(2, -2) });
+    else if (g.strike) push({ t: 'del', text: g.strike.slice(2, -2) });
+    else if (g.em) push({ t: 'em', text: g.em.slice(1, -1) });
+    else if (g.link) {
+      const href = safeUrl(g.href);
+      push(href ? { t: 'link', href, text: g.label } : { t: 'text', text: g.link });
+    } else if (g.url) {
+      const href = safeUrl(g.url);
+      push(href ? { t: 'link', href, text: g.url } : { t: 'text', text: g.url });
     }
   }
   push({ t: 'text', text: text.slice(last) });
@@ -99,13 +119,15 @@ export function parseInline(text) {
 
 /**
  * Blocks: { t: 'p', lines: Inline[][] } (soft line breaks kept), { t: 'ul' | 'ol', items: Inline[][] },
- * { t: 'code', text }. Unknown syntax simply stays text.
+ * { t: 'code', text }, { t: 'h', level, lines }, { t: 'quote', lines }, { t: 'hr' }.
+ * Unknown syntax simply stays text.
  */
 export function parseMarkup(text) {
   const blocks = [];
   const lines = String(text ?? '').replace(/\r\n?/g, '\n').split('\n');
   let paragraph = [];
   let list = null;
+  let quote = null;
   const flushParagraph = () => {
     if (paragraph.length) blocks.push({ t: 'p', lines: paragraph.map(parseInline) });
     paragraph = [];
@@ -114,21 +136,45 @@ export function parseMarkup(text) {
     if (list) blocks.push(list);
     list = null;
   };
+  const flushQuote = () => {
+    if (quote) blocks.push({ t: 'quote', lines: quote.map(parseInline) });
+    quote = null;
+  };
+  const flushAll = () => { flushParagraph(); flushList(); flushQuote(); };
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (/^\s*```/.test(line)) {
-      flushParagraph();
-      flushList();
+      flushAll();
       const code = [];
       i++;
       while (i < lines.length && !/^\s*```/.test(lines[i])) code.push(lines[i++]);
       blocks.push({ t: 'code', text: code.join('\n') });
       continue;
     }
+    if (RULE.test(line)) {
+      flushAll();
+      blocks.push({ t: 'hr' });
+      continue;
+    }
+    const heading = HEADING_BOLD.exec(line) ?? HEADING_PLAIN.exec(line);
+    if (heading) {
+      flushAll();
+      blocks.push({ t: 'h', level: heading[1].length, lines: [parseInline(heading[2])] });
+      continue;
+    }
+    const quoted = QUOTE.exec(line);
+    if (quoted) {
+      flushParagraph();
+      flushList();
+      quote ??= [];
+      quote.push(quoted[1]);
+      continue;
+    }
     const bullet = BULLET.exec(line);
     const ordered = bullet ? null : ORDERED.exec(line);
     if (bullet || ordered) {
       flushParagraph();
+      flushQuote();
       const kind = bullet ? 'ul' : 'ol';
       if (list && list.t !== kind) flushList();
       list ??= { t: kind, items: [] };
@@ -136,10 +182,10 @@ export function parseMarkup(text) {
       continue;
     }
     flushList();
+    flushQuote();
     if (line.trim() === '') flushParagraph();
     else paragraph.push(line);
   }
-  flushParagraph();
-  flushList();
+  flushAll();
   return blocks;
 }

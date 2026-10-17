@@ -340,6 +340,14 @@ dialog::backdrop { background: #29382438; backdrop-filter: blur(2px); }
 .markup pre { margin: 0 0 8px; padding: 10px 12px; background: #f3f5ee; border-radius: 5px; overflow-x: auto; font: 11px/1.7 ui-monospace, "SFMono-Regular", Menlo, monospace; color: #55624a; white-space: pre; }
 .markup a { color: var(--green); text-decoration: underline; text-underline-offset: 2px; overflow-wrap: anywhere; }
 .markup strong { font-weight: 600; color: #38432f; }
+.markup h4.mk-h, .markup h5.mk-h { margin: 14px 0 6px; font-weight: 600; line-height: 1.5; color: #38432f; letter-spacing: -.1px; overflow-wrap: anywhere; }
+.markup h4.mk-h { font-size: 14.5px; }
+.markup h5.mk-h { font-size: 13px; }
+.markup > h4.mk-h:first-child, .markup > h5.mk-h:first-child, .markup > .mk-quote:first-child { margin-top: 0; }
+.markup .mk-quote { margin: 0 0 8px; padding: 2px 0 2px 10px; border-left: 2px solid #d7ddcc; color: #77836c; }
+.markup .mk-hr { border: 0; border-top: 1px solid var(--line); margin: 12px 0; }
+.card-body h4.mk-h { font-size: 13px; margin: 10px 0 4px; }
+.card-body h5.mk-h { font-size: 12px; }
 .markup code { font-size: .82em; }
 
 /* user messages */

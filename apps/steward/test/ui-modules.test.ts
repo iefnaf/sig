@@ -6,7 +6,7 @@
 import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { STRINGS, getLocale, setLocale, t, tOr } from "../ui/i18n.js";
-import { dayKey, formatClock, formatDay, formatRelative, formatUsd, parseInline, parseMarkup, safeUrl, trimOpenMarkup } from "../ui/format.js";
+import { dayKey, formatClock, formatDay, formatRelative, formatUsd, parseInline, parseMarkup, plainText, safeUrl, trimOpenMarkup } from "../ui/format.js";
 import { ACTION_KEYS, FATAL_COPY, KNOWN_TITLES, groupByDay, groupThreads, messagesFor, previewOf, summarize, threadMatches, withPending, workOn } from "../ui/model.js";
 import { cardView } from "../src/workspace.ts";
 import { askUserCard, noteDecisionCard, offlineAskCard, routineOfferCard, workerQuestionCard } from "../src/report-template.ts";
@@ -125,6 +125,34 @@ describe("text with a little markup", () => {
     expect(blocks[1]).toMatchObject({ t: "ul", items: [[{ text: "first" }], [{ text: "second" }]] });
     expect(blocks[3]).toEqual({ t: "code", text: "const a = 1;" });
     expect(blocks[4]).toMatchObject({ lines: [[{ t: "text", text: "After " }, { t: "strong", text: "bold" }, { t: "text", text: " and " }, { t: "code", text: "code" }, { t: "text", text: "." }]] });
+  });
+
+  it("reads the headings models actually write, bold-wrapped or plain", () => {
+    const blocks = parseMarkup("Intro line\n\n## 1. 重启那一刻发生了什么\n\n**## 2. 重启后怎么重新连上**\n\ntext\n\n#### 四级标题\n\n###nospace and ## short stay text");
+    expect(blocks.map((block) => block.t)).toEqual(["p", "h", "h", "p", "h", "p"]);
+    expect(blocks[1]).toEqual({ t: "h", level: 2, lines: [[{ t: "text", text: "1. 重启那一刻发生了什么" }]] });
+    expect(blocks[2]).toEqual({ t: "h", level: 2, lines: [[{ t: "text", text: "2. 重启后怎么重新连上" }]] });
+    expect(blocks[4]).toMatchObject({ level: 4 });
+    // `###` without a space after it is not a heading — it stays text, markers and all.
+    expect(JSON.stringify(blocks[5])).toContain("###nospace and ## short stay text");
+  });
+
+  it("reads quotes, horizontal rules, italics and strikethrough", () => {
+    const blocks = parseMarkup("> quoted line one\n> quoted **two**\n\nplain\n\n---\n\n* * *\n\nkeep ~~this~~ and *emphasis*");
+    expect(blocks.map((block) => block.t)).toEqual(["quote", "p", "hr", "hr", "p"]);
+    expect(blocks[0]).toEqual({ t: "quote", lines: [[{ t: "text", text: "quoted line one" }], [{ t: "text", text: "quoted " }, { t: "strong", text: "two" }]] });
+    expect(blocks[4]).toMatchObject({ lines: [[{ t: "text", text: "keep " }, { t: "del", text: "this" }, { t: "text", text: " and " }, { t: "em", text: "emphasis" }]] });
+  });
+
+  it("flattens markup to one plain line for previews", () => {
+    expect(plainText("## 标题\n\n**加粗** 和 ~~删除~~ 以及 `code`，见 [文档](https://example.com)。")).toBe("标题 加粗 和 删除 以及 code，见 文档。");
+    expect(plainText("> 引用一行")).toBe("引用一行");
+    expect(plainText(null)).toBe("");
+  });
+
+  it("does not italicize stray asterisks or snake-case underscores", () => {
+    expect(parseInline("2 * 3 * 4 and a_b_c")).toEqual([{ t: "text", text: "2 * 3 * 4 and a_b_c" }]);
+    expect(parseInline("**bold** stays bold")).toEqual([{ t: "text", text: "" }, { t: "strong", text: "bold" }, { t: "text", text: " stays bold" }].filter((part) => part.text !== ""));
   });
 
   it("keeps HTML as the plain text it is", () => {

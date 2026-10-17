@@ -1,6 +1,8 @@
 // Derived views over the workspace snapshot (see workspace.ts for its shape). Pure functions,
 // no DOM: the controller asks these what to draw, and tests exercise them directly.
 
+import { plainText } from './format.js';
+
 export const THREAD_STATE_ORDER = ['waiting_you', 'running', 'idle'];
 const ACTIVE_WORKER_STATES = ['queued', 'starting', 'running', 'recovering'];
 
@@ -74,9 +76,9 @@ export function previewOf(thread, messages) {
     const message = messages[i];
     if (message.threadId !== thread.id) continue;
     const text = message.text ?? message.card?.title ?? message.card?.body?.[0];
-    if (text) return String(text).replace(/\s+/g, ' ').trim();
+    if (text) return plainText(text);
   }
-  return (thread.summary ?? thread.goal ?? '').replace(/\s+/g, ' ').trim();
+  return plainText(thread.summary ?? thread.goal ?? '');
 }
 
 /** Open messages that ask for a decision, newest last. */
