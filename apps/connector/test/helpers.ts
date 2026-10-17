@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
 import { PiAdapter } from "../src/pi-adapter.ts";
+import { ClaudeAdapter } from "../src/claude-adapter.ts";
 
 export const exec = promisify(execFile);
 
@@ -42,6 +43,24 @@ export function fakePiAdapter(stateDir: string, scenarioPath: string, extra: Rec
     stateDir,
     command: fakePiCommand(),
     env: { FAKE_PI_SCRIPT: scenarioPath, ...extra },
+  });
+}
+
+/** The fake-claude argv prefix for ClaudeAdapterOptions.command (issue #17). */
+export function fakeClaudeCommand(): string[] {
+  return [process.execPath, join(import.meta.dirname, "fake-claude.mjs")];
+}
+
+export function fakeClaudeAdapter(
+  stateDir: string,
+  scenarioPath: string,
+  extra: Record<string, string> = {},
+): ClaudeAdapter {
+  return new ClaudeAdapter({
+    stateDir,
+    command: fakeClaudeCommand(),
+    env: { FAKE_CLAUDE_SCRIPT: scenarioPath, ...extra },
+    initTimeoutMs: 10_000,
   });
 }
 
@@ -187,5 +206,64 @@ export function reportRun(
       },
     },
     { emit: { type: "agent_settled", aborted: false } },
+  ];
+}
+
+// ---- fake-claude scenarios (issue #17) ----------------------------------------------------
+
+export interface ClaudeStep {
+  delayMs?: number;
+  /** One verbatim stream-json event (system/assistant/user/result shapes). */
+  emit?: Record<string, unknown>;
+  shell?: string;
+  /** Override fields of the final default `result` event. */
+  result?: Record<string, unknown>;
+  /** Suppress the default result event (crash shapes; pair with `exit`). */
+  noResult?: boolean;
+  exit?: number;
+}
+
+/** Writes a fake-claude scenario and returns its path; `startup` models init behavior
+ *  (`delayMs`, `exit`, `mcpStatus`). The run counter file lives next to the script. */
+export function writeClaudeScenario(
+  dir: string,
+  name: string,
+  runs: ClaudeStep[][],
+  startup?: Record<string, unknown>,
+): string {
+  const path = join(dir, `${name}.claude.json`);
+  writeFileSync(path, JSON.stringify({ ...(startup ? { startup } : {}), runs }));
+  return path;
+}
+
+/** One assistant message with a text block (stream-json shape). */
+export function claudeAssistantText(text: string, stopReason = "end_turn"): Record<string, unknown> {
+  return {
+    type: "assistant",
+    message: { id: "msg_1", content: [{ type: "text", text }], stop_reason: stopReason, role: "assistant" },
+    session_id: "-",
+  };
+}
+
+/** One assistant message with a tool_use block — MCP tools arrive NAMESPACED
+ *  (mcp__shepherd__report); the connector must suffix-match, never bare-match. */
+export function claudeToolUse(name: string, input: Record<string, unknown>): Record<string, unknown> {
+  return {
+    type: "assistant",
+    message: { id: "msg_2", content: [{ type: "tool_use", id: "toolu_1", name, input }], stop_reason: "tool_use", role: "assistant" },
+    session_id: "-",
+  };
+}
+
+/** A fake-claude run that reports via the MCP tool, optionally after a shell step. */
+export function claudeReportRun(
+  report: Record<string, unknown>,
+  opts: { shellBefore?: string; tool?: { name: string; input: Record<string, unknown> } } = {},
+): ClaudeStep[] {
+  return [
+    ...(opts.shellBefore ? [{ shell: opts.shellBefore }] : []),
+    ...(opts.tool ? [{ emit: claudeToolUse(opts.tool.name, opts.tool.input) }] : []),
+    { emit: claudeToolUse("mcp__shepherd__report", report) },
+    { emit: claudeAssistantText("Reported.", "end_turn") },
   ];
 }

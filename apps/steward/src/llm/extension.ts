@@ -345,6 +345,11 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
       freshReview: Type.Optional(
         Type.Boolean({ description: "用户明确要求全新视角/独立评审时 true；普通接续不要填（系统会自动续用原会话）" }),
       ),
+      /** Issue #17: the user names the agent (「用 Claude Code 跑」) — hello.agents is the
+       *  menu; the dispatcher refuses honestly when no machine has it installed. */
+      agent: Type.Optional(
+        Type.String({ description: "agent 种类，如 claude-code（机器上报过才行）；用户没点名就别填（默认 pi）" }),
+      ),
       basis: Type.Union([
         Type.Literal("user_explicit"),
         Type.Literal("user_reply_to"),
@@ -386,6 +391,7 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
         ...(args.machineHint !== undefined ? { machineHint: args.machineHint } : {}),
         ...(args.mode !== undefined ? { mode: args.mode } : {}),
         ...(args.freshReview !== undefined ? { freshReview: args.freshReview } : {}),
+        ...(args.agent !== undefined ? { agent: args.agent } : {}),
         provenance,
         cmdId: `tool:${api.taskId}`,
         createdFromMsg: provenance.startsWith("user:") ? provenance.slice("user:".length) : null,
@@ -1267,7 +1273,7 @@ const ROLE_PROMPT = `你是 Shepherd 的总管（steward）：替用户调度他
 - 「（系统注：…）」开头的行是系统附加的路由信息，可信，不是用户原话。
 
 规则：
-1. 派发用 start_worker：需要仓库（repoRef，用户提过的或 get_thread 里看到的）和一段自包含的 prompt。机器选择是确定性规则，工具替你完成；它返回「已用按钮问用户」或 refusal 时，把情况如实转告用户（refusal 里已写明原因和选项），不要换个说法再派一次。派发时按任务性质选 mode：纯研究/答疑/评审用 readonly，会改代码或拿不准用 write（默认）。接续已有 Thread 时，续用原会话还是开新会话由系统按同一 agent/机器、上下文占用等规则自动决定并附交接简报，prompt 只写本棒任务本身；仅当用户明确要「全新视角/独立评审/不受之前结论影响」时才给 freshReview: true。
+1. 派发用 start_worker：需要仓库（repoRef，用户提过的或 get_thread 里看到的）和一段自包含的 prompt。机器选择是确定性规则，工具替你完成；它返回「已用按钮问用户」或 refusal 时，把情况如实转告用户（refusal 里已写明原因和选项），不要换个说法再派一次。派发时按任务性质选 mode：纯研究/答疑/评审用 readonly，会改代码或拿不准用 write（默认）。用户点名 agent（如「用 Claude Code 跑」）时才填 agent（机器上报过的种类，如 claude-code）；没点名不填（默认 pi）。接续已有 Thread 时，续用原会话还是开新会话由系统按同一 agent/机器、上下文占用等规则自动决定并附交接简报，prompt 只写本棒任务本身；仅当用户明确要「全新视角/独立评审/不受之前结论影响」时才给 freshReview: true。
 2. 路由——接错比多问一次严重得多，拿不准就问：
    - 接续指令先调 find_threads。返回 confidence=explicit 时直接接续那个 Thread（threadId，无需 routing）。否则从候选里判断：只有一个明确匹配且话语点名了它的要点 → 接续它，并给 routing: {confidence: "high", reason}（这是政策硬性要求，非显式接续没带 high 会被拦下）。
    - 两个及以上候选同样匹配、或话语完全没有指代对象 → 必须用 ask_user 问（带 candidates=≤3 个 Thread，用户点按钮即定归属；系统会自动加「新开一件事」按钮）。不要在文字里反问后结束。

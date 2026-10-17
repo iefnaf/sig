@@ -12,6 +12,10 @@ import { EventLog } from "./events.ts";
 import type { LocalStore } from "./store.ts";
 import type { StallWatchdogOptions } from "./watchdog.ts";
 import { CommandError, WorkerManager, type RecoveryOptions } from "./worker-manager.ts";
+import type { AgentAdapter } from "./agent.ts";
+import { PiAdapter } from "./pi-adapter.ts";
+import { ClaudeAdapter, detectClaude } from "./claude-adapter.ts";
+import { VERSION } from "./version.ts";
 import type { PrExec } from "./pr.ts";
 
 export interface ConnectorAppOptions {
@@ -19,8 +23,14 @@ export interface ConnectorAppOptions {
   stateDir: string;
   machineName?: string;
   WebSocketImpl?: ClientOptions["WebSocketImpl"];
-  /** Overrides the agent adapter (tests inject fake-pi). */
+  /** Every agent to drive (issue #17); defaults to pi plus Claude Code when installed.
+   *  Overrides `adapter` when both are given. */
+  adapters?: AgentAdapter[];
+  /** Single-adapter override (tests inject fake-pi). */
   adapter?: import("./agent.ts").AgentAdapter;
+  /** The claude argv prefix for the default adapter set (issue #17); tests point it at
+   *  fake-claude. Ignored when `adapters`/`adapter` is given. */
+  claudeCommand?: string[];
   /** §9 recovery knobs (tests shrink timers and inject process I/O). */
   recovery?: RecoveryOptions;
   /** Stall-watchdog knobs (tests shrink timers and inject CPU samples). */
@@ -39,6 +49,17 @@ export function maxWorkersFromMemory(): number {
   return Math.min(8, Math.max(1, Math.floor(0.5 * (os.totalmem() / 1_000_000) / 250)));
 }
 
+/** Issue #17: the connector's default agent set — pi always, Claude Code when the binary is
+ *  on the machine (hello.agents advertises only what is actually installed). */
+export function defaultAdapters(stateDir: string, claudeCommand: string[] = ["claude"]): AgentAdapter[] {
+  const adapters: AgentAdapter[] = [new PiAdapter({ stateDir })];
+  const claude = detectClaude(claudeCommand);
+  if (claude.installed) {
+    adapters.push(new ClaudeAdapter({ stateDir, command: claudeCommand, version: claude.version }));
+  }
+  return adapters;
+}
+
 export class ConnectorApp {
   private readonly store: LocalStore;
   private readonly log?: (event: string, fields?: Record<string, unknown>) => void;
@@ -51,10 +72,11 @@ export class ConnectorApp {
     this.log = options.log;
     const events = new EventLog(options.store.database);
     this.commandLog = new CommandLog(options.store.database);
+    const adapters = options.adapters ?? (options.adapter ? [options.adapter] : defaultAdapters(options.stateDir, options.claudeCommand));
     this.manager = new WorkerManager({
       store: options.store,
       stateDir: options.stateDir,
-      adapter: options.adapter,
+      adapters,
       recovery: options.recovery,
       // Detection failures must surface in the daemon log, never as an unhandled rejection
       // (Node's default would crash the connector over its own watchdog). A caller-supplied
@@ -148,7 +170,7 @@ export class ConnectorApp {
     const events = new EventLog(this.store.database);
     return this.store.listWorkers().map((w) => ({
       workerId: w.workerId,
-      agent: "pi",
+      agent: w.agent ?? "pi",
       state: w.state,
       lastSeq: events.nextSeq(w.workerId) - 1,
       sessionId: w.sessionId ?? "",
@@ -160,7 +182,11 @@ export class ConnectorApp {
   private snapshot() {
     const workers = this.store.listWorkers();
     return {
-      agents: this.manager.agents.map((a) => ({ kind: a.kind, capabilities: a.capabilities })),
+      agents: this.manager.agents.map((a) => ({
+        kind: a.kind,
+        version: a.version ?? VERSION,
+        capabilities: a.capabilities,
+      })),
       repos: this.store.listRepos().map((r) => ({
         repoId: r.repoId,
         name: r.name,
