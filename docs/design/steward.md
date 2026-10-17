@@ -120,9 +120,15 @@ sh_note(noteId, layer, scope_repoId?, kind, text, bytes,
         source, evidence, confirmed, pinned,
         createdAt, lastUsedAt, useCount, status, supersededBy)
 sh_note_fts(text)                     -- FTS5
-sh_note_log(id, ts, op, noteId, text, reason, reportedAt)
+sh_note_log(id, ts, op, noteId, text, reason, delivery, decision, reportedAt)
                                        -- all changes (text = snapshot for the relay);
-                                       -- reportedAt marks "already relayed with a reply" (issue #18)
+                                       -- reportedAt marks "already relayed with a reply" (issue #18);
+                                       -- delivery = 'reply' | 'maintenance' and decision settle the
+                                       --   90-day ask cards (issue #19)
+sh_note_pressure(layer, scope_repoId, text, chars, kind, evidence)
+                                       -- the latest user request for room per placement that a
+                                       --   refused commit left behind (issue #19); PRIMARY KEY
+                                       --   (layer, scope_repoId) — the daily pass resolves it
 ```
 
 | Layer | `layer` | Contents | Capacity | How it loads |
@@ -151,7 +157,9 @@ The module is deterministic and **semantic judgment is left to the steward**, so
 1. `notes.propose(draft)`: the module normalizes and dedupes (an exact match only bumps `useCount`) and uses FTS to find the closest few existing entries, returning `ProposeResult { duplicate?: NoteId, similar: Note[], needsEviction?: Note[] }`.
 2. The steward reviews the candidates and decides on `commit(draft, { replaces })`: same-meaning entries supersede the old one (the old entry moves to the archive, preserving the historical version); different ones coexist.
 
-Capacity handling: if a write would push the resident layer past 2,400 characters, `propose` returns `needsEviction` (sorted by the §2.5 score, lowest first, **pinned entries excluded**); the steward picks which to evict and carries them in `commit.replaces`. The module enforces the cap and rejects anything over it. If the steward does not handle it, `maintenance` evicts the lowest-scoring entry automatically by the same score and emits a `ChangeReport`.
+Capacity handling: if a write would push the resident layer past 2,400 characters, `propose` returns `needsEviction` (sorted by the §2.5 score, lowest first, **pinned entries excluded**); the steward picks which to evict and carries them in `commit.replaces`. The module enforces the cap and rejects anything over it. **Pinned entries are never spendable as room**: a `replaces` target that is pinned is refused outright — the pin leaves only by the owner's unpin (spec §10.2's exemption covers every eviction shape, however it is dressed up).
+
+If the steward does not handle it (issue #19): a **user_said** refusal records the request in `sh_note_pressure` — one row per **distinct request** (latest-wins must never erase an earlier promise without a report), carrying the draft's `kind`/`evidence` and its `replaces` intent; low-trust sources are never worth the room and stay plain refusals. The refusal message says so. The next daily `maintenance` honours each parked request deterministically: supersede its named `replaces` targets first (a parked correction must not score-evict *around* its predecessor; a target pinned in the meantime is skipped — the pin wins), then evict the lowest-scored unpinned entries by the same score, then write what was asked for, reporting both halves (「为腾空间我忘了 xx；记住了 yy」) through the daily delivery. If even that cannot free enough, the request is reported as unmet (`room_refused`) instead of rotting silently. A parked row is cleared only when a same-claim write lands (an *unrelated* successful write never clears it — a write consumes room, it does not make any).
 
 ### 2.5 Forgetting
 
@@ -159,9 +167,9 @@ Three triggers (spec §10.2):
 
 1. **Capacity pressure**: eviction at write time (above). Eviction = demotion to `archive`, not deletion.
 2. **Conflict supersession**: `replaces`. The old entry's `supersededBy` points to the new entry.
-3. **Long unused**: `maintenance` runs once a day via alarm, with these rules:
+3. **Long unused**: `maintenance` runs once a day via a 02:00 UTC cron (idempotent by expression — restarts dedup onto the same schedule row instead of postponing it), with these rules:
    - A project-layer entry whose `lastUsedAt` is over 60 days old and not pinned → demoted to the archive.
-   - A resident-layer entry unused for over 90 days and not pinned → emits a `ChangeReport` suggesting demotion but **does not demote automatically**; the steward asks the user (resident-layer entries have broad impact).
+   - A resident-layer entry unused for over 90 days and not pinned → **proposed to the owner, never demoted automatically** (resident-layer entries have broad impact): the daily pass sends an archive-or-keep card (「已经 90 天没有被用过…要归档吗？」); 归档 sinks the note (still searchable), 保留 renews `lastUsedAt` — a renewal, not a pin; the pin exemption stays the owner's explicit call. An unanswered ask re-fires at most every 30 days.
 
 Retention score (used to pick eviction victims; the lower, the earlier evicted):
 
@@ -171,9 +179,11 @@ sourceWeight: user_said 1.0 | connector 0.9 | worker_reported 0.4 | inferred 0.3
 pinned entries do not participate
 ```
 
-`lastUsedAt` is updated when an entry is assembled into the steward's context; this approximates "being used", which is good enough for the MVP.
+`lastUsedAt` is updated when an entry is assembled into the steward's context (`notes.context`, and `get_thread`'s project-note fetch via `forRepos`); this approximates "being used", which is good enough for the MVP. The always-rendered resident **section** deliberately does not count as use (PR #44 review finding 2) — every resident entry would then be "used" every turn and the 90-day rule would be dead code.
 
 Every change is written to `sh_note_log`, and `ChangeReport`s are generated from it. The user's edits, deletions, and pins on the web memory page go through the same interface and are logged the same way.
+
+**Delivery of the changes (issue #19)** — nothing sinks or is forgotten silently (spec §10.3): conversation-time changes ride the owner's next reply (「记账」 relay). The daily pass's own changes (demotions, evictions, the notes it saved from parked pressure, unmet pressure, 90-day suggestions) get their **own durable delivery** right after the pass: one quiet coalesced 「记账」 message for the bookkeeping and one push card per open suggestion, both through `sh_outbound` with stable ids (`notechg:<logId>`, `noteask:<noteId>:<logId>` — the card's tap resolves through its `providerMsgId`, §3.1's rule, and `decision`/`reportedAt` settle the ask). Three guards keep the classes honest: rows are marked reported only in their own delivery class (a pending `reply` row still rides the next reply); an **undecided suggestion never rides a reply** — plain text would report it while its card has never existed, and the 30-day quiet window would then block the re-ask; and one pass delivers at most **one bounded batch** (the rest stays pending for the next pass — same-vintage notes go stale together, and an unbounded flush would burst). Suggestions are logged **last** in the pass and re-validated at delivery time, so a note sunk by the pass itself (or between passes) never gets a card — its ask settles as gone. Without a bound owner, the rows simply wait for the first reply.
 
 ### 2.6 Summaries and handoff briefs
 
@@ -195,6 +205,28 @@ Task at hand     ← written by the steward
 ```
 
 Briefs carry **pointers, not content** (connector-pi.md §5.3 / spec §5.3).
+
+> **Implemented (issue #8).** Summary versions live in `sh_thread_summary` (`(threadId, version)`
+> PK); the version number doubles as the cumulative update count, and blank or unchanged
+> re-saves move nothing. A thread that predates the table enters history with its then-current
+> summary as version 1, so the counter never reads zero on a thread with a past. The
+> from-scratch prompt fires where it is actionable: the ⟦event⟧ wake text and the
+> `update_thread` tool result both flag it when the NEXT update lands on the every-10th
+> boundary (the 10th, 20th, … update is the rewrite); `get_thread` always exposes
+> `summaryUpdates` / `summaryRewriteDue`. `handoff.build` (ledger.ts) gathers rows — goal,
+> summary, all the thread's reports oldest-first, the from-worker (default: the thread's
+> latest), and the thread's latest reported git facts — and `handoff.ts` assembles/renders
+> deterministically: decisions dedupe by normalized wording with the FIRST reporter credited,
+> leftovers come from the newest report that named any, pointers carry the connector-collected
+> branch/commits(≤20)/changed-files(≤100) plus an uncommitted-changes warning, and every item
+> renders as a single-line bullet so worker-reported text can never forge a brief section. The
+> resume-vs-new-session rule (spec §5.3) is deterministic in the dispatcher (`decideContinuation`):
+> the same agent on the same machine (healthy session, same repo, same mode, context usage
+> < 80%) resumes by sending the task into the existing session — the connector's idle-cold
+> relaunch is the resume mechanism; anything else (agent/machine/repo/mode switch, context
+> ≥ 80%, an explicit fresh-review request, a broken session) starts a new session on the
+> thread's latest worker branch with the brief prefixed and `parentWorker` recorded. The 80%
+> threshold stands in until real-world data exists (connector-pi.md §15.5).
 
 ## 3. Routing
 
@@ -380,6 +412,7 @@ Workers in the `lost` / `broken` states do not count as running; `broken` produc
 | `settled` error:auth | Create a question | Push immediately (the user must fix credentials on the machine) | yes |
 | `settled` error:transient | timeline | none (the connector resumes automatically) | no |
 | `settled` error:context | Create a question suggesting a fresh session | push | yes |
+| `settled` error:stall | Create a question (the connector already auto-restarted once) | push | yes |
 | `settled` unreported | Create a question | none | yes (the steward reads the last utterance and classifies it) |
 | `lost` / `resumed` | timeline | none | no |
 | `broken` | Create a question | push | yes |
@@ -390,6 +423,36 @@ Workers in the `lost` / `broken` states do not count as running; `broken` produc
 | Stall (§8.4) | timeline | Reports once: "X has shown no activity for N minutes" | no |
 
 **The 90-second window**: `needs_decision` / `blocked` reports go to the steward first, letting it try to answer factual questions itself per the first autonomy tier (`answer_worker`, evidence required). If the steward calls `ask_user`, `answer_worker`, or `notify_user` within the window, the report counts as handled; if the window expires with no action (LLM unavailable, budget spent, model error), the core **falls back to a deterministic push** and forwards the worker's question to the user verbatim. A pending user decision can therefore never get lost because of the LLM.
+
+> **Implemented (issue #10).** The window is a durable deadline on the `sh_question` row
+> (`fallbackDueAt`, alarm-driven `sweepQuestionFallback` — cancel-then-schedule so a new,
+> earlier deadline always pulls the alarm in; the pass may run late after a DO reset, never
+> early, and replays converge on one `sh_notify` intent, which the sweep drains
+> unconditionally so a crash between queueing and delivery cannot strand it). Handling is
+> booked as `handledAt`: `answer_worker` (relay settled) or `ask_user`/`notify_user` carrying
+> the wake's `questionId` — the forwarding ask BINDS the worker's question (no second row;
+> its buttons and quote-route resolve to the worker); notify_user is terminal for
+> `resolution: done` / explained failures (it closes the question — an unreported run the
+> steward classified as done unwedges the Thread) but keeps it open for `resolution:
+> question` (prose asks), and a stale `questionId` fails the call visibly. The fallback card
+> forwards the question VERBATIM (uncapped, line breaks preserved) and carries the binding,
+> so the owner's quote-reply or option click relays the answer to the worker
+> deterministically (`send`, after_current_tools semantics) — no LLM run at all for the
+> answer; a failed relay keeps the question open and tells the owner. The deterministic relay
+> applies ONLY to the quoted card's own bound question and only when the WORKER asked it
+> (kind `report`): a reply to a failure/unreported card — or to a card whose question is
+> already answered — is the steward's to handle (the routed-reply close still applies),
+> never a relay into a broken worker or an overflowing session. `answer_worker`'s evidence
+> gate lives in the `beforeTool` hook (§7.2): `note:<id>` must exist in the ledger,
+> `user:<msgId>` must be a message the bound owner actually sent (card clicks count as owner
+> actions); without evidence only `ask_user` remains. Failure-class questions
+> (error/unreported/broken) are refused to `answer_worker` — they are the user's, not the
+> worker's. One deliberate deviation from the M1 text: failure pushes and the
+> broken/start-failed paths now also open an `sh_question` (the rules table's "Create a
+> question"), so those Threads read `waiting_you`, not `idle`, and the hello/reap reconcile
+> paths drain their pushes right at the reconnect; `unreported` still never pushes on its
+> own (classification is the steward's job), and its question carries no fallback deadline —
+> the push would assert a failure the last utterance may contradict.
 
 ### 5.4 Wake-up text
 
@@ -417,7 +480,7 @@ Everything sent to the user goes through `sh_outbound`; a delivery task (alarm-d
 
 Only three sources:
 
-1. **Core templates**: `done` reports, fallback pushes, stall reminders, machine status. Content comes from data, generated deterministically, with no dependence on the LLM.
+1. **Core templates**: `done` reports, fallback pushes, stall reminders, machine status, and the notes maintenance reports (issue #19 — forgetting is reported even with no LLM and no pending conversation). Content comes from data, generated deterministically, with no dependence on the LLM.
 2. **`notify_user` / `ask_user`**: explicit calls by the steward.
 3. **Replies to user messages**: in runs triggered by a user message, the final text reply is sent automatically (`sh_run.kind = user`).
 
@@ -597,6 +660,8 @@ Note that pi-durable's `submit` returns only after the submission succeeds. If a
 | Use fewer tokens | The situation brief has a character budget; hard caps of 2,400 characters (resident layer) and 1,500 (project layer); 600-character Thread summaries |
 | Cheap model for routine events | Later, model choice per input type (strong model for user messages, cheap model for event bookkeeping). One model in the MVP |
 | Budget cap | A soft daily budget: past it, events no longer wake the steward, while `done` reports and fallback pushes continue; user messages are still processed, with the budget state noted |
+
+> **Implemented (issue #28).** `vars.DAILY_BUDGET_USD` (root wrangler.jsonc, default $1, `0` = owner messages only) is the cap; the day is the UTC calendar date and the counter is `sh_usage_day`, fed from pi.usage deltas (`sh_usage_cursor` is the single high-water mark over the session-wide total; a never-seen cursor baselines instead of charging, so an upgrade's history is never billed to "today"). Nothing meters in the background, on purpose — a pi commit listener can only be attached from `conversationCreated`, which never fires for the root of a restarted isolate, and a listener beside the sweep double-charges — so the counter is brought current exactly where a decision reads it: the wake drain (before the gate), run settlement (before the over-budget note), and the spend readout, all through one serialized sync. The gate sits in the wake drain — the single choke point every event/routine/follow-up input passes — and skips are auditable (`sh_channel_log`, and `lastResult` + a timeline entry for routine/follow-up fires, §8.6). The "noted once" line rides exactly one owner reply per capped day (marked only after the reply row is durably enqueued, same discipline as the notes relay), and the spend question is answered deterministically from the counter (`/花费` + whole-message natural forms in budget.ts) — no tool, no prompt change, no model call, so the routing-eval-gated surfaces (§3.4, ADR-0001 decision 14) stay untouched. A wording the matcher misses falls through to the model, which cannot see the counter — `/花费` is the guaranteed path; widening the surface (a `budget_status` tool + prompt line) is deliberately deferred until the eval has a valid in-tree baseline to re-run against.
 | Works without the LLM | Core templates guarantee that `done` reports, the `needs_decision` fallback, stall reminders, and machine status can always be sent |
 
 ## 13. Depended-on APIs and verification status
@@ -616,7 +681,7 @@ Legend: ✓ verified in the protocol spike; ◦ seen only in docs or type declar
 | `input` with a custom `entry` (distinguishing user vs event) | ? `pi-durable@1.1.0` types disallow it, the repo README allows it; `PiHarness.submit` does not expose it. The MVP uses content markers (§4.2) |
 | DO SQLite supports FTS5 and JSON functions | ✓ (issue #7): the trigram tokenizer works in workerd and node:sqlite; the sh_thread_fts triggers (insert / title-goal-summary update / delete / report insert) keep the index current — verified by probe and `test/schema.test.ts` (migration 010). ✓ (issue #18): external-content FTS5 with the `trigram` tokenizer verified by test in workerd — insert/update/delete triggers stay in sync, CJK substring `MATCH` works; the default unicode61 tokenizer would have collapsed Chinese sentences into single tokens |
 | `ctx.storage.transactionSync` | ◦ (DO storage API) |
-| `this.schedule(cron, ...)` idempotent | ✓ (issue #20: cron dedups by expression+payload, one-shots opt in with `idempotent: true`; verified by tests incl. lost-schedule reconciliation) |
+| `this.schedule(cron, ...)` idempotent | ✓ (issue #20: cron dedups by expression+payload, one-shots opt in with `idempotent: true`; verified by tests incl. lost-schedule reconciliation). ✓ (issue #19): the daily notes-maintenance cron reuses it — arming at every `onStart` dedups onto the same row (restarts never postpone or stack it), replacing #18's 24h one-shot chain |
 | Feishu: QR-code creation (`registerApp` device flow) | ◦ official SDK source; no live scan performed |
 | Feishu: long-connection protocol, message send / reply / card update, rate limits and lengths | ◦ official SDK source and comments; not exercised live |
 | Feishu: switching a QR-created app to webhook, publish review, personal-account limits, long-connection stability inside the DO | ? unverified; see [feishu-channel.md](../research/feishu-channel.md) §6 |
@@ -645,4 +710,4 @@ Not included: multi-tenancy, event sources (GitHub, CI, etc.), voice, the autono
 8. **Feishu integration's** unverified items (see research §6), plus WeCom. Hosting the long connection inside the DO means the DO stays permanently awake: duration billing still falls within the included allowance, but "sleeping costs almost nothing" no longer holds, and this must be stated in the cost notes.
 9. **Simultaneous reports from multiple Threads**: how to merge them into one message that stays short without losing any matter's three parts needs to be tried on real cards.
 10. **The user-viewed-a-Thread signal**: how to capture it reliably (web open, reply, button) for clearing unread.
-11. **Budget and usage metering**: the pi-durable `pi.usage` docs, and how the steward's daily usage is aggregated.
+11. **Budget and usage metering**: the pi-durable `pi.usage` docs, and how the steward's daily usage is aggregated. **Resolved (issue #28):** `pi.usage` is cumulative per session (failed attempts and compaction included), so the daily counter charges the growth of that total against a stored high-water cursor — brought current at the wake drain, run settlement, and the spend readout by one serialized sync.

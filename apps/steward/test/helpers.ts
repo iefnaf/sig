@@ -47,9 +47,13 @@ export async function resetLedgerState(): Promise<void> {
     // SDK class, hence the shape cast.
     const storage = (instance as unknown as { ctx: { storage: { sql: { exec: (query: string) => unknown } } } }).ctx.storage;
     for (const table of [
-      "sh_machine", "sh_repo", "sh_thread", "sh_thread_repo", "sh_worker", "sh_report",
+      "sh_machine", "sh_repo", "sh_thread", "sh_thread_repo", "sh_thread_summary", "sh_worker", "sh_report",
       "sh_timeline", "sh_question", "sh_notify", "sh_note", "sh_note_log", "event_inbox", "worker_ack", "outbox",
-      "sh_web_link", "sh_web_session", "sh_deploy", "device", "pairing",
+      "sh_web_link", "sh_web_session", "sh_deploy", "device", "pairing", "sh_reap_pending",
+      // sh_usage_day / sh_usage_cursor are NOT here: resetLlmStateForTests (called just
+      // above) owns them, because pi's tables and the cursor must reset TOGETHER — dropping
+      // both here would leave the cursor absent and swallow the next run's spend as a
+      // baseline (issue #28, budget.ts observe()).
     ]) {
       storage.sql.exec(`DELETE FROM ${table}`);
     }
@@ -654,7 +658,7 @@ export class FakeConnector {
 
   /** Sends one worker event with the next seq for that worker (connector-persisted seqs). */
   async emit(
-    kind: "started" | "progress" | "report" | "settled" | "lost" | "resumed" | "queue_returned",
+    kind: "started" | "progress" | "report" | "settled" | "lost" | "resumed" | "queue_returned" | "queued" | "broken",
     workerId: string,
     fields: Record<string, unknown>,
   ): Promise<void> {

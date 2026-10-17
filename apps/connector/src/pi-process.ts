@@ -65,6 +65,8 @@ export class PiProcess {
   private exited = false;
   private exitInfo: { code: number | null; signal: NodeJS.Signals | null } | null = null;
   private exitWaiters: (() => void)[] = [];
+  /** Last stdout activity (spawn time until the first chunk) — the watchdog's silence clock. */
+  private lastOutputAtMs = 0;
 
   constructor(options: PiProcessOptions) {
     this.options = options;
@@ -82,6 +84,8 @@ export class PiProcess {
       detached: false,
     }) as ChildProcessWithoutNullStreams;
     this.child = child;
+    // Silence counts from spawn: a process that never says anything is silent from birth.
+    this.lastOutputAtMs = Date.now();
 
     // Keep draining stdout unconditionally: pi honors backpressure, so a client that stops
     // reading stalls the process (rpc.md "Framing"). The data handler is attached at spawn
@@ -98,6 +102,11 @@ export class PiProcess {
 
   get pid(): number | undefined {
     return this.child?.pid;
+  }
+
+  /** Last stdout activity, ms epoch (see spawn). */
+  get lastOutputAt(): number {
+    return this.lastOutputAtMs;
   }
 
   getStderrTail(): string {
@@ -172,6 +181,7 @@ export class PiProcess {
   }
 
   private onStdoutChunk(chunk: Buffer): void {
+    this.lastOutputAtMs = Date.now();
     // Strict LF framing: split records only on LF (strip one optional trailing CR). Never use
     // readline — it also splits on U+2028/U+2029, which are valid inside JSON strings.
     this.stdoutBuffer += this.decoder.write(chunk);

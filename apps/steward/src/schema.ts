@@ -170,7 +170,8 @@ export const MIGRATIONS: readonly Migration[] = [
       sql`CREATE TABLE IF NOT EXISTS sh_thread_repo (
         threadId TEXT NOT NULL, repoId TEXT NOT NULL, PRIMARY KEY (threadId, repoId)
       )`;
-      // One row per worker session (steward.md §2.2; parentWorker/relay arrives with M2).
+      // One row per worker session (steward.md §2.2; parentWorker — the relay relationship
+      // — and contextPercent arrive with migration 013 / issue #8).
       sql`CREATE TABLE IF NOT EXISTS sh_worker (
         workerId TEXT PRIMARY KEY, threadId TEXT NOT NULL, deviceId TEXT NOT NULL, repoId TEXT,
         agent TEXT NOT NULL, mode TEXT NOT NULL,
@@ -658,6 +659,128 @@ export const MIGRATIONS: readonly Migration[] = [
       )`;
       sql`CREATE INDEX IF NOT EXISTS sh_note_log_pending ON sh_note_log (reportedAt, id)`;
       sql`CREATE INDEX IF NOT EXISTS sh_note_log_note ON sh_note_log (noteId, op, ts)`;
+    },
+  },
+  {
+    // Issue #13 review: when hello.workers reconciliation is gated behind undelivered events
+    // (snap.lastSeq > processedUpTo), the DO remembers the pending verdict for a reaped
+    // worker and applies it once the event stream catches up — otherwise a worker reaped
+    // while its machine was offline stays `lost` forever even though it is alive (the events
+    // that would prove it are exactly the ones that blocked the reconcile). Numbered 014:
+    // main's #23 took 009/010, #20 took 011, #7 kept 010_routing, #18 took 012_notes, #19
+    // took 013; ids are unique, which is what the ledger keys on — the number keeps the
+    // order readable.
+    id: "014_reap_reconcile",
+    up: (sql) => {
+      sql`CREATE TABLE IF NOT EXISTS sh_reap_pending (
+        workerId TEXT PRIMARY KEY,
+        threadId TEXT NOT NULL,
+        snapState TEXT NOT NULL,
+        lastSeq INTEGER NOT NULL,
+        createdAt INTEGER NOT NULL
+      )`;
+    },
+  },
+  {
+    id: "013_notes_maintenance",
+    up: (sql) => {
+      // A refused write must not break the hard cap. Remember the request for room instead
+      // (one row per distinct request — PR #53 review finding 3); the daily pass frees it
+      // even if the model gives up.
+      sql`CREATE TABLE IF NOT EXISTS sh_note_pressure (
+        layer TEXT NOT NULL, scope_repoId TEXT NOT NULL, text TEXT NOT NULL, chars INTEGER NOT NULL,
+        kind TEXT NOT NULL DEFAULT 'fact', evidence TEXT, replaces TEXT,
+        PRIMARY KEY (layer, scope_repoId, text)
+      )`;
+      ignoringDuplicateColumn(() => {
+        sql`ALTER TABLE sh_note_log ADD COLUMN delivery TEXT NOT NULL DEFAULT 'reply'`;
+      });
+      ignoringDuplicateColumn(() => {
+        sql`ALTER TABLE sh_note_log ADD COLUMN decision TEXT`;
+      });
+      // Lifecycle reports have their own durable delivery, including actionable resident
+      // suggestions. Upgrade any unreported lifecycle rows left by #18 as well.
+      sql`UPDATE sh_note_log SET delivery = 'maintenance'
+          WHERE reportedAt IS NULL AND (op IN ('demoted', 'suggest_demote') OR reason = 'maintenance_cap')`;
+    },
+  },
+  {
+    // Worker questions (issue #10, steward.md §5.2-5.3): the durable 90-second window and
+    // the question/message bindings the answer relay routes through. Numbered 014: main's
+    // #53 took 013_notes_maintenance; ids are unique strings, which is what the migration
+    // ledger keys on (same precedent as 009_web vs 009_history_relay) — the number just
+    // keeps the order readable, and this one applies after the notes migration either way.
+    id: "014_worker_questions",
+    up: (sql) => {
+      sql`ALTER TABLE sh_question ADD COLUMN kind TEXT NOT NULL DEFAULT 'steward'`;
+      sql`ALTER TABLE sh_question ADD COLUMN fallbackDueAt INTEGER`;
+      sql`ALTER TABLE sh_question ADD COLUMN handledAt INTEGER`;
+      sql`ALTER TABLE sh_notify ADD COLUMN questionId TEXT`;
+      sql`ALTER TABLE sh_outbound ADD COLUMN questionId TEXT`;
+      sql`ALTER TABLE sh_inbound ADD COLUMN ownerAuthorized INTEGER NOT NULL DEFAULT 0`;
+      sql`UPDATE sh_inbound SET ownerAuthorized = 1 WHERE EXISTS (
+        SELECT 1 FROM sh_run r WHERE r.kind = 'user' AND r.operationId = 'user:' || sh_inbound.msgId
+      )`;
+      sql`CREATE INDEX sh_question_fallback ON sh_question (status, handledAt, fallbackDueAt)`;
+      // Existing worker questions already had an immediate M1 push. Preserve their state
+      // without issuing a second notification on upgrade.
+      sql`UPDATE sh_question SET kind = CASE
+        WHEN EXISTS (SELECT 1 FROM sh_report r WHERE r.workerId = sh_question.workerId
+          AND sh_question.qid = 'q_' || r.workerId || '_' || r.seq) THEN 'report'
+        ELSE 'failure' END, handledAt = askedAt WHERE workerId IS NOT NULL`;
+    },
+  },
+  {
+    // Daily budget soft cap (issue #28, steward.md §12, ADR-0001 decision 15): today's
+    // counter and the cursor into pi's cumulative usage ledger. spend is an estimate derived
+    // from token counts and catalog pricing — never a bill — and the day is the UTC calendar
+    // date (the same clock as routine cron expressions). Numbered 015: main's #19 took
+    // 013_notes_maintenance, #10 took 014_worker_questions, #13's review 014_reap_reconcile.
+    id: "015_budget",
+    up: (sql) => {
+      // One row per UTC day that saw spend or a skip. costUsd accumulates pi.usage's
+      // cost.total deltas; tokens its totalTokens deltas; skippedWakes counts the wakes the
+      // cap kept from the model; overNotedAt marks the one reply the note rode that day.
+      sql`CREATE TABLE IF NOT EXISTS sh_usage_day (
+        day TEXT PRIMARY KEY,
+        costUsd REAL NOT NULL DEFAULT 0,
+        tokens INTEGER NOT NULL DEFAULT 0,
+        skippedWakes INTEGER NOT NULL DEFAULT 0,
+        overNotedAt INTEGER,
+        updatedAt INTEGER NOT NULL
+      )`;
+      // The last cumulative pi.usage total observed (budget.ts observe()): one row, and the
+      // growth against it is what lands in today's row.
+      sql`CREATE TABLE IF NOT EXISTS sh_usage_cursor (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        costUsd REAL NOT NULL DEFAULT 0,
+        tokens INTEGER NOT NULL DEFAULT 0,
+        updatedAt INTEGER NOT NULL
+      )`;
+    },
+  },
+  {
+    // Relay: handoff briefs and continuing on the previous branch (issue #8, spec §5.3,
+    // steward.md §2.6). The worker rows learn their relay parent and the last-reported
+    // context usage; summary updates become versioned (last 5 kept; every 10th update is
+    // prompted as a from-scratch rewrite — steward.md §2.6's anti-drift rule). Existing
+    // threads keep their current summary: it enters history as version 1 on the next
+    // update, so the cumulative counter never reads zero on a thread with a past.
+    // Numbered 016: main's #46/#19/#10/#28 took 013×2, 014, and 015; ids are unique, which
+    // is what the ledger keys on — the number keeps the order readable.
+    id: "016_relay_handoff",
+    up: (sql) => {
+      ignoringDuplicateColumn(() => {
+        sql`ALTER TABLE sh_worker ADD COLUMN parentWorker TEXT`;
+        sql`ALTER TABLE sh_worker ADD COLUMN contextPercent INTEGER`;
+      });
+      sql`CREATE TABLE IF NOT EXISTS sh_thread_summary (
+        threadId TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        summary TEXT NOT NULL,
+        at INTEGER NOT NULL,
+        PRIMARY KEY (threadId, version)
+      )`;
     },
   },
 ];

@@ -29,6 +29,9 @@ const vitestBin = path.join(root, "node_modules", ".bin", "vitest");
 // `vitest run --reporter=json` pass. Refresh when the mix changes materially.
 const COST = {
   "routing.test.ts": 45,
+  "relay.test.ts": 26,
+  "budget.test.ts": 25,
+  "worker-questions.test.ts": 55,
   "qr-setup.test.ts": 26,
   "intervention.test.ts": 24,
   "review-regressions.test.ts": 21,
@@ -36,6 +39,7 @@ const COST = {
   "llm-reply.test.ts": 19,
   "routines.test.ts": 14,
   "notes.test.ts": 11,
+  "handoff.test.ts": 4,
   "history-relay.test.ts": 9,
   "outbound-queue.test.ts": 6,
   "ledger.test.ts": 5,

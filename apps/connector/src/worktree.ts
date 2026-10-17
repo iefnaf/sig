@@ -6,6 +6,7 @@
 // - one worktree per write task; no automatic deletion (§8.2).
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
 
@@ -132,7 +133,7 @@ export class WorktreeManager {
     return { path: dir, branch, base };
   }
 
-  /** cleanup_worktree (§6.1): refuses uncommitted changes or unpushed commits unless force. */
+  /** cleanup_worktree (§6.1): refuses dirty or unpushed worktrees unless force. */
   async cleanup(repoPath: string, worktreePath: string, opts: { force?: boolean } = {}): Promise<void> {
     if (!opts.force) {
       const dirty = (await git(worktreePath, ["status", "--porcelain"])).trim().length > 0;
@@ -144,6 +145,52 @@ export class WorktreeManager {
     }
     await git(repoPath, ["worktree", "remove", "--force", worktreePath]);
   }
+}
+
+/** A detached, read-only checkout for readonly relay legs (issue #8): its branch starts at
+ *  `base` and is never switched to (detached HEAD), so the repo's own checkout is untouched. */
+export interface ReadonlyWorktreeResult {
+  path: string;
+  /** The commit the detached HEAD sits on. */
+  head: string;
+  base: string;
+}
+
+/**
+ * Creates a worktree for a readonly continuation (issue #8, connector-pi.md §8.3): detached
+ * HEAD at `base` — typically the previous write leg's branch — so a review/read task sees
+ * that state without checking anything out in the owner's working directory. The detached
+ * HEAD also means no branch is ever moved by a task that must not write.
+ *
+ * The directory is unique per invocation (`<slug>-ro-<n>`, smallest free n): a second
+ * readonly leg on the same thread never collides with a live one's directory, and nothing
+ * is ever removed here — stale registrations whose directories disappeared are pruned the
+ * same way WorktreeManager.create does (PR #54 review finding 2: reusing a fixed path hit
+ * git's "missing but already registered", and an unconditional rm could delete a running
+ * leg's checkout). Explicit cleanup stays with cleanup_worktree.
+ */
+export async function createReadonlyWorktree(
+  repoPath: string,
+  opts: { worktreesRoot: string; base: string; threadId: string; maxTries?: number },
+): Promise<ReadonlyWorktreeResult> {
+  await git(repoPath, ["worktree", "prune"]).catch(() => {});
+  const slugBase = `${slugify(opts.threadId)}-ro`;
+  const pathHash = createHash("sha256").update(repoPath).digest("hex").slice(0, 8);
+  const repoName = slugify(basename(repoPath), "repo");
+  const root = join(opts.worktreesRoot, `${repoName}-${pathHash}`);
+  const maxTries = opts.maxTries ?? 999;
+  let dir = "";
+  for (let n = 1; n <= maxTries; n++) {
+    const candidate = join(root, `${slugBase}-${n}`);
+    if (!existsSync(candidate)) {
+      dir = candidate;
+      break;
+    }
+  }
+  if (!dir) throw new GitError(`no free ${slugBase}-<n> worktree within ${maxTries} tries`);
+  await git(repoPath, ["worktree", "add", "--detach", dir, opts.base]);
+  const head = (await git(dir, ["rev-parse", "HEAD"])).trim();
+  return { path: dir, head, base: head };
 }
 
 function joinDir(root: string, repoPath: string, branchSlug: string): string {

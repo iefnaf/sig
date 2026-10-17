@@ -26,6 +26,10 @@ export interface ReportCardInput {
   footer: string;
   /** One-time signed timeline URL appended by the system (steward.md §6.4), never by the LLM. */
   detailsUrl?: string;
+  /** Skip the needsYou length cap and whitespace collapse (issue #10 review finding 6): the
+   *  §5.3 fallback card forwards the worker's question VERBATIM — a clip would silently drop
+   *  the clause the owner must answer on the no-LLM path of last resort. */
+  rawNeedsYou?: boolean;
 }
 
 function clip(text: string, max: number): string {
@@ -41,8 +45,9 @@ export function renderReportCard(input: ReportCardInput): { config: unknown; hea
     elements.push({ tag: "div", text: { tag: "lark_md", content: `**做了什么**\n${did.join("\n")}` } });
   }
   if (input.needsYou && input.needsYou.trim().length > 0) {
+    const needsYouText = input.rawNeedsYou ? input.needsYou.trim() : clip(input.needsYou, MAX_NEEDS_YOU + 6);
     elements.push({ tag: "hr" });
-    elements.push({ tag: "div", text: { tag: "lark_md", content: `**需要你**：${clip(input.needsYou, MAX_NEEDS_YOU + 6)}` } });
+    elements.push({ tag: "div", text: { tag: "lark_md", content: `**需要你**：${needsYouText}` } });
   }
   if (input.detailsUrl) {
     // "查看详情" logs the owner straight into the Thread timeline (spec §7.3; the URL is a
@@ -123,6 +128,27 @@ export function failureCard(conclusion: string, needsYou: string, threadTitle: s
   return renderReportCard({ tone: "failure", conclusion, did: [], needsYou, threadTitle, footer, detailsUrl });
 }
 
+/** The deterministic stall-reminder card (steward.md §8.4 / §6.2 source 1): attention, not
+ * failure — 20 straight minutes of silence may still be one very long tool call. */
+export function stallCard(
+  minutes: number,
+  worker: { agent: string },
+  machineName: string,
+  threadTitle: string,
+  footer: string,
+  detailsUrl?: string,
+) {
+  return renderReportCard({
+    tone: "attention",
+    conclusion: `⏸ ${threadTitle}：${minutes} 分钟没有任何动静`,
+    did: [],
+    needsYou: `${machineName} 上的 ${worker.agent} 无输出已 ${minutes} 分钟。可能是超长的工具调用，也可能卡住了；若确实卡住，连接器会尝试自动重启，持续无动静会被回收为失联。`,
+    threadTitle,
+    footer,
+    detailsUrl,
+  });
+}
+
 /** The offline-ask card (spec §9): dispatch found only an offline machine — never decide silently. */
 export function offlineAskCard(repoName: string, machineName: string, threadTitle: string) {
   return {
@@ -175,6 +201,32 @@ export function notifyCard(input: {
   });
 }
 
+/**
+ * The §5.3 fallback card (issue #10): a blocked/needs_decision question nothing handled in
+ * the window. The worker's question is forwarded VERBATIM — `needsYou` carries it unchanged
+ * (a fixed cap would violate "verbatim"), the summary/did lines stay what the worker
+ * reported. No LLM anywhere on this path.
+ */
+export function workerQuestionCard(input: {
+  question: string;
+  summary?: string;
+  did?: string[];
+  threadTitle: string;
+  footer: string;
+  detailsUrl?: string;
+}) {
+  return renderReportCard({
+    tone: "attention",
+    conclusion: `❓ ${input.threadTitle}：worker 需要你的回答`,
+    did: input.did ?? [],
+    needsYou: input.question,
+    rawNeedsYou: true, // VERBATIM — uncapped, whitespace preserved (review finding 6)
+    threadTitle: input.threadTitle,
+    footer: input.footer,
+    detailsUrl: input.detailsUrl,
+  });
+}
+
 /** The `ask_user` push (steward.md §4.3): plain text — answering flows back as a quote-reply. */
 export function askUserText(question: string, options: string[], threadTitle?: string): string {
   const head = threadTitle ? `【${threadTitle}】` : "";
@@ -222,6 +274,45 @@ export function askUserCard(input: { question: string; threadTitle?: string; but
 }
 
 // ---- proactive behavior (issue #20, steward.md §8; spike-conclusions §2 "digest routines") ----
+
+/**
+ * The resident-note suggestion card (issue #19, steward.md §2.5 rule 3): a 90-day-unused
+ * resident entry is proposed to the owner — archived or kept by their tap, never demoted
+ * automatically. Button values carry only the action; the note is resolved server-side
+ * from the card's providerMsgId (§3.1's rule).
+ */
+export function noteDecisionCard(input: { noteId: string; text: string }): {
+  config: unknown;
+  header: unknown;
+  elements: unknown[];
+} {
+  return {
+    config: { wide_screen_mode: true },
+    header: {
+      template: "turquoise",
+      title: { tag: "plain_text", content: "🧠 一条记忆很久没用了" },
+    },
+    elements: [
+      {
+        tag: "div",
+        text: { tag: "lark_md", content: `「${clip(input.text, 120)}」\n已经 90 天没有被用过（常驻层，影响所有对话）。要归档吗？` },
+      },
+      {
+        tag: "action",
+        actions: [
+          { tag: "button", text: { tag: "plain_text", content: "归档" }, type: "primary", value: { action: "note_archive" } },
+          { tag: "button", text: { tag: "plain_text", content: "保留" }, type: "default", value: { action: "note_keep" } },
+        ],
+      },
+      {
+        tag: "note",
+        elements: [
+          { tag: "plain_text", content: "归档不删除，随时可搜索找回；点「保留」会再等 90 天。" },
+        ],
+      },
+    ],
+  };
+}
 
 /** What a digest renders from — collected deterministically from the ledger, no LLM. */
 export interface DigestData {

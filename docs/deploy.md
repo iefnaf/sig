@@ -122,7 +122,8 @@ Shepherd is designed to be **dormant — and cost nothing — most of the time**
 **Model calls (the steward's own LLM)**
 
 - The drivers: **number of conversations/messages** (each inbound event can wake the model), **summary and digest generation** (routines), and report composition (mostly templates — no LLM). Sending a task to a coding agent costs *one* steward wake plus the agent's own tokens on your machine.
-- With the default DeepSeek-class model, a wake over a conversation's context is a few thousand tokens — **well under a cent each**; a moderately active day is **single-digit cents**; a heavy month is **a few dollars**. Past the daily budget soft cap the model stops waking entirely (ADR-0001 #15).
+- With the default DeepSeek-class model, a wake over a conversation's context is a few thousand tokens — **well under a cent each**; a moderately active day is **single-digit cents**; a heavy month is **a few dollars**.
+- **Daily budget soft cap** (`vars.DAILY_BUDGET_USD` in the root `wrangler.jsonc`, default `$1`/UTC day, `0` = only your messages reach the model): once the day's model spend reaches the cap, worker events, routine fires, and follow-ups no longer wake the model — done reports, failure/fallback pushes, digest cards, and every reply to you keep working (they never depended on the model). Your next reply carries a one-line notice the first time this happens each day, and `/花费` (or just asking "今天花了多少钱") reports the day's spend, token count, and how many wakes were skipped. The figure is an estimate from the provider's reported usage and catalog pricing, not a bill; the counter resets at 00:00 UTC.
 
 **Feishu**: the custom-app bot this uses is free.
 

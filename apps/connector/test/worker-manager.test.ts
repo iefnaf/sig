@@ -347,9 +347,13 @@ describe("WorkerManager over fake-pi (connector-pi.md §4–§8, §11)", () => {
       .split("\n")
       .map((l) => JSON.parse(l) as { commandId?: string; text?: string; type?: string })
       // FAKE_PI_LOG also records pi-side settles (the settle-lag sync point); this test
-      // cares only about the prompt delivery and its ADR-0001 marker.
+      // cares only about the prompt delivery and its ADR-0001 marker. The log now also
+      // carries cwd/sessionId/pid (issue #13's watchdog tests compare the two respawned
+      // processes' cwds), so match on the fields this test cares about.
       .filter((entry) => entry.commandId !== undefined);
-    expect(logged).toEqual([{ commandId: "cmd-marker-1", text: "Fix the login bug", at: expect.any(Number) }]);
+    expect(logged).toEqual([
+      expect.objectContaining({ commandId: "cmd-marker-1", text: "Fix the login bug", at: expect.any(Number) }),
+    ]);
   }, 30_000);
 
   it("writes the shepherd extension into the state dir, not referencing the repo (§4.2)", async () => {

@@ -7,3 +7,4 @@ export * from "./commands.ts";
 export * from "./events.ts";
 export * from "./heartbeat.ts";
 export * from "./history.ts";
+export * from "./git.ts";

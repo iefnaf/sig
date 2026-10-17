@@ -105,7 +105,7 @@ describe("input markers (steward.md §4.2, §15.2)", () => {
   it("eventWakeText carries the marker, the facts, and the bookkeeping instruction", () => {
     const text = eventWakeText({
       thread: { threadId: "t_1", title: "登录 bug", goal: null, summary: null, summaryAt: null, state: "idle", unread: true, lastMachine: null, lastActivityAt: 0, archived: false, createdFromMsg: null, createdAt: 0 },
-      worker: { workerId: "w_a", threadId: "t_1", deviceId: "dev_1", repoId: "/srv/repo-a", agent: "pi", mode: "write", state: "idle", sessionId: null, branch: "shepherd/x-1", cmdId: null, lastOutcome: "reported:done", lastEventAt: null, lastProgress: null, createdAt: 0 },
+      worker: { workerId: "w_a", threadId: "t_1", deviceId: "dev_1", repoId: "/srv/repo-a", agent: "pi", mode: "write", state: "idle", sessionId: null, branch: "shepherd/x-1", cmdId: null, parentWorker: null, lastOutcome: "reported:done", lastEventAt: null, lastProgress: null, contextPercent: null, createdAt: 0 },
       machine: { deviceId: "dev_1", name: "mac-studio", online: true, lastSeen: null, agents: [], maxWorkers: 4, bootId: "boot-1" },
       report: { status: "done", summary: "修好了", changes: ["a.ts"], decisions: ["用 session 方案"], leftovers: null, tests: { ran: true, passed: true }, question: null, git: { branch: "shepherd/x-1", base: "main", ahead: 2, dirty: 0, filesChanged: 1, insertions: 5, deletions: 1, pushed: false } },
       notified: true,

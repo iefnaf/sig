@@ -101,7 +101,7 @@ export interface SessionUsage {
   contextUsage?: { tokens?: number | null; contextWindow?: number; percent?: number | null };
 }
 
-export type ErrorClass = "auth" | "transient" | "context" | "unknown";
+export type ErrorClass = "auth" | "transient" | "context" | "stall" | "unknown";
 
 export type SettledOutcome = "reported" | "aborted" | "error" | "unreported";
 
@@ -162,6 +162,8 @@ export interface AgentAdapter {
    * parsing the session JSONL — lives with the WorkerManager, which owns the session file path.
    */
   history?(id: string, since: string | undefined, maxBytes: number): Promise<HistoryPage>;
+  /** Live processes with their last stdout time — the stall watchdog's inputs (issue #13). */
+  workerActivity?(): Array<{ workerId: string; pid: number; lastOutputAt: number }>;
   /** Test support: emulate a hard crash of the connector (children SIGKILLed, no cleanup). */
   simulateCrash?(): void;
 }

@@ -69,6 +69,15 @@ import {
   pollDeviceFlow as pollDeviceFlowOnce,
 } from "./channel/registration.ts";
 import { RetriableChannelError, type Brand, type InboundEvent } from "./channel/types.ts";
+import {
+  formatUsd,
+  renderOverBudgetNote,
+  renderSpendStatus,
+  resolveBudgetConfig,
+  sumUsage,
+  type BudgetConfig,
+  type BudgetState,
+} from "./budget.ts";
 import { Dispatcher, parseOwnerCommand } from "./dispatch.ts";
 import { buildSituationBrief } from "./llm/brief.ts";
 import { buildStewardExtension, type StewardExtensionContext } from "./llm/extension.ts";
@@ -80,9 +89,10 @@ import {
   type FauxRequestRecord,
   type StewardModels,
 } from "./llm/models.ts";
-import { createLedger, type Ledger, type LedgerSql, type NotifyRow, type RunRow } from "./ledger.ts";
+import { createLedger, type Ledger, type LedgerSql, type NotifyRow, type QuestionRow, type RunRow, type WakeRow } from "./ledger.ts";
+import { renderChangeReports } from "./notes.ts";
 import { RoutineService } from "./routines.ts";
-import { failureCard, notifyCard, askUserCard, reportCardFor, type AskCardButton } from "./report-template.ts";
+import { failureCard, notifyCard, askUserCard, reportCardFor, noteDecisionCard, stallCard, workerQuestionCard, didBullets, type AskCardButton } from "./report-template.ts";
 import { MIGRATIONS, runMigrations } from "./schema.ts";
 import { openSecret, sealSecret } from "./secretbox.ts";
 import { renderSetupPage, type SetupView } from "./setup-page.ts";
@@ -131,6 +141,16 @@ const DEFAULT_NOTAFTER_MS = 10 * 60_000;
 // browser's stream JS treats silence past its own deadline as the end. Shrunk in tests.
 const HISTORY_RELAY_TTL_DEFAULT_MS = HISTORY_RELAY_TTL_MS;
 
+// ---- Worker maintenance sweeps (issue #13, steward.md §8.4; spike-conclusions §2) --------------
+// One alarm-driven pass every interval while any worker is in an active state: the §8.4 stall
+// alarm (one template notice per silent stall, reset by the next event) and the DO-side reap
+// sweep (running + offline 10 min, or online-but-silent 45 min → lost), so a Thread never
+// wedges in "running" when its connector died or forgot the worker.
+const STALL_ALARM_MS = 20 * 60_000;
+const REAP_OFFLINE_MS = 10 * 60_000;
+const REAP_SILENT_MS = 45 * 60_000;
+const WORKER_SWEEP_INTERVAL_S = 60;
+
 // ---- Channel: Feishu webhook inbound + outbound queue (steward.md §6.1, §9; spike bugs 1, 3) ----
 // A claim is the double-send guard (bug 1): the conditional UPDATE hands a row to exactly one
 // delivery pass; it outlives the 10s send timeout so a merely-slow send keeps its owner.
@@ -156,9 +176,9 @@ export const claimsDispatch = (text: string): boolean => DISPATCH_CLAIM_RE.test(
 // — bounded in time, so a long-dead fire is not a standing authorization. Generous enough
 // for a wake queued behind a busy harness (whenBusy: followUp), short enough to revoke.
 const PROVENANCE_FIRE_FRESHNESS_MS = 10 * 60_000;
-// steward.md §2.5 (issue #18): notes maintenance (decay, demotion suggestions, capacity
-// backstop) runs once a day via alarm; its ChangeReports relay with the next user reply.
-const NOTES_MAINTENANCE_DAY_S = 86_400;
+// The steward's daily notes lifecycle pass (issue #19, steward.md §2.5) runs at 02:00 UTC:
+// one cron, idempotent by expression — armNotesMaintenance/notesMaintenance both use it.
+const NOTES_MAINTENANCE_CRON = "0 2 * * *";
 // Sent when the first event lands on the webhook after the QR switch: only a delivered event
 // proves the transport actually moved (research §8.2 — the API's callback_type report stays
 // out of sync with real delivery until the console republish lands).
@@ -194,6 +214,8 @@ export interface ShOutboundRow {
   kind: string;
   receiveId: string;
   threadId: string | null;
+  /** The worker question this message asks/answers (issue #10); null when unbound. */
+  questionId?: string | null;
   payload: string;
   urgency: string;
   status: string;
@@ -208,6 +230,15 @@ export interface ShOutboundRow {
 }
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** pi-durable's invocation Context is structural (an abort signal, keyed values, a name), and
+ *  chord's own BACKGROUND_CONTEXT lives in a dev-only dependency of this package — so, like
+ *  agents/harness/pi, we carry the same never-cancelled value rather than import it. */
+const BACKGROUND_CONTEXT: Parameters<Harness["usage"]>[0] = Object.freeze({
+  abortSignal: undefined,
+  value: () => undefined,
+  toString: () => "[Context steward background]",
+});
 
 /** UTF-8 size of a serialized relay message — the byte meter is numbers only, never content. */
 function jsonByteLength(value: unknown): number {
@@ -255,10 +286,25 @@ export class Steward extends Agent<Env> {
     // a multi-statement rebuild can never persist half of itself, and the ledger write
     // cannot lag the commit (the copy-drop-rename migrations are not re-runnable).
     runMigrations(this.sql.bind(this), MIGRATIONS, (fn) => this.ctx.storage.transactionSync(fn));
-    // Notes maintenance is daily and idempotent (steward.md §2.5): arming at boot covers a
-    // fresh deployment; the handler re-arms itself with the review-#1 cancel-then-schedule
-    // pattern so the chain never dies with an evicted isolate.
-    void this.schedule(NOTES_MAINTENANCE_DAY_S, "notesMaintenance", undefined, { idempotent: true });
+    // Notes maintenance is daily (steward.md §2.5, issue #19): a 02:00 UTC cron, idempotent
+    // by expression — re-arming at boot dedups onto the same row and never postpones it,
+    // so the chain cannot die (or drift) with an evicted isolate.
+    this.armNotesMaintenance();
+    // Issue #28: the usage cursor is seeded FIRST — queued ahead of everything below that can
+    // start a model call — so the first reading is the boot baseline (pi's history ≠ today's
+    // spend, budget.ts observe()). Void: onStart must not gate startup on pi.
+    void this.syncUsageQuietly("budget_baseline_failed");
+    // §5.3 (issue #10): a blocked report's question is durably deadlined — the fallback
+    // forwards it even if this isolate never saw the report arrive.
+    void this.armQuestionFallback();
+    // Review finding 3 (issue #10): a crash between queueFallbacks and the delivery pass
+    // strands the intent with its question already handled — the sweep would not re-arm (no
+    // unhandled question left). Draining pending intents at boot closes that window; the
+    // rows are idempotent, so an extra pass on a clean boot is free.
+    void this.drainNotifications();
+    // A DO restart clears the in-memory arm-dedupe while storage alarms keep their own
+    // clock: re-arm maintenance so a restart never strands active workers unwatched.
+    this.armWorkerSweeps();
     // Wakes queued by past reducers (crash between queue and submit, §11) drain now.
     void this.drainWakes();
     void this.pollRuns();
@@ -284,6 +330,59 @@ export class Steward extends Agent<Env> {
   /** The deploy-config selection (vars.STEWARD_MODEL; deepseek/deepseek-flash default). */
   private get modelVarsConfig(): ReturnType<typeof resolveModelConfig> {
     return resolveModelConfig(this.env.STEWARD_MODEL);
+  }
+
+  // Issue #28 (steward.md §12): the resolved daily budget. Tests swap it on the live DO
+  // instance (setBudgetForTest) to sit right under/over the cap without page-scale token
+  // counts; production reads it from vars.DAILY_BUDGET_USD once per isolate.
+  private budgetConfig_?: BudgetConfig;
+
+  private get budgetConfig(): BudgetConfig {
+    if (this.budgetConfig_ === undefined) {
+      const config = resolveBudgetConfig(this.env.DAILY_BUDGET_USD);
+      if (config.error !== undefined) this.logChannel("budget_config_error", config.error);
+      this.budgetConfig_ = config;
+    }
+    return this.budgetConfig_;
+  }
+
+  /** Today's counter against the cap; the one read every gate and readout uses. */
+  private budgetState(): BudgetState {
+    return this.ledger.budget.state(this.budgetConfig);
+  }
+
+  // Usage syncs serialize here (budget.ts observe() demands it: a stale pi.usage read
+  // landing after a newer one must never be folded twice). Same chain shape as
+  // notifyChain/deliveryChain.
+  private usageSyncChain: Promise<void> = Promise.resolve();
+
+  /**
+   * Folds pi's cumulative session usage into today's counter; resolves once the write landed.
+   *
+   * Nothing feeds the counter in the background, on purpose. A pi commit listener has to be
+   * attached from `conversationCreated`, which pi runs only when it CREATES the root — an
+   * isolate that restarts onto an existing root (every Durable Object eviction) never gets
+   * one, and a second writer next to this sweep double-charges the same spend. So the
+   * counter is brought current exactly where a decision reads it: the wake drain (before the
+   * gate), run settlement (before the over-budget note), and the spend readout.
+   */
+  private syncUsage(): Promise<void> {
+    const run = this.usageSyncChain.then(async () => {
+      const pi = await this.piHarness.pi();
+      this.ledger.budget.observe(sumUsage(await pi.usage(BACKGROUND_CONTEXT)));
+    });
+    this.usageSyncChain = run.catch(() => {});
+    return run;
+  }
+
+  /** syncUsage for decision points: a failed read must not take the decision down with it —
+   *  the persisted counter is stale-but-honest and the failure is on the channel log. */
+  private async syncUsageQuietly(reason = "budget_sync_failed"): Promise<void> {
+    try {
+      await this.syncUsage();
+    } catch (err) {
+      this.logChannel(reason, errorText(err));
+    }
   }
 
   /**
@@ -393,6 +492,15 @@ export class Steward extends Agent<Env> {
         this.sql`UPDATE outbox SET state = 'expired' WHERE cmdId = ${cmdId} AND state = 'queued'`;
         return this.sql<{ changes: number }>`SELECT changes() AS changes`[0]!.changes > 0;
       },
+      // A start_worker that has not left the outbox pipeline yet (issue #13 review finding 3):
+      // the run is alive even when its worker row was reaped away.
+      hasDeliverableStart: (threadId) =>
+        this.sql<{ one: number }>`
+          SELECT 1 AS one FROM outbox o JOIN sh_worker w ON w.workerId = o.workerId
+          WHERE w.threadId = ${threadId} AND o.kind = 'start_worker'
+            AND o.state IN ('queued', 'sent') AND o.workerId IS NOT NULL
+          LIMIT 1
+        `.length > 0,
       commandExists: (cmdId) => this.sql`SELECT 1 AS one FROM outbox WHERE cmdId = ${cmdId}`.length > 0,
       sendText: async (text, threadId) => {
         const owner = this.ownerOpenIdSync();
@@ -409,6 +517,15 @@ export class Steward extends Agent<Env> {
       webLinkUrl: (target) => this.web.linkUrl(target),
       // Routine suggestion cards (`offer:` outbound ids) route their taps here (§8.5).
       onOfferTap: (offerId, action) => this.routineService.handleOfferTap(offerId, action),
+      // Issue #28: the deterministic spend readout ("how much today?") — counter, no LLM.
+      spendStatusText: async () => {
+        await this.syncUsageQuietly();
+        const state = this.budgetState();
+        // Asking is hearing: the explicit readout carries the same information the daily
+        // note would, so it satisfies "noted once" for today too (no double notice).
+        if (state.over && state.overNotedAt === null) this.ledger.budget.markNoted(state.day);
+        return renderSpendStatus(state);
+      },
     }));
   }
 
@@ -556,6 +673,11 @@ export class Steward extends Agent<Env> {
         const owner = this.ownerOpenIdSync();
         if (!owner) return;
         const thread = input.threadId ? this.ledger.threads.get(input.threadId) : null;
+        const question = input.questionId !== undefined ? this.ledger.questions.get(input.questionId) : null;
+        if (input.questionId !== undefined && (question === null || question.status !== "open" || question.workerId === null)) {
+          this.logChannel("notify_question_invalid", input.questionId);
+          return;
+        }
         // §6.4: the timeline link is appended by the system, never by the model — the same
         // fresh one-time link the core-template cards carry (issue #22).
         const detailsUrl = thread ? await this.web.linkUrl(linkTargetForThread(thread.threadId)) : null;
@@ -571,29 +693,54 @@ export class Steward extends Agent<Env> {
             ...(thread ? { threadTitle: thread.title, detailsUrl: detailsUrl ?? undefined } : {}),
           }),
           threadId: input.threadId ?? null,
+          questionId: question !== null && question.status === "open" && question.workerId !== null ? question.qid : null,
           urgency: input.urgency,
         });
+        if (question !== null && question.status === "open" && question.workerId !== null) {
+          // §5.3 (issue #10, review finding 5): reaching the user always cancels the fallback
+          // (markHandled), but only a TERMINAL resolution closes the question — "done" (an
+          // unreported run the steward verified) or an explained failure. resolution:"question"
+          // is the steward ASKING the user something in prose: the question stays open, the
+          // card keeps its binding, and the owner's quote-reply still resolves it.
+          this.ledger.questions.markHandled(question.qid);
+          if (input.resolution !== "question") {
+            this.ledger.questions.close(question.qid, input.resolution === "done" ? "总管核实：已完成并汇报" : "总管已向用户说明");
+          }
+        }
         if (thread) this.sql`UPDATE sh_thread SET unread = 1 WHERE threadId = ${thread.threadId}`;
         await this.markRunNotified();
       },
       askUser: async (input) => {
         const owner = this.ownerOpenIdSync();
         if (!owner) return;
-        const thread = input.threadId ? this.ledger.threads.get(input.threadId) : null;
+        // §5.3 (issue #10): forwarding a worker's question BINDS that question — no second
+        // row is created; the card's buttons and the quote-route resolve to the worker's qid,
+        // and the 90-second fallback for it is cancelled (it reached the user).
+        const forwarded = input.questionId !== undefined ? this.ledger.questions.get(input.questionId) : null;
+        if (input.questionId !== undefined && (forwarded === null || forwarded.status !== "open" || forwarded.workerId === null)) {
+          this.logChannel("ask_question_invalid", input.questionId);
+          return;
+        }
+        const thread = input.threadId ? this.ledger.threads.get(input.threadId) : forwarded?.threadId ? this.ledger.threads.get(forwarded.threadId) : null;
         // §4.3 (issue #7): ask_user creates the sh_question — thread-scoped when it belongs
         // to one Thread (flipping it to waiting_you), threadless for routing asks, where the
         // candidates column carries the button mapping a click resolves against. One
         // question per call: a unique id (review #3 — a per-run id collided and INSERT OR
         // IGNORE silently swallowed repeats).
-        const qid = `q_steward_${ulid()}`;
-        this.ledger.questions.insert({
-          qid,
-          threadId: thread?.threadId ?? null,
-          workerId: null,
-          text: input.question,
-          options: input.options,
-          candidates: input.candidates,
-        });
+        const qid = forwarded?.qid ?? `q_steward_${ulid()}`;
+        if (forwarded === null) {
+          this.ledger.questions.insert({
+            qid,
+            threadId: thread?.threadId ?? null,
+            workerId: null,
+            text: input.question,
+            options: input.options,
+            candidates: input.candidates,
+          });
+        } else {
+          this.ledger.questions.setOptions(qid, input.options);
+          this.ledger.questions.markHandled(qid); // reached the user; cancel the fallback
+        }
         if (thread) {
           this.ledger.recomputeThreadState(thread.threadId);
           this.sql`UPDATE sh_thread SET unread = 1 WHERE threadId = ${thread.threadId}`; // news landed (§5.2)
@@ -622,6 +769,7 @@ export class Steward extends Agent<Env> {
             buttons,
           }),
           threadId: thread?.threadId ?? null,
+          questionId: forwarded !== null ? forwarded.qid : null,
           urgency: "push",
         });
         await this.markRunNotified();
@@ -630,7 +778,12 @@ export class Steward extends Agent<Env> {
         this.logChannel(kind, detail);
       },
       routines: this.routineService,
-      // §8.6 (audit trail): an explicit in-run outcome (no_action) beats the settle fallback.
+      /** §4.3/§7.2 (issue #10): whether a user-message evidence ref is one the bound owner
+       *  actually sent — the one check answer_worker's hook cannot do for itself. */
+      isOwnerMessage: (msgId) => this.isOwnerMessage(msgId),
+      // §4.3 (issue #10): answer_worker's deterministic landing — close the question, relay
+      // to the worker, cancel the fallback. The evidence gate is the extension's hook.
+      answerWorker: (input) => this.answerWorker(input),
       recordProactiveOutcome: (operationId, outcome) => {
         const followup = /^followup:(f_.+)$/.exec(operationId);
         if (followup) {
@@ -699,6 +852,83 @@ export class Steward extends Agent<Env> {
     return this.sql<{ ownerOpenId: string | null }>`
       SELECT ownerOpenId FROM sh_channel WHERE channel = 'feishu'
     `[0]?.ownerOpenId ?? null;
+  }
+
+  /** The owner's message that authorizes answering a worker (§4.3/§7.2): null when the
+   *  message never existed here or did not come from the bound owner. */
+  private ownerMessageRef(msgId: string): string | null {
+    return this.sql`SELECT 1 AS one FROM sh_inbound WHERE channel = 'feishu' AND msgId = ${msgId} AND ownerAuthorized = 1`.length > 0
+      ? `user:${msgId}`
+      : null;
+  }
+
+  /** Whether the bound owner actually sent this message (answer_worker evidence, §4.3). */
+  private async isOwnerMessage(msgId: string): Promise<boolean> {
+    return this.ownerMessageRef(msgId) !== null;
+  }
+
+  /**
+   * A user action that resolves a worker's open question (issue #10): a quote-reply to the
+   * question's message or an option-button click on it. Atomically resolves ONE question —
+   * never guessing between several workers on the same Thread — closes it, relays the answer
+   * to the worker (`send`, after_current_tools semantics), and says so in chat. Returns null
+   * when this action answers no worker question (the normal conversational path continues).
+   * Throwing (caught by the callers) means: this WAS a worker-question answer, but it could
+   * not be delivered — the user is told, the question stays open.
+   */
+  private async answerWorkerQuestion(input: { question: QuestionRow; answer: string; ref: string }): Promise<{
+    workerId: string;
+    delivery: string;
+  } | null> {
+    const { question, answer } = input;
+    // Review finding 1, defense in depth: only the WORKER's own question (kind 'report') is
+    // answered deterministically. Failure/unreported questions are the system asking the
+    // user to decide — their replies belong to the steward, never to a broken/idle worker.
+    if (question.kind !== "report") return null;
+    const worker = question.workerId !== null ? this.ledger.workers.get(question.workerId) : null;
+    if (worker === null) return null; // steward's own question: no worker to relay to
+    const thread = question.threadId !== null ? this.ledger.threads.get(question.threadId) : null;
+    // The owner's answer IS newsworthy on the Thread it belongs to.
+    if (thread) this.ledger.timeline.add(thread.threadId, "user_instruction", `用户回答 worker 的问题：${answer}`, { qid: question.qid, workerId: worker.workerId, ref: input.ref });
+    try {
+      const outcome = await this.dispatcher.sendToWorker({
+        workerId: worker.workerId,
+        text: `（用户对你问题的回答）${answer}`,
+        intent: "now",
+        provenance: input.ref,
+        cmdId: `answer:${question.qid}:${ulid()}`,
+      });
+      if (outcome.kind === "refused") throw new Error(outcome.reason);
+      if (!this.ledger.questions.close(question.qid, answer)) {
+        // Lost the race to ask-side handling: don't relay a second time.
+        this.logChannel("question_answer_race", question.qid);
+        return null;
+      }
+      const owner = this.ownerOpenIdSync();
+      if (owner && thread) {
+        await this.enqueueOutbound({
+          id: `answer:${question.qid}`,
+          kind: "text",
+          to: owner,
+          threadId: thread.threadId,
+          text: `✅ 已把你的回答转给 ${worker.workerId}（${outcome.delivery === "steer" ? "不打断手头工具，当前批次结束后生效" : "按其状态尽快送达"}）。`,
+        });
+      }
+      return { workerId: worker.workerId, delivery: outcome.delivery };
+    } catch (err) {
+      this.logChannel("answer_relay_failed", `${question.qid} ${errorText(err)}`);
+      const owner = this.ownerOpenIdSync();
+      if (owner && thread) {
+        await this.enqueueOutbound({
+          kind: "text",
+          to: owner,
+          threadId: thread.threadId,
+          text: `⚠️ 回答没有送达 ${worker.workerId}（${errorText(err)}）。问题保持打开，稍后再试一次。`,
+          urgency: "push",
+        });
+      }
+      throw err;
+    }
   }
 
   // Plain-HTTP surface reached via the Worker's stub.fetch forwards (index.ts): the Feishu
@@ -1096,6 +1326,14 @@ export class Steward extends Agent<Env> {
     // pending events drained first, the gate inside (lastSeq <= processedUpTo) means this only
     // fires for workers whose event stream cannot tell the story anymore. Timeline, no push.
     this.ledger.workers.reconcileFromSnapshot(auth.deviceId, hello.workers);
+    // Review finding 4 (issue #10): a snapshot-only broken verdict (a caught-up inbox — the
+    // exact case reconciliation exists for) queues a failure push and a wake that the
+    // applied>0-gated drains above never see. Reconcile-side effects drain unconditionally.
+    void this.drainNotifications();
+    void this.drainWakes();
+    // The machine is back (or fresh workers appeared): the maintenance alarm must be live
+    // for whatever is running now (issue #13).
+    this.armWorkerSweeps();
   }
 
   // protocol §4.2 + ADR-0001 (spike bug 10): hello redelivers queued, sent, AND
@@ -1208,7 +1446,14 @@ export class Steward extends Agent<Env> {
     const row = this.sql<{ workerId: string | null; kind: string }>`
       SELECT workerId, kind FROM outbox WHERE cmdId = ${cmdId}
     `[0];
-    if (!row || row.kind !== "start_worker" || !row.workerId) return;
+    if (!row || !row.workerId) return;
+    // A failed resume send (issue #8): revert the resume-pending `starting` back to idle —
+    // the session itself is intact — and push the failure to the user.
+    if (row.kind === "send" && this.ledger.workers.markResumeFailed(row.workerId, cmdId, reason)) {
+      void this.drainNotifications();
+      return;
+    }
+    if (row.kind !== "start_worker") return;
     if (this.ledger.workers.markStartFailed(row.workerId, cmdId, reason)) {
       void this.drainNotifications();
     }
@@ -1295,6 +1540,15 @@ export class Steward extends Agent<Env> {
     try {
       const { applied } = this.ledger.applyPendingEvents();
       if (applied > 0) {
+        // Events catching up can release a parked hello-snapshot verdict for a reaped
+        // worker (issue #13 review finding 2) — resolve before anything reads the state.
+        this.ledger.workers.resolveReapPending();
+        // Any applied event can start a run (started/resumed) or end one (settled/lost) —
+        // the maintenance alarm follows suit (issue #13).
+        this.armWorkerSweeps();
+        // And a question window may have opened (§5.3, issue #10): the fallback alarm
+        // follows the deadlines the reducer just wrote.
+        void this.armQuestionFallback();
         void this.drainNotifications();
         // The reducer may have queued wake_requests (§5.1 step 4): drain what is already due
         // (the 3-second merge window keeps fresh rows waiting for their siblings) and arm the
@@ -1331,7 +1585,15 @@ export class Steward extends Agent<Env> {
           this.ledger.notifications.markSent(intent.id);
           continue;
         }
-        await this.enqueueOutbound({ kind: "card", to: cfg.ownerOpenId, threadId: intent.threadId, card, urgency: "push" });
+        const question = intent.questionId !== null ? this.ledger.questions.get(intent.questionId) : null;
+        await this.enqueueOutbound({
+          kind: "card",
+          to: cfg.ownerOpenId,
+          threadId: intent.threadId,
+          questionId: question?.status === "open" && question.threadId !== null ? question.qid : null,
+          card,
+          urgency: "push",
+        });
         this.ledger.notifications.markSent(intent.id);
       } catch (err) {
         this.logChannel("notify_drain_failed", `${intent.id} ${errorText(err)}`);
@@ -1346,30 +1608,69 @@ export class Steward extends Agent<Env> {
     if (!worker || !thread) return null;
     const machine = this.ledger.machines.get(worker.deviceId);
     const machineName = machine?.name ?? worker.deviceId;
-    const footer = `Thread「${thread.title}」 · ${worker.agent} @ ${machineName} · 引用回复可继续这个 Thread`;
+    // Review note (c): only cards bound to an open REPORT-kind question teach the answer
+    // path (that is the deterministic relay); failure/unreported replies go to the steward,
+    // and a done report keeps the plain continuation footer (there is nothing to answer).
+    const boundQuestion = intent.questionId !== null ? this.ledger.questions.get(intent.questionId) : null;
+    const asksQuestion = boundQuestion !== null && boundQuestion.kind === "report" && boundQuestion.status === "open" && boundQuestion.threadId !== null;
+    const footer = asksQuestion
+      ? `Thread「${thread.title}」 · ${worker.agent} @ ${machineName} · 引用回复这个卡片即可回答它`
+      : `Thread「${thread.title}」 · ${worker.agent} @ ${machineName} · 引用回复可继续这个 Thread`;
     // steward.md §6.4: the timeline link is appended by the system — a fresh one-time link
     // per card, never by the (M2) LLM.
     const detailsUrl = await this.web.linkUrl(linkTargetForThread(thread.threadId));
 
-    if (intent.kind === "done_report" || intent.kind === "attention_report") {
+    if (intent.kind === "done_report") {
       const report = this.ledger.workers.reportsForWorker(worker.workerId).at(-1);
       if (!report) return null;
       return reportCardFor(report, worker, machineName, thread.title, detailsUrl ?? undefined);
     }
 
+    // §5.3 (issue #10): a blocked/needs_decision question that nothing handled within the
+    // window — the worker's question reaches the user verbatim, from data, with no LLM.
+    // settle:transient never gets here (it queues no question and no intent); error/unreported
+    // classes have their own failure_push rendering below.
+    if (intent.kind === "attention_report" && intent.questionId !== null) {
+      const question = this.ledger.questions.get(intent.questionId);
+      if (!question) return null;
+      const report = this.ledger.workers.reportsForWorker(worker.workerId).at(-1);
+      return workerQuestionCard({
+        question: question.text,
+        ...(report?.summary ? { summary: report.summary } : {}),
+        ...(report?.changes?.length ? { did: didBullets(report) } : {}),
+        threadTitle: thread.title,
+        footer,
+        detailsUrl: detailsUrl ?? undefined,
+      });
+    }
+
+    // stall_notice (§8.4): attention, not failure — the run may still be a very long tool
+    // call. The minutes are recomputed at render time (no event has arrived since the stall,
+    // or the intent would have been for a different, newer stall).
+    if (intent.kind === "stall_notice") {
+      const minutes = Math.max(1, Math.round((Date.now() - (worker.lastEventAt ?? worker.createdAt)) / 60_000));
+      return stallCard(minutes, worker, machineName, thread.title, footer, detailsUrl ?? undefined);
+    }
+
     // failure_push: either the start never happened or the run ended in a failure class that
     // needs a human (steward.md §5.3); the matching open question carries the specifics.
-    if (worker.lastOutcome?.startsWith("start_failed:")) {
+    if (worker.lastOutcome?.startsWith("resume_failed:")) {
       return failureCard(
-        `派发失败：任务没有开始`,
-        `${worker.lastOutcome.slice("start_failed:".length)}。重新说一次要做什么即可。`,
+        `接续原会话失败`,
+        `${worker.lastOutcome.slice("resume_failed:".length)}。原会话未受影响，重新说一次要做什么即可。`,
         thread.title,
         footer,
         detailsUrl ?? undefined,
       );
     }
-    const question = this.ledger.questions.openForThread(thread.threadId);
-    return failureCard("运行出错，需要你决定下一步", question?.text ?? "查看 Thread 时间线了解详情。", thread.title, footer, detailsUrl ?? undefined);
+    const needsYou =
+      boundQuestion?.status === "open" && boundQuestion.text.trim().length > 0
+        ? boundQuestion.text
+        : "查看 Thread 时间线了解详情。";
+    if (worker.lastOutcome?.startsWith("start_failed:")) {
+      return failureCard(`派发失败：任务没有开始`, `${worker.lastOutcome.slice("start_failed:".length)}。重新说一次要做什么即可。`, thread.title, footer, detailsUrl ?? undefined);
+    }
+    return failureCard(worker.lastOutcome === "unreported" ? "运行结束但没有汇报" : "运行出错，需要你决定下一步", needsYou, thread.title, footer, detailsUrl ?? undefined);
   }
 
   // `/加机器` in chat is the trigger (issue #22); `/pair` is the only HTTP consumer of the
@@ -1471,6 +1772,9 @@ export class Steward extends Agent<Env> {
       INSERT INTO outbox (cmdId, deviceId, workerId, cseq, kind, payload, notAfter, state, createdAt)
       VALUES (${cmdId}, ${deviceId}, ${opts.workerId ?? null}, ${cseq}, ${kind}, ${JSON.stringify(args ?? {})}, ${notAfter}, 'queued', ${Date.now()})
     `;
+    // A dispatch registers the worker before enqueueing: the moment the row exists, the
+    // maintenance alarm (stall notice + reap) must be armed (issue #13).
+    this.armWorkerSweeps();
     this.deliver(cmdId, opts.ackTimeoutMs);
     const state = this.sql<{ state: string }>`SELECT state FROM outbox WHERE cmdId = ${cmdId}`[0]!.state;
     return { cmdId, cseq, state };
@@ -1506,7 +1810,12 @@ export class Steward extends Agent<Env> {
     if (!row || (row.state !== "queued" && row.state !== "sent")) return false;
     const now = Date.now();
     if (row.notAfter !== null && row.notAfter < now) {
-      this.sql`UPDATE outbox SET state = 'expired' WHERE cmdId = ${cmdId}`;
+      // The delivery window lapsed (queue timeout). NOT the user's cancellation — that is the
+      // dispatcher's `expired` state (steward.ts cancelQueuedCommand), and conflating the two
+      // made the sweep close the worker as a silent "user withdrew it". `failed/not_after`
+      // is terminal: redeliverOutbox only re-queues `failed/ack_timeout`, and the connector
+      // would reject a past-notAfter command anyway (protocol §4.2).
+      this.sql`UPDATE outbox SET state = 'failed', failReason = 'not_after' WHERE cmdId = ${cmdId}`;
       return false;
     }
     const connection = this.connFor(row.deviceId);
@@ -1565,6 +1874,278 @@ export class Steward extends Agent<Env> {
     }
     const waiting = this.sql<{ n: number }>`SELECT COUNT(*) AS n FROM outbox WHERE state = 'queued'`[0]!.n;
     if (waiting > 0) void this.schedule(IDLE_SWEEP_INTERVAL_S, "sweepIdle");
+  }
+
+  // ---- Worker maintenance: stall alarm + reap sweep (issue #13) -----------------------------------
+  // Thresholds are instance fields so tests can shrink them inside the DO (same pattern as
+  // feishuSendTimeoutMs); the cadence follows suit.
+
+  protected stallAlarmMs = STALL_ALARM_MS;
+  protected reapOfflineMs = REAP_OFFLINE_MS;
+  protected reapSilentMs = REAP_SILENT_MS;
+  protected workerSweepIntervalS = WORKER_SWEEP_INTERVAL_S;
+  /** In-memory dedupe of pending schedule() rows (the SDK fires every row; see armWorkerSweeps). */
+  private lastSweepArmAt = 0;
+
+  /** Arms the maintenance alarm while any worker is in an active state. Called from every
+   * point that can change that (event reduction, hello reconciliation, dispatch enqueue);
+   * sweepWorkers re-arms itself and lets the alarm lapse once nothing is active. `queued`
+   * counts as active (PR #46 review round 3, finding 1): a queued worker's ONLY closure is
+   * the sweep's measured-offline reap, so an arming count that skips it would let the chain
+   * die and wedge exactly the shape the sweep exists to close. */
+  private armWorkerSweeps(): void {
+    const active = this.sql<{ n: number }>`
+      SELECT COUNT(*) AS n FROM sh_worker WHERE state IN ('queued', 'starting', 'running', 'recovering')
+    `[0]!.n;
+    if (active === 0) return;
+    // schedule() rows each fire once: without this guard every wake that touches a worker
+    // would add another row and the alarm would fan out. A DO reset clears the flag — the
+    // cost is at most one redundant no-op pass. The window is interval − 1s, the SHORTEST
+    // time a row armed at `lastSweepArmAt` can still be pending (schedule() truncates due
+    // times to whole seconds): any longer and a row that already fired would strand the
+    // chain — its re-arm eaten by a stale timestamp (0.9×interval was that bug; it bit
+    // whenever the interval was shrunk below 10 s).
+    if (Date.now() - this.lastSweepArmAt < Math.max(0, (this.workerSweepIntervalS - 1) * 1000)) return;
+    this.lastSweepArmAt = Date.now();
+    void this.schedule(this.workerSweepIntervalS, "sweepWorkers");
+  }
+
+  /**
+   * One maintenance pass: the §8.4 stall alarm (online machine + silence past the threshold →
+   * one template notice per stall) and the reap sweep (issue #13). Reap rules:
+   * - `running`/`recovering`: machine offline for a real 10 minutes (measured from the
+   *   offline transition, so a connection blip never reaps — review finding 4), or
+   *   online-but-silent 45 min (the connector forgot the worker).
+   * - `starting`: NEVER by silence clocks alone (review finding 3) — a start_worker that can
+   *   still be delivered means the worker is queued, not lost, and reaping it would open the
+   *   duplicate-dispatch door. The command's own lifecycle decides; only once it is terminal
+   *   does the sweep close the worker out.
+   * Offline workers skip the stall notice on purpose — they are the reap sweep's territory,
+   * and "lost contact" is not news worth interrupting the user for (spec §9).
+   */
+  async sweepWorkers(): Promise<{ stalled: number; reaped: number }> {
+    let stalled = 0;
+    let reaped = 0;
+    const now = Date.now();
+    try {
+      // Query with the shorter threshold and classify per worker in one pass.
+      for (const worker of this.ledger.workers.silentSince(Math.min(this.reapOfflineMs, this.stallAlarmMs))) {
+        const silentMs = now - (worker.lastEventAt ?? worker.createdAt);
+        if (worker.state === "queued") {
+          // A serial-queue park (issue #16): silent BY DESIGN while the slot is held — a long
+          // task ahead may legitimately hold it for hours, so no silence clock (neither stall
+          // notice nor the 45-min reap) may ever touch it. Only the machine measurably
+          // disappearing closes it, with the same 10-min offline clock running workers use;
+          // a reconnecting connector re-arms its queue and the `started` event resurrects.
+          if (!worker.machineOnline && now - worker.machineLastSeen >= this.reapOfflineMs) {
+            if (this.ledger.workers.reapWorker(worker.workerId, false)) reaped += 1;
+          }
+          continue;
+        }
+        if (worker.state === "starting") {
+          const cmdId = worker.cmdId;
+          const cmd = cmdId ? this.commandState(cmdId) : null;
+          // A resume-pending worker (issue #8): its cmdId points at the resume SEND, not a
+          // start_worker — markResumePending overwrote it. The session underneath is intact,
+          // so a failed/expired send must revert the worker to idle (never `broken`, never a
+          // "派发失败" push): the next dispatch can resume or re-dispatch freely. Without this
+          // routing the sweep would treat every failed resume send as a failed start (PR #54
+          // review, blocker 3) and break a healthy session.
+          if (cmd?.kind === "send") {
+            if (cmd.state === "failed") {
+              if (this.ledger.workers.markResumeFailed(worker.workerId, cmdId!, this.startFailureText(cmd))) reaped += 1;
+              continue;
+            }
+            if (cmd.state === "expired") {
+              // The dispatcher's cancel normally settled it already; the sweep is the backstop.
+              if (this.ledger.workers.markResumeCancelled(worker.workerId, cmdId!)) reaped += 1;
+              continue;
+            }
+            if (cmd.state === "queued" || cmd.state === "sent") {
+              // Still deliverable — the same wait-online rule as starts.
+              continue;
+            }
+            // done/accepted/ambiguous: the send may have reached the machine without an
+            // event ever landing — fall through to the horizon logic below, whose quiet
+            // lost+reaped is safe for a session worker too (a live event resurrects).
+          }
+          if (cmd && cmd.kind !== "send" && (cmd.state === "failed" || cmd.state === "expired")) {
+            const settled =
+              cmd.state === "expired"
+                ? // The user withdrew it (`expired` is the dispatcher's cancel state and its
+                  // only writer): close quietly, no push (they already know).
+                  this.ledger.workers.settleWithdrawnStart(worker.workerId)
+                : // Failed undelivered — queue timeout (`idle`), delivery-window lapse
+                  // (`not_after`), ack exhaustion (`ack_timeout`→terminal), or a connector
+                  // rejection: the owner must hear that it never started.
+                  this.ledger.workers.markStartFailed(worker.workerId, worker.cmdId, this.startFailureText(cmd));
+            if (settled) reaped += 1;
+            continue;
+          }
+          if (cmd && (cmd.state === "queued" || cmd.state === "sent")) {
+            // Still deliverable (hello redelivery / the resend alarm): the run is queued, not
+            // lost — the wait_online flow depends on the sweep never touching these.
+            continue;
+          }
+          // The remaining shapes may or may not have started on the machine: `done` (resulted,
+          // but the `started` event never landed), `accepted` (acked, then the connector died
+          // before resulting — nothing else ever transitions that row), `ambiguous` (§4.2:
+          // terminal but undecidable), or no command row at all (enqueue threw). Close only at
+          // the online-but-silent horizon OR the measured-offline clock the running/recovering
+          // reap uses — a connector that died right after acking must not lock the Thread for a
+          // full 45 minutes (PR #46 review findings 1 and 4).
+          const horizon =
+            silentMs >= this.reapSilentMs ||
+            (!worker.machineOnline && now - worker.machineLastSeen >= this.reapOfflineMs);
+          if (!horizon) continue;
+          if (cmd === null) {
+            // The command row never came to exist: nothing can ever start. Close it with a
+            // push so the owner re-dispatches.
+            if (this.ledger.workers.markStartFailed(worker.workerId, null, "派发命令未能创建（内部错误）")) reaped += 1;
+          } else if (this.ledger.workers.reapWorker(worker.workerId, worker.machineOnline)) {
+            // Quiet lost+reaped: "it failed" might be a lie, and a live event resurrects.
+            reaped += 1;
+          }
+          continue;
+        }
+        if (!worker.machineOnline) {
+          if (now - worker.machineLastSeen >= this.reapOfflineMs) {
+            if (this.ledger.workers.reapWorker(worker.workerId, false)) reaped += 1;
+          }
+          continue; // recently dropped, or not yet due: wait out the offline clock
+        }
+        if (silentMs >= this.reapSilentMs) {
+          if (this.ledger.workers.reapWorker(worker.workerId, true)) reaped += 1;
+          continue;
+        }
+        if (silentMs >= this.stallAlarmMs) {
+          if (this.ledger.workers.notifyStall(worker.workerId, silentMs)) stalled += 1;
+        }
+      }
+      // A settled queue-timeout queues a failure push (markStartFailed); drain for reaps too.
+      if (stalled > 0 || reaped > 0) void this.drainNotifications();
+    } finally {
+      // Re-arm even when a pass throws mid-way: a ledger error must not kill the alarm chain.
+      this.armWorkerSweeps();
+    }
+    return { stalled, reaped };
+  }
+
+  /** The outbox row's state/failReason for a worker's start_worker command, if it exists. */
+  private commandState(cmdId: string): { state: string; failReason: string | null; kind: string } | null {
+    return this.sql<{ state: string; failReason: string | null; kind: string }>`
+      SELECT state, failReason, kind FROM outbox WHERE cmdId = ${cmdId}
+    `[0] ?? null;
+  }
+
+  // ---- Worker questions: the §5.3 window, its fallback, and answer_worker (issue #10) ----
+
+  /** Arms the fallback alarm while any unhandled question is inside its window (§5.3).
+   *  Cancel-then-schedule (the pollRuns/drainWakes pattern, review #1): an idempotent insert
+   *  alone would dedup onto an already-pending LATER row, so a shrunken window (or a new,
+   *  earlier deadline) could never pull the alarm in. */
+  private questionFallbackScheduleId: string | undefined;
+
+  private async armQuestionFallback(): Promise<void> {
+    const next = this.ledger.questions.nextFallback();
+    if (next === null) return;
+    if (this.questionFallbackScheduleId !== undefined) {
+      await this.cancelSchedule(this.questionFallbackScheduleId).catch(() => {});
+      this.questionFallbackScheduleId = undefined;
+    }
+    const scheduled = await this.schedule(Math.max(1, Math.ceil((next - Date.now()) / 1000)), "sweepQuestionFallback", undefined, {
+      idempotent: true,
+    }).catch(() => undefined);
+    this.questionFallbackScheduleId = scheduled?.id;
+  }
+
+  /**
+   * The §5.3 fallback pass: questions whose window expired unhandled become a deterministic
+   * attention_report intent — rendered and pushed by drainNotifications straight from the
+   * ledger (worker's question verbatim), with no LLM anywhere on the path. Re-arms while any
+   * question remains unhandled. Safe under DO resets and concurrent alarms: the deadline is
+   * persisted on the question row and queueFallbacks is idempotent. The drain is
+   * UNCONDITIONAL (review finding 3): a restart between queueFallbacks and the delivery pass
+   * leaves the question handled — so `forwarded` alone can no longer be the trigger — and
+   * with no unhandled questions left, armQuestionFallback would not even re-arm the sweep.
+   * Pending intents are idempotent rows; an extra drain pass is always safe.
+   */
+  async sweepQuestionFallback(): Promise<{ forwarded: number }> {
+    let forwarded = 0;
+    try {
+      const pending = this.ledger.questions.unhandled();
+      this.ledger.questions.queueFallbacks();
+      forwarded = this.ledger.notifications.pending().filter((n) => n.questionId !== null && pending.some((q) => q.qid === n.questionId)).length;
+    } catch (err) {
+      this.logChannel("question_fallback_failed", errorText(err));
+    } finally {
+      void this.drainNotifications();
+      void this.armQuestionFallback();
+    }
+    return { forwarded };
+  }
+
+  /**
+   * The steward's `answer_worker` landing (steward.md §4.3, issue #10): the steward answered a
+   * worker's factual question itself. Deterministic here: close exactly the named question,
+   * relay the text to the worker (`send`), and — only after a successful enqueue — cancel the
+   * fallback (markHandled) so the core never also forwards the now-answered question to the
+   * user. A refusal/failure is reported back as an error the model sees.
+   */
+  async answerWorker(input: {
+    workerId: string;
+    questionId: string;
+    text: string;
+    provenance: string;
+    cmdId: string;
+  }): Promise<{ kind: "answered"; delivery: string; threadId: string } | { kind: "refused"; reason: string }> {
+    const worker = this.ledger.workers.get(input.workerId);
+    if (!worker) return { kind: "refused", reason: `worker ${input.workerId} 不存在。` };
+    const question = this.ledger.questions.get(input.questionId);
+    if (!question || question.status !== "open" || question.workerId !== input.workerId) {
+      return { kind: "refused", reason: `问题 ${input.questionId} 不存在、已回答或不属于 worker ${input.workerId}。` };
+    }
+    if (question.kind === "failure" || question.kind === "unreported") {
+      return {
+        kind: "refused",
+        reason:
+          question.kind === "unreported"
+            ? "这个问题是「没有产出汇报」——需要你按最后的原话分类（notify_user 带 questionId）或转问用户，不能对 worker 回答。"
+            : "这个问题是运行失败（凭据/上下文/损坏），不是 worker 的提问——请转问用户（ask_user 带 questionId）。",
+      };
+    }
+    try {
+      const outcome = await this.dispatcher.sendToWorker({
+        workerId: worker.workerId,
+        text: `（总管对你问题的回答，依据见下）${input.text}`,
+        intent: "now",
+        provenance: input.provenance,
+        cmdId: input.cmdId,
+      });
+      if (outcome.kind === "refused") return { kind: "refused", reason: outcome.reason };
+      if (!this.ledger.questions.close(question.qid, `总管代答：${input.text.slice(0, 160)}`)) {
+        return { kind: "refused", reason: "问题刚刚被回答了（可能是用户）。不要重复发送。" };
+      }
+      return { kind: "answered", delivery: outcome.delivery, threadId: worker.threadId };
+    } catch (err) {
+      this.logChannel("answer_worker_failed", `${input.questionId} ${errorText(err)}`);
+      return { kind: "refused", reason: `发送失败：${errorText(err)}` };
+    }
+  }
+
+  /** The owner-facing reason a start_worker command failed before the worker ever ran. */
+  private startFailureText(cmd: { state: string; failReason: string | null }): string {
+    switch (cmd.failReason) {
+      case "idle":
+        // The wait-online queue gave up: the machine never came back within ~30 min.
+        return "排队超时（机器长时间未上线）";
+      case "not_after":
+        // The delivery window lapsed while the machine was unreachable; when it reconnected
+        // the command was too old to run (protocol §4.2 notAfter).
+        return "命令过期未送达（机器断线太久，超出送达时限）";
+      default:
+        return `命令失败（${cmd.failReason ?? cmd.state}）`;
+    }
   }
 
   // =================================================================================================
@@ -2149,9 +2730,14 @@ export class Steward extends Agent<Env> {
     // effects are on disk. The Feishu send itself settles later through the durable queue.
     const dup = this.sql`SELECT 1 AS one FROM sh_inbound WHERE channel = 'feishu' AND msgId = ${parsed.msgId}`;
     if (dup.length > 0) return Response.json({ code: 0 }); // Feishu redelivery: ack and drop
+    const owner = cfg.ownerOpenId;
+    const ownerAuthorized =
+      owner !== null &&
+      ((parsed.kind === "message" && parsed.chatType === "p2p" && parsed.senderId === owner) ||
+        (parsed.kind === "card_action" && parsed.operatorId === owner));
     this.sql`
-      INSERT INTO sh_inbound (channel, msgId, eventId, eventType, receivedAt)
-      VALUES ('feishu', ${parsed.msgId}, ${parsed.eventId}, ${parsed.eventType}, ${Date.now()})
+      INSERT INTO sh_inbound (channel, msgId, eventId, eventType, receivedAt, ownerAuthorized)
+      VALUES ('feishu', ${parsed.msgId}, ${parsed.eventId}, ${parsed.eventType}, ${Date.now()}, ${ownerAuthorized ? 1 : 0})
     `;
 
     // Delivery verification (issue #24): a QR-created app keeps delivering over its websocket
@@ -2229,13 +2815,35 @@ export class Steward extends Agent<Env> {
   ): Promise<void> {
     const operationId = `user:${input.msgId}`;
     // Signal 1 (§3.1): a quote of one of our messages routes to that Thread directly.
-    const routed = input.parentId ? this.ledger.outbound.threadIdForProviderMsg(input.parentId) : null;
+    const routedRow = input.parentId ? this.ledger.outbound.rowForProviderMsg(input.parentId) : null;
+    const routed = routedRow?.threadId ?? null;
     const routedThread = routed ? this.ledger.threads.get(routed) : null;
     if (routedThread) {
       this.ledger.threads.markRead(routedThread.threadId); // a reply means the report was seen (§6.5)
       // Review #7: a reply routed to a Thread with an open question IS the answer — close it
       // (the deterministic path only closed on re-dispatch, leaving waiting_you stuck when
       // the user e.g. answered "算了"). The steward sees the closed state in the next brief.
+      // Issue #10 (review findings 1-2): the deterministic worker relay applies ONLY to the
+      // quoted card's OWN bound question, and only when the WORKER asked it (kind 'report').
+      // A failure/unreported question is the system asking the user to decide — the reply
+      // must reach the steward (it can re-dispatch; relaying into a broken worker is refused,
+      // and into an error:context worker would prompt the same overflowing session). And a
+      // card whose question is already answered must never resolve a DIFFERENT, later open
+      // question on the Thread — that guess is exactly what the binding exists to prevent.
+      const quotedQuestion = routedRow?.questionId !== null && routedRow?.questionId !== undefined ? this.ledger.questions.get(routedRow.questionId) : null;
+      if (quotedQuestion?.status === "open" && quotedQuestion.workerId !== null && quotedQuestion.kind === "report") {
+        const ref = this.ownerMessageRef(input.msgId);
+        if (ref !== null) {
+          try {
+            await this.answerWorkerQuestion({ question: quotedQuestion, answer: input.text, ref });
+            return; // delivered to the worker; no LLM run for this message
+          } catch {
+            return; // the failure was already told to the user; the question stays open
+          }
+        }
+        // Not a (recorded) owner message — e.g. a card click replayed as text: fall through
+        // to the steward run, closing the question as before.
+      }
       this.ledger.questions.closeOpen(routedThread.threadId, "用户回复了提问");
     }
     // Content markers (§4.2): user text is escaped so it can never mimic a ⟦…⟧ system input;
@@ -2293,6 +2901,9 @@ export class Steward extends Agent<Env> {
           }
           continue;
         }
+        // Issue #28: bring the counter current before the over-budget note reads it — the
+        // run that just settled is the spend that may tip today over the cap.
+        await this.syncUsageQuietly();
         this.settleRun(run, result);
       }
     } catch (err) {
@@ -2325,7 +2936,14 @@ export class Steward extends Agent<Env> {
       // silent one. `upTo` bounds the marking: a change landing between render and mark
       // stays pending and rides the reply after it.
       const relay = this.ledger.notes.renderPendingForReply();
-      const withRelay = (text: string): string => (relay.text === "" ? text : `${text}\n${relay.text}`);
+      // Issue #28 (steward.md §12 "with the budget state noted"): over the cap, a one-line
+      // notice rides exactly ONE reply per day — same durability discipline as the relay
+      // (rendered here, marked only after the reply row is durably enqueued; a crash in the
+      // window costs a duplicate line at worst, never a lost one). Null when under budget or
+      // already noted today, so normal days never see it.
+      const budgetNote = this.pendingBudgetNote();
+      const withRelay = (text: string): string =>
+        [text, ...(relay.text === "" ? [] : [relay.text]), ...(budgetNote === null ? [] : [budgetNote.text])].join("\n");
       // Review #9: a `done` run with no final text is legitimate when the model already
       // produced user-facing output (ask_user terminates the turn right after its push;
       // notify_user cards went out mid-run). Only a silent empty answer is treated as a
@@ -2346,6 +2964,7 @@ export class Steward extends Agent<Env> {
             urgency: "push",
           });
           this.ledger.notes.markPendingReported(relay.upTo);
+          if (budgetNote !== null) this.ledger.budget.markNoted(budgetNote.day);
           this.ledger.runs.settle(run.operationId, result, id);
         } catch (err) {
           // Nothing durable went out: the run stays open and the next poll retries, with the
@@ -2385,6 +3004,13 @@ export class Steward extends Agent<Env> {
     // Event/routine/follow-up runs, and user runs that already reached the user: the text is
     // kept for audit and nothing more is sent (§6.2).
     this.ledger.runs.settle(run.operationId, result);
+  }
+
+  /** The over-budget notice when it has not ridden a reply yet today; null otherwise. */
+  private pendingBudgetNote(): (BudgetState & { text: string }) | null {
+    const state = this.budgetState();
+    if (!state.over || state.overNotedAt !== null) return null;
+    return { ...state, text: renderOverBudgetNote(state) };
   }
 
   /** The settle-time lastResult for routine/follow-up runs (§8.6), when none was recorded. */
@@ -2436,7 +3062,21 @@ export class Steward extends Agent<Env> {
   async drainWakes(_payload?: unknown, schedule?: { id: string }): Promise<void> {
     let submitted = false;
     try {
-      for (const wake of this.ledger.wakes.due(Date.now())) {
+      // The budget gate (issue #28, steward.md §12): today's spend has reached the cap →
+      // event/routine/follow-up wakes are skipped, not submitted — while their deterministic
+      // halves (done cards, fallback pushes, digest routines) already ran and never depended
+      // on the model. The counter syncs first (a failed read degrades to the last honest
+      // number rather than skipping the drain) and a single check before the loop is the
+      // boundary: wakes submitted in one drain may overshoot the cap by the batch's spend,
+      // and the next drain stops — the soft cap bounds a runaway, it is not a prepaid meter.
+      const due = this.ledger.wakes.due(Date.now());
+      if (due.length > 0) await this.syncUsageQuietly();
+      const budget = this.budgetState();
+      for (const wake of due) {
+        if (budget.over) {
+          this.skipWake(wake, budget);
+          continue;
+        }
         this.ledger.runs.open(wake.operationId, wake.kind, wake.text);
         try {
           await this.ensureRootModel();
@@ -2469,22 +3109,99 @@ export class Steward extends Agent<Env> {
     if (submitted) void this.pollRuns();
   }
 
+  /** One wake the cap kept from the model: skip it, count it, leave every audit trail (§8.6). */
+  private skipWake(wake: WakeRow, budget: BudgetState): void {
+    this.ledger.wakes.markSkipped(wake.id);
+    this.ledger.budget.recordSkip();
+    this.logChannel(
+      "budget_skip_wake",
+      `${wake.operationId} kind=${wake.kind} spent=${formatUsd(budget.costUsd)} cap=${formatUsd(budget.budgetUsd)}`,
+    );
+    const reason = `skipped:超出每日预算（${formatUsd(budget.costUsd)} / ${formatUsd(budget.budgetUsd)}，${budget.day} 00:00 UTC 重置）`;
+    // A fire's row owns an outcome either way (§8.6): list_schedules shows the skip instead
+    // of a stale "已交给总管执行", and the timeline says the fire never reached the model.
+    const routine = /^routine:(r_.+):\d+$/.exec(wake.operationId);
+    if (routine) {
+      const row = this.ledger.routines.get(routine[1]!);
+      this.ledger.routines.recordOutcome(routine[1]!, reason);
+      this.ledger.timeline.add(row?.threadId ?? null, "routine", `例行任务 ${routine[1]!} 触发：超出每日预算，未唤醒总管`, {
+        routineId: routine[1]!,
+        operationId: wake.operationId,
+      });
+      return;
+    }
+    const followup = /^followup:(f_.+)$/.exec(wake.operationId);
+    if (followup) {
+      const row = this.ledger.followups.get(followup[1]!);
+      this.ledger.followups.recordOutcome(followup[1]!, reason);
+      this.ledger.timeline.add(row?.threadId ?? null, "followup", `定时回看 ${followup[1]!} 到期：超出每日预算，未唤醒总管`, {
+        followupId: followup[1]!,
+      });
+    }
+  }
+
   /**
-   * The notes lifecycle pass (issue #18, steward.md §2.5): 60-day project demotions, 90-day
-   * resident demotion *suggestions* (never automatic — resident entries have broad impact),
-   * and the capacity backstop. Deterministic; its ChangeReports land in sh_note_log and
-   * reach the user with the next reply (spec §10.3) — no wake, no push of their own.
+   * The notes lifecycle pass (issues #18/#19, steward.md §2.5): 60-day project demotions,
+   * 90-day resident demotion *suggestions* (never automatic — resident entries have broad
+   *  impact), the capacity backstop, and the pressure record left by a commit that ignored
+   * `needsEviction` (evict lowest-score first, then write — reported in both cases). All
+   *  deterministic; every result lands in sh_note_log. Afterwards, this pass delivers what
+   *  accumulated since the owner's last reply: one bookkeeping message, and an archive-or-
+   *  keep card per open suggestion (spec §10.2/§10.3 — the ask must actually reach the
+   *  owner, not wait silently for the next conversation).
    */
-  async notesMaintenance(_payload?: unknown, schedule?: { id: string }): Promise<void> {
+  async notesMaintenance(_payload?: unknown): Promise<void> {
     try {
       this.ledger.notes.maintenance(Date.now());
     } catch (err) {
       this.logChannel("notes_maintenance_failed", errorText(err));
+      return;
     }
-    // Rearm daily (review #1's pattern: cancel the running job's schedule first, else the
-    // idempotent insert dedups onto a job the driver deletes when this handler returns).
-    if (schedule !== undefined) await this.cancelSchedule(schedule.id).catch(() => {});
-    await this.schedule(NOTES_MAINTENANCE_DAY_S, "notesMaintenance", undefined, { idempotent: true });
+    await this.deliverNotesChanges().catch((err) => this.logChannel("notes_changes_failed", errorText(err)));
+  }
+
+  /** Delivers ONE bounded batch of the pending maintenance-classed note changes (PR #53
+   *  review finding 7: the loop used to drain everything — 118 stale notes meant 118 push
+   *  cards in a single invocation; same-vintage notes go stale together, so the burst is
+   *  reachable without artificial seeding). One quiet bookkeeping text for the batch's
+   *  informational rows plus one push card per still-open suggestion; the rest stays
+   *  pending for the next pass or the next reply — never dropped, never a burst. Durable
+   *  and idempotent: stable outbound ids, marked only in this delivery class. */
+  private async deliverNotesChanges(): Promise<void> {
+    const owner = this.ownerOpenIdSync();
+    if (owner === null) return; // nobody to tell yet: rows stay pending for the first reply
+    const batch = this.ledger.notes.pendingMaintenance();
+    if (batch.length === 0) return;
+    // Finding 8: a suggestion whose note sank since the pass (an eviction at commit time,
+    // an owner archive on another card) gets no card — the ask settles as gone instead of
+    // asking the owner to keep something that no longer exists.
+    const actionable: typeof batch = [];
+    for (const item of batch) {
+      if (item.op !== "suggest_demote" || item.noteId === null) continue;
+      const note = this.ledger.notes.get(item.noteId);
+      if (note && note.status === "active" && note.layer === "resident") actionable.push(item);
+      else this.ledger.notes.abandonAsk(item.id, item.noteId);
+    }
+    const bookkeeping = batch.filter((p) => p.op !== "suggest_demote");
+    if (bookkeeping.length > 0) {
+      await this.enqueueOutbound({
+        id: `notechg:${bookkeeping[bookkeeping.length - 1]!.id}`,
+        kind: "text",
+        to: owner,
+        urgency: "quiet",
+        text: renderChangeReports(bookkeeping.map((p) => ({ op: p.op, noteId: p.noteId ?? "", text: p.text, reason: p.reason }))),
+      });
+    }
+    for (const item of actionable) {
+      await this.enqueueOutbound({
+        id: `noteask:${item.noteId}:${item.id}`,
+        kind: "card",
+        to: owner,
+        card: noteDecisionCard({ noteId: item.noteId!, text: item.text }),
+        urgency: "push",
+      });
+    }
+    this.ledger.notes.markPendingMaintenanceReported(batch[batch.length - 1]!.id);
   }
 
   // Card button callbacks (issue #5): the Thread is resolved from the card's providerMsgId —
@@ -2505,7 +3222,49 @@ export class Steward extends Agent<Env> {
       await this.handleAskCardAction(ev, action, ev.cardMsgId);
       return;
     }
+    if (action === "note_archive" || action === "note_keep") {
+      await this.handleNoteDecisionCard(action, ev.cardMsgId, ownerOpenId);
+      return;
+    }
     await this.dispatcher.handleCardAction({ operatorId: ev.operatorId, action, cardMsgId: ev.cardMsgId });
+  }
+
+  /**
+   * A resident-note suggestion card's button (issue #19, spec §10.2): the outbound row id
+   * is `noteask:<noteId>:<logId>` — resolved via providerMsgId, never button data (the
+   * §3.1 rule). The tap is the owner's own decision; the module keeps its invariants
+   * (archive is refused on a pinned note; the state settles the ask either way).
+   */
+  private async handleNoteDecisionCard(action: string, cardMsgId: string, ownerOpenId: string): Promise<void> {
+    const row = this.ledger.outbound.rowForProviderMsg(cardMsgId);
+    const ask = row !== null && row.id.startsWith("noteask:") ? /^noteask:(n_[^:]+):(\d+)$/.exec(row.id) : null;
+    let reply: string;
+    if (!ask) {
+      reply = "这张记忆卡片已失效（没有待决定的建议）。";
+    } else {
+      const [, noteId, logIdRaw] = ask;
+      if (action === "note_archive") {
+        const note = this.ledger.notes.get(noteId!);
+        if (!note || note.status !== "active" || note.layer !== "resident") {
+          reply = "这条建议已处理过（或记忆已不在常驻层）。";
+        } else if (note.pinned) {
+          reply = "这条记忆已置顶，不会自动腾挪；先取消置顶才能归档。";
+        } else {
+          this.ledger.notes.demote(noteId!, Number(logIdRaw), "note_archive");
+          reply = "已归档；需要时可随时搜索找回。";
+        }
+      } else {
+        // note_keep: the 90-day clock restarts (a renewal, not a pin — the pin exemption is
+        // the owner's explicit call); a later maintenance pass may re-ask after another 90d.
+        // A note sunk since the card went out cannot be kept — say so instead of promising
+        // a renewal that will never fire (PR #53 review finding 8); the ask settles either way.
+        const kept = this.ledger.notes.renew(noteId!, Number(logIdRaw));
+        reply = kept.ok
+          ? "好的，保留这条记忆；90 天未再提及会再问你一次。"
+          : "这条记忆已经不在常驻层了（可能已被归档或腾挪），无需保留。";
+      }
+    }
+    await this.enqueueOutbound({ kind: "text", to: ownerOpenId, text: reply });
   }
 
   /**
@@ -2539,6 +3298,31 @@ export class Steward extends Agent<Env> {
       await this.dispatcher.replyToCard(cardMsgId, "这个问题已经回答过了。", chosenThread?.threadId);
       return;
     }
+
+    // An option click on a WORKER's own question (kind 'report', review finding 1) is that
+    // worker's answer (issue #10): relay it before any steward run — a refusal/failure keeps
+    // the question open and tells the user. Failure/unreported questions fall through to the
+    // plain click flow: the decision goes to the steward, not into a broken/idle worker.
+    if (!isNew && !candidate && question.workerId !== null && question.kind === "report") {
+      if (option === null) {
+        await this.dispatcher.replyToCard(cardMsgId, "这个选项已经失效，直接回复文字说明即可。", question.threadId);
+        return;
+      }
+      const ref = this.ownerMessageRef(ev.eventId);
+      if (ref === null) {
+        await this.dispatcher.replyToCard(cardMsgId, "无法确认这次点击的来源，直接回复这张卡片即可。", question.threadId);
+        return;
+      }
+      try {
+        const relayed = await this.answerWorkerQuestion({ question, answer: option, ref });
+        if (relayed !== null) return; // answered and relayed; no steward run for the click
+      } catch {
+        return; // the failure was already told to the user; the question stays open
+      }
+      // The race path (close() lost to a concurrent answer): fall through to the plain click
+      // flow below — the question is answered, the run notes it.
+    }
+
     this.ledger.questions.close(question.qid, candidate?.label ?? option ?? "新开一件事");
 
     if (candidate && chosenThread) {
@@ -2601,6 +3385,7 @@ export class Steward extends Agent<Env> {
     text?: string;
     card?: unknown;
     threadId?: string | null;
+    questionId?: string | null;
     urgency?: "push" | "quiet";
     /** Stable dedupe key (review #6): retries/replays of the same logical message converge on
      *  one row (INSERT OR IGNORE) — the id doubles as the provider-side uuid, so a repeated
@@ -2636,16 +3421,135 @@ export class Steward extends Agent<Env> {
     });
   }
 
+  /** Test-only: force a worker's recorded context usage percent (the connector reports it
+   *  in settled.usage.contextUsage; issue #8's high-context rule reads it at dispatch). */
+  async setWorkerContextForTest(workerId: string, percent: number | null): Promise<void> {
+    this.sql`UPDATE sh_worker SET contextPercent = ${percent} WHERE workerId = ${workerId}`;
+  }
+
+  /** Test-only: set a worker's state + outcome directly (e.g. terminally broken). */
+  async setWorkerStateForTest(workerId: string, state: string, lastOutcome: string): Promise<void> {
+    this.sql`UPDATE sh_worker SET state = ${state}, lastOutcome = ${lastOutcome}, updatedAt = ${Date.now()} WHERE workerId = ${workerId}`;
+  }
+
+  /** Test-only: force a still-queued command into a terminal failure — the idle sweep's
+   *  queue-timeout shape (`failed/idle`), without waiting out the real ~30 min. */
+  async failQueuedForTest(cmdId: string, failReason: string): Promise<void> {
+    this.sql`UPDATE outbox SET state = 'failed', failReason = ${failReason} WHERE cmdId = ${cmdId}`;
+  }
+
+  /** Test-only: backdates a worker's lastEventAt (the sweep's silence clock). */
+  async backdateWorkerForTest(workerId: string, minutes: number): Promise<void> {
+    this.sql`UPDATE sh_worker SET lastEventAt = ${Date.now() - minutes * 60_000} WHERE workerId = ${workerId}`;
+  }
+
+  /** Test read of the memory module's handoff brief (issue #8, steward.md §2.6). */
+  async handoffForTest(
+    threadId: string,
+    fromWorker?: string,
+  ): Promise<import("./handoff.ts").HandoffBrief | null> {
+    return this.ledger.handoff.build(threadId, fromWorker);
+  }
+
+  /** Test read of the summary-version state (issue #8, steward.md §2.6). */
+  async summaryStateForTest(
+    threadId: string,
+  ): Promise<{ versions: Array<{ version: number; summary: string }>; status: { updates: number; rewriteDue: boolean } }> {
+    return {
+      versions: this.ledger.threads.summaryVersions(threadId).map((v) => ({ version: v.version, summary: v.summary })),
+      status: this.ledger.threads.summaryStatus(threadId),
+    };
+  }
+
+  /** Test-only: writes through the ledger's threads.update (the update_thread tool's path). */
+  async updateThreadForTest(threadId: string, patch: { title?: string; goal?: string; summary?: string }): Promise<boolean> {
+    return this.ledger.threads.update(threadId, patch);
+  }
+
   /** Test-only: pushes a thread's lastActivityAt back `days` — the idle-attach band (#7). */
   async ageThreadForTest(threadId: string, days: number): Promise<void> {
     this.sql`UPDATE sh_thread SET lastActivityAt = ${Date.now() - days * 86_400_000} WHERE threadId = ${threadId}`;
 }
+
+  // ---- Daily budget (issue #28): the RPC surface tests and future web pages read --------------
+
+  /** Today's counter against the cap, synced to pi's usage ledger first. */
+  async budgetStatus(): Promise<BudgetState & { text: string }> {
+    await this.syncUsage();
+    const state = this.budgetState();
+    return { ...state, text: renderSpendStatus(state) };
+  }
+
+  /** Test-only: pi's own session-wide usage total — the number the counter must agree with. */
+  async piUsageForTest(): Promise<{ costUsd: number; tokens: number }> {
+    return sumUsage(await (await this.piHarness.pi()).usage(BACKGROUND_CONTEXT));
+  }
+
+  /** Test-only: swaps the cap (setBudgetForTest(0.5)); undefined restores the deploy config. */
+  async setBudgetForTest(usd?: number): Promise<void> {
+    this.budgetConfig_ = usd === undefined ? undefined : resolveBudgetConfig(usd);
+  }
+
+  /** Test-only: attributes spend to a day directly (faux's price is $0 — models.ts). */
+  async spendForTest(usd: number, tokens = 0, at = Date.now()): Promise<void> {
+    this.ledger.budget.add({ costUsd: usd, tokens }, at);
+  }
+
+  /** Test-only: the persisted days, newest first. */
+  async usageDaysForTest(): Promise<Array<{ day: string; costUsd: number; tokens: number; skippedWakes: number; overNotedAt: number | null }>> {
+    return this.sql<{
+      day: string; costUsd: number; tokens: number; skippedWakes: number; overNotedAt: number | null;
+    }>`SELECT day, costUsd, tokens, skippedWakes, overNotedAt FROM sh_usage_day ORDER BY day DESC`;
+  }
+
+  /** Test-only: wipes the cursors only — pi history stays, so the next sync must re-baseline. */
+  async resetCursorsForTest(): Promise<void> {
+    this.ctx.storage.sql.exec("DELETE FROM sh_usage_cursor");
+    await this.syncUsage();
+  }
+
+  /** Test-only: every budget test starts virgin — no day rows, cursor parked at zero. One
+   *  transaction on purpose: a cursor deleted-but-not-yet-reseeded reads as never-seen to a
+   *  racing background sync, which then baseline-seeds it at pi's CURRENT total and swallows
+   *  the run the test is about to measure. */
+  async resetBudgetForTest(): Promise<void> {
+    const now = Date.now();
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec("DELETE FROM sh_usage_day");
+      this.ctx.storage.sql.exec("DELETE FROM sh_usage_cursor");
+      this.ctx.storage.sql.exec(`INSERT INTO sh_usage_cursor (id, costUsd, tokens, updatedAt) VALUES (1, 0, 0, ${now})`);
+    });
+  }
+
+  /** Test-only: the never-seen state — the next observation baselines instead of charging. */
+  async resetCursorForTest(): Promise<void> {
+    this.ctx.storage.sql.exec("DELETE FROM sh_usage_cursor");
+  }
+
+  /** Test-only: marks a past day's over-budget note as sent. */
+  async noteBudgetForTest(day: string): Promise<void> {
+    this.ledger.budget.markNoted(day, Date.now());
+  }
 
   /** Test entry into the intervention half of the dispatch service (send/interrupt). */
   async sendForTest(
     input: Omit<import("./dispatch.ts").SendToWorkerInput, "provenance" | "cmdId"> & { cmdId?: string },
   ): Promise<import("./dispatch.ts").SendToWorkerOutcome> {
     return this.dispatcher.sendToWorker({ ...input, provenance: "test", cmdId: input.cmdId ?? `test:${ulid()}` });
+  }
+
+  /** Test-only: shrinks every open worker question's fallback window to `ms` (issue #10)
+   *  and re-arms the alarm at the new deadline — returns the affected qids. */
+  async shrinkQuestionWindowForTest(ms: number): Promise<string[]> {
+    const affected = this.ledger.questions.unhandled().map((q) => q.qid);
+    for (const qid of affected) this.ledger.questions.setFallbackWindow(qid, ms);
+    await this.armQuestionFallback();
+    return affected;
+  }
+
+  /** Test-only: the alarm-driven §5.3 fallback pass, callable directly. */
+  async sweepQuestionFallbackForTest(): Promise<{ forwarded: number }> {
+    return this.sweepQuestionFallback();
   }
 
   /** Test entry into the intervention half of the dispatch service (send/interrupt). */
@@ -2722,6 +3626,14 @@ export class Steward extends Agent<Env> {
     for (const table of tables) this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS "${table}"`);
     this.ctx.storage.sql.exec("DELETE FROM sh_run");
     this.ctx.storage.sql.exec("DELETE FROM sh_wake");
+    // Issue #28: pi's usage tables are gone, so the next conversation starts from zero — the
+    // counters must follow, and the cursor row must EXIST at zero: an absent row would make
+    // the next sync treat the first run's spend as a never-seen baseline and swallow it.
+    this.ctx.storage.sql.exec("DELETE FROM sh_usage_day");
+    this.ctx.storage.sql.exec("DELETE FROM sh_usage_cursor");
+    this.ctx.storage.sql.exec(
+      "INSERT INTO sh_usage_cursor (id, costUsd, tokens, updatedAt) VALUES (1, 0, 0, " + Date.now() + ")",
+    );
     if (this.llmModels.faux) this.llmModels.faux.reset();
   }
 
@@ -2734,6 +3646,29 @@ export class Steward extends Agent<Env> {
     this.ctx.storage.sql.exec("DELETE FROM sh_followup");
     this.ctx.storage.sql.exec("DELETE FROM sh_routine_offer");
     this.routineService_ = undefined;
+  }
+
+  /** Queues the daily lifecycle pass (issue #19) to run at the next 02:00 UTC. Idempotent
+   *  by expression, so a restart never postpones it. */
+  private armNotesMaintenance(): void {
+    void this.schedule(NOTES_MAINTENANCE_CRON, "notesMaintenance", undefined).catch((err) =>
+      this.logChannel("notes_maintenance_arm_failed", errorText(err)),
+    );
+  }
+
+  /** Test read: the notes-maintenance schedule row (empty before arming). */
+  async notesMaintenanceSchedulesForTest(): Promise<Array<{ id: string; type: string; cron: string | null; time: number }>> {
+    return (await this.listSchedules())
+      .filter((s) => s.callback === "notesMaintenance")
+      .map((s) => ({ id: s.id, type: s.type, cron: (s as { cron?: string }).cron ?? null, time: s.time }));
+  }
+
+  /** Test-only: clears the notes tables (the daily cron stays armed — a stray fire is
+   *  idempotent and finds nothing pending; cancelling it would leave nothing to assert). */
+  async resetNotesStateForTests(): Promise<void> {
+    this.ctx.storage.sql.exec("DELETE FROM sh_note");
+    this.ctx.storage.sql.exec("DELETE FROM sh_note_log");
+    this.ctx.storage.sql.exec("DELETE FROM sh_note_pressure");
   }
 
   // Scheduled callback (also fired inline after each enqueue): claims due rows, sends them

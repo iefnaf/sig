@@ -3,7 +3,7 @@
 // main checkout via the local CLI; approveProject is a connector-local setting that a command
 // must never set; cleanup_worktree refuses dirty or unpushed worktrees unless forced, and
 // nothing is ever auto-deleted.
-import { existsSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { installAssets } from "../src/install.ts";
@@ -442,6 +442,68 @@ describe("cleanup_worktree (connector-pi.md §6.1/§8.2)", () => {
     await manager.startWorker("cmd-main", args({ workerId }));
     await waitFor(() => settledOf(workerId), 15_000, "settled event");
     await expect(manager.cleanupWorktree(workerId, true)).rejects.toMatchObject({ code: "no_worktree" });
+  }, 30_000);
+});
+
+describe("readonly relay legs continue from the previous branch (issue #8, spec §5.3)", () => {
+  it("a readonly start_worker with base runs on a detached-HEAD worktree at that branch", async () => {
+    setup([reportRun({ status: "done", summary: "reviewed" })]);
+    registerRepo();
+    // The write leg's branch: one commit with a plan file, on shepherd/write-1.
+    await git(repo, ["checkout", "-b", "shepherd/write-1"]);
+    const planPath = join(repo, "PLAN.md");
+    writeFileSync(planPath, "# plan from leg 1\n");
+    await git(repo, ["add", "PLAN.md"]);
+    await git(repo, ["commit", "-m", "leg 1 plan"]);
+    await git(repo, ["checkout", "main"]);
+    expect(existsSync(join(repo, "PLAN.md"))).toBe(false); // main does not see it
+
+    const workerId = "w-review-leg";
+    workerIds.add(workerId);
+    const result = await manager.startWorker("cmd-ro", args({ workerId, mode: "readonly", base: "shepherd/write-1" }));
+    expect(result.branch).toBeUndefined(); // detached: no branch is created or moved
+    expect(result.worktree).toBeTruthy();
+    // The detached worktree sees leg 1's plan file; the owner's checkout stays on main.
+    expect(existsSync(join(result.worktree!, "PLAN.md"))).toBe(true);
+    expect((await git(result.worktree!, ["rev-parse", "--abbrev-ref", "HEAD"])).trim()).toBe("HEAD");
+    expect((await git(repo, ["rev-parse", "--abbrev-ref", "HEAD"])).trim()).toBe("main");
+    expect(result.base).toMatch(/^[0-9a-f]{40}$/);
+
+    const started = startedOf(workerId) as { base?: string } | undefined;
+    expect(started?.base).toBe(result.base); // the started event carries the pin
+    await waitFor(() => settledOf(workerId), 15_000, "settled event");
+  }, 30_000);
+
+  it("a second readonly leg on the same thread+repo gets its own worktree (finding 2)", async () => {
+    setup([reportRun({ status: "done", summary: "r1" }), reportRun({ status: "done", summary: "r2" })]);
+    registerRepo();
+    await git(repo, ["checkout", "-b", "shepherd/write-1"]);
+    writeFileSync(join(repo, "PLAN.md"), "# plan\n");
+    await git(repo, ["add", "PLAN.md"]);
+    await git(repo, ["commit", "-m", "plan"]);
+    await git(repo, ["checkout", "main"]);
+
+    const first = await manager.startWorker("cmd-ro-a", args({ workerId: "w-ro-1", threadId: "relay-thread", mode: "readonly", base: "shepherd/write-1" }));
+    await waitFor(() => settledOf("w-ro-1"), 15_000, "first readonly leg settled");
+    // The leg went idle-hot (process alive, directory in use) — the second leg must not
+    // reuse or delete that directory; it gets its own, and git's "missing but already
+    // registered" never fires (PR #54 review finding 2).
+    const second = await manager.startWorker("cmd-ro-b", args({ workerId: "w-ro-2", threadId: "relay-thread", mode: "readonly", base: "shepherd/write-1" }));
+    expect(second.worktree).toBeTruthy();
+    expect(second.worktree).not.toBe(first.worktree);
+    expect(existsSync(join(second.worktree!, "PLAN.md"))).toBe(true);
+    expect(existsSync(join(first.worktree!, "PLAN.md"))).toBe(true); // the live leg kept its checkout
+    await waitFor(() => settledOf("w-ro-2"), 15_000, "second readonly leg settled");
+  }, 30_000);
+
+  it("an unknown base fails loudly instead of silently starting from the default branch", async () => {
+    setup([]);
+    registerRepo();
+    const workerId = "w-review-missing";
+    workerIds.add(workerId);
+    await expect(
+      manager.startWorker("cmd-ro-2", args({ workerId, mode: "readonly", base: "shepherd/never-pushed" })),
+    ).rejects.toMatchObject({ code: "worktree_failed" });
   }, 30_000);
 });
 
