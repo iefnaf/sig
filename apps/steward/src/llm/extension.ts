@@ -508,6 +508,13 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
       const did = args.did ?? [];
       const violation = validateNotifyArgs({ conclusion: args.conclusion, did, needsYou: args.needsYou });
       if (violation) return err(`refused: ${violation}`);
+      // §5.3 (issue #10, review finding 7): a stale/mistyped questionId must FAIL the call —
+      // silently swallowing it ("notified" with nothing sent, question open, no fallback)
+      // tells the model a lie it cannot correct. Same refusal ask_user already has.
+      const notifyQuestion = args.questionId !== undefined ? ctx.ledger.questions.get(args.questionId) : null;
+      if (args.questionId !== undefined && (notifyQuestion === null || notifyQuestion.status !== "open" || notifyQuestion.workerId === null)) {
+        return err(`refused: questionId ${args.questionId} 不存在、已回答或不是 worker 的问题。`);
+      }
       const tone: Tone = args.tone === "failure" ? "failure" : args.tone === "info" ? "success" : "attention";
       await ctx.notifyUser({
         conclusion: args.conclusion,

@@ -8,6 +8,7 @@
 // silent. Everything runs the production path — real webhook, real reducer, real alarms —
 // with the model scripted through the faux provider.
 import { beforeEach, describe, expect, it } from "vitest";
+import { runInDurableObject } from "cloudflare:test";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import {
   configureAndBind,
@@ -423,6 +424,246 @@ describe("the user's answer reaches the worker (steward.md §4.3, AC4)", () => {
     const after = await ownerStub().debugSnapshot();
     expect(after.questions.find((x) => x.qid === q.qid)).toMatchObject({ status: "answered" });
     expect((await sentTexts()).some((t) => t.includes("已把你的回答转给"))).toBe(true);
+  }, 45_000);
+});
+
+describe("review findings (PR #52)", () => {
+  it("F1: a quote-reply to a FAILURE card reaches the steward, never the broken worker", async () => {
+    const { fake, workerId } = await runningWorker("跑回归");
+    await fake.emit("settled", workerId, { type: "settled", outcome: "error", errorClass: "auth" });
+    const snap = await waitFor(
+      () => ownerStub().debugSnapshot(),
+      (s) => s.questions.some((x) => x.workerId === workerId),
+      "failure question",
+    );
+    const q = snap.questions.find((x) => x.workerId === workerId)!;
+    await waitWhileOutboundPending();
+    const card = (await sentCards()).find((c) => c.questionId === q.qid);
+    expect(card).toBeTruthy();
+
+    // The owner replies to the failure card: the decision is the STEWARD's to execute.
+    await scriptModel(fauxAssistantMessage([fauxText("收到，凭据修好后我就重新派发。")]));
+    await postEvent(messageEvent({ msgId: `om_fix_${crypto.randomUUID().slice(0, 6)}`, text: "凭据已经修好了，重新派发", parentId: card!.providerMsgId ?? undefined }));
+    await waitRunsSettled();
+    await waitWhileOutboundPending();
+    // Nothing was relayed into the broken worker — the reply became a steward run.
+    expect(fake.cmds.filter((c) => c.kind === "send")).toHaveLength(0);
+    const runs = (await llmState()).runs;
+    expect(runs.some((r) => r.kind === "user" && r.text.includes("凭据已经修好了"))).toBe(true);
+    // The failure question closed via the routed-reply path (the steward sees it answered).
+    expect((await ownerStub().debugSnapshot()).questions.find((x) => x.qid === q.qid)).toMatchObject({ status: "answered" });
+    fake.close();
+    void (await mockCalls());
+  }, 45_000);
+
+  it("F1: a quote-reply to an error:context card reaches the steward too (the dead session is never prompted)", async () => {
+    const { fake, workerId } = await runningWorker("大重构");
+    await fake.emit("settled", workerId, { type: "settled", outcome: "error", errorClass: "context" });
+    const snap = await waitFor(
+      () => ownerStub().debugSnapshot(),
+      (s) => s.questions.some((x) => x.workerId === workerId),
+      "context question",
+    );
+    const q = snap.questions.find((x) => x.workerId === workerId)!;
+    await waitWhileOutboundPending();
+    const card = (await sentCards()).find((c) => c.questionId === q.qid);
+    expect(card).toBeTruthy();
+    await scriptModel(fauxAssistantMessage([fauxText("好，我开个新会话接着做。")]));
+    await postEvent(messageEvent({ msgId: `om_ctx_${crypto.randomUUID().slice(0, 6)}`, text: "开个新会话接着做", parentId: card!.providerMsgId ?? undefined }));
+    await waitRunsSettled();
+    // The overflowing session was never prompted; the steward got the instruction.
+    expect(fake.cmds.filter((c) => c.kind === "send")).toHaveLength(0);
+    expect((await llmState()).runs.some((r) => r.kind === "user" && r.text.includes("开个新会话"))).toBe(true);
+    fake.close();
+    void (await mockCalls());
+  }, 45_000);
+
+  it("F2: a quote-reply to an ANSWERED question's card never answers a later, different question", async () => {
+    const { fake, workerId } = await runningWorker("两问");
+    // Question A: forwarded by the fallback, then answered by quote-reply (one send).
+    await fake.emit("report", workerId, { type: "report", status: "blocked", summary: "第一问", question: "先用哪个分支？" });
+    const q1 = (await waitFor(
+      () => ownerStub().debugSnapshot(),
+      (s) => s.questions.some((x) => x.workerId === workerId && x.status === "open"),
+      "question A opened",
+    )).questions.find((x) => x.workerId === workerId)!;
+    await scriptModel(fauxAssistantMessage([fauxText("(boom)")], { stopReason: "error", errorMessage: "down" }));
+    await waitRunsSettled();
+    await ownerStub().shrinkQuestionWindowForTest(0);
+    await ownerStub().sweepQuestionFallbackForTest();
+    await waitWhileOutboundPending();
+    const cardA = (await sentCards()).find((c) => c.questionId === q1.qid);
+    expect(cardA).toBeTruthy();
+    await postEvent(messageEvent({ msgId: `om_a1_${crypto.randomUUID().slice(0, 6)}`, text: "用 main", parentId: cardA!.providerMsgId ?? undefined }));
+    await waitFor(() => Promise.resolve(fake.cmds.filter((c) => c.kind === "send")), (s) => s.length === 1, "answer A relayed");
+
+    // Question B opens on the same worker; the owner then quote-replies the OLD card A.
+    await fake.emit("report", workerId, { type: "report", status: "needs_decision", summary: "第二问", question: "要不要带迁移脚本？" });
+    const q2 = (await waitFor(
+      () => ownerStub().debugSnapshot(),
+      (s) => s.questions.some((x) => x.qid !== q1.qid && x.workerId === workerId && x.status === "open"),
+      "question B opened",
+    )).questions.find((x) => x.qid !== q1.qid && x.workerId === workerId)!;
+    await scriptModel(fauxAssistantMessage([fauxText("好的，两问都收到了。")]));
+    await postEvent(messageEvent({ msgId: `om_b1_${crypto.randomUUID().slice(0, 6)}`, text: "是的，就这么办", parentId: cardA!.providerMsgId ?? undefined }));
+    await waitRunsSettled();
+    await waitWhileOutboundPending();
+    // Still exactly ONE worker send: the reply to the answered card A was NOT relayed as B's
+    // answer — it went to the steward (which sees the thread's questions and can act).
+    expect(fake.cmds.filter((c) => c.kind === "send")).toHaveLength(1);
+    expect(String((fake.cmds.find((c) => c.kind === "send")!.args as Record<string, unknown>).text)).toContain("用 main");
+    expect((await llmState()).runs.some((r) => r.kind === "user" && r.text.includes("是的，就这么办"))).toBe(true);
+    // The thread's open question closed via the routed-reply path (pre-#10 semantics).
+    expect((await ownerStub().debugSnapshot()).questions.find((x) => x.qid === q2.qid)).toMatchObject({ status: "answered" });
+    fake.close();
+    void (await mockCalls());
+  }, 60_000);
+
+  it("F3: a sweep that forwarded nothing this pass still drains an intent stranded by a restart", async () => {
+    const { fake, workerId, threadId } = await runningWorker("重启后送达");
+    await fake.emit("report", workerId, { type: "report", status: "blocked", summary: "等拍板", question: "继续用旧的连接池吗？" });
+    const q = (await waitFor(
+      () => ownerStub().debugSnapshot(),
+      (s) => s.questions.some((x) => x.workerId === workerId && x.status === "open"),
+      "question opened",
+    )).questions.find((x) => x.workerId === workerId)!;
+    // Model the post-crash state exactly: queueFallbacks committed (intent + handledAt), the
+    // delivery pass never ran. `forwarded` will be 0 — the drain must happen anyway.
+    await runInDurableObject(ownerStub(), (_instance: unknown, state: { storage: { sql: { exec: (q: string) => unknown } } }) => {
+      state.storage.sql.exec(`UPDATE sh_question SET fallbackDueAt = askedAt, handledAt = askedAt WHERE qid = '${q.qid}'`);
+      state.storage.sql.exec(
+        `INSERT OR IGNORE INTO sh_notify (dedupeKey, kind, threadId, workerId, createdAt, questionId) VALUES ('question:${q.qid}', 'attention_report', '${threadId}', '${workerId}', ${Date.now()}, '${q.qid}')`,
+      );
+    });
+    const { forwarded } = await ownerStub().sweepQuestionFallbackForTest();
+    expect(forwarded).toBe(0); // nothing NEW was forwarded — the strand is the point
+    await waitWhileOutboundPending();
+    const card = (await sentCards()).find((c) => JSON.stringify(c.payload).includes("连接池"));
+    expect(card).toBeTruthy();
+    expect(card!.questionId).toBe(q.qid);
+    fake.close();
+    void (await mockCalls());
+  }, 45_000);
+
+  it("F5: notify_user resolution:'question' keeps the question open; 'done' closes it", async () => {
+    const { fake, workerId } = await runningWorker("静默收尾二");
+    await fake.emit("settled", workerId, { type: "settled", outcome: "unreported", lastText: "大体做完了" });
+    const q = (await waitFor(
+      () => ownerStub().debugSnapshot(),
+      (s) => s.questions.some((x) => x.workerId === workerId),
+      "unreported question",
+    )).questions.find((x) => x.workerId === workerId)!;
+    // The steward asks the user IN PROSE: the card goes out, the question stays open.
+    await scriptModel(
+      fauxAssistantMessage([
+        fauxToolCall("notify_user", {
+          conclusion: "worker 结束但没有汇报",
+          did: ["最后说：大体做完"],
+          needsYou: "要我现在按原任务重新派发核实一遍吗？",
+          tone: "attention",
+          urgency: "push",
+          questionId: q.qid,
+          resolution: "question",
+        }),
+      ], { stopReason: "toolUse" }),
+    );
+    await waitRunsSettled();
+    await waitWhileOutboundPending();
+    expect((await sentCards()).some((c) => JSON.stringify(c.payload).includes("重新派发核实"))).toBe(true);
+    let snap = await ownerStub().debugSnapshot();
+    expect(snap.questions.find((x) => x.qid === q.qid)).toMatchObject({ status: "open" });
+    expect(snap.threads[0]!.state).toBe("waiting_you");
+    // The fallback is cancelled though (it reached the user): expiring sends nothing more.
+    await ownerStub().shrinkQuestionWindowForTest(0);
+    await ownerStub().sweepQuestionFallbackForTest();
+    await waitWhileOutboundPending();
+    // (The fallback card would render the QUESTION text — "没有产出汇报…" — not the
+    // notify card's conclusion, so this cannot match the card that already went out.)
+    expect((await sentCards()).filter((c) => JSON.stringify(c.payload).includes("没有产出汇报"))).toHaveLength(0);
+
+    // A later run classifies it as done: terminal resolution closes the question.
+    await scriptModel(
+      fauxAssistantMessage([
+        fauxToolCall("notify_user", {
+          conclusion: "已核实：任务完成",
+          did: ["检查了分支与测试"],
+          tone: "info",
+          urgency: "quiet",
+          questionId: q.qid,
+          resolution: "done",
+        }),
+      ], { stopReason: "toolUse" }),
+      fauxAssistantMessage([fauxText("备")]),
+    );
+    await fake.emit("report", workerId, { type: "report", status: "done", summary: "补交了收尾" });
+    await waitRunsSettled();
+    await waitWhileOutboundPending();
+    snap = await ownerStub().debugSnapshot();
+    expect(snap.questions.find((x) => x.qid === q.qid)).toMatchObject({ status: "answered" });
+    fake.close();
+    void (await mockCalls());
+  }, 60_000);
+
+  it("F6: the fallback card forwards a long, multi-line question VERBATIM (no clip, no collapse)", async () => {
+    const { fake, workerId } = await runningWorker("超长问题");
+    const longQuestion = [
+      "数据库迁移到新集群前需要确认几件事，每件都会影响回滚窗口和周五的发布节奏，请逐条拍板：",
+      "1. 旧的 search_index 是否可以在迁移完成后顺手删掉，还是必须保留给回滚使用？如果保留，保留多久（一周 / 一个月 / 直到下次大版本）？",
+      "2. 新集群的连接池上限沿用旧的 200 还是按机器内存重新估算？如果重新估算，按什么比例给批量任务留余量？",
+      "3. 迁移窗口定在周五晚高峰之后（23:00 UTC+8）是否可以，还是需要避开整点备份任务？备份任务目前的结束时间并不固定，请一并确认。",
+    ].join("\n");
+    expect(longQuestion.length).toBeGreaterThan(200); // well past the old 126-char clip
+    await fake.emit("report", workerId, { type: "report", status: "needs_decision", summary: "迁移前确认", question: longQuestion });
+    await waitFor(
+      () => ownerStub().debugSnapshot(),
+      (s) => s.questions.some((x) => x.workerId === workerId && x.status === "open"),
+      "question opened",
+    );
+    await scriptModel(fauxAssistantMessage([fauxText("(boom)")], { stopReason: "error", errorMessage: "down" }));
+    await waitRunsSettled();
+    await ownerStub().shrinkQuestionWindowForTest(0);
+    await ownerStub().sweepQuestionFallbackForTest();
+    await waitWhileOutboundPending();
+    const card = (await sentCards()).find((c) => JSON.stringify(c.payload).includes("search_index"));
+    expect(card).toBeTruthy();
+    const payload = JSON.stringify(JSON.parse(card!.payload as string));
+    // Every clause survives — including the last one past the old 126-char clip point…
+    expect(payload).toContain("避开整点备份任务");
+    // …and the line breaks are preserved, not whitespace-collapsed.
+    expect(payload).toContain("\\n3. 迁移窗口");
+    fake.close();
+    void (await mockCalls());
+  }, 45_000);
+
+  it("F7: notify_user with a stale questionId is refused — the model sees the error and nothing is sent", async () => {
+    const { fake, workerId } = await runningWorker("静默收尾三");
+    await fake.emit("settled", workerId, { type: "settled", outcome: "unreported", lastText: "差不多完了" });
+    await waitFor(
+      () => ownerStub().debugSnapshot(),
+      (s) => s.questions.some((x) => x.workerId === workerId),
+      "unreported question",
+    );
+    await scriptModel(
+      fauxAssistantMessage([
+        fauxToolCall("notify_user", {
+          conclusion: "已核实完成",
+          did: [],
+          tone: "info",
+          urgency: "quiet",
+          questionId: "q_typo_zzz",
+          resolution: "done",
+        }),
+      ], { stopReason: "toolUse" }),
+      fauxAssistantMessage([fauxText("备")]),
+    );
+    await waitRunsSettled();
+    await waitWhileOutboundPending();
+    const results = await allToolResults();
+    expect(results.some((r) => r.includes("refused") && r.includes("q_typo_zzz"))).toBe(true);
+    // Nothing was sent, and no card claimed a handling that never happened.
+    expect((await sentCards()).filter((c) => JSON.stringify(c.payload).includes("已核实"))).toHaveLength(0);
+    fake.close();
+    void (await mockCalls());
   }, 45_000);
 });
 

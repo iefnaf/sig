@@ -26,6 +26,10 @@ export interface ReportCardInput {
   footer: string;
   /** One-time signed timeline URL appended by the system (steward.md §6.4), never by the LLM. */
   detailsUrl?: string;
+  /** Skip the needsYou length cap and whitespace collapse (issue #10 review finding 6): the
+   *  §5.3 fallback card forwards the worker's question VERBATIM — a clip would silently drop
+   *  the clause the owner must answer on the no-LLM path of last resort. */
+  rawNeedsYou?: boolean;
 }
 
 function clip(text: string, max: number): string {
@@ -41,8 +45,9 @@ export function renderReportCard(input: ReportCardInput): { config: unknown; hea
     elements.push({ tag: "div", text: { tag: "lark_md", content: `**做了什么**\n${did.join("\n")}` } });
   }
   if (input.needsYou && input.needsYou.trim().length > 0) {
+    const needsYouText = input.rawNeedsYou ? input.needsYou.trim() : clip(input.needsYou, MAX_NEEDS_YOU + 6);
     elements.push({ tag: "hr" });
-    elements.push({ tag: "div", text: { tag: "lark_md", content: `**需要你**：${clip(input.needsYou, MAX_NEEDS_YOU + 6)}` } });
+    elements.push({ tag: "div", text: { tag: "lark_md", content: `**需要你**：${needsYouText}` } });
   }
   if (input.detailsUrl) {
     // "查看详情" logs the owner straight into the Thread timeline (spec §7.3; the URL is a
@@ -215,6 +220,7 @@ export function workerQuestionCard(input: {
     conclusion: `❓ ${input.threadTitle}：worker 需要你的回答`,
     did: input.did ?? [],
     needsYou: input.question,
+    rawNeedsYou: true, // VERBATIM — uncapped, whitespace preserved (review finding 6)
     threadTitle: input.threadTitle,
     footer: input.footer,
     detailsUrl: input.detailsUrl,

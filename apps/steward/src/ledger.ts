@@ -1065,20 +1065,6 @@ export function createLedger(deps: LedgerDeps) {
         SELECT * FROM sh_question WHERE workerId = ${workerId} AND status = 'open' ORDER BY askedAt, qid
       `.map(viewQuestion);
     },
-    /** Never guess between several workers/questions on the same Thread. */
-    forCommunication(threadId?: string, questionId?: string): QuestionRow | null {
-      if (questionId) {
-        const q = questions.get(questionId);
-        if (!q || q.status !== 'open' || (threadId && q.threadId !== threadId)) throw new Error('问题不存在、已回答或不属于这个 Thread。');
-        return q;
-      }
-      if (!threadId) return null;
-      const rows = sql<Record<string, unknown>>`
-        SELECT * FROM sh_question WHERE threadId = ${threadId} AND workerId IS NOT NULL AND status = 'open'
-      `.map(viewQuestion);
-      if (rows.length > 1) throw new Error('有多个 worker 问题，请指定 questionId。');
-      return rows[0] ?? null;
-    },
     markHandled(qid: string): void {
       sql`UPDATE sh_question SET handledAt = COALESCE(handledAt, ${now()}) WHERE qid = ${qid}`;
     },
@@ -1772,6 +1758,10 @@ export function createLedger(deps: LedgerDeps) {
         break;
       }
       case "broken": {
+        // The connector currently surfaces a broken worker through settled error events
+        // (breakWorker emits error-class settles) and the hello/reap reconcile paths — this
+        // explicit protocol event is the defensive shape for a future producer. Review note
+        // (a): kept deliberately; the rules table's `broken` row is wired either way.
         sql`UPDATE sh_worker SET state = 'broken', lastOutcome = 'broken', lastEventAt = ${ts}, updatedAt = ${now()} WHERE workerId = ${workerId}`;
         recordBrokenQuestion(worker, `q_${workerId}_${seq}`, str(event.reason) ?? '自动恢复未成功，需要你决定下一步。');
         break;
@@ -1965,7 +1955,7 @@ function settledQuestionText(outcome: string, errorClass: string | null, event: 
   const lastText = typeof event.lastText === "string" && event.lastText.length > 0 ? event.lastText : "";
   const detail = lastText ? `（${lastText.slice(0, 160)}）` : "";
   if (outcome === "unreported") {
-    return `worker 结束时没有产出汇报。${lastText ? `最后说：${lastText}` : ""}`;
+    return `worker 结束时没有产出汇报。${lastText ? `最后说：${lastText.slice(0, 300)}` : ""}`;
   }
   switch (errorClass) {
     case "auth":

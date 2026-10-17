@@ -255,6 +255,11 @@ export class Steward extends Agent<Env> {
     // §5.3 (issue #10): a blocked report's question is durably deadlined — the fallback
     // forwards it even if this isolate never saw the report arrive.
     void this.armQuestionFallback();
+    // Review finding 3 (issue #10): a crash between queueFallbacks and the delivery pass
+    // strands the intent with its question already handled — the sweep would not re-arm (no
+    // unhandled question left). Draining pending intents at boot closes that window; the
+    // rows are idempotent, so an extra pass on a clean boot is free.
+    void this.drainNotifications();
     // A DO restart clears the in-memory arm-dedupe while storage alarms keep their own
     // clock: re-arm maintenance so a restart never strands active workers unwatched.
     this.armWorkerSweeps();
@@ -588,15 +593,15 @@ export class Steward extends Agent<Env> {
           urgency: input.urgency,
         });
         if (question !== null && question.status === "open" && question.workerId !== null) {
-          // §5.3 (issue #10): notify_user is a TERMINAL handling of a worker question — the
-          // user just got the answer/report, so the question closes (an unreported run the
-          // steward classified as done, or a failure it explained). ask_user is the one that
-          // keeps the question open — the user's answer closes it.
+          // §5.3 (issue #10, review finding 5): reaching the user always cancels the fallback
+          // (markHandled), but only a TERMINAL resolution closes the question — "done" (an
+          // unreported run the steward verified) or an explained failure. resolution:"question"
+          // is the steward ASKING the user something in prose: the question stays open, the
+          // card keeps its binding, and the owner's quote-reply still resolves it.
           this.ledger.questions.markHandled(question.qid);
-          this.ledger.questions.close(
-            question.qid,
-            input.resolution === "done" ? "总管核实：已完成并汇报" : "总管已向用户说明",
-          );
+          if (input.resolution !== "question") {
+            this.ledger.questions.close(question.qid, input.resolution === "done" ? "总管核实：已完成并汇报" : "总管已向用户说明");
+          }
         }
         if (thread) this.sql`UPDATE sh_thread SET unread = 1 WHERE threadId = ${thread.threadId}`;
         await this.markRunNotified();
@@ -772,6 +777,10 @@ export class Steward extends Agent<Env> {
     delivery: string;
   } | null> {
     const { question, answer } = input;
+    // Review finding 1, defense in depth: only the WORKER's own question (kind 'report') is
+    // answered deterministically. Failure/unreported questions are the system asking the
+    // user to decide — their replies belong to the steward, never to a broken/idle worker.
+    if (question.kind !== "report") return null;
     const worker = question.workerId !== null ? this.ledger.workers.get(question.workerId) : null;
     if (worker === null) return null; // steward's own question: no worker to relay to
     const thread = question.threadId !== null ? this.ledger.threads.get(question.threadId) : null;
@@ -1199,6 +1208,11 @@ export class Steward extends Agent<Env> {
     // pending events drained first, the gate inside (lastSeq <= processedUpTo) means this only
     // fires for workers whose event stream cannot tell the story anymore. Timeline, no push.
     this.ledger.workers.reconcileFromSnapshot(auth.deviceId, hello.workers);
+    // Review finding 4 (issue #10): a snapshot-only broken verdict (a caught-up inbox — the
+    // exact case reconciliation exists for) queues a failure push and a wake that the
+    // applied>0-gated drains above never see. Reconcile-side effects drain unconditionally.
+    void this.drainNotifications();
+    void this.drainWakes();
     // The machine is back (or fresh workers appeared): the maintenance alarm must be live
     // for whatever is running now (issue #13).
     this.armWorkerSweeps();
@@ -1391,7 +1405,14 @@ export class Steward extends Agent<Env> {
     if (!worker || !thread) return null;
     const machine = this.ledger.machines.get(worker.deviceId);
     const machineName = machine?.name ?? worker.deviceId;
-    const footer = `Thread「${thread.title}」 · ${worker.agent} @ ${machineName} · 引用回复这个卡片即可回答它`;
+    // Review note (c): only cards bound to an open REPORT-kind question teach the answer
+    // path (that is the deterministic relay); failure/unreported replies go to the steward,
+    // and a done report keeps the plain continuation footer (there is nothing to answer).
+    const boundQuestion = intent.questionId !== null ? this.ledger.questions.get(intent.questionId) : null;
+    const asksQuestion = boundQuestion !== null && boundQuestion.kind === "report" && boundQuestion.status === "open" && boundQuestion.threadId !== null;
+    const footer = asksQuestion
+      ? `Thread「${thread.title}」 · ${worker.agent} @ ${machineName} · 引用回复这个卡片即可回答它`
+      : `Thread「${thread.title}」 · ${worker.agent} @ ${machineName} · 引用回复可继续这个 Thread`;
     // steward.md §6.4: the timeline link is appended by the system — a fresh one-time link
     // per card, never by the (M2) LLM.
     const detailsUrl = await this.web.linkUrl(linkTargetForThread(thread.threadId));
@@ -1430,10 +1451,9 @@ export class Steward extends Agent<Env> {
 
     // failure_push: either the start never happened or the run ended in a failure class that
     // needs a human (steward.md §5.3); the matching open question carries the specifics.
-    const question = intent.questionId !== null ? this.ledger.questions.get(intent.questionId) : null;
     const needsYou =
-      question?.status === "open" && question.text.trim().length > 0
-        ? question.text
+      boundQuestion?.status === "open" && boundQuestion.text.trim().length > 0
+        ? boundQuestion.text
         : "查看 Thread 时间线了解详情。";
     if (worker.lastOutcome?.startsWith("start_failed:")) {
       return failureCard(`派发失败：任务没有开始`, `${worker.lastOutcome.slice("start_failed:".length)}。重新说一次要做什么即可。`, thread.title, footer, detailsUrl ?? undefined);
@@ -1807,7 +1827,11 @@ export class Steward extends Agent<Env> {
    * attention_report intent — rendered and pushed by drainNotifications straight from the
    * ledger (worker's question verbatim), with no LLM anywhere on the path. Re-arms while any
    * question remains unhandled. Safe under DO resets and concurrent alarms: the deadline is
-   * persisted on the question row and queueFallbacks is idempotent.
+   * persisted on the question row and queueFallbacks is idempotent. The drain is
+   * UNCONDITIONAL (review finding 3): a restart between queueFallbacks and the delivery pass
+   * leaves the question handled — so `forwarded` alone can no longer be the trigger — and
+   * with no unhandled questions left, armQuestionFallback would not even re-arm the sweep.
+   * Pending intents are idempotent rows; an extra drain pass is always safe.
    */
   async sweepQuestionFallback(): Promise<{ forwarded: number }> {
     let forwarded = 0;
@@ -1815,10 +1839,10 @@ export class Steward extends Agent<Env> {
       const pending = this.ledger.questions.unhandled();
       this.ledger.questions.queueFallbacks();
       forwarded = this.ledger.notifications.pending().filter((n) => n.questionId !== null && pending.some((q) => q.qid === n.questionId)).length;
-      if (forwarded > 0) void this.drainNotifications();
     } catch (err) {
       this.logChannel("question_fallback_failed", errorText(err));
     } finally {
+      void this.drainNotifications();
       void this.armQuestionFallback();
     }
     return { forwarded };
@@ -2562,24 +2586,19 @@ export class Steward extends Agent<Env> {
       // Review #7: a reply routed to a Thread with an open question IS the answer — close it
       // (the deterministic path only closed on re-dispatch, leaving waiting_you stuck when
       // the user e.g. answered "算了"). The steward sees the closed state in the next brief.
-      // Issue #10: when the question is a WORKER's (from the quoted message, or the Thread's
-      // single open one), the answer is relayed to the worker first — and only if that
-      // succeeds is the question closed and the run skipped (the answer already did its job).
+      // Issue #10 (review findings 1-2): the deterministic worker relay applies ONLY to the
+      // quoted card's OWN bound question, and only when the WORKER asked it (kind 'report').
+      // A failure/unreported question is the system asking the user to decide — the reply
+      // must reach the steward (it can re-dispatch; relaying into a broken worker is refused,
+      // and into an error:context worker would prompt the same overflowing session). And a
+      // card whose question is already answered must never resolve a DIFFERENT, later open
+      // question on the Thread — that guess is exactly what the binding exists to prevent.
       const quotedQuestion = routedRow?.questionId !== null && routedRow?.questionId !== undefined ? this.ledger.questions.get(routedRow.questionId) : null;
-      let workerQuestion = quotedQuestion?.status === "open" && quotedQuestion.workerId !== null ? quotedQuestion : null;
-      if (workerQuestion === null) {
-        try {
-          const single = this.ledger.questions.forCommunication(routedThread.threadId, undefined);
-          workerQuestion = single !== null && single.workerId !== null ? single : null;
-        } catch {
-          workerQuestion = null; // ambiguous: several open worker questions on this Thread
-        }
-      }
-      if (workerQuestion !== null) {
+      if (quotedQuestion?.status === "open" && quotedQuestion.workerId !== null && quotedQuestion.kind === "report") {
         const ref = this.ownerMessageRef(input.msgId);
         if (ref !== null) {
           try {
-            await this.answerWorkerQuestion({ question: workerQuestion, answer: input.text, ref });
+            await this.answerWorkerQuestion({ question: quotedQuestion, answer: input.text, ref });
             return; // delivered to the worker; no LLM run for this message
           } catch {
             return; // the failure was already told to the user; the question stays open
@@ -2892,9 +2911,11 @@ export class Steward extends Agent<Env> {
       return;
     }
 
-    // An option click on a WORKER's question is that worker's answer (issue #10): relay it
-    // before any steward run — a refusal/failure keeps the question open and tells the user.
-    if (!isNew && !candidate && question.workerId !== null) {
+    // An option click on a WORKER's own question (kind 'report', review finding 1) is that
+    // worker's answer (issue #10): relay it before any steward run — a refusal/failure keeps
+    // the question open and tells the user. Failure/unreported questions fall through to the
+    // plain click flow: the decision goes to the steward, not into a broken/idle worker.
+    if (!isNew && !candidate && question.workerId !== null && question.kind === "report") {
       if (option === null) {
         await this.dispatcher.replyToCard(cardMsgId, "这个选项已经失效，直接回复文字说明即可。", question.threadId);
         return;

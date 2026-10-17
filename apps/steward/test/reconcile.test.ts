@@ -179,10 +179,14 @@ describe("hello.workers reconciliation (issue #12, connector-pi.md §9.1 step 4)
 
     const snap = await snapshotWhere((s) => workerIn(s, workerId)?.state === "broken", "worker reconciled broken");
     expect(threadOf(snap, workerId).timeline.some((t) => t.text.includes("自动恢复未成功"))).toBe(true);
-    // Issue #10 (rules table): a broken verdict asks the user how to handle it — reconcile
-    // now routes the push instead of leaving it timeline-only.
-    expect(snap.pendingNotifications.some((n) => n.kind === "failure_push")).toBe(true);
-    expect(threadOf(snap, workerId).questions.some((q) => q.status === "open" && q.kind === "failure")).toBe(true);
+    // Issue #10 (rules table + review finding 4): a broken verdict asks the user how to
+    // handle it, and the push is DELIVERED right at the reconnect — even though the event
+    // stream was fully caught up (no applied>0 pass would have drained it; the drain may
+    // already have consumed the intent by the time the broken state is observed).
+    expect(snap.questions.some((q) => q.workerId === workerId && q.status === "open" && q.kind === "failure")).toBe(true);
+    await waitWhileOutboundPending();
+    const pushes = sendCalls(await mockCalls()).map((c) => c.body ?? "");
+    expect(pushes.some((c) => c.includes("自动恢复未成功"))).toBe(true);
   });
 });
 
