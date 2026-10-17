@@ -313,8 +313,10 @@ export class FeishuAdapter implements ChannelAdapter {
     }
     if (!res.ok) {
       // 4xx (bad token, bad request, size…) is permanent: retrying cannot fix it.
+      // Keep Feishu's field-level detail (field_violations sits after log_id/troubleshooter,
+      // ~250 chars in): a bare "210031 invalid request" is undiagnosable.
       const body = await res.text().catch(() => "");
-      throw new Error(`feishu http ${res.status}: ${body.slice(0, 200)}`);
+      throw new Error(`feishu http ${res.status}: ${body.slice(0, 1000)}`);
     }
     const code = (await res.clone().json().catch(() => ({}))) as { code?: unknown };
     if (typeof code?.code === "number" && code.code !== 0) {

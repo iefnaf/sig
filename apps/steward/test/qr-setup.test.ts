@@ -235,7 +235,13 @@ describe("QR flow: config PATCH switches delivery to the webhook", () => {
       request_url: "https://example.com/channels/feishu/events",
       add_events: ["im.message.receive_v1"],
     });
-    expect(body.callback).toEqual({ callback_type: "webhook", add_callbacks: ["card.action.trigger"] });
+    // The callback names its own webhook address, the same one the events use (spike-proven
+    // shape; the first live run without it was rejected with 210031).
+    expect(body.callback).toEqual({
+      callback_type: "webhook",
+      request_url: "https://example.com/channels/feishu/events",
+      add_callbacks: ["card.action.trigger"],
+    });
     expect(body.event_and_callback_encrypt_strategy).toEqual({ verification_token: cfg!.verificationToken });
 
     // The page guides the one manual step: the console republish.

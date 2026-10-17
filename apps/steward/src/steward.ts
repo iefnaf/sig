@@ -2992,7 +2992,10 @@ export class Steward extends Agent<Env> {
     const webhookUrl = `${origin}/channels/feishu/events`;
     const body: ApplicationConfigPatch = {
       event: { subscription_type: "webhook", request_url: webhookUrl, add_events: WEBHOOK_EVENTS },
-      callback: { callback_type: "webhook", add_callbacks: WEBHOOK_CALLBACKS },
+      // A webhook callback carries its own request_url (official SDK: "if the callback is
+      // webhook, the webhook's request address"); the spike's live-tested body set both. The
+      // first live run without it got 210031 "invalid request".
+      callback: { callback_type: "webhook", request_url: webhookUrl, add_callbacks: WEBHOOK_CALLBACKS },
       event_and_callback_encrypt_strategy: { verification_token: cfg.verificationToken },
     };
     try {

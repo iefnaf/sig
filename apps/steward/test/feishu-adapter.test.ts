@@ -203,6 +203,20 @@ describe("FeishuAdapter.send and token cache", () => {
     await expect(mk(400).send(msg)).rejects.not.toBeInstanceOf(RetriableChannelError);
   });
 
+  it("keeps Feishu's field-level detail in a permanent 4xx error, past the first 200 chars", async () => {
+    // Shape of the live 210031: log_id + troubleshooter come first, the violated field after.
+    const body = {
+      code: 210031,
+      msg: "invalid request",
+      error: { log_id: "x".repeat(300), field_violations: [{ field: "callback.request_url", description: "required" }] },
+    };
+    const a = adapter(
+      { getCachedToken: async () => ({ token: "t", expiresAt: Date.now() + 3_600_000 }), saveToken: async () => {} },
+      (async () => Response.json(body, { status: 400 })) as unknown as typeof fetch,
+    );
+    await expect(a.send(msg)).rejects.toThrow(/callback\.request_url/);
+  });
+
   it("rejects serialized payloads over 30 KB without any request", async () => {
     const boom: typeof fetch = async () => {
       throw new Error("must not be called");
