@@ -275,7 +275,7 @@ describe("the resume-vs-new-session decision at dispatch (spec §5.3, issue #8)"
     fake.close();
   });
 
-  it("a broken previous session → new session (session_unusable), the branch still relayed", async () => {
+  it("an unusable previous session (broken, or context-overflowed idle) → new session, branch still relayed", async () => {
     const fake = await pairFakeConnector("mac-studio", { run: null, autorun: false });
     await fake.connect();
     const outcome1 = await ownerStub().dispatchForTest({ prompt: "跑一趟", repoRef: "repo-a", newTitle: "跑一趟" });
@@ -283,15 +283,27 @@ describe("the resume-vs-new-session decision at dispatch (spec §5.3, issue #8)"
     const [cmd] = await fake.waitForCmds(1);
     const workerId = String((cmd!.args as Record<string, unknown>).workerId);
     await fake.emit("started", workerId, { sessionId: workerId, branch: "shepherd/pao-1" });
+    // issue #10: error:auth lands `broken`; error:context lands `idle` ("suggest a new
+    // session") — both are unresumable, the latter precisely because the connector said
+    // the session cannot go on (the merge of #10 × #8).
     await fake.emit("settled", workerId, { type: "settled", outcome: "error", errorClass: "context" });
-    await snapshotWhere((s) => s.threads[0]?.workers[0]?.state === "broken", "worker broken");
+    await snapshotWhere((s) => s.threads[0]?.workers[0]?.state === "idle", "context-overflowed leg idle");
 
-    const outcome2 = await ownerStub().dispatchForTest({ prompt: "换个新会话接着来", repoRef: "repo-a", threadId: outcome1.threadId });
-    expect(outcome2).toMatchObject({
+    const afterContext = await ownerStub().dispatchForTest({ prompt: "接着来（上下文溢出后）", repoRef: "repo-a", threadId: outcome1.threadId });
+    expect(afterContext).toMatchObject({
       continuation: { action: "new_session", reason: "session_unusable", base: "shepherd/pao-1", brief: true },
     });
+
+    // And the terminally broken shape (error:auth) behaves the same — note the middle leg
+    // (the dispatch above, still un-started) is now the previous: no brief (the gate), but
+    // the thread's latest branch still relays.
+    await ownerStub().setWorkerStateForTest(workerId, "broken", "error:auth");
+    const outcome2 = await ownerStub().dispatchForTest({ prompt: "换个新会话接着来", repoRef: "repo-a", threadId: outcome1.threadId });
+    expect(outcome2).toMatchObject({
+      continuation: { action: "new_session", reason: "session_unusable", base: "shepherd/pao-1", brief: false },
+    });
     fake.close();
-  });
+  }, 15_000);
 });
 
 function snapWorker(snap: Awaited<ReturnType<typeof snapshot>>, workerId: string) {

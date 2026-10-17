@@ -61,6 +61,9 @@ export interface StewardExtensionContext {
     tone: Tone;
     urgency: "push" | "quiet";
     threadId?: string;
+    /** §5.3 (issue #10): the worker question this notification resolves (when it does). */
+    questionId?: string;
+    resolution?: "done" | "question";
     dedupeId?: string;
   }): Promise<void>;
   askUser(input: {
@@ -69,8 +72,18 @@ export interface StewardExtensionContext {
     /** Routing candidates — each becomes a card button that routes back as user_reply_to. */
     candidates: Array<{ threadId: string; label: string }>;
     threadId?: string;
+    /** §5.3 (issue #10): the worker question being forwarded to the user. */
+    questionId?: string;
     dedupeId?: string;
   }): Promise<void>;
+  /** answer_worker's deterministic half (§4.3, issue #10): close the question, relay to the
+   *  worker, cancel the 90-second fallback. The evidence gate lives in the beforeTool hook. */
+  answerWorker(input: { workerId: string; questionId: string; text: string; provenance: string; cmdId: string }): Promise<
+    { kind: "answered"; delivery: string; threadId: string } | { kind: "refused"; reason: string }
+  >;
+  /** Whether the bound owner actually sent this message (answer_worker's user-message
+   *  evidence, §4.3): a card click's eventId counts as the owner's action too. */
+  isOwnerMessage(msgId: string): Promise<boolean>;
   /** Audit trail for no_action and other quiet outcomes (§8.6). */
   audit(kind: string, detail: string): void;
   /** The proactive-behavior service (issue #20, steward.md §8): routines and follow-ups. */
@@ -101,6 +114,11 @@ const candidateLine = (c: RouteCandidate): string =>
 
 const ok = (text: string) => ({ output: [{ type: "text" as const, text }] });
 const err = (text: string) => ({ output: [{ type: "text" as const, text }], isError: true });
+
+/** Default option buttons when the steward forwards a worker's question without inventing
+ *  options (issue #10): the two answers a blocked worker most often needs. The user's click —
+ *  or a free-text quote-reply — is relayed to the worker either way. */
+const deriveWorkerOptions = (question: { text: string }): string[] => ["同意/按你说的办", "先别，等我细说"];
 
 /** Length rules for notify_user (steward.md §6.4) — over-length is rejected, demanding a rewrite. */
 export function validateNotifyArgs(args: { conclusion: string; did: string[]; needsYou?: string }): string | null {
@@ -522,12 +540,21 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
       tone: Type.Optional(Type.Union([Type.Literal("info"), Type.Literal("attention"), Type.Literal("failure")])),
       urgency: Type.Optional(Type.Union([Type.Literal("push"), Type.Literal("quiet")])),
       threadId: Type.Optional(Type.String()),
+      questionId: Type.Optional(Type.String({ description: "本通知处置的 worker 问题 id（q_…）：带上即视为已转告用户，取消 90 秒兜底" })),
+      resolution: Type.Optional(Type.Union([Type.Literal("done"), Type.Literal("question")], { description: "处置结果：done=如实汇报了完成（unreported 分类用）；question=已向用户提问" })),
     }),
     replay: "safe",
     execute: async (args, api) => {
       const did = args.did ?? [];
       const violation = validateNotifyArgs({ conclusion: args.conclusion, did, needsYou: args.needsYou });
       if (violation) return err(`refused: ${violation}`);
+      // §5.3 (issue #10, review finding 7): a stale/mistyped questionId must FAIL the call —
+      // silently swallowing it ("notified" with nothing sent, question open, no fallback)
+      // tells the model a lie it cannot correct. Same refusal ask_user already has.
+      const notifyQuestion = args.questionId !== undefined ? ctx.ledger.questions.get(args.questionId) : null;
+      if (args.questionId !== undefined && (notifyQuestion === null || notifyQuestion.status !== "open" || notifyQuestion.workerId === null)) {
+        return err(`refused: questionId ${args.questionId} 不存在、已回答或不是 worker 的问题。`);
+      }
       const tone: Tone = args.tone === "failure" ? "failure" : args.tone === "info" ? "success" : "attention";
       await ctx.notifyUser({
         conclusion: args.conclusion,
@@ -536,6 +563,8 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
         tone,
         urgency: args.urgency === "push" ? "push" : "quiet",
         ...(args.threadId !== undefined ? { threadId: args.threadId } : {}),
+        ...(args.questionId !== undefined ? { questionId: args.questionId } : {}),
+        ...(args.resolution !== undefined ? { resolution: args.resolution } : {}),
         dedupeId: `notify:${api.taskId}`,
       });
       return ok("notified");
@@ -547,7 +576,8 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
     description:
       "向用户提问并结束本轮（路由不明、意图存疑、必须用户拍板时用它，不要在文字里反问后结束）。最多 3 个简短选项。" +
       "路由不明时给 candidates（≤3 个 Thread，用 find_threads 的结果，label 用标题短语）：用户点按钮即确定归属。" +
-      "带 threadId 的问题会把这个 Thread 置为「等你」。用户的回答会作为新消息回来。",
+      "带 threadId 的问题会把这个 Thread 置为「等你」。用户的回答会作为新消息回来。" +
+      "转问 worker 的问题时必带 questionId（⟦event⟧ 输入里有）——用户点按钮或引用回复会把答案直接转回给 worker。",
     parameters: Type.Object({
       question: Type.String(),
       options: Type.Optional(Type.Array(Type.String(), { maxItems: 3 })),
@@ -555,20 +585,73 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
         Type.Array(Type.Object({ threadId: Type.String(), label: Type.String() }), { maxItems: 3 }),
       ),
       threadId: Type.Optional(Type.String()),
+      questionId: Type.Optional(Type.String({ description: "转问的 worker 问题 id（q_…，⟦event⟧ 输入里有）" })),
     }),
     replay: "safe",
     execute: async (args, api) => {
       if ((args.options?.length ?? 0) > 3 || (args.candidates?.length ?? 0) > 3) {
         return err("refused: 选项最多 3 个。");
       }
+      // §5.3 (issue #10): forwarding a worker's question must name it — the card binds THAT
+      // question (its buttons and the quote-route resolve to the worker), and the fallback
+      // for it is cancelled. No candidates on a forwarded worker question (those are for
+      // routing ambiguity); options default to two clickable answers when the model gives none.
+      const question = args.questionId !== undefined ? ctx.ledger.questions.get(args.questionId) : null;
+      if (args.questionId !== undefined && (question === null || question.status !== "open" || question.workerId === null)) {
+        return err(`refused: questionId ${args.questionId} 不存在、已回答或不是 worker 的问题。`);
+      }
+      if (question !== null && (args.candidates?.length ?? 0) > 0) {
+        return err("refused: 转问 worker 的问题不要带 candidates（那是路由歧义专用的）。");
+      }
+      const options = question !== null ? (args.options !== undefined && args.options.length > 0 ? args.options : deriveWorkerOptions(question)) : (args.options ?? []);
       await ctx.askUser({
         question: args.question,
-        options: args.options ?? [],
+        options,
         candidates: args.candidates ?? [],
-        ...(args.threadId !== undefined ? { threadId: args.threadId } : {}),
+        ...(args.threadId !== undefined && question === null ? { threadId: args.threadId } : {}),
+        ...(question !== null ? { questionId: question.qid } : {}),
         dedupeId: `ask:${api.taskId}`,
       });
       return { output: [{ type: "text" as const, text: "asked" }], control: { terminate: true } };
+    },
+  });
+
+  // ---- answer_worker (steward.md §4.3, issue #10) ----------------------------------------------
+
+  const answerWorker = defineTool({
+    name: "answer_worker",
+    description:
+      "总管自己回答 worker 的纯事实性问题（「目标分支是哪个」「跑测试用什么命令」）。答案会作为指令转给 worker，问题关闭，不再打扰用户。" +
+      "只能回答「不知道它就会派错/说错」且证据在手的事实问题；需要用户拍板/取舍/授权的改用 ask_user（带 questionId）。" +
+      "evidence 必填：note:<笔记id>（notes_search/notes_list 可查）或 user:<消息id>（⟦event⟧ 输入 refs 里的用户消息）；没有证据会被拒。",
+    parameters: Type.Object({
+      workerId: Type.String({ description: "提问的 worker，如 w_01J…" }),
+      questionId: Type.String({ description: "要回答的问题 id（q_…，⟦event⟧ 输入里有 questionId=）" }),
+      text: Type.String({ description: "给 worker 的回答：自包含、直接可用" }),
+      // Optional at the schema on purpose: the §7.2 HOOK must be what blocks an evidence-less
+      // answer (the block reason teaches the model the ask_user alternative) — a required
+      // field would surface a bare schema error instead.
+      evidence: Type.Optional(Type.String({ description: "依据：note:<笔记id> 或 user:<消息id>" })),
+      basis: Type.Union([Type.Literal("memory"), Type.Literal("user_explicit")]),
+    }),
+    replay: "unsafe",
+    execute: async (args, api) => {
+      const run = await ctx.currentRun();
+      const outcome = await ctx.answerWorker({
+        workerId: args.workerId,
+        questionId: args.questionId,
+        text: args.text,
+        provenance: run?.provenance ?? "unknown",
+        cmdId: `tool:${api.taskId}`,
+      });
+      if (outcome.kind === "refused") return err(`refused: ${outcome.reason}`);
+      const tail =
+        outcome.delivery === "steer"
+          ? "不打断它手头的工具，当前批次结束后送达。"
+          : outcome.delivery === "queued"
+            ? "worker 正在启动/恢复，回答已排队。"
+            : "已送达。";
+      return ok(`已回答问题 ${args.questionId} 并转给 ${args.workerId}：${tail}问题关闭，无需再通知用户。`);
     },
   });
 
@@ -1089,6 +1172,32 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
         }
         dispatchedTarget = target;
       }
+      // §7.2 (issue #10): answer_worker answers only with evidence — a note id the ledger
+      // actually holds (and can quote back), or a user message this deployment received from
+      // the bound owner. Anything else is the model's own assertion; the only path left is
+      // ask_user. Evidence-less answers never reach the worker.
+      if (call.name === "answer_worker") {
+        const evidence = args.evidence;
+        if (typeof evidence !== "string" || evidence.trim().length === 0) {
+          return { block: "Autonomy rule: answer_worker 需要 evidence（note:<笔记id> 或 user:<消息id>）；没有证据就改用 ask_user（带 questionId）。" };
+        }
+        const trimmed = evidence.trim();
+        if (trimmed.startsWith("note:")) {
+          const note = ctx.ledger.notes.get(trimmed.slice("note:".length));
+          if (!note || note.status === "removed") {
+            return { block: `Autonomy rule: evidence 笔记 ${trimmed} 不存在。用 notes_search / notes_list 找到真实笔记 id，或改用 ask_user。` };
+          }
+        } else if (trimmed.startsWith("user:")) {
+          if (!(await ctx.isOwnerMessage(trimmed.slice("user:".length)))) {
+            return { block: `Autonomy rule: evidence 消息 ${trimmed} 不是本部署收到过的用户消息。改用 ask_user（带 questionId）。` };
+          }
+        } else {
+          return { block: "Autonomy rule: evidence 只能是 note:<笔记id> 或 user:<消息id>。没有证据就改用 ask_user（带 questionId）。" };
+        }
+        if (typeof args.questionId !== "string" || args.questionId.length === 0) {
+          return { block: "answer_worker 需要 questionId（⟦event⟧ 输入里有 questionId=）。" };
+        }
+      }
       if (call.name === "interrupt_worker") {
         const basis = args.basis;
         if (basis !== "user_explicit" && basis !== "user_reply_to") {
@@ -1131,7 +1240,7 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
     name: "shepherd-steward",
     tools: [
       situation, findThreads, getThread, updateThread, startWorker, sendToWorker, interruptWorker,
-      notifyUser, askUser, noAction,
+      notifyUser, askUser, answerWorker, noAction,
       createRoutine, suggestRoutine, setFollowup, listSchedules, cancelSchedule, pauseSchedule,
       notesPropose, notesCommit, notesConfirm, notesPin, notesRemove, notesList, notesSearch,
     ],
@@ -1171,6 +1280,7 @@ const ROLE_PROMPT = `你是 Shepherd 的总管（steward）：替用户调度他
 5. 给用户的回复要短：先结论，再要点，几行以内。严禁声称派发过而实际没有调用工具；只有看到 dispatched 结果才算派发过。
 6. 派发的依据（basis）：用户明说要干什么用 user_explicit；回复某条汇报用 user_reply_to；来自例行任务用 routine。凭空的推断禁止派发，改用 ask_user。
 7. 运行中的任务可以干预（workerId 从 get_thread 拿）：转向/追加用 send_to_worker —— 用户要「立刻改」用 intent=now（不打断当前工具，当前批次结束就转向，回复里说明 after_current_tools），「做完这个再顺便…」用 intent=after；停下/停止用 interrupt_worker，且仅限用户明示（basis=user_explicit 或 user_reply_to），「停，然后改用 X」把 X 放进 then。转向不是停下：想停就说停。
+7b. worker 的提问（⟦event⟧ 里 blocked/needs_decision，带 questionId=）：90 秒内由你处置——纯事实问题（目标分支、命令、约定）且证据在手（笔记或用户原话）用 answer_worker（evidence 必填，否则被拦）；需要用户拍板/授权/没有证据的用 ask_user 转问，必带 questionId，选项给「同意/按你说的办」这类可点项；unreported（没有产出汇报）按最后的原话分类：像完成就 notify_user（questionId + resolution=done）如实汇报，在提问或拿不准就 ask_user 带 questionId 转问，不要凭空当作失败。没有任何处置时核心会在 90 秒后把问题原文转给用户（兜底不丢）。notify_user 带 questionId 时同样取消兜底。
 8. notify_user 的三段有硬性长度限制（结论 ≤80 字；做了什么 ≤4 条、每条 ≤100 字；需要你 ≤120 字），超长会被拒绝——压缩重写，不要截断。
 9. 永远不要替用户宣布「这件事完成了」；完成与否由汇报与事实说话。
 10. 例行任务与定时回看（spec §8）：用户表达周期性需求（「每个工作日 9 点汇总昨晚进展」）时，先把触发条件和要做的事复述给他确认，确认后用 create_routine（basis=user_explicit；digest=确定性汇总，instruction=按指令执行；cron 用 UTC）。你只是「察觉到重复模式」时，用 suggest_routine 发一张带按钮的建议卡——点按钮才会创建，绝不绕过按钮。给某个 Thread 设闹钟用 set_followup；管理用 list_schedules / pause_schedule / cancel_schedule（「暂停那个每天九点的」）。

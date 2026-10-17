@@ -45,6 +45,9 @@ export interface EventWakeInput {
   /** §2.6 (issue #8): the next summary update lands on the every-10th boundary — the wake
    *  asks for a from-scratch rewrite instead of an edit. */
   summaryRewriteDue?: boolean;
+  /** Issue #10: the question this report/settle opened — answer_worker / ask_user /
+   *  notify_user must carry it, and the core's fallback forwards verbatim if unhandled. */
+  questionId?: string;
 }
 
 /**
@@ -59,6 +62,7 @@ export function eventWakeText(input: EventWakeInput): string {
   if (input.report) {
     const r = input.report;
     const lines = [head, `- ${who} 汇报 ${r.status}：${r.summary}`];
+    if (input.questionId) lines.push(`questionId=${input.questionId}`);
     if (r.changes?.length) lines.push(`  改动：${r.changes.join("；")}`);
     if (r.tests?.ran) lines.push(`  测试：${r.tests.passed === false ? "未通过" : "通过"}${r.tests.note ? `（${r.tests.note}）` : ""}`);
     if (r.git) {
@@ -69,11 +73,13 @@ export function eventWakeText(input: EventWakeInput): string {
     if (r.question) lines.push(`  问题：${r.question}`);
     lines.push(`已发送给用户的通知：${input.notified ? "是（核心模板卡片）" : "否"}`);
     lines.push(
-      "请做记账：用 update_thread 更新摘要。" +
-        (input.summaryRewriteDue
-          ? "⚠️ 这次的摘要更新落在整十版：必须【从头重写】（按 get_thread 的时间线与汇报重建，不要在旧摘要上缝补）。"
-          : "") +
-        "除非有用户必须知道的新信息，不要再通知用户；无事可做用 no_action 结束。",
+      r.status === "done"
+        ? "请做记账：用 update_thread 更新摘要。" +
+            (input.summaryRewriteDue
+              ? "⚠️ 这次的摘要更新落在整十版：必须【从头重写】（按 get_thread 的时间线与汇报重建，不要在旧摘要上缝补）。"
+              : "") +
+            "除非有用户必须知道的新信息，不要再通知用户；无事可做用 no_action 结束。"
+        : "问题尚未转给用户。90 秒内可用 answer_worker 回答纯事实问题（必须有笔记或用户消息 evidence）；需要决定或没有证据时，用 ask_user 转问，带 questionId。notify_user 也须带 questionId。没有处理则核心原文转发。",
     );
     return lines.join("\n");
   }
@@ -83,7 +89,10 @@ export function eventWakeText(input: EventWakeInput): string {
     head,
     `- ${who} 结束（${s.outcome}${s.errorClass ? `，${s.errorClass}` : ""}）：${s.text}`,
     `已发送给用户的通知：${input.notified ? "是（核心模板卡片）" : "否"}`,
-    "请做记账与分类；除非有用户必须知道的新信息，不要再通知用户；无事可做用 no_action 结束。",
+    ...(input.questionId ? [`questionId=${input.questionId}`] : []),
+    s.outcome === 'unreported'
+      ? "请根据最后原话分类：若已完成，用 notify_user 汇报并带 questionId、resolution=done；若在提问或无法确定，用 ask_user 带 questionId 转问用户。不要凭空当作失败。"
+      : "请做记账与分类；除非有用户必须知道的新信息，不要再通知用户；无事可做用 no_action 结束。", 
   ].join("\n");
 }
 

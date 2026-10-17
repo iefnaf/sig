@@ -145,6 +145,8 @@ export function buildEvalContext(ledger: Ledger, caseId: number, observation: Ob
     askUser: async (input) => {
       observation.asks.push({ question: input.question, candidates: input.candidates });
     },
+    answerWorker: async () => ({ kind: "refused", reason: "eval world has no workers to answer" }),
+    isOwnerMessage: async (msgId) => msgId.startsWith("eval_"),
     audit: () => {},
   };
 }

@@ -70,14 +70,17 @@ export function decideContinuation(input: ContinuationInput): ContinuationDecisi
 
 /** A session the connector can actually deliver into: the worker is not terminally broken,
  *  it ran at least once (a sessionId — the connector knows the worker), was not withdrawn
- *  before starting (`cancelled`), and its start did not fail (`start_failed:*`; those also
- *  land `broken`, but the check is cheap insurance). A `starting` worker without a sessionId
- *  is a start still in flight — equally unresumable (PR #54 review finding 1). */
+ *  before starting (`cancelled`), its start did not fail (`start_failed:*`; those also land
+ *  `broken`, but the check is cheap insurance), and it did not die of context overflow
+ *  (`error:context` lands `idle` per issue #10 — the connector's verdict is exactly "this
+ *  session cannot go on", so resuming it would defeat the context rule at its boundary).
+ *  A `starting` worker without a sessionId is a start still in flight — equally unresumable
+ *  (PR #54 review finding 1). */
 function resumableSession(previous: WorkerRow): boolean {
   if (previous.state === "broken") return false;
   if (previous.sessionId === null || previous.sessionId.length === 0) return false;
   const outcome = previous.lastOutcome ?? "";
-  return !outcome.startsWith("cancelled") && !outcome.startsWith("start_failed");
+  return !outcome.startsWith("cancelled") && !outcome.startsWith("start_failed") && !outcome.startsWith("error:context");
 }
 
 /** One deduped decision, attributed to the worker that first reported it. */

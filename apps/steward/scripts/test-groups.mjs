@@ -30,6 +30,7 @@ const vitestBin = path.join(root, "node_modules", ".bin", "vitest");
 const COST = {
   "routing.test.ts": 45,
   "relay.test.ts": 26,
+  "worker-questions.test.ts": 55,
   "qr-setup.test.ts": 26,
   "intervention.test.ts": 24,
   "review-regressions.test.ts": 21,

@@ -80,10 +80,10 @@ import {
   type FauxRequestRecord,
   type StewardModels,
 } from "./llm/models.ts";
-import { createLedger, type Ledger, type LedgerSql, type NotifyRow, type RunRow } from "./ledger.ts";
+import { createLedger, type Ledger, type LedgerSql, type NotifyRow, type QuestionRow, type RunRow } from "./ledger.ts";
 import { renderChangeReports } from "./notes.ts";
 import { RoutineService } from "./routines.ts";
-import { failureCard, notifyCard, askUserCard, reportCardFor, noteDecisionCard, stallCard, type AskCardButton } from "./report-template.ts";
+import { failureCard, notifyCard, askUserCard, reportCardFor, noteDecisionCard, stallCard, workerQuestionCard, didBullets, type AskCardButton } from "./report-template.ts";
 import { MIGRATIONS, runMigrations } from "./schema.ts";
 import { openSecret, sealSecret } from "./secretbox.ts";
 import { renderSetupPage, type SetupView } from "./setup-page.ts";
@@ -205,6 +205,8 @@ export interface ShOutboundRow {
   kind: string;
   receiveId: string;
   threadId: string | null;
+  /** The worker question this message asks/answers (issue #10); null when unbound. */
+  questionId?: string | null;
   payload: string;
   urgency: string;
   status: string;
@@ -251,6 +253,14 @@ export class Steward extends Agent<Env> {
     // by expression — re-arming at boot dedups onto the same row and never postpones it,
     // so the chain cannot die (or drift) with an evicted isolate.
     this.armNotesMaintenance();
+    // §5.3 (issue #10): a blocked report's question is durably deadlined — the fallback
+    // forwards it even if this isolate never saw the report arrive.
+    void this.armQuestionFallback();
+    // Review finding 3 (issue #10): a crash between queueFallbacks and the delivery pass
+    // strands the intent with its question already handled — the sweep would not re-arm (no
+    // unhandled question left). Draining pending intents at boot closes that window; the
+    // rows are idempotent, so an extra pass on a clean boot is free.
+    void this.drainNotifications();
     // A DO restart clears the in-memory arm-dedupe while storage alarms keep their own
     // clock: re-arm maintenance so a restart never strands active workers unwatched.
     this.armWorkerSweeps();
@@ -560,6 +570,11 @@ export class Steward extends Agent<Env> {
         const owner = this.ownerOpenIdSync();
         if (!owner) return;
         const thread = input.threadId ? this.ledger.threads.get(input.threadId) : null;
+        const question = input.questionId !== undefined ? this.ledger.questions.get(input.questionId) : null;
+        if (input.questionId !== undefined && (question === null || question.status !== "open" || question.workerId === null)) {
+          this.logChannel("notify_question_invalid", input.questionId);
+          return;
+        }
         // §6.4: the timeline link is appended by the system, never by the model — the same
         // fresh one-time link the core-template cards carry (issue #22).
         const detailsUrl = thread ? await this.web.linkUrl(linkTargetForThread(thread.threadId)) : null;
@@ -575,29 +590,54 @@ export class Steward extends Agent<Env> {
             ...(thread ? { threadTitle: thread.title, detailsUrl: detailsUrl ?? undefined } : {}),
           }),
           threadId: input.threadId ?? null,
+          questionId: question !== null && question.status === "open" && question.workerId !== null ? question.qid : null,
           urgency: input.urgency,
         });
+        if (question !== null && question.status === "open" && question.workerId !== null) {
+          // §5.3 (issue #10, review finding 5): reaching the user always cancels the fallback
+          // (markHandled), but only a TERMINAL resolution closes the question — "done" (an
+          // unreported run the steward verified) or an explained failure. resolution:"question"
+          // is the steward ASKING the user something in prose: the question stays open, the
+          // card keeps its binding, and the owner's quote-reply still resolves it.
+          this.ledger.questions.markHandled(question.qid);
+          if (input.resolution !== "question") {
+            this.ledger.questions.close(question.qid, input.resolution === "done" ? "总管核实：已完成并汇报" : "总管已向用户说明");
+          }
+        }
         if (thread) this.sql`UPDATE sh_thread SET unread = 1 WHERE threadId = ${thread.threadId}`;
         await this.markRunNotified();
       },
       askUser: async (input) => {
         const owner = this.ownerOpenIdSync();
         if (!owner) return;
-        const thread = input.threadId ? this.ledger.threads.get(input.threadId) : null;
+        // §5.3 (issue #10): forwarding a worker's question BINDS that question — no second
+        // row is created; the card's buttons and the quote-route resolve to the worker's qid,
+        // and the 90-second fallback for it is cancelled (it reached the user).
+        const forwarded = input.questionId !== undefined ? this.ledger.questions.get(input.questionId) : null;
+        if (input.questionId !== undefined && (forwarded === null || forwarded.status !== "open" || forwarded.workerId === null)) {
+          this.logChannel("ask_question_invalid", input.questionId);
+          return;
+        }
+        const thread = input.threadId ? this.ledger.threads.get(input.threadId) : forwarded?.threadId ? this.ledger.threads.get(forwarded.threadId) : null;
         // §4.3 (issue #7): ask_user creates the sh_question — thread-scoped when it belongs
         // to one Thread (flipping it to waiting_you), threadless for routing asks, where the
         // candidates column carries the button mapping a click resolves against. One
         // question per call: a unique id (review #3 — a per-run id collided and INSERT OR
         // IGNORE silently swallowed repeats).
-        const qid = `q_steward_${ulid()}`;
-        this.ledger.questions.insert({
-          qid,
-          threadId: thread?.threadId ?? null,
-          workerId: null,
-          text: input.question,
-          options: input.options,
-          candidates: input.candidates,
-        });
+        const qid = forwarded?.qid ?? `q_steward_${ulid()}`;
+        if (forwarded === null) {
+          this.ledger.questions.insert({
+            qid,
+            threadId: thread?.threadId ?? null,
+            workerId: null,
+            text: input.question,
+            options: input.options,
+            candidates: input.candidates,
+          });
+        } else {
+          this.ledger.questions.setOptions(qid, input.options);
+          this.ledger.questions.markHandled(qid); // reached the user; cancel the fallback
+        }
         if (thread) {
           this.ledger.recomputeThreadState(thread.threadId);
           this.sql`UPDATE sh_thread SET unread = 1 WHERE threadId = ${thread.threadId}`; // news landed (§5.2)
@@ -626,6 +666,7 @@ export class Steward extends Agent<Env> {
             buttons,
           }),
           threadId: thread?.threadId ?? null,
+          questionId: forwarded !== null ? forwarded.qid : null,
           urgency: "push",
         });
         await this.markRunNotified();
@@ -634,7 +675,12 @@ export class Steward extends Agent<Env> {
         this.logChannel(kind, detail);
       },
       routines: this.routineService,
-      // §8.6 (audit trail): an explicit in-run outcome (no_action) beats the settle fallback.
+      /** §4.3/§7.2 (issue #10): whether a user-message evidence ref is one the bound owner
+       *  actually sent — the one check answer_worker's hook cannot do for itself. */
+      isOwnerMessage: (msgId) => this.isOwnerMessage(msgId),
+      // §4.3 (issue #10): answer_worker's deterministic landing — close the question, relay
+      // to the worker, cancel the fallback. The evidence gate is the extension's hook.
+      answerWorker: (input) => this.answerWorker(input),
       recordProactiveOutcome: (operationId, outcome) => {
         const followup = /^followup:(f_.+)$/.exec(operationId);
         if (followup) {
@@ -703,6 +749,83 @@ export class Steward extends Agent<Env> {
     return this.sql<{ ownerOpenId: string | null }>`
       SELECT ownerOpenId FROM sh_channel WHERE channel = 'feishu'
     `[0]?.ownerOpenId ?? null;
+  }
+
+  /** The owner's message that authorizes answering a worker (§4.3/§7.2): null when the
+   *  message never existed here or did not come from the bound owner. */
+  private ownerMessageRef(msgId: string): string | null {
+    return this.sql`SELECT 1 AS one FROM sh_inbound WHERE channel = 'feishu' AND msgId = ${msgId} AND ownerAuthorized = 1`.length > 0
+      ? `user:${msgId}`
+      : null;
+  }
+
+  /** Whether the bound owner actually sent this message (answer_worker evidence, §4.3). */
+  private async isOwnerMessage(msgId: string): Promise<boolean> {
+    return this.ownerMessageRef(msgId) !== null;
+  }
+
+  /**
+   * A user action that resolves a worker's open question (issue #10): a quote-reply to the
+   * question's message or an option-button click on it. Atomically resolves ONE question —
+   * never guessing between several workers on the same Thread — closes it, relays the answer
+   * to the worker (`send`, after_current_tools semantics), and says so in chat. Returns null
+   * when this action answers no worker question (the normal conversational path continues).
+   * Throwing (caught by the callers) means: this WAS a worker-question answer, but it could
+   * not be delivered — the user is told, the question stays open.
+   */
+  private async answerWorkerQuestion(input: { question: QuestionRow; answer: string; ref: string }): Promise<{
+    workerId: string;
+    delivery: string;
+  } | null> {
+    const { question, answer } = input;
+    // Review finding 1, defense in depth: only the WORKER's own question (kind 'report') is
+    // answered deterministically. Failure/unreported questions are the system asking the
+    // user to decide — their replies belong to the steward, never to a broken/idle worker.
+    if (question.kind !== "report") return null;
+    const worker = question.workerId !== null ? this.ledger.workers.get(question.workerId) : null;
+    if (worker === null) return null; // steward's own question: no worker to relay to
+    const thread = question.threadId !== null ? this.ledger.threads.get(question.threadId) : null;
+    // The owner's answer IS newsworthy on the Thread it belongs to.
+    if (thread) this.ledger.timeline.add(thread.threadId, "user_instruction", `用户回答 worker 的问题：${answer}`, { qid: question.qid, workerId: worker.workerId, ref: input.ref });
+    try {
+      const outcome = await this.dispatcher.sendToWorker({
+        workerId: worker.workerId,
+        text: `（用户对你问题的回答）${answer}`,
+        intent: "now",
+        provenance: input.ref,
+        cmdId: `answer:${question.qid}:${ulid()}`,
+      });
+      if (outcome.kind === "refused") throw new Error(outcome.reason);
+      if (!this.ledger.questions.close(question.qid, answer)) {
+        // Lost the race to ask-side handling: don't relay a second time.
+        this.logChannel("question_answer_race", question.qid);
+        return null;
+      }
+      const owner = this.ownerOpenIdSync();
+      if (owner && thread) {
+        await this.enqueueOutbound({
+          id: `answer:${question.qid}`,
+          kind: "text",
+          to: owner,
+          threadId: thread.threadId,
+          text: `✅ 已把你的回答转给 ${worker.workerId}（${outcome.delivery === "steer" ? "不打断手头工具，当前批次结束后生效" : "按其状态尽快送达"}）。`,
+        });
+      }
+      return { workerId: worker.workerId, delivery: outcome.delivery };
+    } catch (err) {
+      this.logChannel("answer_relay_failed", `${question.qid} ${errorText(err)}`);
+      const owner = this.ownerOpenIdSync();
+      if (owner && thread) {
+        await this.enqueueOutbound({
+          kind: "text",
+          to: owner,
+          threadId: thread.threadId,
+          text: `⚠️ 回答没有送达 ${worker.workerId}（${errorText(err)}）。问题保持打开，稍后再试一次。`,
+          urgency: "push",
+        });
+      }
+      throw err;
+    }
   }
 
   // Plain-HTTP surface reached via the Worker's stub.fetch forwards (index.ts): the Feishu
@@ -1086,6 +1209,11 @@ export class Steward extends Agent<Env> {
     // pending events drained first, the gate inside (lastSeq <= processedUpTo) means this only
     // fires for workers whose event stream cannot tell the story anymore. Timeline, no push.
     this.ledger.workers.reconcileFromSnapshot(auth.deviceId, hello.workers);
+    // Review finding 4 (issue #10): a snapshot-only broken verdict (a caught-up inbox — the
+    // exact case reconciliation exists for) queues a failure push and a wake that the
+    // applied>0-gated drains above never see. Reconcile-side effects drain unconditionally.
+    void this.drainNotifications();
+    void this.drainWakes();
     // The machine is back (or fresh workers appeared): the maintenance alarm must be live
     // for whatever is running now (issue #13).
     this.armWorkerSweeps();
@@ -1223,6 +1351,9 @@ export class Steward extends Agent<Env> {
         // Any applied event can start a run (started/resumed) or end one (settled/lost) —
         // the maintenance alarm follows suit (issue #13).
         this.armWorkerSweeps();
+        // And a question window may have opened (§5.3, issue #10): the fallback alarm
+        // follows the deadlines the reducer just wrote.
+        void this.armQuestionFallback();
         void this.drainNotifications();
         // The reducer may have queued wake_requests (§5.1 step 4): drain what is already due
         // (the 3-second merge window keeps fresh rows waiting for their siblings) and arm the
@@ -1259,7 +1390,15 @@ export class Steward extends Agent<Env> {
           this.ledger.notifications.markSent(intent.id);
           continue;
         }
-        await this.enqueueOutbound({ kind: "card", to: cfg.ownerOpenId, threadId: intent.threadId, card, urgency: "push" });
+        const question = intent.questionId !== null ? this.ledger.questions.get(intent.questionId) : null;
+        await this.enqueueOutbound({
+          kind: "card",
+          to: cfg.ownerOpenId,
+          threadId: intent.threadId,
+          questionId: question?.status === "open" && question.threadId !== null ? question.qid : null,
+          card,
+          urgency: "push",
+        });
         this.ledger.notifications.markSent(intent.id);
       } catch (err) {
         this.logChannel("notify_drain_failed", `${intent.id} ${errorText(err)}`);
@@ -1274,15 +1413,40 @@ export class Steward extends Agent<Env> {
     if (!worker || !thread) return null;
     const machine = this.ledger.machines.get(worker.deviceId);
     const machineName = machine?.name ?? worker.deviceId;
-    const footer = `Thread「${thread.title}」 · ${worker.agent} @ ${machineName} · 引用回复可继续这个 Thread`;
+    // Review note (c): only cards bound to an open REPORT-kind question teach the answer
+    // path (that is the deterministic relay); failure/unreported replies go to the steward,
+    // and a done report keeps the plain continuation footer (there is nothing to answer).
+    const boundQuestion = intent.questionId !== null ? this.ledger.questions.get(intent.questionId) : null;
+    const asksQuestion = boundQuestion !== null && boundQuestion.kind === "report" && boundQuestion.status === "open" && boundQuestion.threadId !== null;
+    const footer = asksQuestion
+      ? `Thread「${thread.title}」 · ${worker.agent} @ ${machineName} · 引用回复这个卡片即可回答它`
+      : `Thread「${thread.title}」 · ${worker.agent} @ ${machineName} · 引用回复可继续这个 Thread`;
     // steward.md §6.4: the timeline link is appended by the system — a fresh one-time link
     // per card, never by the (M2) LLM.
     const detailsUrl = await this.web.linkUrl(linkTargetForThread(thread.threadId));
 
-    if (intent.kind === "done_report" || intent.kind === "attention_report") {
+    if (intent.kind === "done_report") {
       const report = this.ledger.workers.reportsForWorker(worker.workerId).at(-1);
       if (!report) return null;
       return reportCardFor(report, worker, machineName, thread.title, detailsUrl ?? undefined);
+    }
+
+    // §5.3 (issue #10): a blocked/needs_decision question that nothing handled within the
+    // window — the worker's question reaches the user verbatim, from data, with no LLM.
+    // settle:transient never gets here (it queues no question and no intent); error/unreported
+    // classes have their own failure_push rendering below.
+    if (intent.kind === "attention_report" && intent.questionId !== null) {
+      const question = this.ledger.questions.get(intent.questionId);
+      if (!question) return null;
+      const report = this.ledger.workers.reportsForWorker(worker.workerId).at(-1);
+      return workerQuestionCard({
+        question: question.text,
+        ...(report?.summary ? { summary: report.summary } : {}),
+        ...(report?.changes?.length ? { did: didBullets(report) } : {}),
+        threadTitle: thread.title,
+        footer,
+        detailsUrl: detailsUrl ?? undefined,
+      });
     }
 
     // stall_notice (§8.4): attention, not failure — the run may still be a very long tool
@@ -1304,17 +1468,14 @@ export class Steward extends Agent<Env> {
         detailsUrl ?? undefined,
       );
     }
+    const needsYou =
+      boundQuestion?.status === "open" && boundQuestion.text.trim().length > 0
+        ? boundQuestion.text
+        : "查看 Thread 时间线了解详情。";
     if (worker.lastOutcome?.startsWith("start_failed:")) {
-      return failureCard(
-        `派发失败：任务没有开始`,
-        `${worker.lastOutcome.slice("start_failed:".length)}。重新说一次要做什么即可。`,
-        thread.title,
-        footer,
-        detailsUrl ?? undefined,
-      );
+      return failureCard(`派发失败：任务没有开始`, `${worker.lastOutcome.slice("start_failed:".length)}。重新说一次要做什么即可。`, thread.title, footer, detailsUrl ?? undefined);
     }
-    const question = this.ledger.questions.openForThread(thread.threadId);
-    return failureCard("运行出错，需要你决定下一步", question?.text ?? "查看 Thread 时间线了解详情。", thread.title, footer, detailsUrl ?? undefined);
+    return failureCard(worker.lastOutcome === "unreported" ? "运行结束但没有汇报" : "运行出错，需要你决定下一步", needsYou, thread.title, footer, detailsUrl ?? undefined);
   }
 
   // `/加机器` in chat is the trigger (issue #22); `/pair` is the only HTTP consumer of the
@@ -1680,6 +1841,101 @@ export class Steward extends Agent<Env> {
     return this.sql<{ state: string; failReason: string | null; kind: string }>`
       SELECT state, failReason, kind FROM outbox WHERE cmdId = ${cmdId}
     `[0] ?? null;
+  }
+
+  // ---- Worker questions: the §5.3 window, its fallback, and answer_worker (issue #10) ----
+
+  /** Arms the fallback alarm while any unhandled question is inside its window (§5.3).
+   *  Cancel-then-schedule (the pollRuns/drainWakes pattern, review #1): an idempotent insert
+   *  alone would dedup onto an already-pending LATER row, so a shrunken window (or a new,
+   *  earlier deadline) could never pull the alarm in. */
+  private questionFallbackScheduleId: string | undefined;
+
+  private async armQuestionFallback(): Promise<void> {
+    const next = this.ledger.questions.nextFallback();
+    if (next === null) return;
+    if (this.questionFallbackScheduleId !== undefined) {
+      await this.cancelSchedule(this.questionFallbackScheduleId).catch(() => {});
+      this.questionFallbackScheduleId = undefined;
+    }
+    const scheduled = await this.schedule(Math.max(1, Math.ceil((next - Date.now()) / 1000)), "sweepQuestionFallback", undefined, {
+      idempotent: true,
+    }).catch(() => undefined);
+    this.questionFallbackScheduleId = scheduled?.id;
+  }
+
+  /**
+   * The §5.3 fallback pass: questions whose window expired unhandled become a deterministic
+   * attention_report intent — rendered and pushed by drainNotifications straight from the
+   * ledger (worker's question verbatim), with no LLM anywhere on the path. Re-arms while any
+   * question remains unhandled. Safe under DO resets and concurrent alarms: the deadline is
+   * persisted on the question row and queueFallbacks is idempotent. The drain is
+   * UNCONDITIONAL (review finding 3): a restart between queueFallbacks and the delivery pass
+   * leaves the question handled — so `forwarded` alone can no longer be the trigger — and
+   * with no unhandled questions left, armQuestionFallback would not even re-arm the sweep.
+   * Pending intents are idempotent rows; an extra drain pass is always safe.
+   */
+  async sweepQuestionFallback(): Promise<{ forwarded: number }> {
+    let forwarded = 0;
+    try {
+      const pending = this.ledger.questions.unhandled();
+      this.ledger.questions.queueFallbacks();
+      forwarded = this.ledger.notifications.pending().filter((n) => n.questionId !== null && pending.some((q) => q.qid === n.questionId)).length;
+    } catch (err) {
+      this.logChannel("question_fallback_failed", errorText(err));
+    } finally {
+      void this.drainNotifications();
+      void this.armQuestionFallback();
+    }
+    return { forwarded };
+  }
+
+  /**
+   * The steward's `answer_worker` landing (steward.md §4.3, issue #10): the steward answered a
+   * worker's factual question itself. Deterministic here: close exactly the named question,
+   * relay the text to the worker (`send`), and — only after a successful enqueue — cancel the
+   * fallback (markHandled) so the core never also forwards the now-answered question to the
+   * user. A refusal/failure is reported back as an error the model sees.
+   */
+  async answerWorker(input: {
+    workerId: string;
+    questionId: string;
+    text: string;
+    provenance: string;
+    cmdId: string;
+  }): Promise<{ kind: "answered"; delivery: string; threadId: string } | { kind: "refused"; reason: string }> {
+    const worker = this.ledger.workers.get(input.workerId);
+    if (!worker) return { kind: "refused", reason: `worker ${input.workerId} 不存在。` };
+    const question = this.ledger.questions.get(input.questionId);
+    if (!question || question.status !== "open" || question.workerId !== input.workerId) {
+      return { kind: "refused", reason: `问题 ${input.questionId} 不存在、已回答或不属于 worker ${input.workerId}。` };
+    }
+    if (question.kind === "failure" || question.kind === "unreported") {
+      return {
+        kind: "refused",
+        reason:
+          question.kind === "unreported"
+            ? "这个问题是「没有产出汇报」——需要你按最后的原话分类（notify_user 带 questionId）或转问用户，不能对 worker 回答。"
+            : "这个问题是运行失败（凭据/上下文/损坏），不是 worker 的提问——请转问用户（ask_user 带 questionId）。",
+      };
+    }
+    try {
+      const outcome = await this.dispatcher.sendToWorker({
+        workerId: worker.workerId,
+        text: `（总管对你问题的回答，依据见下）${input.text}`,
+        intent: "now",
+        provenance: input.provenance,
+        cmdId: input.cmdId,
+      });
+      if (outcome.kind === "refused") return { kind: "refused", reason: outcome.reason };
+      if (!this.ledger.questions.close(question.qid, `总管代答：${input.text.slice(0, 160)}`)) {
+        return { kind: "refused", reason: "问题刚刚被回答了（可能是用户）。不要重复发送。" };
+      }
+      return { kind: "answered", delivery: outcome.delivery, threadId: worker.threadId };
+    } catch (err) {
+      this.logChannel("answer_worker_failed", `${input.questionId} ${errorText(err)}`);
+      return { kind: "refused", reason: `发送失败：${errorText(err)}` };
+    }
   }
 
   /** The owner-facing reason a start_worker command failed before the worker ever ran. */
@@ -2279,9 +2535,14 @@ export class Steward extends Agent<Env> {
     // effects are on disk. The Feishu send itself settles later through the durable queue.
     const dup = this.sql`SELECT 1 AS one FROM sh_inbound WHERE channel = 'feishu' AND msgId = ${parsed.msgId}`;
     if (dup.length > 0) return Response.json({ code: 0 }); // Feishu redelivery: ack and drop
+    const owner = cfg.ownerOpenId;
+    const ownerAuthorized =
+      owner !== null &&
+      ((parsed.kind === "message" && parsed.chatType === "p2p" && parsed.senderId === owner) ||
+        (parsed.kind === "card_action" && parsed.operatorId === owner));
     this.sql`
-      INSERT INTO sh_inbound (channel, msgId, eventId, eventType, receivedAt)
-      VALUES ('feishu', ${parsed.msgId}, ${parsed.eventId}, ${parsed.eventType}, ${Date.now()})
+      INSERT INTO sh_inbound (channel, msgId, eventId, eventType, receivedAt, ownerAuthorized)
+      VALUES ('feishu', ${parsed.msgId}, ${parsed.eventId}, ${parsed.eventType}, ${Date.now()}, ${ownerAuthorized ? 1 : 0})
     `;
 
     // Delivery verification (issue #24): a QR-created app keeps delivering over its websocket
@@ -2359,13 +2620,35 @@ export class Steward extends Agent<Env> {
   ): Promise<void> {
     const operationId = `user:${input.msgId}`;
     // Signal 1 (§3.1): a quote of one of our messages routes to that Thread directly.
-    const routed = input.parentId ? this.ledger.outbound.threadIdForProviderMsg(input.parentId) : null;
+    const routedRow = input.parentId ? this.ledger.outbound.rowForProviderMsg(input.parentId) : null;
+    const routed = routedRow?.threadId ?? null;
     const routedThread = routed ? this.ledger.threads.get(routed) : null;
     if (routedThread) {
       this.ledger.threads.markRead(routedThread.threadId); // a reply means the report was seen (§6.5)
       // Review #7: a reply routed to a Thread with an open question IS the answer — close it
       // (the deterministic path only closed on re-dispatch, leaving waiting_you stuck when
       // the user e.g. answered "算了"). The steward sees the closed state in the next brief.
+      // Issue #10 (review findings 1-2): the deterministic worker relay applies ONLY to the
+      // quoted card's OWN bound question, and only when the WORKER asked it (kind 'report').
+      // A failure/unreported question is the system asking the user to decide — the reply
+      // must reach the steward (it can re-dispatch; relaying into a broken worker is refused,
+      // and into an error:context worker would prompt the same overflowing session). And a
+      // card whose question is already answered must never resolve a DIFFERENT, later open
+      // question on the Thread — that guess is exactly what the binding exists to prevent.
+      const quotedQuestion = routedRow?.questionId !== null && routedRow?.questionId !== undefined ? this.ledger.questions.get(routedRow.questionId) : null;
+      if (quotedQuestion?.status === "open" && quotedQuestion.workerId !== null && quotedQuestion.kind === "report") {
+        const ref = this.ownerMessageRef(input.msgId);
+        if (ref !== null) {
+          try {
+            await this.answerWorkerQuestion({ question: quotedQuestion, answer: input.text, ref });
+            return; // delivered to the worker; no LLM run for this message
+          } catch {
+            return; // the failure was already told to the user; the question stays open
+          }
+        }
+        // Not a (recorded) owner message — e.g. a card click replayed as text: fall through
+        // to the steward run, closing the question as before.
+      }
       this.ledger.questions.closeOpen(routedThread.threadId, "用户回复了提问");
     }
     // Content markers (§4.2): user text is escaped so it can never mimic a ⟦…⟧ system input;
@@ -2757,6 +3040,31 @@ export class Steward extends Agent<Env> {
       await this.dispatcher.replyToCard(cardMsgId, "这个问题已经回答过了。", chosenThread?.threadId);
       return;
     }
+
+    // An option click on a WORKER's own question (kind 'report', review finding 1) is that
+    // worker's answer (issue #10): relay it before any steward run — a refusal/failure keeps
+    // the question open and tells the user. Failure/unreported questions fall through to the
+    // plain click flow: the decision goes to the steward, not into a broken/idle worker.
+    if (!isNew && !candidate && question.workerId !== null && question.kind === "report") {
+      if (option === null) {
+        await this.dispatcher.replyToCard(cardMsgId, "这个选项已经失效，直接回复文字说明即可。", question.threadId);
+        return;
+      }
+      const ref = this.ownerMessageRef(ev.eventId);
+      if (ref === null) {
+        await this.dispatcher.replyToCard(cardMsgId, "无法确认这次点击的来源，直接回复这张卡片即可。", question.threadId);
+        return;
+      }
+      try {
+        const relayed = await this.answerWorkerQuestion({ question, answer: option, ref });
+        if (relayed !== null) return; // answered and relayed; no steward run for the click
+      } catch {
+        return; // the failure was already told to the user; the question stays open
+      }
+      // The race path (close() lost to a concurrent answer): fall through to the plain click
+      // flow below — the question is answered, the run notes it.
+    }
+
     this.ledger.questions.close(question.qid, candidate?.label ?? option ?? "新开一件事");
 
     if (candidate && chosenThread) {
@@ -2819,6 +3127,7 @@ export class Steward extends Agent<Env> {
     text?: string;
     card?: unknown;
     threadId?: string | null;
+    questionId?: string | null;
     urgency?: "push" | "quiet";
     /** Stable dedupe key (review #6): retries/replays of the same logical message converge on
      *  one row (INSERT OR IGNORE) — the id doubles as the provider-side uuid, so a repeated
@@ -2858,6 +3167,11 @@ export class Steward extends Agent<Env> {
    *  in settled.usage.contextUsage; issue #8's high-context rule reads it at dispatch). */
   async setWorkerContextForTest(workerId: string, percent: number | null): Promise<void> {
     this.sql`UPDATE sh_worker SET contextPercent = ${percent} WHERE workerId = ${workerId}`;
+  }
+
+  /** Test-only: set a worker's state + outcome directly (e.g. terminally broken). */
+  async setWorkerStateForTest(workerId: string, state: string, lastOutcome: string): Promise<void> {
+    this.sql`UPDATE sh_worker SET state = ${state}, lastOutcome = ${lastOutcome}, updatedAt = ${Date.now()} WHERE workerId = ${workerId}`;
   }
 
   /** Test-only: force a still-queued command into a terminal failure — the idle sweep's
@@ -2904,6 +3218,20 @@ export class Steward extends Agent<Env> {
     input: Omit<import("./dispatch.ts").SendToWorkerInput, "provenance" | "cmdId"> & { cmdId?: string },
   ): Promise<import("./dispatch.ts").SendToWorkerOutcome> {
     return this.dispatcher.sendToWorker({ ...input, provenance: "test", cmdId: input.cmdId ?? `test:${ulid()}` });
+  }
+
+  /** Test-only: shrinks every open worker question's fallback window to `ms` (issue #10)
+   *  and re-arms the alarm at the new deadline — returns the affected qids. */
+  async shrinkQuestionWindowForTest(ms: number): Promise<string[]> {
+    const affected = this.ledger.questions.unhandled().map((q) => q.qid);
+    for (const qid of affected) this.ledger.questions.setFallbackWindow(qid, ms);
+    await this.armQuestionFallback();
+    return affected;
+  }
+
+  /** Test-only: the alarm-driven §5.3 fallback pass, callable directly. */
+  async sweepQuestionFallbackForTest(): Promise<{ forwarded: number }> {
+    return this.sweepQuestionFallback();
   }
 
   /** Test entry into the intervention half of the dispatch service (send/interrupt). */
