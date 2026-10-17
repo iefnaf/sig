@@ -360,6 +360,21 @@ connection drops ─▶ connector reconnects with backoff ─▶ wss + token ─
 
 ### 7.3 Dispatching commands while a machine is offline
 
+> **As implemented (issue #14, PR #51).** The offline ask parks the whole dispatch: the
+> worker row (a plain `starting` — #13's sweepWorkers owns its closure), the outbox command
+> (`held` — deliver refuses it, and its enqueue arms the lapse alarm), and the card
+> (`offline:<cmdId>` outbound id, so a tap resolves to exactly that command, never the
+> Thread's latest worker). [wait] clears the hold (`notAfter = null`, delivered at the next
+> hello with a deterministic "started" notice); [switch] expires the held command and
+> re-dispatches over the same deterministic rule — to the unique alternative, or a machine
+> picker when several; with no alternative the original stays held. An unanswered ask lapses
+> with its `notAfter` (default 10 minutes): sweepIdle marks the command `failed/not_after`
+> (the user-withdrawal state `expired` stays reserved for cancel/switch, per #13) and
+> sweepWorkers closes the worker with a failure push — nothing wedges. A waited command
+> keeps the queue's 30-minute idle bound, closed the same way with a「排队超时」push. A
+> continuation to the Thread's remembered machine now asks the same way instead of silently
+> queueing (spec §9 "never decide silently" supersedes the spike's bug-4 behavior).
+
 - The DO finds the machine has no active connection: the command is written to `outbox` (`queued`) and "machine offline" is returned to the steward immediately; the steward asks the user "wait for it to come online, or switch to another machine" (spec §9).
 - User picks "wait": the command's `notAfter` is set to `null`; it is delivered automatically after `welcome` once the machine comes online.
 - User picks "switch": the command is marked `expired` and a new command is created for another machine.

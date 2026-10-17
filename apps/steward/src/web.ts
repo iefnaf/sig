@@ -167,6 +167,7 @@ const KIND_LABELS: Record<string, string> = {
   settled: "结束",
   lost: "失联",
   resumed: "恢复",
+  machine_status: "机器",
   note: "备注",
   stall: "长时间静默",
 };
@@ -740,7 +741,8 @@ export function renderTimeline(view: TimelineView, now: number): string {
             ? "❌"
             : "·";
     const outcome = w.lastOutcome ? ` · ${esc(OUTCOME_LABELS[w.lastOutcome] ?? w.lastOutcome)}` : "";
-    return `<li>${state} ${esc(w.agent)} @ ${esc(w.machineName)}${w.branch ? ` · 分支 ${esc(w.branch)}` : ""}${outcome} · <a href="/app/threads/${esc(view.thread.threadId)}/workers/${esc(w.workerId)}">原始过程</a></li>`;
+    const unreachableTag = w.unreachable ? " · 失联中" : "";
+    return `<li>${state} ${esc(w.agent)} @ ${esc(w.machineName)}${unreachableTag}${w.branch ? ` · 分支 ${esc(w.branch)}` : ""}${outcome} · <a href="/app/threads/${esc(view.thread.threadId)}/workers/${esc(w.workerId)}">原始过程</a></li>`;
   });
   return `<h1>${thread.unread ? "● " : ""}${esc(thread.title)}</h1>${stateBadge(thread.state)}
 <p class="meta">${meta}</p>

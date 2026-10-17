@@ -783,4 +783,28 @@ export const MIGRATIONS: readonly Migration[] = [
       )`;
     },
   },
+  {
+    // Offline dispatch (issue #14, protocol §7.3): the held-command ask. `outbox.held` parks
+    // a start_worker (or resume send) written at an offline machine until the owner answers
+    // (deliver refuses it); `sh_worker.unreachable` marks in-flight workers during a drop
+    // (a flag — the connector's hello snapshot re-states the truth); `sh_machine.otherRunning`
+    // counts worker slots the ledger does not track; `sh_offline_dispatch` binds each ask
+    // card to exactly one command. `sh_notify.dueAt` carries the machine-status debounce:
+    // 004's CREATE TABLE already has it on fresh databases, and the ALTER below adds it to
+    // every deployment that ran the pre-#14 004 — the exact 010_history_relay_cursor hazard
+    // this file documents (PR #51 review finding 1). Numbered 017: #13/#19 took the two
+    // 013s, #10 took 014, #28 took 015_budget, #8 took 016_relay_handoff; ids are unique
+    // strings, which is what the migration ledger keys on.
+    id: "017_offline_dispatch",
+    up: (sql) => {
+      ignoringDuplicateColumn(() => { sql`ALTER TABLE sh_notify ADD COLUMN dueAt INTEGER`; });
+      ignoringDuplicateColumn(() => { sql`ALTER TABLE outbox ADD COLUMN held INTEGER NOT NULL DEFAULT 0`; });
+      ignoringDuplicateColumn(() => { sql`ALTER TABLE sh_worker ADD COLUMN unreachable INTEGER NOT NULL DEFAULT 0`; });
+      ignoringDuplicateColumn(() => { sql`ALTER TABLE sh_machine ADD COLUMN otherRunning INTEGER NOT NULL DEFAULT 0`; });
+      sql`CREATE TABLE IF NOT EXISTS sh_offline_dispatch (
+        cmdId TEXT PRIMARY KEY, threadId TEXT NOT NULL, deviceId TEXT NOT NULL,
+        input TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'offered', choices TEXT
+      )`;
+    },
+  },
 ];

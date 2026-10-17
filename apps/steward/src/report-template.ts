@@ -150,36 +150,80 @@ export function stallCard(
 }
 
 /** The offline-ask card (spec §9): dispatch found only an offline machine — never decide silently. */
-export function offlineAskCard(repoName: string, machineName: string, threadTitle: string) {
+export function offlineAskCard(repoName: string, machineName: string, threadTitle: string, alternatives: string[] = []) {
+  // [换台机器] appears only when another machine actually has the repo (protocol §7.3
+  // "switch to another machine that has the repo"); otherwise the choice is wait or cancel.
+  // The title/body follow the button set (PR #51 review finding 11):「只在 X 上」is a lie
+  // when alternatives exist, and the body must state the actual three-way choice.
+  const actions = [
+    { tag: "button", text: { tag: "plain_text", content: "等它上线" }, type: "primary", value: { action: "wait_online" } },
+    ...(alternatives.length > 0
+      ? [{ tag: "button", text: { tag: "plain_text", content: `换台机器（${alternatives.slice(0, 2).join("／")}${alternatives.length > 2 ? "等" : ""}）` }, type: "default", value: { action: "switch_machine" } }] 
+      : []),
+    { tag: "button", text: { tag: "plain_text", content: "算了" }, type: "default", value: { action: "cancel" } },
+  ];
   return {
     config: { wide_screen_mode: true },
     header: {
       template: "orange",
-      title: { tag: "plain_text", content: `⚠️ ${repoName} 只在 ${machineName} 上，它现在不在线` },
+      title: {
+        tag: "plain_text",
+        content: alternatives.length > 0 ? `⚠️ ${machineName} 不在线（${repoName}）` : `⚠️ ${repoName} 只在 ${machineName} 上，它现在不在线`,
+      },
     },
     elements: [
       {
         tag: "div",
         text: {
           tag: "lark_md",
-          content: `已建好 Thread「${threadTitle}」。要排队等它上线后自动开始，还是取消？`,
+          content:
+            alternatives.length > 0
+              ? `已建好 Thread「${threadTitle}」。等 ${machineName} 上线后自动开始，还是换台机器（${alternatives.slice(0, 2).join("、")}${alternatives.length > 2 ? " 等" : ""}）？`
+              : `已建好 Thread「${threadTitle}」。要排队等它上线后自动开始，还是取消？`,
         },
       },
       {
         tag: "action",
         // The values carry only the action — the Thread is resolved from the card's
         // providerMsgId on callback, never from data stuffed in here (spike bug, §3.1).
-        actions: [
-          { tag: "button", text: { tag: "plain_text", content: "排队等上线" }, type: "primary", value: { action: "wait_online" } },
-          { tag: "button", text: { tag: "plain_text", content: "算了" }, type: "default", value: { action: "cancel" } },
-        ],
+        actions,
       },
       { tag: "note", elements: [{ tag: "plain_text", content: `Thread「${threadTitle}」 · ${machineName}` }] },
     ],
   };
 }
 
-/** The three-part card the steward's `notify_user` renders (steward.md §6.4 source 2). */
+export function machineOfflineCard(machineName: string, threadTitle: string, footer: string) {
+  return renderReportCard({
+    tone: "attention",
+    conclusion: `${machineName} 暂时联系不上`,
+    did: [`「${threadTitle}」正在它上面运行：已标记为暂时失联，未按失败处理`],
+    needsYou: "无需操作；机器重新上线后会自动对账并告诉你结果。",
+    threadTitle,
+    footer,
+  });
+}
+
+export function machineOnlineCard(machineName: string, threadTitle: string, outcome: string, footer: string) {
+  return renderReportCard({
+    tone: "success",
+    conclusion: `${machineName} 回来了`,
+    did: [`「${threadTitle}」${outcome}`],
+    threadTitle,
+    footer,
+  });
+}
+
+export function waitedStartCard(machineName: string, threadTitle: string, footer: string, detailsUrl?: string) {
+  return renderReportCard({
+    tone: "success",
+    conclusion: `${machineName} 上线了，等它的任务开始跑`,
+    did: [`「${threadTitle}」已送达 ${machineName}，开始后照常汇报`],
+    threadTitle,
+    footer,
+    detailsUrl,
+  });
+}
 export function notifyCard(input: {
   tone: Tone;
   conclusion: string;
