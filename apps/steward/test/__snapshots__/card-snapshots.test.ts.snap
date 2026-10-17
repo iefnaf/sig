@@ -1,5 +1,92 @@
 // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
 
+exports[`card snapshots (issue #11) > consent-carrying done report (issue #21): the ask replaces needs-you, [同意]/[先不要] ride along 1`] = `
+{
+  "config": {
+    "wide_screen_mode": true,
+  },
+  "elements": [
+    {
+      "tag": "div",
+      "text": {
+        "content": "**做了什么**
+- auth/session.ts 里补上了 token 过期后的刷新
+- 测试通过
+- 分支 shepherd/login-1，2 个提交，未推送",
+        "tag": "lark_md",
+      },
+    },
+    {
+      "tag": "hr",
+    },
+    {
+      "tag": "div",
+      "text": {
+        "content": "**需要你**：分支 shepherd/login-1（2 个提交）还没推送。点「同意」我会推送并创建 PR；选「先不要」就先留在机器上。",
+        "tag": "lark_md",
+      },
+    },
+    {
+      "actions": [
+        {
+          "tag": "button",
+          "text": {
+            "content": "同意",
+            "tag": "plain_text",
+          },
+          "type": "primary",
+          "value": {
+            "action": "pr_approve",
+          },
+        },
+        {
+          "tag": "button",
+          "text": {
+            "content": "先不要",
+            "tag": "plain_text",
+          },
+          "type": "default",
+          "value": {
+            "action": "pr_decline",
+          },
+        },
+      ],
+      "tag": "action",
+    },
+    {
+      "actions": [
+        {
+          "tag": "button",
+          "text": {
+            "content": "查看详情",
+            "tag": "plain_text",
+          },
+          "type": "default",
+          "url": "https://example.com/link/wl1.t/t_test.1.0abc",
+        },
+      ],
+      "tag": "action",
+    },
+    {
+      "elements": [
+        {
+          "content": "Thread「修复登录 bug」 · pi @ mac-studio · 引用回复可继续这个 Thread",
+          "tag": "plain_text",
+        },
+      ],
+      "tag": "note",
+    },
+  ],
+  "header": {
+    "template": "green",
+    "title": {
+      "content": "✅ 登录 bug 修好，测试通过",
+      "tag": "plain_text",
+    },
+  },
+}
+`;
+
 exports[`card snapshots (issue #11) > merged done reports: one card, each Thread keeps its three parts 1`] = `
 {
   "config": {
@@ -28,7 +115,7 @@ exports[`card snapshots (issue #11) > merged done reports: one card, each Thread
       "text": {
         "content": "- auth/session.ts 里补上了 token 过期后的刷新
 - 测试通过
-- 分支 shepherd/login-1，2 个提交，未推送",
+- 分支 shepherd/login-1，2 个提交，已推送",
         "tag": "lark_md",
       },
     },
@@ -113,7 +200,7 @@ exports[`card snapshots (issue #11) > single done report: the fixed three-part c
         "content": "**做了什么**
 - auth/session.ts 里补上了 token 过期后的刷新
 - 测试通过
-- 分支 shepherd/login-1，2 个提交，未推送",
+- 分支 shepherd/login-1，2 个提交，已推送",
         "tag": "lark_md",
       },
     },

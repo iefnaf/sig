@@ -196,12 +196,15 @@ describe("quiet merging: one window, one message (steward.md §6.4)", () => {
   });
 
   it("done reports across Threads merge into one card that keeps each Thread's three parts", async () => {
+    // pushed: ordinary completions — an unpushed write completion would carry #21's consent
+    // ask and push instead of merging (that behavior has its own suite in pr-consent.test.ts).
     const runA: FakeWorkerRun = {
       status: "done",
       summary: "登录 bug 修好，测试通过",
       changes: ["auth/session.ts 补上 token 刷新"],
       tests: { ran: true, passed: true },
       branch: "shepherd/login-1",
+      pushed: true,
     };
     const runB: FakeWorkerRun = {
       status: "done",
@@ -210,6 +213,7 @@ describe("quiet merging: one window, one message (steward.md §6.4)", () => {
       tests: { ran: true, passed: true },
       branch: "shepherd/refund-1",
       next: "跑一遍全量回归",
+      pushed: true,
     };
     const fake = await pairFakeConnector("mac-studio", { run: runA, autorun: true });
     await fake.connect();
@@ -274,7 +278,7 @@ describe("viewing a Thread clears unread (steward.md §6.5)", () => {
   /** One idle thread with a forced-sent done card (quiet, window time-travelled). */
   async function threadWithUnreadCard(): Promise<{ fake: FakeConnector; threadId: string; cardMsgId: string }> {
     const fake = await pairFakeConnector("mac-studio", {
-      run: { status: "done", summary: "登录 bug 修好，测试通过", changes: ["auth/session.ts 补上 token 刷新"] },
+      run: { status: "done", summary: "登录 bug 修好，测试通过", changes: ["auth/session.ts 补上 token 刷新"], pushed: true },
     });
     await fake.connect();
     const dispatched = await ownerStub().dispatchForTest({ prompt: "修登录 bug", repoRef: "repo-a", newTitle: "修登录 bug" });

@@ -259,6 +259,7 @@ Common envelope:
 | `stop_process` | none | |
 | `cleanup_worktree` | `force?` | |
 | `reconcile` | none | Ask for a fresh `hello.workers` snapshot |
+| `pr_worker` | `workerId, title?, body?` | The PR consent gate (issue #21): push the branch + `gh pr create` in the worktree; result arrives as `pr_created`/`pr_failed` events |
 | `diag` | none | Ask for diagnostic information |
 
 Images ride base64-encoded in `images` and must fit, together with the whole command, within 256 KiB (about 190 KB of image bytes). Anything larger is compressed on the steward side before dispatch (downscaled or converted to JPEG); if it still does not fit, the command is rejected and the user is told. Ways to pass larger images: open question 3 in §8; not implemented in the MVP.

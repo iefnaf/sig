@@ -16,6 +16,7 @@ import type { AgentAdapter } from "./agent.ts";
 import { PiAdapter } from "./pi-adapter.ts";
 import { ClaudeAdapter, detectClaude } from "./claude-adapter.ts";
 import { VERSION } from "./version.ts";
+import type { PrExec } from "./pr.ts";
 
 export interface ConnectorAppOptions {
   store: LocalStore;
@@ -34,6 +35,8 @@ export interface ConnectorAppOptions {
   recovery?: RecoveryOptions;
   /** Stall-watchdog knobs (tests shrink timers and inject CPU samples). */
   watchdog?: StallWatchdogOptions;
+  /** pr_worker knobs (issue #21): the exec seam scripts gh/git in tests. */
+  pr?: { exec?: PrExec; timeoutMs?: number };
   /** Coarse lifecycle logging (daemon): event names and ids only, never session content. */
   log?: (event: string, fields?: Record<string, unknown>) => void;
   /** Connection lifecycle hooks, forwarded to the client (the daemon logs these). */
@@ -86,6 +89,7 @@ export class ConnectorApp {
           this.log?.("watchdog_error", { error: err instanceof Error ? err.message : String(err) });
         },
       },
+      pr: options.pr,
       emit: (workerId, fields) => {
         this.log?.("worker_event", { workerId, type: fields.type });
         this.client.emit(workerId, fields);

@@ -109,6 +109,10 @@ import {
   machineOfflineCard,
   machineOnlineCard,
   waitedStartCard,
+  prConsentFor,
+  prCreatedCard,
+  prFailureNeedsYou,
+  prCommandArgs,
   type AskCardButton,
   type QuietSection,
 } from "./report-template.ts";
@@ -262,6 +266,33 @@ const BACKGROUND_CONTEXT: Parameters<Harness["usage"]>[0] = Object.freeze({
 /** UTF-8 size of a serialized relay message — the byte meter is numbers only, never content. */
 function jsonByteLength(value: unknown): number {
   return new TextEncoder().encode(JSON.stringify(value)).length;
+}
+
+/** The connector's pr_worker error codes (worker-manager.ts) → the failure card's stages
+ *  (review finding 3): lets the failed-cmd_result path keep the stage-specific fix text
+ *  even when it wins the race against the classified pr_failed event. */
+const PR_ERROR_CODE_TO_STAGE: Readonly<Record<string, string>> = {
+  gh_missing: "gh_missing",
+  gh_auth: "auth",
+  push_rejected: "push",
+  pr_create_failed: "create",
+};
+
+/** The pr notify intents' render inputs (issue #21): JSON written by the reducer, read here;
+ *  malformed/absent payload degrades to empty strings, never a thrown render. */
+function parseNotifyPayload(payload: string | null): { url?: string; branch?: string; stage?: string; message?: string } {
+  if (payload === null) return {};
+  try {
+    const parsed = JSON.parse(payload) as Record<string, unknown>;
+    return {
+      ...(typeof parsed.url === "string" ? { url: parsed.url } : {}),
+      ...(typeof parsed.branch === "string" ? { branch: parsed.branch } : {}),
+      ...(typeof parsed.stage === "string" ? { stage: parsed.stage } : {}),
+      ...(typeof parsed.message === "string" ? { message: parsed.message } : {}),
+    };
+  } catch {
+    return {};
+  }
 }
 
 function errorText(err: unknown): string {
@@ -1355,6 +1386,8 @@ export class Steward extends Agent<Env> {
     // ambiguous rows are never re-delivered (§4.2) — the steward is woken to ask (issue #15).
     for (const pending of hello.pendingAcks) {
       if (pending.state === "ambiguous") {
+        // pr_worker rows route to the consent gate's own deterministic answer inside
+        // (issue #21); every other kind gets #15's wake-to-ask.
         this.markCommandAmbiguous(pending.cmdId, "hello.pendingAcks");
       } else if (pending.state === "done" || pending.state === "failed") {
         // The connector resolved the command from session-tail evidence before connecting:
@@ -1456,7 +1489,8 @@ export class Steward extends Agent<Env> {
       this.noteCommandFailure(ack.re, `连接器拒绝（${ack.code ?? "未知原因"}）`);
     } else if (ack.status === "ambiguous") {
       // protocol §4.2: a crash during `sending`, undecidable — no automatic re-send. The row
-      // is marked ambiguous and the steward is woken to ask the user (issue #15).
+      // is marked ambiguous; #15 wakes the steward to ask, except pr_worker rows, which the
+      // consent gate answers deterministically (issue #21).
       this.markCommandAmbiguous(ack.re, "cmd_ack");
     }
   }
@@ -1470,7 +1504,23 @@ export class Steward extends Agent<Env> {
       UPDATE outbox SET state = ${result.ok ? "done" : "failed"}, result = ${JSON.stringify(result.ok ? result.data ?? null : result.error ?? null)}
       WHERE cmdId = ${result.re}
     `;
-    if (!result.ok && !wasFailed) {
+    if (result.ok) {
+      // Review finding 4 (#57): a pr_worker settles with the URL even when its pr_created
+      // event was lost (the connector's emit raced a shutdown). This backstop delivers the
+      // card from the command result; idempotent against the event path — whichever lands
+      // first wins, the other no-ops on the already-set url (so redeliveries are free).
+      const row = this.sql<{ workerId: string | null; kind: string }>`
+        SELECT workerId, kind FROM outbox WHERE cmdId = ${result.re}
+      `[0];
+      const data = (result.data ?? {}) as { url?: unknown; branch?: unknown };
+      if (row?.kind === "pr_worker" && row.workerId && typeof data.url === "string" && data.url !== "") {
+        if (this.ledger.prConsent.settleFromCommand(result.re, data.url, typeof data.branch === "string" ? data.branch : "")) {
+          void this.drainNotifications();
+        }
+      }
+      return;
+    }
+    if (!wasFailed) {
       const error = (result.error ?? {}) as { code?: unknown; message?: unknown };
       const reason = [typeof error.code === "string" ? error.code : null, typeof error.message === "string" ? error.message : null]
         .filter((part): part is string => part !== null)
@@ -1524,8 +1574,10 @@ export class Steward extends Agent<Env> {
 
   // A start_worker the connector could not run: the worker lands `broken`, the failure reaches
   // the timeline + the user deterministically (there is no LLM to relay it in M1). Idempotent
-  // on the cmdId — cmd_result redeliveries re-run this handler.
-  private noteCommandFailure(cmdId: string, reason: string): void {
+  // on the cmdId — cmd_result redeliveries re-run this handler. `stageHint` (issue #21) lets
+  // callers without a settled result pick the pr_failed card's stage (the idle sweep's
+  // timeout is a *delivery* failure, not an execution one).
+  private noteCommandFailure(cmdId: string, reason: string, stageHint?: string): void {
     const row = this.sql<{ workerId: string | null; kind: string }>`
       SELECT workerId, kind FROM outbox WHERE cmdId = ${cmdId}
     `[0];
@@ -1536,6 +1588,29 @@ export class Steward extends Agent<Env> {
       void this.drainNotifications();
       return;
     }
+    // A pr_worker that never succeeded (issue #21): the connector's own failures arrive as
+    // pr_failed events (which call the same sink — the first one wins, no double card); this
+    // path covers rejections at the door and results the event stream already reported.
+    if (row.kind === "pr_worker") {
+      // Review finding 3: the result's error code carries the connector's classification —
+      // map it back so the card keeps the stage-specific fix even when this path wins the
+      // race against the pr_failed event (fail() dedupes whichever lands second).
+      const resultRaw = this.sql<{ result: string | null }>`SELECT result FROM outbox WHERE cmdId = ${cmdId}`[0]?.result;
+      let code: string | null = null;
+      let message: string | null = null;
+      try {
+        const parsed = resultRaw ? (JSON.parse(resultRaw) as { code?: unknown; message?: unknown }) : null;
+        if (typeof parsed?.code === "string") code = parsed.code;
+        if (typeof parsed?.message === "string" && parsed.message !== "") message = parsed.message;
+      } catch {
+        // result unreadable — the generic reason stands
+      }
+      const stage = stageHint ?? PR_ERROR_CODE_TO_STAGE[code ?? ""] ?? "command";
+      if (this.ledger.prConsent.fail({ workerId: row.workerId, cmdId, stage, message: message ?? reason })) {
+        void this.drainNotifications();
+      }
+      return;
+    }
     if (row.kind !== "start_worker") return;
     if (this.ledger.workers.markStartFailed(row.workerId, cmdId, reason)) {
       void this.drainNotifications();
@@ -1544,7 +1619,10 @@ export class Steward extends Agent<Env> {
 
   /** Issue #15 / protocol §4.2: the connector reported a command `ambiguous` (a crash during
    *  `sending` — delivery unknowable). Mark the outbox row ambiguous (never re-sent) and wake
-   *  the steward to ask the user; idempotent on the cmdId via the wake's dedupeKey. */
+   *  the steward to ask the user; idempotent on the cmdId via the wake's dedupeKey.
+   *  Exception: a pr_worker routes to the consent gate's own deterministic answer (issue #21,
+   *  review finding 2) — an "ask the user" wake would only second-guess the card that already
+   *  tells them exactly what to do (check the repo, re-tap to retry). */
   private markCommandAmbiguous(cmdId: string, via: string): void {
     // Idempotency gate: the wake/note fire only when this call actually transitioned the
     // row (duplicate cmd_acks and repeated hellos find it already ambiguous).
@@ -1557,6 +1635,10 @@ export class Steward extends Agent<Env> {
       SELECT workerId, kind, payload FROM outbox WHERE cmdId = ${cmdId}
     `[0];
     if (!row || !row.workerId) return;
+    if (row.kind === "pr_worker") {
+      this.markPrWorkerAmbiguous(row.workerId, cmdId);
+      return;
+    }
     const worker = this.ledger.workers.get(row.workerId);
     if (!worker) return;
     const instruction = escapeMarkers(commandInstruction(row.kind, row.payload));
@@ -1573,6 +1655,26 @@ export class Steward extends Agent<Env> {
       { priority: "high" },
     );
     void this.drainWakes();
+  }
+
+  /**
+   * The consent gate's ambiguous answer (issue #21, review finding 2 of #57): an ambiguous
+   * pr_worker must not wedge the consent row in "in flight" forever. The outcome is
+   * undecidable — the PR may or may not exist — which is itself an answer the owner needs;
+   * a later replayed pr_created (persist-first §11.3) heals the row with the URL. fail() is
+   * idempotent, so the duplicate hello/pendingAck redeliveries are free.
+   */
+  private markPrWorkerAmbiguous(workerId: string, cmdId: string): void {
+    if (
+      this.ledger.prConsent.fail({
+        workerId,
+        cmdId,
+        stage: "ambiguous",
+        message: "连接器在执行中途失联，PR 是否已创建无法确定",
+      })
+    ) {
+      void this.drainNotifications();
+    }
   }
 
   private handleEvents(connection: Connection, raw: unknown): void {
@@ -1686,11 +1788,22 @@ export class Steward extends Agent<Env> {
         // Issue #11 (spec §7.6): an ordinary done report is QUIET — it merges over the
         // 60-second window instead of buzzing the phone. Everything the reducer queues for
         // the user's attention (question-bound reports, stalls, failures) pushes at once,
-        // and a done report on a Thread already waiting on the user pushes too.
-        const quiet = intent.kind === "done_report" && !questionTied && thread?.state !== "waiting_you";
+        // and a done report on a Thread already waiting on the user pushes too. Issue #21:
+        // a done report carrying the consent ask is waiting_you in card form — [同意]/[先不
+        // 要] cannot ride a merged card (sections carry no buttons, and one merged message
+        // settles N member rows' providerMsgIds, which would break the tap's §3.1 routing) —
+        // so it pushes on its own, buttons intact.
+        const quiet =
+          intent.kind === "done_report" &&
+          !questionTied &&
+          thread?.state !== "waiting_you" &&
+          rendered.holdsConsentAsk !== true;
         await this.enqueueOutbound({
           kind: "card",
           to: cfg.ownerOpenId,
+          // Stable id (issue #21): the done card's [同意]/[先不要] resolves through this id
+          // (`notify:report:<workerId>:<seq>`) on callback — the §3.1 rule applied to consent.
+          id: `notify:${intent.dedupeKey}`,
           threadId: intent.threadId,
           questionId: questionTied && question!.threadId !== null ? question!.qid : null,
           card: rendered.card,
@@ -1708,7 +1821,9 @@ export class Steward extends Agent<Env> {
   /** Deterministic core templates (steward.md §6.2 source 1): data in, card out, no LLM.
    *  Done reports also carry their merge section (issue #11) so a quiet window folds several
    *  threads into one card that keeps each one's three parts. */
-  private async renderNotification(intent: NotifyRow): Promise<{ card: unknown; section?: QuietSection } | null> {
+  private async renderNotification(intent: NotifyRow): Promise<
+    { card: unknown; section?: QuietSection; holdsConsentAsk?: boolean } | null
+  > {
     const worker = intent.workerId ? this.ledger.workers.get(intent.workerId) : null;
     const thread = this.ledger.threads.get(intent.threadId);
     if (!worker || !thread) return null;
@@ -1763,22 +1878,65 @@ export class Steward extends Agent<Env> {
     }
 
     if (intent.kind === "done_report") {
-      const report = this.ledger.workers.reportsForWorker(worker.workerId).at(-1);
+      // The intent's own seq (its dedupeKey is `report:<workerId>:<seq>`), so the consent
+      // gate binds to the report this card rendered — not to a newer one that arrived in
+      // between (issue #21: the [同意] tap must key on exactly what the user saw).
+      const seqMatch = /^report:([^:]+):(\d+)$/.exec(intent.dedupeKey);
+      const report = seqMatch
+        ? (this.ledger.workers.reportsForWorker(seqMatch[1]!)?.find((r) => r.seq === Number(seqMatch[2])) ??
+          this.ledger.workers.reportsForWorker(worker.workerId).at(-1))
+        : this.ledger.workers.reportsForWorker(worker.workerId).at(-1);
       if (!report) return null;
       const needsYou = needsYouOf(report);
+      // Issue #21 × #11: a consent-carrying done report asks the user ([同意]/[先不要]) — it
+      // pushes as its own card (see drainNotifyPass) and never contributes a merge section
+      // (sections carry no buttons). Ordinary completions keep #11's quiet merge.
+      const consent = prConsentFor(report, worker);
       return {
         card: reportCardFor(report, worker, machineName, thread.title, detailsUrl ?? undefined),
-        // The merge section (issue #11): the same three parts the single card renders, kept
-        // per Thread when several done reports share one quiet window.
-        section: {
-          kind: "report",
-          tone: toneOfReport(report.status),
-          conclusion: report.summary,
-          did: didBullets(report),
-          ...(needsYou !== undefined ? { needsYou } : {}),
+        ...(consent
+          ? { holdsConsentAsk: true }
+          : {
+              // The merge section (issue #11): the same three parts the single card renders,
+              // kept per Thread when several done reports share one quiet window.
+              section: {
+                kind: "report",
+                tone: toneOfReport(report.status),
+                conclusion: report.summary,
+                did: didBullets(report),
+                ...(needsYou !== undefined ? { needsYou } : {}),
+                threadTitle: thread.title,
+                ...(detailsUrl ? { detailsUrl } : {}),
+              } satisfies QuietSection,
+            }),
+      };
+    }
+
+    // The consent gate's async answers (issue #21): the PR URL, or the classified failure —
+    // both deterministic, both from the payload the reducer attached to the intent. Both are
+    // the user's awaited answer to their own tap: push, never a merge section.
+    if (intent.kind === "pr_created") {
+      const payload = parseNotifyPayload(intent.payload);
+      return {
+        card: prCreatedCard({
+          url: payload.url ?? "",
+          branch: payload.branch ?? "",
           threadTitle: thread.title,
-          ...(detailsUrl ? { detailsUrl } : {}),
-        } satisfies QuietSection,
+          footer,
+          detailsUrl: detailsUrl ?? undefined,
+        }),
+      };
+    }
+    if (intent.kind === "pr_failed") {
+      const payload = parseNotifyPayload(intent.payload);
+      return {
+        card: failureCard(
+          "推送 / 创建 PR 失败",
+          prFailureNeedsYou(String(payload.stage ?? ""), String(payload.message ?? "")),
+          thread.title,
+          footer,
+          detailsUrl ?? undefined,
+        ),
       };
     }
 
@@ -2061,17 +2219,22 @@ export class Steward extends Agent<Env> {
     // while the machine is away — this pass is the only writer it will see. It writes the
     // same terminal `failed/not_after` deliver() would (never `expired`: that is the
     // user's withdrawal state); sweepWorkers then closes the `starting` worker with a push.
-    const lapsed = this.sql<{ cmdId: string }>`
-      SELECT cmdId FROM outbox
+    const lapsed = this.sql<{ cmdId: string; kind: string }>`
+      SELECT cmdId, kind FROM outbox
       WHERE state = 'queued' AND notAfter IS NOT NULL AND notAfter <= ${nowMs}
     `;
     for (const row of lapsed) {
       this.sql`UPDATE outbox SET state = 'failed', failReason = 'not_after' WHERE cmdId = ${row.cmdId} AND state = 'queued'`;
     }
     const cutoff = nowMs - IDLE_FAIL_MS;
-    const stale = this.sql<{ cmdId: string }>`SELECT cmdId FROM outbox WHERE state = 'queued' AND createdAt <= ${cutoff} AND held = 0`;
+    const stale = this.sql<{ cmdId: string; kind: string }>`SELECT cmdId, kind FROM outbox WHERE state = 'queued' AND createdAt <= ${cutoff} AND held = 0`;
     for (const row of stale) {
       this.sql`UPDATE outbox SET state = 'failed', failReason = 'idle' WHERE cmdId = ${row.cmdId}`;
+      // Issue #21: a pr_worker the machine never came back for must not vanish silently —
+      // the consent click promised an answer, so the failure reaches the owner as a card
+      // (the `delivery` stage fits: the instruction never reached the machine).
+      // (start_worker rows keep their existing quiet path: the worker sweep owns those.)
+      if (row.kind === "pr_worker") this.noteCommandFailure(row.cmdId, "机器长时间未上线，指令超时未送达", "delivery");
     }
     const waiting = this.sql<{ n: number }>`SELECT COUNT(*) AS n FROM outbox WHERE state = 'queued'`[0]!.n;
     if (waiting > 0) void this.schedule(IDLE_SWEEP_INTERVAL_S, "sweepIdle");
@@ -3435,6 +3598,10 @@ export class Steward extends Agent<Env> {
       await this.handleNoteDecisionCard(action, ev.cardMsgId, ownerOpenId);
       return;
     }
+    if (action === "pr_approve" || action === "pr_decline") {
+      await this.handlePrConsentCard(action, ev.cardMsgId, ownerOpenId);
+      return;
+    }
     await this.dispatcher.handleCardAction({ operatorId: ev.operatorId, action, cardMsgId: ev.cardMsgId });
   }
 
@@ -3475,6 +3642,114 @@ export class Steward extends Agent<Env> {
     }
     // The tap's ack is a direct response to the owner's action (issue #11): push.
     await this.enqueueOutbound({ kind: "text", to: ownerOpenId, text: reply, urgency: "push" });
+  }
+
+  /**
+   * The consent gate's chat half (issue #21, spike-conclusions §2): the done card's
+   * [同意] / [先不要]. The tap resolves through the card's providerMsgId → outbound row id
+   * `notify:report:<workerId>:<seq>` — identity never rides in the button (§3.1).
+   *
+   * - [同意] sends the `pr_worker` command (push + `gh pr create` on the machine); the
+   *   result lands back asynchronously as a pr_created / pr_failed card. A re-tap after a
+   *   failure is a retry: a fresh command id, the failure marker cleared.
+   * - [先不要] records the decision and does nothing else — the commits stay on the machine.
+   */
+  private async handlePrConsentCard(action: string, cardMsgId: string, ownerOpenId: string): Promise<void> {
+    const row = this.ledger.outbound.rowForProviderMsg(cardMsgId);
+    const parsed = row !== null && row.id.startsWith("notify:report:") ? /^notify:report:([^:]+):(\d+)$/.exec(row.id) : null;
+    const reply = async (text: string): Promise<void> => {
+      await this.enqueueOutbound({ kind: "text", to: ownerOpenId, text, threadId: row?.threadId ?? null, urgency: "push" });
+    };
+    if (!parsed || !row?.threadId) {
+      await reply("这张汇报卡片已经失效（找不到对应的汇报）；直接回复文字说明想做什么即可。");
+      return;
+    }
+    const workerId = parsed[1]!;
+    const seq = Number(parsed[2]);
+    const worker = this.ledger.workers.get(workerId);
+    if (!worker) {
+      await reply("这个 worker 已经不在了；重新描述一下要做什么即可。");
+      return;
+    }
+    this.ledger.threads.markRead(worker.threadId); // a click is both read and a reply (§6.5)
+    const consent = this.ledger.prConsent.get(workerId, seq);
+    // Cross-card truth (review finding 5): rows are per report, the PR is per worker/branch —
+    // any of this worker's cards' outcomes answers for this tap, so two done cards can never
+    // race two pr_worker commands onto one branch.
+    const branch = this.ledger.prConsent.branchState(workerId);
+
+    if (action === "pr_decline") {
+      if (branch.url) {
+        await reply(`PR 已经创建过了：${branch.url}；这次就不再动了。`);
+        return;
+      }
+      if (branch.pending && this.commandInFlight(branch.pendingCmdId)) {
+        // An approve is already in flight; the honest answer is that it cannot be recalled.
+        await reply("已经在推送并创建 PR 了，停不下来；结果稍后回到这里。不想要的话可以去仓库关掉它。");
+        return;
+      }
+      this.ledger.prConsent.record({ workerId, seq, threadId: worker.threadId, decision: "declined" });
+      this.ledger.timeline.add(worker.threadId, "note", "用户选择先不推送/创建 PR（consent gate）", { workerId, seq });
+      await reply("好的，先不推送；提交都还在机器上。想创建 PR 时回到这张卡片点「同意」，或直接跟我说。");
+      return;
+    }
+
+    // pr_approve
+    if (branch.url) {
+      await reply(`PR 已经创建过了：${branch.url}`);
+      return;
+    }
+    if (branch.pending && this.commandInFlight(branch.pendingCmdId)) {
+      await reply("正在推送并创建 PR，稍等结果回到这里。");
+      return;
+    }
+    // A pending row whose command is provably dead (crash between the consent record and the
+    // enqueue, or an ambiguous that never reached us) is a wedge, not an in-flight run — fall
+    // through: this tap becomes the retry, and the attempt counter keeps the history honest.
+    if (!worker.branch) {
+      await reply("这个 worker 没有分支（可能是只读任务），无法创建 PR；重新描述一下需求即可。");
+      return;
+    }
+    if (!this.ledger.machines.get(worker.deviceId)) {
+      await reply("找不到当初那台机器；等它上线后回到这张卡片再点一次「同意」即可。");
+      return;
+    }
+    const attempt = (consent?.attempts ?? 0) + 1;
+    const cmdId = `pr:${workerId}:${seq}:${attempt}`;
+    const report = (this.ledger.workers.reportsForWorker(workerId) ?? []).find((r) => r.seq === seq) ?? null;
+    const thread = this.ledger.threads.get(worker.threadId);
+    const { title, body } = prCommandArgs({ report, threadTitle: thread?.title ?? worker.threadId, branch: worker.branch });
+    // notAfter null: an offline machine gets the command at its next hello — the user's tap
+    // is the same "queue until online" consent as the offline-ask card's 排队等上线.
+    // Record BEFORE enqueueing: the consent row is the event handlers' anchor (pr_created /
+    // pr_failed resolve through cmdId), and no async gap may precede its existence.
+    this.ledger.prConsent.record({ workerId, seq, threadId: worker.threadId, decision: "approved", cmdId, attempts: attempt });
+    await this.enqueue(worker.deviceId, "pr_worker", { workerId, title, body }, { workerId, notAfter: null, cmdId });
+    const retryNote = attempt > 1 ? `（第 ${attempt} 次尝试）` : "";
+    this.ledger.timeline.add(worker.threadId, "note", `用户同意推送 ${worker.branch} 并创建 PR${retryNote}`, {
+      workerId,
+      seq,
+      cmdId,
+    });
+    await this.enqueueOutbound({
+      kind: "text",
+      to: ownerOpenId,
+      text: `好的，正在推送 ${worker.branch} 并创建 PR${retryNote}；结果稍后回到这里。`,
+      threadId: worker.threadId,
+      urgency: "push",
+    });
+  }
+
+  /** Whether a consent-pending command is still deliverable (review finding 2): queued,
+   *  sent, or accepted. Terminal states (done/failed/ambiguous/expired) and rows that never
+   *  came to exist (the record-then-enqueue crash window) are "dead" — the pending consent
+   *  row they left behind is a wedge this tap is allowed to break by retrying.
+   *  done-with-url rows never read as pending (branchState saw the url), so a done row here
+   *  means its result carried no url — dead for our purposes. */
+  private commandInFlight(cmdId: string | null): boolean {
+    if (cmdId === null) return false;
+    const state = this.sql<{ state: string }>`SELECT state FROM outbox WHERE cmdId = ${cmdId}`[0]?.state;
+    return state === "queued" || state === "sent" || state === "accepted";
   }
 
   /**

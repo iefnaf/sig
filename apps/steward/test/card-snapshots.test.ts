@@ -35,7 +35,9 @@ function report(overrides: Partial<ReportRow> = {}): ReportRow {
     tests: { ran: true, passed: true },
     question: null,
     next: null,
-    git: { branch: "shepherd/login-1", base: "main", ahead: 2, dirty: 0, filesChanged: 2, insertions: 30, deletions: 4, pushed: false },
+    // pushed: an ORDINARY completion (nothing left to ask) — issue #21 gives unpushed write
+    // completions their own consent-card snapshot below.
+    git: { branch: "shepherd/login-1", base: "main", ahead: 2, dirty: 0, filesChanged: 2, insertions: 30, deletions: 4, pushed: true },
     ...overrides,
   };
 }
@@ -63,6 +65,12 @@ describe("card snapshots (issue #11)", () => {
   it("single done report: the fixed three-part card", () => {
     const done = report({ next: "跑一遍全量测试" });
     const card = reportCardFor(done, worker, "mac-studio", "修复登录 bug", "https://example.com/link/wl1.t/t_test.1.0abc");
+    expect(card).toMatchSnapshot();
+  });
+
+  it("consent-carrying done report (issue #21): the ask replaces needs-you, [同意]/[先不要] ride along", () => {
+    const unpushed = report({ git: { ...report().git!, pushed: false } });
+    const card = reportCardFor(unpushed, worker, "mac-studio", "修复登录 bug", "https://example.com/link/wl1.t/t_test.1.0abc");
     expect(card).toMatchSnapshot();
   });
 

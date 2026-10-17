@@ -52,7 +52,7 @@ export async function resetLedgerState(): Promise<void> {
     for (const table of [
       "sh_machine", "sh_repo", "sh_thread", "sh_thread_repo", "sh_thread_summary", "sh_worker", "sh_report",
       "sh_timeline", "sh_question", "sh_notify", "sh_offline_dispatch", "sh_note", "sh_note_log", "event_inbox", "worker_ack", "outbox",
-      "sh_web_link", "sh_web_session", "sh_deploy", "device", "pairing", "sh_reap_pending",
+      "sh_web_link", "sh_web_session", "sh_deploy", "device", "pairing", "sh_reap_pending", "sh_pr_consent",
       // sh_usage_day / sh_usage_cursor are NOT here: resetLlmStateForTests (called just
       // above) owns them, because pi's tables and the cursor must reset TOGETHER — dropping
       // both here would leave the cursor absent and swallow the next run's spend as a
@@ -439,6 +439,10 @@ export interface FakeWorkerRun {
   tests?: { ran: boolean; passed?: boolean; note?: string };
   /** Emitted as the `started` event's branch and the report's git facts. */
   branch?: string;
+  /** Whether the run's commits are already on the remote (git.pushed). Default false — an
+   *  unpushed write completion carries the #21 consent ask, which pushes instead of merging
+   *  quietly; tests that model an ORDINARY completion (e.g. #11's merge windows) set this. */
+  pushed?: boolean;
   /** Extra delay (ms) between the report and settled events. */
   settleDelayMs?: number;
 }
@@ -657,7 +661,7 @@ export class FakeConnector {
       ...(run.next ? { next: run.next } : {}),
       ...(run.leftovers ? { leftovers: run.leftovers } : {}),
       ...(run.tests ? { tests: run.tests } : {}),
-      git: { branch, base: "main", ahead: 1, dirty: 0, filesChanged: 2, insertions: 10, deletions: 2, pushed: false },
+      git: { branch, base: "main", ahead: 1, dirty: 0, filesChanged: 2, insertions: 10, deletions: 2, pushed: run.pushed === true },
     });
     if (run.settleDelayMs) await new Promise((resolve) => setTimeout(resolve, run.settleDelayMs));
     await this.emit("settled", workerId, {
@@ -669,7 +673,18 @@ export class FakeConnector {
 
   /** Sends one worker event with the next seq for that worker (connector-persisted seqs). */
   async emit(
-    kind: "started" | "progress" | "report" | "settled" | "lost" | "resumed" | "queue_returned" | "queued" | "broken",
+    kind:
+      | "started"
+      | "progress"
+      | "report"
+      | "settled"
+      | "lost"
+      | "resumed"
+      | "queue_returned"
+      | "queued"
+      | "broken"
+      | "pr_created"
+      | "pr_failed",
     workerId: string,
     fields: Record<string, unknown>,
   ): Promise<void> {

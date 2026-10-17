@@ -807,4 +807,34 @@ export const MIGRATIONS: readonly Migration[] = [
       )`;
     },
   },
+  {
+    // The PR consent gate (issue #21, spike-conclusions §2): one row per done report that
+    // offered [同意]/[先不要]. The tap is recorded here; the machine work is the `pr_worker`
+    // command (cmdId + attempts, so a retry click after a failure sends a fresh command);
+    // the asynchronous result lands back on the same row (url / failure) so a repeated
+    // click can answer honestly. sh_notify gains a payload column: pr cards render from
+    // event data (url / stage / message) that belongs to the intent itself, not to whatever
+    // ledger row a later renderer might still find. Numbered 018: #14's offline dispatch
+    // took 017 on main; ids are unique strings, which is what the migration ledger keys on.
+    id: "018_pr_consent",
+    up: (sql) => {
+      sql`CREATE TABLE IF NOT EXISTS sh_pr_consent (
+        workerId TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        threadId TEXT NOT NULL,
+        decision TEXT NOT NULL,
+        cmdId TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        url TEXT,
+        failure TEXT,
+        decidedAt INTEGER NOT NULL,
+        updatedAt INTEGER NOT NULL,
+        PRIMARY KEY (workerId, seq)
+      )`;
+      sql`CREATE INDEX IF NOT EXISTS sh_pr_consent_cmd ON sh_pr_consent (cmdId)`;
+      ignoringDuplicateColumn(() => {
+        sql`ALTER TABLE sh_notify ADD COLUMN payload TEXT`;
+      });
+    },
+  },
 ];
