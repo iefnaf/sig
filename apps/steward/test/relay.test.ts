@@ -481,7 +481,9 @@ describe("PR #54 review findings", () => {
     await fake.connect();
     const { threadId, workerId } = await runLeg1(fake);
 
-    // Resume while the machine is offline: the send queues (notAfter null), worker pending.
+    // Resume while the machine is offline (issue #14): the send parks HELD behind the ask
+    // card — the resume decision itself is unchanged (same agent+machine+repo), only its
+    // delivery waits for the owner's wait/switch answer instead of queueing silently.
     fake.close();
     for (;;) {
       const snap = await ownerStub().debugSnapshot();
@@ -489,7 +491,7 @@ describe("PR #54 review findings", () => {
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
     const resume = await ownerStub().dispatchForTest({ prompt: "第二棒", repoRef: "repo-a", threadId });
-    expect(resume).toMatchObject({ continuation: { action: "resume" } });
+    expect(resume).toMatchObject({ kind: "asked_offline" });
     const pending = await snapshotWhere(
       (s) => s.threads.some((t) => t.workers.some((w) => w.workerId === workerId && w.state === "starting")),
       "resume pending",

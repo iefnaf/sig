@@ -392,7 +392,9 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
       });
       if (outcome.kind === "refused") return err(`refused: ${outcome.reason}`);
       if (outcome.kind === "asked_offline") {
-        return ok(`已用按钮卡片问用户（${outcome.machineName} 不在线：排队等上线，还是取消）。本轮不要再派发或追问。`);
+        return ok(
+          `已用按钮卡片问用户（${outcome.machineName} 不在线：等它上线、换台机器，还是算了——命令先扣住，等用户点按钮）。本轮不要再派发或追问。`,
+        );
       }
       // Issue #8: the deterministic continuation — tell the model exactly what happened, so
       // its reply to the user states it (resumed session / new session with brief) and it

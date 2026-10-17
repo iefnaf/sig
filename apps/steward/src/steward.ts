@@ -92,7 +92,20 @@ import {
 import { createLedger, type Ledger, type LedgerSql, type NotifyRow, type QuestionRow, type RunRow, type WakeRow } from "./ledger.ts";
 import { renderChangeReports } from "./notes.ts";
 import { RoutineService } from "./routines.ts";
-import { failureCard, notifyCard, askUserCard, reportCardFor, noteDecisionCard, stallCard, workerQuestionCard, didBullets, type AskCardButton } from "./report-template.ts";
+import {
+  failureCard,
+  notifyCard,
+  askUserCard,
+  reportCardFor,
+  noteDecisionCard,
+  stallCard,
+  workerQuestionCard,
+  didBullets,
+  machineOfflineCard,
+  machineOnlineCard,
+  waitedStartCard,
+  type AskCardButton,
+} from "./report-template.ts";
 import { MIGRATIONS, runMigrations } from "./schema.ts";
 import { openSecret, sealSecret } from "./secretbox.ts";
 import { renderSetupPage, type SetupView } from "./setup-page.ts";
@@ -305,6 +318,8 @@ export class Steward extends Agent<Env> {
     // A DO restart clears the in-memory arm-dedupe while storage alarms keep their own
     // clock: re-arm maintenance so a restart never strands active workers unwatched.
     this.armWorkerSweeps();
+    // Crash-window machine-status intents (created, never drained) get their due-date wake.
+    this.rearmNoticeDrain();
     // Wakes queued by past reducers (crash between queue and submit, §11) drain now.
     void this.drainWakes();
     void this.pollRuns();
@@ -489,28 +504,35 @@ export class Steward extends Agent<Env> {
       // Withdraw only what never left the DO (still `queued`); a sent command may already be
       // persisted connector-side, and at-most-once beats a maybe-duplicate cancel (§4.2).
       cancelQueuedCommand: (cmdId) => {
-        this.sql`UPDATE outbox SET state = 'expired' WHERE cmdId = ${cmdId} AND state = 'queued'`;
+        this.sql`UPDATE outbox SET state = 'expired', held = 0 WHERE cmdId = ${cmdId} AND state = 'queued'`;
         return this.sql<{ changes: number }>`SELECT changes() AS changes`[0]!.changes > 0;
       },
-      // A start_worker that has not left the outbox pipeline yet (issue #13 review finding 3):
-      // the run is alive even when its worker row was reaped away.
-      hasDeliverableStart: (threadId) =>
-        this.sql<{ one: number }>`
-          SELECT 1 AS one FROM outbox o JOIN sh_worker w ON w.workerId = o.workerId
-          WHERE w.threadId = ${threadId} AND o.kind = 'start_worker'
-            AND o.state IN ('queued', 'sent') AND o.workerId IS NOT NULL
-          LIMIT 1
-        `.length > 0,
+      // "wait" (protocol §7.3): the command loses its deadline entirely — held AND notAfter —
+      // and tries to deliver right away (a machine that reconnected while the card sat
+      // unread starts immediately).
+      waitForCommand: (cmdId) => {
+        try {
+          this.ctx.storage.transactionSync(() => {
+            this.sql`UPDATE outbox SET held = 0, notAfter = NULL WHERE cmdId = ${cmdId} AND state = 'queued' AND held = 1`;
+          });
+          const changed = this.sql<{ changes: number }>`SELECT changes() AS changes`[0]!.changes > 0;
+          if (changed) void this.deliver(cmdId);
+          return changed;
+        } catch (err) {
+          this.logChannel("wait_command_failed", `${cmdId} ${errorText(err)}`);
+          return false;
+        }
+      },
       commandExists: (cmdId) => this.sql`SELECT 1 AS one FROM outbox WHERE cmdId = ${cmdId}`.length > 0,
       sendText: async (text, threadId) => {
         const owner = this.ownerOpenIdSync();
         if (!owner) return;
         await this.enqueueOutbound({ kind: "text", to: owner, text, threadId: threadId ?? null, urgency: "push" });
       },
-      sendCard: async (card, threadId) => {
+      sendCard: async (card, threadId, id) => {
         const owner = this.ownerOpenIdSync();
         if (!owner) return;
-        await this.enqueueOutbound({ kind: "card", to: owner, card, threadId, urgency: "push" });
+        await this.enqueueOutbound({ kind: "card", to: owner, card, threadId, urgency: "push", ...(id !== undefined ? { id } : {}) });
       },
       createPairing: () => this.createPairing(),
       deployOrigin: () => this.web.origin(),
@@ -1012,6 +1034,7 @@ export class Steward extends Agent<Env> {
     // Machine online state derives from live connections (issue #5): this and onClose are the
     // only writers. hello fills in the machine's real name and facts moments later.
     this.ledger.machines.setOnline(parsed.deviceId, true, row.name ?? undefined);
+    this.rearmNoticeDrain(); // a recovery intent may now be counting down its debounce
   }
 
   onClose(connection: Connection): void {
@@ -1038,6 +1061,7 @@ export class Steward extends Agent<Env> {
       this.getConnection(relay.webConnId)?.send(JSON.stringify({ t: "machine_offline", re: relay.reqId } satisfies MachineOfflineMessage));
     }
     this.ledger.machines.setOnline(state.deviceId, false);
+    this.rearmNoticeDrain(); // the offline intents' 2-minute window starts here
   }
 
   async onMessage(connection: Connection, raw: WSMessage): Promise<void> {
@@ -1271,6 +1295,7 @@ export class Steward extends Agent<Env> {
     // hello is the machine/repo snapshot's source of truth (protocol §6.1, steward.md §2.2):
     // name, agents, limits, and the full repo list — removals included — land in the ledger.
     this.ledger.machines.upsertFromHello(hello);
+    this.rearmNoticeDrain();
     const acks = Object.fromEntries(
       this.sql<{ workerId: string; upTo: number }>`SELECT workerId, upTo FROM worker_ack`.map((row) => [row.workerId, row.upTo]),
     );
@@ -1318,7 +1343,15 @@ export class Steward extends Agent<Env> {
         }
       }
     }
+    // protocol §6.1: hello re-delivers every queued/sent command; "waited" start_workers
+    // (their notAfter cleared by the owner's wait) are queued for exactly this moment.
+    const before = new Set(
+      this.sql<{ cmdId: string }>`
+        SELECT cmdId FROM outbox WHERE deviceId = ${auth.deviceId} AND state = 'queued' AND kind = 'start_worker' AND held = 0 AND notAfter IS NULL
+      `.map((r) => r.cmdId),
+    );
     this.redeliverOutbox(auth.deviceId);
+    this.queueWaitedStartNotices(auth.deviceId, before);
     // A reconnect is also the natural catch-up point for events persisted but not yet reduced
     // (crash between the events_ack and the reducer, protocol §4.3): drain, then notify.
     this.applyLedgerEvents();
@@ -1348,6 +1381,22 @@ export class Steward extends Agent<Env> {
       SELECT cmdId FROM outbox WHERE deviceId = ${deviceId} AND state IN ('queued', 'sent') ORDER BY cseq
     `;
     for (const row of pending) this.deliver(row.cmdId);
+  }
+
+  /** The "runs on reconnect with a notice" half of protocol §7.3: a start_worker whose
+   *  notAfter the owner's wait cleared was queued only for the machine's return — its
+   *  delivery at this hello is exactly the promised moment, so the notice follows it out. */
+  private queueWaitedStartNotices(deviceId: string, before: Set<string>): void {
+    const delivered = this.sql<{ cmdId: string; workerId: string }>`
+      SELECT cmdId, workerId FROM outbox WHERE deviceId = ${deviceId} AND state = 'sent' AND kind = 'start_worker' AND held = 0
+    `;
+    for (const row of delivered) {
+      if (!before.has(row.cmdId)) continue;
+      const worker = this.ledger.workers.get(row.workerId);
+      if (!worker || worker.state !== "starting") continue;
+      this.ledger.notifications.queue(`waited:${row.cmdId}`, "waited_started", worker.threadId, worker.workerId);
+    }
+    void this.drainNotifications();
   }
 
   private handleCmdAck(raw: unknown): void {
@@ -1567,6 +1616,17 @@ export class Steward extends Agent<Env> {
   // The pending drainWakes schedule's id, so a fresh earlier wake can cancel and pull it in.
   private drainWakeScheduleId: string | undefined;
 
+  /** F4 (PR #51 review): the debounce is a due date, not a timer promise — something must
+   *  wake the DO at it, or an offline notice sits pending through the very outage it exists
+   *  to report (and the reconnect then deletes it as healed). */
+  private rearmNoticeDrain(): void {
+    const at = this.sql<{ at: number | null }>`
+      SELECT MIN(dueAt) AS at FROM sh_notify WHERE sentAt IS NULL AND dueAt IS NOT NULL
+    `[0]?.at ?? null;
+    if (at === null) return;
+    void this.schedule(Math.max(1, Math.ceil((at - Date.now()) / 1000)), "drainNotifications");
+  }
+
   drainNotifications(): Promise<void> {
     const run = this.notifyChain.then(() => this.drainNotifyPass());
     this.notifyChain = run.catch(() => {});
@@ -1580,9 +1640,10 @@ export class Steward extends Agent<Env> {
         if (!cfg?.ownerOpenId) continue; // no owner yet: the intent stays pending, not lost
         const card = await this.renderNotification(intent);
         if (card === null) {
-          // Its data is gone (thread archived / worker pruned); drop the intent rather than
-          // retry forever.
-          this.ledger.notifications.markSent(intent.id);
+          // Its data is gone (thread archived / worker pruned), or the news evaporated (a
+          // drop that healed inside the debounce window): remove the intent rather than
+          // retry forever — and never count it as "the owner was told".
+          this.ledger.notifications.drop(intent.id);
           continue;
         }
         const question = intent.questionId !== null ? this.ledger.questions.get(intent.questionId) : null;
@@ -1599,6 +1660,7 @@ export class Steward extends Agent<Env> {
         this.logChannel("notify_drain_failed", `${intent.id} ${errorText(err)}`);
       }
     }
+    this.rearmNoticeDrain(); // a still-debounced intent needs its own wake
   }
 
   /** Deterministic core templates (steward.md §6.2 source 1): data in, card out, no LLM. */
@@ -1619,6 +1681,42 @@ export class Steward extends Agent<Env> {
     // steward.md §6.4: the timeline link is appended by the system — a fresh one-time link
     // per card, never by the (M2) LLM.
     const detailsUrl = await this.web.linkUrl(linkTargetForThread(thread.threadId));
+
+    // Machine status (issue #14, steward.md §5.3): only when in-flight work is affected,
+    // debounced two minutes — and the drop only counts if the worker is still unreachable
+    // when the window closes (a blip that healed produces no notice at all).
+    if (intent.kind === "machine_offline") {
+      if (!worker.unreachable) return null;
+      return machineOfflineCard(machineName, thread.title, footer);
+    }
+    if (intent.kind === "machine_online") {
+      // "X is back" only when the owner heard about THIS outage: the offline intent paired
+      // to this transition (dedupeKey machine:<dev>:<T>:on:<worker> ← machine:<dev>:<T-1>:off:<worker>)
+      // must have actually been sent. A sub-debounce blip's offline intent was dropped as
+      // healed, so its recovery stays quiet too — and a later blip cannot ride an earlier
+      // outage's notice (PR #51 review finding 7).
+      const paired = /^machine:([^:]+):(\d+):on:(.+)$/.exec(intent.dedupeKey);
+      const offlineKey = paired ? `machine:${paired[1]}:${Number(paired[2]) - 1}:off:${paired[3]}` : null;
+      const announced =
+        offlineKey === null
+          ? 0
+          : this.sql<{ n: number }>`
+              SELECT COUNT(*) AS n FROM sh_notify WHERE dedupeKey = ${offlineKey} AND sentAt IS NOT NULL
+            `[0]!.n;
+      if (announced === 0) return null;
+      const outcome =
+        worker.state === "running" || worker.state === "recovering"
+          ? "已恢复运行"
+          : worker.state === "starting" || worker.state === "queued"
+            ? "仍在排队/启动中"
+            : worker.state === "lost" || worker.state === "broken"
+              ? "未恢复（见时间线）"
+              : "已结束，结果已对账";
+      return machineOnlineCard(machineName, thread.title, outcome, footer);
+    }
+    if (intent.kind === "waited_started") {
+      return waitedStartCard(machineName, thread.title, footer, detailsUrl ?? undefined);
+    }
 
     if (intent.kind === "done_report") {
       const report = this.ledger.workers.reportsForWorker(worker.workerId).at(-1);
@@ -1756,7 +1854,7 @@ export class Steward extends Agent<Env> {
     deviceId: string,
     kind: string,
     args: unknown,
-    opts: { workerId?: string; notAfter?: number | null; ackTimeoutMs?: number; cmdId?: string } = {},
+    opts: { workerId?: string; notAfter?: number | null; ackTimeoutMs?: number; cmdId?: string; held?: boolean } = {},
   ): Promise<{ cmdId: string; cseq: number; state: string }> {
     const cseq = (this.sql<{ m: number | null }>`SELECT MAX(cseq) AS m FROM outbox WHERE deviceId = ${deviceId}`[0]?.m ?? 0) + 1;
     // `cmdId` is the idempotency key for steward tool replays (protocol §7.1): the start_worker
@@ -1769,12 +1867,19 @@ export class Steward extends Agent<Env> {
     if (existing) return { cmdId: existing.cmdId, cseq: existing.cseq, state: existing.state };
     const notAfter = opts.notAfter === undefined ? Date.now() + DEFAULT_NOTAFTER_MS : opts.notAfter;
     this.sql`
-      INSERT INTO outbox (cmdId, deviceId, workerId, cseq, kind, payload, notAfter, state, createdAt)
-      VALUES (${cmdId}, ${deviceId}, ${opts.workerId ?? null}, ${cseq}, ${kind}, ${JSON.stringify(args ?? {})}, ${notAfter}, 'queued', ${Date.now()})
+      INSERT INTO outbox (cmdId, deviceId, workerId, cseq, kind, payload, notAfter, held, state, createdAt)
+      VALUES (${cmdId}, ${deviceId}, ${opts.workerId ?? null}, ${cseq}, ${kind}, ${JSON.stringify(args ?? {})}, ${notAfter}, ${opts.held ? 1 : 0}, 'queued', ${Date.now()})
     `;
     // A dispatch registers the worker before enqueueing: the moment the row exists, the
     // maintenance alarm (stall notice + reap) must be armed (issue #13).
     this.armWorkerSweeps();
+    if (opts.held && notAfter !== null) {
+      // Nothing will ever try to deliver a held row while the machine is away, so its own
+      // notAfter lapse needs the alarm armed here (PR #51 review finding 2): sweepIdle
+      // marks the row failed/not_after at the deadline, and sweepWorkers (armed by the
+      // enqueue above, the worker is `starting`) closes the worker with a push.
+      void this.schedule(Math.max(1, Math.ceil((notAfter - Date.now()) / 1000)) + 1, "sweepIdle");
+    }
     this.deliver(cmdId, opts.ackTimeoutMs);
     const state = this.sql<{ state: string }>`SELECT state FROM outbox WHERE cmdId = ${cmdId}`[0]!.state;
     return { cmdId, cseq, state };
@@ -1803,9 +1908,10 @@ export class Steward extends Agent<Env> {
       kind: string;
       payload: string;
       notAfter: number | null;
+      held: number;
       state: string;
     }>`
-      SELECT deviceId, workerId, cseq, kind, payload, notAfter, state FROM outbox WHERE cmdId = ${cmdId}
+      SELECT deviceId, workerId, cseq, kind, payload, notAfter, held, state FROM outbox WHERE cmdId = ${cmdId}
     `[0];
     if (!row || (row.state !== "queued" && row.state !== "sent")) return false;
     const now = Date.now();
@@ -1818,6 +1924,10 @@ export class Steward extends Agent<Env> {
       this.sql`UPDATE outbox SET state = 'failed', failReason = 'not_after' WHERE cmdId = ${cmdId}`;
       return false;
     }
+    // An offline ask is still open (protocol §7.3): the command must not slip out at a
+    // reconnect before the owner answers. Lapsed rows were already marked above — the hold
+    // never outlives its own delivery window.
+    if (row.held) return false;
     const connection = this.connFor(row.deviceId);
     if (!connection) {
       void this.schedule(IDLE_SWEEP_INTERVAL_S, "sweepIdle");
@@ -1867,8 +1977,21 @@ export class Steward extends Agent<Env> {
   // Periodic backstop (spike-conclusions bug 5): a command queued for a device that never
   // comes back must not wait forever even when `notAfter` is null ("wait until online").
   async sweepIdle(): Promise<void> {
-    const cutoff = Date.now() - IDLE_FAIL_MS;
-    const stale = this.sql<{ cmdId: string }>`SELECT cmdId FROM outbox WHERE state = 'queued' AND createdAt <= ${cutoff}`;
+    const nowMs = Date.now();
+    // notAfter enforcement while offline (protocol §4.2, PR #51 review finding 2): deliver()
+    // marks lapsed rows when something attempts them, but a HELD row is never attempted
+    // while the machine is away — this pass is the only writer it will see. It writes the
+    // same terminal `failed/not_after` deliver() would (never `expired`: that is the
+    // user's withdrawal state); sweepWorkers then closes the `starting` worker with a push.
+    const lapsed = this.sql<{ cmdId: string }>`
+      SELECT cmdId FROM outbox
+      WHERE state = 'queued' AND notAfter IS NOT NULL AND notAfter <= ${nowMs}
+    `;
+    for (const row of lapsed) {
+      this.sql`UPDATE outbox SET state = 'failed', failReason = 'not_after' WHERE cmdId = ${row.cmdId} AND state = 'queued'`;
+    }
+    const cutoff = nowMs - IDLE_FAIL_MS;
+    const stale = this.sql<{ cmdId: string }>`SELECT cmdId FROM outbox WHERE state = 'queued' AND createdAt <= ${cutoff} AND held = 0`;
     for (const row of stale) {
       this.sql`UPDATE outbox SET state = 'failed', failReason = 'idle' WHERE cmdId = ${row.cmdId}`;
     }
@@ -3569,6 +3692,13 @@ export class Steward extends Agent<Env> {
       createdFromMsg: input.createdFromMsg ?? "om_test_source",
     });
     return outcome.ok ? { ok: true, routineId: outcome.routine.routineId } : { ok: false, reason: outcome.reason };
+  }
+
+  /** Test read: the alarm-driven maintenance callbacks currently scheduled (findings 2/4). */
+  async maintenanceSchedulesForTest(): Promise<Array<{ id: string; callback: string; type: string; time: number }>> {
+    return (await this.listSchedules())
+      .filter((s) => ["sweepIdle", "sweepWorkers", "drainNotifications"].includes(s.callback))
+      .map((s) => ({ id: s.id, callback: s.callback, type: s.type, time: s.time ?? 0 }));
   }
 
   /** Test read: the fireRoutine/fireFollowup schedule rows the Agents SDK currently holds. */

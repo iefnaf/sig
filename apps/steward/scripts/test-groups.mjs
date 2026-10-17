@@ -43,6 +43,8 @@ const COST = {
   "history-relay.test.ts": 9,
   "outbound-queue.test.ts": 6,
   "ledger.test.ts": 5,
+  "offline-dispatch.test.ts": 10,
+  "machine-status.test.ts": 7,
   "raw-process-page.test.ts": 4,
   "dispatch.test.ts": 4,
   "alarm.test.ts": 4,
