@@ -104,6 +104,10 @@ describe("report cards carry the one-time 查看详情 link", () => {
     await fake.connect();
     await ownerStub().dispatchForTest({ prompt: "干件大事", repoRef: "repo-a", newTitle: "干件大事" });
     await waitForWorkerIdle();
+    // §5.3 (issue #10): the needs_decision question is held for the window — expire it so
+    // the deterministic fallback card (the one carrying the link) goes out.
+    await ownerStub().shrinkQuestionWindowForTest(0);
+    await ownerStub().sweepQuestionFallbackForTest();
     await waitWhileOutboundPending();
     const [card] = await sentCards();
     const action = JSON.stringify(JSON.parse(card!.payload as string).card.elements);

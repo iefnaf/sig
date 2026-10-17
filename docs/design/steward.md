@@ -400,6 +400,36 @@ Workers in the `lost` / `broken` states do not count as running; `broken` produc
 
 **The 90-second window**: `needs_decision` / `blocked` reports go to the steward first, letting it try to answer factual questions itself per the first autonomy tier (`answer_worker`, evidence required). If the steward calls `ask_user`, `answer_worker`, or `notify_user` within the window, the report counts as handled; if the window expires with no action (LLM unavailable, budget spent, model error), the core **falls back to a deterministic push** and forwards the worker's question to the user verbatim. A pending user decision can therefore never get lost because of the LLM.
 
+> **Implemented (issue #10).** The window is a durable deadline on the `sh_question` row
+> (`fallbackDueAt`, alarm-driven `sweepQuestionFallback` — cancel-then-schedule so a new,
+> earlier deadline always pulls the alarm in; the pass may run late after a DO reset, never
+> early, and replays converge on one `sh_notify` intent, which the sweep drains
+> unconditionally so a crash between queueing and delivery cannot strand it). Handling is
+> booked as `handledAt`: `answer_worker` (relay settled) or `ask_user`/`notify_user` carrying
+> the wake's `questionId` — the forwarding ask BINDS the worker's question (no second row;
+> its buttons and quote-route resolve to the worker); notify_user is terminal for
+> `resolution: done` / explained failures (it closes the question — an unreported run the
+> steward classified as done unwedges the Thread) but keeps it open for `resolution:
+> question` (prose asks), and a stale `questionId` fails the call visibly. The fallback card
+> forwards the question VERBATIM (uncapped, line breaks preserved) and carries the binding,
+> so the owner's quote-reply or option click relays the answer to the worker
+> deterministically (`send`, after_current_tools semantics) — no LLM run at all for the
+> answer; a failed relay keeps the question open and tells the owner. The deterministic relay
+> applies ONLY to the quoted card's own bound question and only when the WORKER asked it
+> (kind `report`): a reply to a failure/unreported card — or to a card whose question is
+> already answered — is the steward's to handle (the routed-reply close still applies),
+> never a relay into a broken worker or an overflowing session. `answer_worker`'s evidence
+> gate lives in the `beforeTool` hook (§7.2): `note:<id>` must exist in the ledger,
+> `user:<msgId>` must be a message the bound owner actually sent (card clicks count as owner
+> actions); without evidence only `ask_user` remains. Failure-class questions
+> (error/unreported/broken) are refused to `answer_worker` — they are the user's, not the
+> worker's. One deliberate deviation from the M1 text: failure pushes and the
+> broken/start-failed paths now also open an `sh_question` (the rules table's "Create a
+> question"), so those Threads read `waiting_you`, not `idle`, and the hello/reap reconcile
+> paths drain their pushes right at the reconnect; `unreported` still never pushes on its
+> own (classification is the steward's job), and its question carries no fallback deadline —
+> the push would assert a failure the last utterance may contradict.
+
 ### 5.4 Wake-up text
 
 Multiple events within 3 seconds merge into a single wake-up. The text looks like this (kept in Chinese — it is real input data; English gloss below):
