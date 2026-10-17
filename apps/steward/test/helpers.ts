@@ -8,6 +8,9 @@ export function ownerStub() {
   return env.Steward.get(id) as unknown as DurableObjectStub<Steward> & Steward;
 }
 
+/** Raw SQL inside the DO (the tagged template must be invoked through the instance). */
+type Sql = (strings: TemplateStringsArray, ...values: unknown[]) => unknown;
+
 // DO SQLite is NOT rolled back between tests in this setup (state visibly carries over), so
 // every channel test starts by clearing the sh_* tables the same way the outbox tests reach
 // in with raw SQL.
@@ -300,11 +303,19 @@ export function urlVerification(token = TEST_VERIFY_TOKEN): Promise<Response> {
   return postEvent({ type: "url_verification", challenge: "ch-123", token });
 }
 
-/** Polls until no sh_outbound row is queued/sending (the void-fired delivery settled). */
+/** Polls until no sh_outbound row is queued/sending (the void-fired delivery settled).
+ *  Quiet rows legitimately wait out the 60 s merge window (issue #11) — waiting that out
+ *  would time every content test out, so the helper TIME-TRAVELS them due instead (the
+ *  window's own timing behavior has its dedicated suite in report-merge.test.ts). */
 export async function waitWhileOutboundPending(timeoutMs = 5000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const pending = await ownerStub().outboundRows(20);
+    await runInDurableObject(ownerStub(), (instance: Steward) => {
+      const sql = (instance as unknown as { sql: Sql }).sql.bind(instance);
+      sql`UPDATE sh_outbound SET nextAttemptAt = 1 WHERE status = 'queued' AND urgency = 'quiet' AND nextAttemptAt > ${Date.now()}`;
+    });
+    await ownerStub().deliverOutbound();
+    const pending = await ownerStub().outboundRows(50);
     if (pending.every((row) => row.status === "sent" || row.status === "failed")) return;
     if (Date.now() > deadline) throw new Error(`outbound rows still pending: ${JSON.stringify(pending.map((r) => [r.id, r.status]))}`);
     await new Promise((resolve) => setTimeout(resolve, 25));

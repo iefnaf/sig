@@ -13,6 +13,7 @@ import { assembleBrief, type BriefDecision, type HandoffBrief } from "./handoff.
 import { eventWakeText, externalActivityWakeText, queueReturnedWakeText } from "./wake-text.ts";
 import { createMachineStatus, type MachineReliability } from "./machine-status.ts";
 import type { StartWorkerInput } from "./dispatch.ts";
+import type { QuietSection } from "./report-template.ts";
 
 /** Tagged-template SQL over the DO's SQLite (same shape schema.ts migrations use). */
 export type LedgerSql = <T = Record<string, unknown>>(
@@ -28,6 +29,9 @@ export const SUMMARY_VERSIONS_KEPT = 5;
 export const SUMMARY_REWRITE_EVERY = 10;
 /** The wake merge window (steward.md §5.1/§5.4): events within it become one steward input. */
 export const WAKE_MERGE_MS = 3_000;
+/** The quiet merge window (issue #11, spec §7.6 / steward.md §6.4): `urgency: quiet` outbound
+ *  holds this long per channel+receiver, so notifications landing together leave as one. */
+export const QUIET_MERGE_MS = 60_000;
 /** steward.md §5.3: external_activity wakes merge over a 10-minute window (low priority). */
 export const EXTERNAL_ACTIVITY_MERGE_MS = 10 * 60_000;
 /** Blocked reports give the steward this long before the core forwards the question. */
@@ -38,6 +42,8 @@ export interface LedgerDeps {
   sql: LedgerSql;
   tx: <T>(fn: () => T) => T;
   now?: () => number;
+  /** The quiet merge window (issue #11); overridable so tests shrink it. */
+  quietWindowMs?: () => number;
 }
 
 // ---- relay (issue #8, spec §5.3) ------------------------------------------------------------------
@@ -540,6 +546,7 @@ const viewOffer = (r: Record<string, unknown>): RoutineOfferRow => ({
 export function createLedger(deps: LedgerDeps) {
   const { sql, tx } = deps;
   const now = deps.now ?? Date.now;
+  const quietWindowMs = deps.quietWindowMs ?? (() => QUIET_MERGE_MS);
 
   // The notes half of the memory module (issue #18, steward.md §2.3-§2.5): layered
   // knowledge with a two-phase write. Same SQL handle, same transaction wrapper.
@@ -1501,15 +1508,32 @@ export function createLedger(deps: LedgerDeps) {
       text?: string;
       card?: unknown;
       urgency?: "push" | "quiet";
+      /** Structured merge section (issue #11): carried in the payload so a quiet group folds
+       *  into one card that keeps each thread's three parts. */
+      part?: QuietSection;
       /** Stable dedupe key (review #6): same id → same row (INSERT OR IGNORE), never a second
        *  message; the id doubles as the provider-side uuid. Omitted: a fresh one-of message. */
       id?: string;
     }): string {
+      // Issue #11 (steward.md §6.4): `urgency: push` is due NOW; a quiet row holds for the
+      // merge window, ANCHORED at the oldest still-open quiet row for this channel+receiver —
+      // arrivals inside an open window join it, later ones start their own.
+      let dueAt = now();
+      if ((input.urgency ?? "quiet") === "quiet") {
+        const windowMs = quietWindowMs();
+        const anchor = sql<{ at: number | null }>`
+          SELECT MIN(createdAt) AS at FROM sh_outbound
+          WHERE channel = 'feishu' AND receiveId = ${input.to} AND urgency = 'quiet'
+            AND status = 'queued' AND createdAt > ${now() - windowMs}
+        `[0]?.at;
+        dueAt = anchor !== null && anchor !== undefined ? anchor + windowMs : now() + windowMs;
+      }
+      const payload = JSON.stringify({ text: input.text, card: input.card, part: input.part });
       if (input.id !== undefined) {
         sql`
           INSERT OR IGNORE INTO sh_outbound (id, channel, kind, receiveId, threadId, questionId, payload, urgency, status, attempts, nextAttemptAt, createdAt)
           VALUES (${input.id}, 'feishu', ${input.kind}, ${input.to}, ${input.threadId ?? null}, ${input.questionId ?? null},
-                  ${JSON.stringify({ text: input.text, card: input.card })}, ${input.urgency ?? "quiet"}, 'queued', 0, ${now()}, ${now()})
+                  ${payload}, ${input.urgency ?? "quiet"}, 'queued', 0, ${dueAt}, ${now()})
         `;
         return input.id;
       }
@@ -1517,17 +1541,23 @@ export function createLedger(deps: LedgerDeps) {
       sql`
         INSERT INTO sh_outbound (id, channel, kind, receiveId, threadId, questionId, payload, urgency, status, attempts, nextAttemptAt, createdAt)
         VALUES (${id}, 'feishu', ${input.kind}, ${input.to}, ${input.threadId ?? null}, ${input.questionId ?? null},
-                ${JSON.stringify({ text: input.text, card: input.card })}, ${input.urgency ?? "quiet"}, 'queued', 0, ${now()}, ${now()})
+                ${payload}, ${input.urgency ?? "quiet"}, 'queued', 0, ${dueAt}, ${now()})
       `;
       return id;
     },
-    /** §3.1 signal 1: reply-to / card-callback routing, never data stuffed into the card. */
+    /** §3.1 signal 1: reply-to / card-callback routing, never data stuffed into the card.
+     *  A MERGED card (issue #11) spans several threads — no single owner — so it routes to
+     *  the conversation and the steward decides which matter the reply belongs to. */
     threadIdForProviderMsg(providerMsgId: string): string | null {
-      return (
-        sql<{ threadId: string }>`
-          SELECT threadId FROM sh_outbound WHERE providerMsgId = ${providerMsgId} AND threadId IS NOT NULL
-        `[0]?.threadId ?? null
-      );
+      const rows = outbound.threadIdsForProviderMsg(providerMsgId);
+      return rows.length === 1 ? rows[0]! : null;
+    },
+    /** Every thread bound to a provider message (issue #11): one for single cards, several
+     *  for a merged card — a reply to it means ALL of them were seen (§6.5). */
+    threadIdsForProviderMsg(providerMsgId: string): string[] {
+      return sql<{ threadId: string }>`
+        SELECT DISTINCT threadId FROM sh_outbound WHERE providerMsgId = ${providerMsgId} AND threadId IS NOT NULL
+      `.map((row) => row.threadId);
     },
     /** The full routing row behind a provider message: id (button actions key off it — e.g.
      *  `offer:` ids resolve a routine suggestion) plus its Thread, when bound. */
@@ -1555,6 +1585,15 @@ export function createLedger(deps: LedgerDeps) {
         SELECT id FROM sh_outbound WHERE status = 'queued' AND nextAttemptAt <= ${nowMs}
         ORDER BY createdAt, id LIMIT ${batch}
       `.map((row) => row.id);
+    },
+    /** Due rows WITH their routing keys (issue #11): the delivery pass groups quiet rows by
+     *  channel+receiver so one window leaves as one merged message. */
+    dueRows(nowMs: number, batch: number): Array<{ id: string; urgency: string; channel: string; receiveId: string }> {
+      return sql<{ id: string; urgency: string; channel: string; receiveId: string }>`
+        SELECT id, urgency, channel, receiveId FROM sh_outbound
+        WHERE status = 'queued' AND nextAttemptAt <= ${nowMs}
+        ORDER BY createdAt, id LIMIT ${batch}
+      `;
     },
     /** The claim (spike bug 1): one conditional UPDATE hands a row to exactly one pass. */
     claimForDelivery(id: string, nowMs: number, claimMs: number): OutboundDeliveryRow | null {

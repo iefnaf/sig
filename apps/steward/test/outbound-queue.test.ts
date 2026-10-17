@@ -30,6 +30,9 @@ async function settleDelivery(): Promise<void> {
 }
 
 describe("outbound queue: delivery (steward.md §6.1)", () => {
+  // Every enqueue here is explicitly `push` (issue #11): these suites exercise delivery
+  // MECHANICS (claims, pacing, backoff) where each row must be its own wire send. The quiet
+  // merge window — holding, grouping, merged sends — lives in report-merge.test.ts.
   beforeEach(async () => {
     await resetChannelState();
     await mockReset();
@@ -38,7 +41,7 @@ describe("outbound queue: delivery (steward.md §6.1)", () => {
   });
 
   it("sends through the adapter, records providerMsgId, and passes the stable id as uuid", async () => {
-    const { id } = await ownerStub().enqueueOutbound({ kind: "text", to: "ou_owner", text: "report done" });
+    const { id } = await ownerStub().enqueueOutbound({ kind: "text", to: "ou_owner", urgency: "push", text: "report done" });
     await settleDelivery();
 
     const row = await ownerStub().outboundRow(id);
@@ -53,15 +56,15 @@ describe("outbound queue: delivery (steward.md §6.1)", () => {
   });
 
   it("caches tenant_access_token across sends and refetches once expired", async () => {
-    await ownerStub().enqueueOutbound({ kind: "text", to: "ou_owner", text: "one" });
+    await ownerStub().enqueueOutbound({ kind: "text", to: "ou_owner", urgency: "push", text: "one" });
     await settleDelivery();
-    await ownerStub().enqueueOutbound({ kind: "text", to: "ou_owner", text: "two" });
+    await ownerStub().enqueueOutbound({ kind: "text", to: "ou_owner", urgency: "push", text: "two" });
     await settleDelivery();
     // The setup page's live validation already cached a token; sends must not refetch.
     expect(tokenCalls(await mockCalls())).toHaveLength(0);
 
     await execSql((sql) => sql`UPDATE sh_channel_token SET expiresAt = 1 WHERE channel = 'feishu'`);
-    await ownerStub().enqueueOutbound({ kind: "text", to: "ou_owner", text: "three" });
+    await ownerStub().enqueueOutbound({ kind: "text", to: "ou_owner", urgency: "push", text: "three" });
     await settleDelivery();
     const calls = await mockCalls();
     expect(tokenCalls(calls)).toHaveLength(1); // stale cache → one refetch
@@ -69,8 +72,8 @@ describe("outbound queue: delivery (steward.md §6.1)", () => {
   });
 
   it("pacing: consecutive sends to the same receiver are spaced ≥ 200ms (5 QPS cap)", async () => {
-    await ownerStub().enqueueOutbound({ kind: "text", to: "ou_owner", text: "a" });
-    await ownerStub().enqueueOutbound({ kind: "text", to: "ou_owner", text: "b" });
+    await ownerStub().enqueueOutbound({ kind: "text", to: "ou_owner", urgency: "push", text: "a" });
+    await ownerStub().enqueueOutbound({ kind: "text", to: "ou_owner", urgency: "push", text: "b" });
     await settleDelivery();
     const sends = sendCalls(await mockCalls());
     expect(sends).toHaveLength(2);
@@ -88,7 +91,7 @@ describe("outbound queue: retries and failures (spike bugs 1 and 3)", () => {
 
   it("a 5xx send failure stays queued with attempts counted and a future backoff", async () => {
     await mockQueue({ status: 500 });
-    const { id } = await ownerStub().enqueueOutbound({ kind: "text", to: "ou_owner", text: "will fail" });
+    const { id } = await ownerStub().enqueueOutbound({ kind: "text", to: "ou_owner", urgency: "push", text: "will fail" });
     await settleDelivery();
 
     const row = await ownerStub().outboundRow(id);
@@ -105,7 +108,7 @@ describe("outbound queue: retries and failures (spike bugs 1 and 3)", () => {
 
   it("a 4xx failure is permanent: failed immediately, no retry", async () => {
     await mockQueue({ status: 400, body: { code: 99991663, msg: "bad token" } });
-    const { id } = await ownerStub().enqueueOutbound({ kind: "text", to: "ou_owner", text: "nope" });
+    const { id } = await ownerStub().enqueueOutbound({ kind: "text", to: "ou_owner", urgency: "push", text: "nope" });
     await settleDelivery();
     const row = await ownerStub().outboundRow(id);
     expect(row?.status).toBe("failed");
@@ -117,7 +120,7 @@ describe("outbound queue: retries and failures (spike bugs 1 and 3)", () => {
   });
 
   it("a serialized payload over 30 KB fails permanently without hitting the API (card limit)", async () => {
-    const { id } = await ownerStub().enqueueOutbound({ kind: "card", to: "ou_owner", card: { elements: [{ text: "x".repeat(31_000) }] } });
+    const { id } = await ownerStub().enqueueOutbound({ kind: "card", to: "ou_owner", urgency: "push", card: { elements: [{ text: "x".repeat(31_000) }] } });
     await settleDelivery();
     const row = await ownerStub().outboundRow(id);
     expect(row?.status).toBe("failed");
@@ -127,7 +130,7 @@ describe("outbound queue: retries and failures (spike bugs 1 and 3)", () => {
 
   it("gives up after the attempt budget is exhausted", async () => {
     await mockQueue({ status: 500 });
-    const { id } = await ownerStub().enqueueOutbound({ kind: "text", to: "ou_owner", text: "flaky" });
+    const { id } = await ownerStub().enqueueOutbound({ kind: "text", to: "ou_owner", urgency: "push", text: "flaky" });
     await settleDelivery();
     expect((await ownerStub().outboundRow(id))?.attempts).toBe(1);
 
@@ -144,7 +147,7 @@ describe("outbound queue: retries and failures (spike bugs 1 and 3)", () => {
     // A slow reply keeps the first pass inside its await window; the enqueue's own void-fired
     // delivery plus two explicit passes all contend, but only one may reach the wire.
     await mockQueue({ delayMs: 400, body: { code: 0, data: { message_id: "om_mock_slow" } } });
-    const { id } = await ownerStub().enqueueOutbound({ kind: "text", to: "ou_owner", text: "once only" });
+    const { id } = await ownerStub().enqueueOutbound({ kind: "text", to: "ou_owner", urgency: "push", text: "once only" });
     await Promise.all([ownerStub().deliverOutbound(), ownerStub().deliverOutbound()]);
 
     expect(sendCalls(await mockCalls())).toHaveLength(1);
@@ -155,7 +158,7 @@ describe("outbound queue: retries and failures (spike bugs 1 and 3)", () => {
 
   it("a claim abandoned by a dead pass is reclaimed after its timeout and delivered", async () => {
     await mockQueue({ status: 500 }); // the original pass fails…
-    const { id } = await ownerStub().enqueueOutbound({ kind: "text", to: "ou_owner", text: "crashed mid-send" });
+    const { id } = await ownerStub().enqueueOutbound({ kind: "text", to: "ou_owner", urgency: "push", text: "crashed mid-send" });
     await settleDelivery();
     expect((await ownerStub().outboundRow(id))?.status).toBe("queued");
 

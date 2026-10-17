@@ -9,7 +9,7 @@
 // creation time. Suggestions (§8.5) send a button card only; the tap is what creates.
 import { ulid } from "@shepherd/protocol";
 import type { FollowupRow, Ledger, RoutineKind, RoutineRow, RoutineSpecStored } from "./ledger.ts";
-import { digestCard, digestIsEmpty, routineOfferCard, type DigestData } from "./report-template.ts";
+import { digestCard, digestIsEmpty, digestSection, routineOfferCard, type DigestData, type QuietSection } from "./report-template.ts";
 import { followupWakeText, routineWakeText } from "./wake-text.ts";
 
 /** What a schedule payload carries into the Agents SDK callback. */
@@ -38,6 +38,7 @@ export interface RoutineServiceDeps {
     card?: unknown;
     threadId?: string | null;
     urgency?: "push" | "quiet";
+    part?: QuietSection;
     id?: string;
   }): Promise<{ id: string }>;
   ownerOpenId(): string | null;
@@ -332,15 +333,19 @@ export class RoutineService {
       });
       return;
     }
+    // spec §7.6: only "waiting on you" justifies buzzing the phone; a quiet digest does not.
+    const urgency = data.waiting.length > 0 ? "push" : "quiet";
+    const digestFooter = `例行任务 ${routine.routineId} · ${describeSchedule(routine)} · 引用回复可继续对应 Thread`;
     await this.#deps.enqueueOutbound({
       // Stable id: a re-dispatched fire converges on the one card (§11).
       id: `digest:${operationId}`,
       kind: "card",
       to: owner,
-      card: digestCard(data, `例行任务 ${routine.routineId} · ${describeSchedule(routine)} · 引用回复可继续对应 Thread`),
+      card: digestCard(data, digestFooter),
       threadId: routine.threadId,
-      // spec §7.6: only "waiting on you" justifies buzzing the phone; a quiet digest does not.
-      urgency: data.waiting.length > 0 ? "push" : "quiet",
+      urgency,
+      // The merge section (issue #11): a quiet digest can fold into a shared window's card.
+      ...(urgency === "quiet" ? { part: digestSection(data, digestFooter) satisfies QuietSection } : {}),
     });
     this.ledger.routines.recordOutcome(routine.routineId, `card:${data.running.length} 跑/${data.waiting.length} 等/${data.unreadIdle.length} 未读`);
     this.ledger.timeline.add(
