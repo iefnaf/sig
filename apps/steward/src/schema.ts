@@ -662,13 +662,34 @@ export const MIGRATIONS: readonly Migration[] = [
     },
   },
   {
+    // Issue #13 review: when hello.workers reconciliation is gated behind undelivered events
+    // (snap.lastSeq > processedUpTo), the DO remembers the pending verdict for a reaped
+    // worker and applies it once the event stream catches up — otherwise a worker reaped
+    // while its machine was offline stays `lost` forever even though it is alive (the events
+    // that would prove it are exactly the ones that blocked the reconcile). Numbered 013:
+    // main's #23 took 009/010, #20 took 011, #7 kept 010_routing, #18 took 012_notes; ids
+    // are unique, which is what the ledger keys on — the number keeps the order readable.
+    id: "013_reap_reconcile",
+    up: (sql) => {
+      sql`CREATE TABLE IF NOT EXISTS sh_reap_pending (
+        workerId TEXT PRIMARY KEY,
+        threadId TEXT NOT NULL,
+        snapState TEXT NOT NULL,
+        lastSeq INTEGER NOT NULL,
+        createdAt INTEGER NOT NULL
+      )`;
+    },
+  },
+  {
     // Relay: handoff briefs and continuing on the previous branch (issue #8, spec §5.3,
     // steward.md §2.6). The worker rows learn their relay parent and the last-reported
     // context usage; summary updates become versioned (last 5 kept; every 10th update is
     // prompted as a from-scratch rewrite — steward.md §2.6's anti-drift rule). Existing
     // threads keep their current summary: it enters history as version 1 on the next
     // update, so the cumulative counter never reads zero on a thread with a past.
-    id: "013_relay_handoff",
+    // Numbered 014: main's #46 took 013_reap_reconcile; ids are unique, which is what the
+    // ledger keys on — the number keeps the order readable.
+    id: "014_relay_handoff",
     up: (sql) => {
       ignoringDuplicateColumn(() => {
         sql`ALTER TABLE sh_worker ADD COLUMN parentWorker TEXT`;

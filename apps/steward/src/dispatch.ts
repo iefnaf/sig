@@ -180,6 +180,8 @@ export interface DispatcherDeps {
   ) => Promise<{ cmdId: string }>;
   /** Withdraws a still-queued command; false once it has left the DO. */
   cancelQueuedCommand: (cmdId: string) => boolean;
+  /** Whether the Thread still has a start_worker that can be delivered (queued or sent). */
+  hasDeliverableStart: (threadId: string) => boolean;
   /** Whether a command with this id already exists (replay dedup, protocol §7.1). */
   commandExists: (cmdId: string) => boolean;
   sendText: (text: string, threadId?: string | null) => Promise<void>;
@@ -493,7 +495,16 @@ export class Dispatcher {
         return;
       }
       if (latest.cmdId && this.#deps.cancelQueuedCommand(latest.cmdId)) {
-        this.ledger.workers.markResumeCancelled(latest.workerId, latest.cmdId); // queued resume → back to idle (issue #8)
+        // Route by what the withdrawn command was (PR #54 review, blocker 2): a start_worker
+        // withdrawal closes the never-started worker now (issue #13 review finding 3 — the
+        // Thread is free for a fresh dispatch right away); a resume-send withdrawal reverts
+        // the resume-pending worker quietly (issue #8 — the session itself is intact). A
+        // never-started worker has no sessionId; a resumed one always does.
+        if (latest.sessionId === null) {
+          this.ledger.workers.settleWithdrawnStart(latest.workerId);
+        } else {
+          this.ledger.workers.markResumeCancelled(latest.workerId, latest.cmdId);
+        }
         this.ledger.timeline.add(threadId!, "note", "用户取消：命令在送出前撤回", null);
         await this.#deps.sendText("已取消。想再派发时直接说即可。", threadId);
         return;
@@ -506,9 +517,16 @@ export class Dispatcher {
   }
 
   private hasLiveWorker(threadId: string): boolean {
-    return this.ledger.workers
-      .listByThread(threadId)
-      .some((w) => w.state === "queued" || w.state === "starting" || w.state === "running" || w.state === "recovering");
+    return (
+      this.ledger.workers
+        .listByThread(threadId)
+        .some((w) => w.state === "queued" || w.state === "starting" || w.state === "running" || w.state === "recovering") ||
+      // A start_worker still in flight (queued for an offline machine, or sent and un-acked)
+      // is just as live — the run exists and has merely not reached the worker yet. Keying
+      // the guard on the pending command too keeps a reap from opening duplicate dispatches
+      // (issue #13 review finding 3).
+      this.#deps.hasDeliverableStart(threadId)
+    );
   }
 
   /**

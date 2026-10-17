@@ -49,7 +49,8 @@ export async function resetLedgerState(): Promise<void> {
     for (const table of [
       "sh_machine", "sh_repo", "sh_thread", "sh_thread_repo", "sh_thread_summary", "sh_worker", "sh_report",
       "sh_timeline", "sh_question", "sh_notify", "sh_note", "sh_note_log", "event_inbox", "worker_ack", "outbox",
-      "sh_web_link", "sh_web_session", "sh_deploy", "device", "pairing",
+      "sh_web_link", "sh_web_session", "sh_deploy", "device", "pairing", "sh_reap_pending",
+
     ]) {
       storage.sql.exec(`DELETE FROM ${table}`);
     }
@@ -654,7 +655,7 @@ export class FakeConnector {
 
   /** Sends one worker event with the next seq for that worker (connector-persisted seqs). */
   async emit(
-    kind: "started" | "progress" | "report" | "settled" | "lost" | "resumed" | "queue_returned",
+    kind: "started" | "progress" | "report" | "settled" | "lost" | "resumed" | "queue_returned" | "queued",
     workerId: string,
     fields: Record<string, unknown>,
   ): Promise<void> {

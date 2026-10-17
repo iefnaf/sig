@@ -123,6 +123,27 @@ export function failureCard(conclusion: string, needsYou: string, threadTitle: s
   return renderReportCard({ tone: "failure", conclusion, did: [], needsYou, threadTitle, footer, detailsUrl });
 }
 
+/** The deterministic stall-reminder card (steward.md §8.4 / §6.2 source 1): attention, not
+ * failure — 20 straight minutes of silence may still be one very long tool call. */
+export function stallCard(
+  minutes: number,
+  worker: { agent: string },
+  machineName: string,
+  threadTitle: string,
+  footer: string,
+  detailsUrl?: string,
+) {
+  return renderReportCard({
+    tone: "attention",
+    conclusion: `⏸ ${threadTitle}：${minutes} 分钟没有任何动静`,
+    did: [],
+    needsYou: `${machineName} 上的 ${worker.agent} 无输出已 ${minutes} 分钟。可能是超长的工具调用，也可能卡住了；若确实卡住，连接器会尝试自动重启，持续无动静会被回收为失联。`,
+    threadTitle,
+    footer,
+    detailsUrl,
+  });
+}
+
 /** The offline-ask card (spec §9): dispatch found only an offline machine — never decide silently. */
 export function offlineAskCard(repoName: string, machineName: string, threadTitle: string) {
   return {

@@ -168,6 +168,15 @@ const KIND_LABELS: Record<string, string> = {
   lost: "失联",
   resumed: "恢复",
   note: "备注",
+  stall: "长时间静默",
+};
+
+/** Worker `lastOutcome` codes this feature adds, rendered in the UI's language; every other
+ *  code keeps its raw form (the pre-existing pattern, e.g. `start_failed:…`). */
+const OUTCOME_LABELS: Record<string, string> = {
+  reaped: "失联（DO 回收）",
+  cancelled: "命令已撤回",
+  "error:stall": "挂死（重启一次仍无输出）",
 };
 
 function relTime(ts: number, now: number): string {
@@ -730,7 +739,8 @@ export function renderTimeline(view: TimelineView, now: number): string {
           : w.state === "broken"
             ? "❌"
             : "·";
-    return `<li>${state} ${esc(w.agent)} @ ${esc(w.machineName)}${w.branch ? ` · 分支 ${esc(w.branch)}` : ""}${w.lastOutcome ? ` · ${esc(w.lastOutcome)}` : ""} · <a href="/app/threads/${esc(view.thread.threadId)}/workers/${esc(w.workerId)}">原始过程</a></li>`;
+    const outcome = w.lastOutcome ? ` · ${esc(OUTCOME_LABELS[w.lastOutcome] ?? w.lastOutcome)}` : "";
+    return `<li>${state} ${esc(w.agent)} @ ${esc(w.machineName)}${w.branch ? ` · 分支 ${esc(w.branch)}` : ""}${outcome} · <a href="/app/threads/${esc(view.thread.threadId)}/workers/${esc(w.workerId)}">原始过程</a></li>`;
   });
   return `<h1>${thread.unread ? "● " : ""}${esc(thread.title)}</h1>${stateBadge(thread.state)}
 <p class="meta">${meta}</p>
