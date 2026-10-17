@@ -665,10 +665,11 @@ export const MIGRATIONS: readonly Migration[] = [
     // (snap.lastSeq > processedUpTo), the DO remembers the pending verdict for a reaped
     // worker and applies it once the event stream catches up — otherwise a worker reaped
     // while its machine was offline stays `lost` forever even though it is alive (the events
-    // that would prove it are exactly the ones that blocked the reconcile). Numbered 013:
-    // main's #23 took 009/010, #20 took 011, #7 kept 010_routing, #18 took 012_notes; ids
-    // are unique, which is what the ledger keys on — the number keeps the order readable.
-    id: "013_reap_reconcile",
+    // that would prove it are exactly the ones that blocked the reconcile). Numbered 014:
+    // main's #23 took 009/010, #20 took 011, #7 kept 010_routing, #18 took 012_notes, #19
+    // took 013; ids are unique, which is what the ledger keys on — the number keeps the
+    // order readable.
+    id: "014_reap_reconcile",
     up: (sql) => {
       sql`CREATE TABLE IF NOT EXISTS sh_reap_pending (
         workerId TEXT PRIMARY KEY,
@@ -680,11 +681,35 @@ export const MIGRATIONS: readonly Migration[] = [
     },
   },
   {
+    id: "013_notes_maintenance",
+    up: (sql) => {
+      // A refused write must not break the hard cap. Remember the request for room instead
+      // (one row per distinct request — PR #53 review finding 3); the daily pass frees it
+      // even if the model gives up.
+      sql`CREATE TABLE IF NOT EXISTS sh_note_pressure (
+        layer TEXT NOT NULL, scope_repoId TEXT NOT NULL, text TEXT NOT NULL, chars INTEGER NOT NULL,
+        kind TEXT NOT NULL DEFAULT 'fact', evidence TEXT, replaces TEXT,
+        PRIMARY KEY (layer, scope_repoId, text)
+      )`;
+      ignoringDuplicateColumn(() => {
+        sql`ALTER TABLE sh_note_log ADD COLUMN delivery TEXT NOT NULL DEFAULT 'reply'`;
+      });
+      ignoringDuplicateColumn(() => {
+        sql`ALTER TABLE sh_note_log ADD COLUMN decision TEXT`;
+      });
+      // Lifecycle reports have their own durable delivery, including actionable resident
+      // suggestions. Upgrade any unreported lifecycle rows left by #18 as well.
+      sql`UPDATE sh_note_log SET delivery = 'maintenance'
+          WHERE reportedAt IS NULL AND (op IN ('demoted', 'suggest_demote') OR reason = 'maintenance_cap')`;
+    },
+  },
+  {
     // Daily budget soft cap (issue #28, steward.md §12, ADR-0001 decision 15): today's
     // counter and the cursor into pi's cumulative usage ledger. spend is an estimate derived
     // from token counts and catalog pricing — never a bill — and the day is the UTC calendar
-    // date (the same clock as routine cron expressions). Numbered 014: main's #13 took 013.
-    id: "014_budget",
+    // date (the same clock as routine cron expressions). Numbered 015: main's #13/#19 took
+    // 013, #13's review took 014.
+    id: "015_budget",
     up: (sql) => {
       // One row per UTC day that saw spend or a skip. costUsd accumulates pi.usage's
       // cost.total deltas; tokens its totalTokens deltas; skippedWakes counts the wakes the
