@@ -11,6 +11,7 @@ import { PartialInterruptError } from "./agent.ts";
 import { classifyError } from "./adjudication.ts";
 import { killOrphans, listDescendants, type ProcRef } from "./descendants.ts";
 import { collectGitFacts } from "./git-facts.ts";
+import { openPr, PrError, type PrExec } from "./pr.ts";
 import { acquireLock, markLocksHeldByDeadProcess, releaseLock, removeStaleLocks } from "./locks.ts";
 import { RESUME_PROMPT, PiAdapter } from "./pi-adapter.ts";
 import { ProgressThrottle } from "./progress.ts";
@@ -140,6 +141,9 @@ export interface WorkerManagerOptions {
   store: LocalStore;
   stateDir: string;
   adapter?: AgentAdapter;
+  /** Knobs for the pr_worker command (issue #21): the exec seam lets tests script gh/git
+   *  without a network or a GitHub account. */
+  pr?: { exec?: PrExec; timeoutMs?: number };
   /**
    * Persist-and-send for worker events (§11.3): the transport supplies this (ConnectorClient
    * writes the event to the durable EventLog — per-worker seq — before batching it out).
@@ -173,6 +177,7 @@ export class WorkerManager {
   private readonly stateDir: string;
   private readonly adapter: AgentAdapter;
   private readonly worktrees: WorktreeManager;
+  private readonly prOptions: { exec?: PrExec; timeoutMs?: number } | undefined;
   private readonly emit?: (workerId: string, fields: Record<string, unknown>) => void;
   private readonly now: () => number;
   private readonly throttles = new Map<string, ProgressThrottle>();
@@ -229,6 +234,7 @@ export class WorkerManager {
     this.stateDir = options.stateDir;
     this.adapter = options.adapter ?? new PiAdapter({ stateDir: options.stateDir });
     this.worktrees = new WorktreeManager({ worktreesRoot: join(options.stateDir, "worktrees") });
+    this.prOptions = options.pr;
     this.emit = options.emit;
     this.now = options.now ?? Date.now;
     const recovery = options.recovery ?? {};
@@ -296,6 +302,15 @@ export class WorkerManager {
       case "cleanup_worktree": {
         const workerId = commandWorkerId(args, envelopeWorkerId, kind);
         return this.cleanupWorktree(workerId, args.force === true);
+      }
+      case "pr_worker": {
+        const workerId = commandWorkerId(args, envelopeWorkerId, kind);
+        return this.prWorker(
+          commandId,
+          workerId,
+          typeof args.title === "string" ? args.title : "",
+          typeof args.body === "string" ? args.body : "",
+        );
       }
       default:
         throw new CommandError("unsupported_command", `command kind '${kind}' is not implemented yet`);
@@ -743,6 +758,60 @@ export class WorkerManager {
     }
     this.store.clearWorkerWorktree(workerId);
     return { removed: worker.worktree };
+  }
+
+  // --- pr_worker (connector-pi.md §6.1, issue #21: the consent gate's machine half) ------------------
+
+  /** `pr_worker`: push the worker's branch and run `gh pr create` in its worktree. The
+   *  command only exists because the user tapped [同意] on the done card; the connector
+   *  never pushes on its own (§7.3 rule 4). The result rides the event stream —
+   *  `pr_created{url}` / `pr_failed{stage,message}` — so the chat hears it asynchronously
+   *  even though the command result settles with the URL too. */
+  async prWorker(commandId: string, workerId: string, title: string, body: string): Promise<{ url: string; branch: string }> {
+    const worker = this.requireWorker(workerId);
+    if (!worker.worktree || !worker.branch) {
+      throw new CommandError(
+        "no_worktree",
+        `worker ${workerId} has no worktree branch to open a PR from (readonly task or main-checkout repo)`,
+      );
+    }
+    if (SERIAL_SLOT_STATES.has(worker.state)) {
+      throw new CommandError(
+        "worker_running",
+        `worker ${workerId} is ${worker.state}; let the run settle before opening a PR`,
+      );
+    }
+    if (!this.store.getRepo(worker.repoId)) {
+      throw new CommandError("not_registered_repo", `repo '${worker.repoId}' is not registered on this machine`);
+    }
+    try {
+      const { url } = await openPr({
+        worktree: worker.worktree,
+        branch: worker.branch,
+        title: title || worker.branch,
+        body,
+        ...(this.prOptions?.exec !== undefined ? { exec: this.prOptions.exec } : {}),
+        ...(this.prOptions?.timeoutMs !== undefined ? { timeoutMs: this.prOptions.timeoutMs } : {}),
+      });
+      await this.emitEvent(workerId, "pr_created", { cmdId: commandId, url, branch: worker.branch });
+      return { url, branch: worker.branch };
+    } catch (err) {
+      // The failure card's inputs (issue #21 AC4): the event carries the classified stage;
+      // the command still fails loudly so the steward's outbox row settles. The emit is
+      // best-effort — a store already closed at shutdown must not mask the real error.
+      const stage = err instanceof PrError ? err.stage : "create";
+      const message = (err instanceof Error ? err.message : String(err)).slice(0, 300);
+      await this.emitEvent(workerId, "pr_failed", { cmdId: commandId, stage, message }).catch(() => undefined);
+      const code =
+        stage === "gh_missing"
+          ? "gh_missing"
+          : stage === "auth"
+            ? "gh_auth"
+            : stage === "push"
+              ? "push_rejected"
+              : "pr_create_failed";
+      throw new CommandError(code, message);
+    }
   }
 
   // --- §6.1/§6.2: send and interrupt -----------------------------------------------------------

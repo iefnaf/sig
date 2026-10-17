@@ -504,6 +504,8 @@ Over-length input is rejected by the tool with a demand to rewrite. The link (th
 
 Merging rules: within one channel, multiple `urgency: quiet` notifications merge into one over a 60-second window; `urgency: push` sends immediately; anything related to `waiting_you` is always `push`.
 
+**The PR consent gate (issue #21, spike-conclusions §2):** a done report for a *write* task whose git facts say `ahead > 0 && !pushed` renders with two extra buttons — [同意] (approve) / [先不要] (not yet). Nothing is pushed without that tap (connector-pi.md §7.3 rule 4). [同意] sends the `pr_worker` command to the worker's machine; the PR URL (or the classified failure: no gh / auth / push rejected) lands back in the chat asynchronously as a deterministic card, and a failure re-arms the same button as a retry. [先不要] records the decision on `sh_pr_consent` and does nothing else. The tap resolves through the card's providerMsgId → outbound row id (`notify:report:<workerId>:<seq>`) — never data stuffed into the button (§3.1).
+
 ### 6.5 User views and unread
 
 Opening a Thread on the web, or replying to its report, clears `unread`. A card button click counts as both read and one reply.

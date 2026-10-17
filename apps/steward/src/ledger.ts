@@ -147,10 +147,28 @@ export interface MachineRow {
 export interface NotifyRow {
   id: number;
   dedupeKey: string;
-  kind: "done_report" | "attention_report" | "failure_push" | "stall_notice";
+  kind: "done_report" | "attention_report" | "failure_push" | "stall_notice" | "pr_created" | "pr_failed";
   threadId: string;
   workerId: string | null;
   questionId: string | null;
+  /** Issue #21: render inputs that belong to the intent (a pr_created's url/branch, a
+   *  pr_failed's stage/message) — JSON, read by the renderer, written by the reducer. */
+  payload: string | null;
+}
+
+/** The consent gate's durable state (issue #21): the user's tap on a done card's
+ *  [同意]/[先不要], the pr_worker command it sent, and the async result that came back. */
+export interface PrConsentRow {
+  workerId: string;
+  seq: number;
+  threadId: string;
+  decision: "approved" | "declined";
+  cmdId: string | null;
+  attempts: number;
+  url: string | null;
+  failure: string | null;
+  decidedAt: number;
+  updatedAt: number;
 }
 
 /** A worker in an active state, plus its machine's connection state (issue #13 review: the
@@ -467,6 +485,19 @@ const viewQuestion = (r: Record<string, unknown>): QuestionRow => ({
   kind: (r.kind as QuestionRow["kind"]) ?? "steward",
   fallbackDueAt: (r.fallbackDueAt as number | null) ?? null,
   handledAt: (r.handledAt as number | null) ?? null,
+});
+
+const viewPrConsent = (r: Record<string, unknown>): PrConsentRow => ({
+  workerId: r.workerId as string,
+  seq: r.seq as number,
+  threadId: r.threadId as string,
+  decision: r.decision === "approved" ? "approved" : "declined",
+  cmdId: (r.cmdId as string | null) ?? null,
+  attempts: (r.attempts as number) ?? 0,
+  url: (r.url as string | null) ?? null,
+  failure: (r.failure as string | null) ?? null,
+  decidedAt: r.decidedAt as number,
+  updatedAt: r.updatedAt as number,
 });
 
 const viewRoutine = (r: Record<string, unknown>): RoutineRow => ({
@@ -1374,10 +1405,17 @@ export function createLedger(deps: LedgerDeps) {
 
   const notifications = {
     /** INSERT OR IGNORE on dedupeKey: the reducer transaction may be re-entered after a crash. */
-    queue(dedupeKey: string, kind: NotifyRow["kind"], threadId: string, workerId: string | null, questionId: string | null = null): void {
+    queue(
+      dedupeKey: string,
+      kind: NotifyRow["kind"],
+      threadId: string,
+      workerId: string | null,
+      questionId: string | null = null,
+      payload: string | null = null,
+    ): void {
       sql`
-        INSERT OR IGNORE INTO sh_notify (dedupeKey, kind, threadId, workerId, createdAt, questionId)
-        VALUES (${dedupeKey}, ${kind}, ${threadId}, ${workerId}, ${now()}, ${questionId})
+        INSERT OR IGNORE INTO sh_notify (dedupeKey, kind, threadId, workerId, createdAt, questionId, payload)
+        VALUES (${dedupeKey}, ${kind}, ${threadId}, ${workerId}, ${now()}, ${questionId}, ${payload})
       `;
     },
     /** Whether a row with this dedupeKey exists (sent or pending) — "already notified". */
@@ -1385,10 +1423,92 @@ export function createLedger(deps: LedgerDeps) {
       return sql`SELECT 1 AS one FROM sh_notify WHERE dedupeKey = ${dedupeKey}`.length > 0;
     },
     pending(): NotifyRow[] {
-      return sql<NotifyRow>`SELECT id, dedupeKey, kind, threadId, workerId, questionId FROM sh_notify WHERE sentAt IS NULL ORDER BY id`;
+      return sql<NotifyRow>`SELECT id, dedupeKey, kind, threadId, workerId, questionId, payload FROM sh_notify WHERE sentAt IS NULL ORDER BY id`;
     },
     markSent(id: number): void {
       sql`UPDATE sh_notify SET sentAt = ${now()} WHERE id = ${id} AND sentAt IS NULL`;
+    },
+  };
+
+  // ---- PR consent gate (issue #21, spike-conclusions §2) ---------------------------------------
+
+  const prConsent = {
+    get(workerId: string, seq: number): PrConsentRow | null {
+      const row = sql<Record<string, unknown>>`
+        SELECT * FROM sh_pr_consent WHERE workerId = ${workerId} AND seq = ${seq}
+      `[0];
+      return row ? viewPrConsent(row) : null;
+    },
+    byCmd(cmdId: string): PrConsentRow | null {
+      if (!cmdId) return null;
+      const row = sql<Record<string, unknown>>`
+        SELECT * FROM sh_pr_consent WHERE cmdId = ${cmdId} ORDER BY updatedAt DESC LIMIT 1
+      `[0];
+      return row ? viewPrConsent(row) : null;
+    },
+    latestForWorker(workerId: string): PrConsentRow | null {
+      const row = sql<Record<string, unknown>>`
+        SELECT * FROM sh_pr_consent WHERE workerId = ${workerId} ORDER BY updatedAt DESC, seq DESC LIMIT 1
+      `[0];
+      return row ? viewPrConsent(row) : null;
+    },
+    /** Records the user's tap. An upsert, never a silent re-create: a declined row may be
+     *  approved later, and a failed approved row re-approved for another attempt (which
+     *  clears the failure — the retry gets a fresh command id). */
+    record(input: {
+      workerId: string;
+      seq: number;
+      threadId: string;
+      decision: "approved" | "declined";
+      cmdId?: string | null;
+      attempts?: number;
+    }): void {
+      sql`
+        INSERT INTO sh_pr_consent (workerId, seq, threadId, decision, cmdId, attempts, url, failure, decidedAt, updatedAt)
+        VALUES (${input.workerId}, ${input.seq}, ${input.threadId}, ${input.decision}, ${input.cmdId ?? null},
+                ${input.attempts ?? 0}, NULL, NULL, ${now()}, ${now()})
+        ON CONFLICT (workerId, seq) DO UPDATE SET
+          decision = excluded.decision, cmdId = excluded.cmdId, attempts = excluded.attempts,
+          url = NULL, failure = NULL, updatedAt = ${now()}
+      `;
+    },
+    /** The pr_created landing: the loop's async answer (issue #21 AC2). */
+    settleUrl(workerId: string, seq: number, url: string): void {
+      sql`
+        UPDATE sh_pr_consent SET url = ${url}, failure = NULL, updatedAt = ${now()}
+        WHERE workerId = ${workerId} AND seq = ${seq}
+      `;
+    },
+    /** The failure sink both paths share — the pr_failed event AND a failed pr_worker
+     *  command row (rejected at the door, or never delivered to an offline machine).
+     *  Idempotent: only the FIRST failure on a decided row notifies; the duplicate that
+     *  can follow (cmd_result after the event, or the event after the cmd path) must not
+     *  push a second card. */
+    fail(input: { workerId: string; cmdId?: string | null; stage: string; message: string }): boolean {
+      const row = (input.cmdId ? prConsent.byCmd(input.cmdId) : null) ?? prConsent.latestForWorker(input.workerId);
+      if (!row || row.failure !== null) return false;
+      const message = input.message.slice(0, 280);
+      sql`
+        UPDATE sh_pr_consent SET failure = ${message}, url = NULL, updatedAt = ${now()}
+        WHERE workerId = ${row.workerId} AND seq = ${row.seq}
+      `;
+      notifications.queue(
+        `prfail:${row.workerId}:${row.seq}`,
+        "pr_failed",
+        row.threadId,
+        row.workerId,
+        null,
+        JSON.stringify({ stage: input.stage, message }),
+      );
+      timeline.add(
+        row.threadId,
+        "note",
+        `推送/创建 PR 失败（${input.stage}）：${message}`,
+        { workerId: row.workerId, ...(input.cmdId ? { cmdId: input.cmdId } : {}) },
+      );
+      sql`UPDATE sh_thread SET unread = 1 WHERE threadId = ${row.threadId}`;
+      recomputeThreadState(row.threadId);
+      return true;
     },
   };
 
@@ -2040,6 +2160,45 @@ export function createLedger(deps: LedgerDeps) {
         timeline.add(worker.threadId, "note", "检测到会话在机器上被直接使用过", { workerId, seq });
         break;
       }
+      case "pr_created": {
+        // The consent gate's async answer (issue #21 AC2): the connector pushed the branch
+        // and gh opened the PR. Deterministic card, no wake — there is nothing for the model
+        // to decide; the URL is recorded on the consent row so a repeated [同意] answers
+        // honestly instead of opening a second PR.
+        const url = str(event.url) ?? "";
+        const branch = str(event.branch);
+        const consentRow = (str(event.cmdId) ? prConsent.byCmd(str(event.cmdId)!) : null) ?? prConsent.latestForWorker(workerId);
+        if (consentRow) prConsent.settleUrl(consentRow.workerId, consentRow.seq, url);
+        timeline.add(
+          worker.threadId,
+          "note",
+          `PR 已创建${url ? `：${url}` : ""}${branch ? `（分支 ${branch}）` : ""}`,
+          { workerId, seq, url },
+        );
+        sql`UPDATE sh_thread SET unread = 1 WHERE threadId = ${worker.threadId}`;
+        notifications.queue(
+          `pr_created:${workerId}:${seq}`,
+          "pr_created",
+          worker.threadId,
+          workerId,
+          null,
+          JSON.stringify({ url, branch: branch ?? "" }),
+        );
+        break;
+      }
+      case "pr_failed": {
+        // The failure half (issue #21 AC4): the classified stage rides the payload so the
+        // card can tell the owner what to fix on the machine. prConsent.fail owns the
+        // timeline/unread/notify — it is shared with the failed-command path and dedupes
+        // between the two.
+        prConsent.fail({
+          workerId,
+          cmdId: str(event.cmdId) || null,
+          stage: str(event.stage) ?? "unknown",
+          message: str(event.message) ?? "",
+        });
+        break;
+      }
       default:
         // process_exit and future event types carry no ledger semantics yet.
         break;
@@ -2119,6 +2278,8 @@ export function createLedger(deps: LedgerDeps) {
       threads: Array<ThreadRow & { repoIds: string[]; workers: WorkerRow[]; questions: QuestionRow[]; timeline: TimelineRow[] }>;
       /** Every question row, threadless routing asks included (issue #7). */
       questions: QuestionRow[];
+      /** The consent gate's rows (issue #21) — what the user tapped and what came back. */
+      prConsent: PrConsentRow[];
       pendingNotifications: NotifyRow[];
       runs: RunRow[];
       wakes: WakeRow[];
@@ -2143,6 +2304,7 @@ export function createLedger(deps: LedgerDeps) {
         questions: sql<QuestionRow>`
           SELECT * FROM sh_question ORDER BY askedAt
         `,
+        prConsent: sql<Record<string, unknown>>`SELECT * FROM sh_pr_consent ORDER BY decidedAt`.map(viewPrConsent),
         pendingNotifications: notifications.pending(),
         runs: runs.rows(),
         wakes: sql<WakeRow>`SELECT * FROM sh_wake ORDER BY id`,
@@ -2167,6 +2329,7 @@ export function createLedger(deps: LedgerDeps) {
   return {
     machines, repos, threads, workers, reports, questions, timeline, notifications, outbound,
     runs, wakes, notes, budget, routines, followups, offers, handoff, views, applyPendingEvents, recomputeThreadState, debug,
+    prConsent,
   };
 }
 

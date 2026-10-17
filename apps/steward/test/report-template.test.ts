@@ -10,7 +10,12 @@ import {
   needsYouOf,
   notifyCard,
   offlineAskCard,
+  prCommandArgs,
+  prConsentFor,
+  prCreatedCard,
+  prFailureNeedsYou,
   renderReportCard,
+  reportCardFor,
   toneOfReport,
 } from "../src/report-template.ts";
 
@@ -171,5 +176,64 @@ describe("notifyCard / askUserText (issue #6)", () => {
     expect(text).toContain("【登录 bug】");
     expect(text).toContain("1. A 登录 bug");
     expect(text).toContain("直接回复这句话");
+  });
+});
+
+describe("the PR consent gate's templates (issue #21)", () => {
+  it("reportCardFor adds [同意]/[先不要] exactly for done write reports with unpushed commits", () => {
+    const withConsent = reportCardFor(report(), worker, "mac-studio", "登录 bug") as { elements: Array<Record<string, unknown>> };
+    const action = withConsent.elements.find((el) => el.tag === "action") as { actions: Array<{ value: Record<string, unknown> }> };
+    expect(action.actions.map((b) => b.value.action)).toEqual(["pr_approve", "pr_decline"]);
+    expect(JSON.stringify(withConsent)).toContain("还没推送");
+    expect(JSON.stringify(withConsent)).toContain("2 个提交");
+
+    const pushed = reportCardFor(report({ git: { ...report().git!, pushed: true } }), worker, "m", "t") as { elements: unknown[] };
+    expect(pushed.elements.some((el) => (el as Record<string, unknown>).tag === "action" && (el as { actions?: unknown[] }).actions?.some((b) => (b as { value?: { action?: string } }).value?.action?.startsWith("pr_")))).toBe(false);
+
+    const readonlyWorker = { ...worker, mode: "readonly" } as WorkerRow;
+    expect(prConsentFor(report(), readonlyWorker)).toBeNull();
+    expect(prConsentFor(report({ status: "needs_decision" }), worker)).toBeNull();
+    expect(prConsentFor(report({ git: { ...report().git!, ahead: 0 } }), worker)).toBeNull();
+  });
+
+  it("button values carry ONLY the action — identity resolves via providerMsgId (§3.1)", () => {
+    const card = reportCardFor(report(), worker, "mac-studio", "登录 bug") as { elements: Array<Record<string, unknown>> };
+    const action = card.elements.find((el) => el.tag === "action") as { actions: Array<{ value: Record<string, unknown> }> };
+    for (const button of action.actions) {
+      expect(Object.keys(button.value)).toEqual(["action"]);
+    }
+    expect(JSON.stringify(card)).not.toMatch(/w_[0-9A-Z]+/); // no worker id stuffed in
+  });
+
+  it("prCreatedCard is green, carries the URL as text and as an open-PR button", () => {
+    const card = prCreatedCard({ url: "https://github.com/example/repo-a/pull/7", branch: "shepherd/login-1", threadTitle: "登录 bug", footer: "f" }) as {
+      header: Record<string, unknown>;
+      elements: unknown[];
+    };
+    expect(JSON.stringify(card.header)).toContain("green");
+    expect(JSON.stringify(card.header)).toContain("PR 已创建");
+    const parts = JSON.stringify(card.elements);
+    expect(parts).toContain("https://github.com/example/repo-a/pull/7");
+    expect(parts).toContain("已推送到远端");
+  });
+
+  it("prFailureNeedsYou names the machine-side fix per stage and the retry contract", () => {
+    expect(prFailureNeedsYou("gh_missing", "")).toContain("GitHub CLI");
+    expect(prFailureNeedsYou("auth", "Bad credentials")).toContain("gh auth login");
+    expect(prFailureNeedsYou("push", "pre-receive declined")).toContain("推送分支被拒绝");
+    expect(prFailureNeedsYou("whatever", "boom")).toContain("boom");
+    expect(prFailureNeedsYou("gh_missing", "")).toContain("再点一次「同意」");
+  });
+
+  it("prCommandArgs builds the title/body from the report — data only, no LLM", () => {
+    const { title, body } = prCommandArgs({ report: report(), threadTitle: "登录 bug", branch: "shepherd/login-1" });
+    expect(title).toBe("登录 bug 修好，测试通过");
+    expect(body).toContain("auth/session.ts 里补上了 token 过期后的刷新");
+    expect(body).toContain("测试：通过");
+    expect(body).toContain("shepherd/login-1");
+    // No report (it was pruned): the thread title stands in, the body still names the branch.
+    const fallback = prCommandArgs({ report: null, threadTitle: "登录 bug", branch: "shepherd/login-1" });
+    expect(fallback.title).toBe("登录 bug");
+    expect(fallback.body).toContain("shepherd/login-1");
   });
 });

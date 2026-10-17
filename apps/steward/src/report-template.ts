@@ -17,6 +17,16 @@ export type Tone = "success" | "attention" | "failure";
 const TONE_BADGE = { success: "✅", attention: "⚠️", failure: "❌" } as const;
 const TONE_TEMPLATE = { success: "green", attention: "orange", failure: "red" } as const;
 
+export interface ReportCardButton {
+  label: string;
+  /** Callback buttons carry ONLY this opaque action string; Thread identity resolves via
+   *  the card's providerMsgId on click — never data stuffed into the button (§3.1). */
+  value?: string;
+  /** URL buttons open a link; no callback. */
+  url?: string;
+  primary?: boolean;
+}
+
 export interface ReportCardInput {
   tone: Tone;
   conclusion: string;
@@ -30,6 +40,9 @@ export interface ReportCardInput {
    *  §5.3 fallback card forwards the worker's question VERBATIM — a clip would silently drop
    *  the clause the owner must answer on the no-LLM path of last resort. */
   rawNeedsYou?: boolean;
+  /** Action buttons (issue #21: the consent gate's [同意]/[先不要], the PR link). Rendered
+   *  as one `action` element after needs-you, before the details link. */
+  buttons?: ReportCardButton[];
 }
 
 function clip(text: string, max: number): string {
@@ -48,6 +61,18 @@ export function renderReportCard(input: ReportCardInput): { config: unknown; hea
     const needsYouText = input.rawNeedsYou ? input.needsYou.trim() : clip(input.needsYou, MAX_NEEDS_YOU + 6);
     elements.push({ tag: "hr" });
     elements.push({ tag: "div", text: { tag: "lark_md", content: `**需要你**：${needsYouText}` } });
+  }
+  if (input.buttons && input.buttons.length > 0) {
+    elements.push({
+      tag: "action",
+      actions: input.buttons.map((button) => ({
+        tag: "button",
+        text: { tag: "plain_text", content: clip(button.label, 24) },
+        type: button.primary ? "primary" : "default",
+        ...(button.value !== undefined ? { value: { action: button.value } } : {}),
+        ...(button.url !== undefined ? { url: button.url } : {}),
+      })),
+    });
   }
   if (input.detailsUrl) {
     // "查看详情" logs the owner straight into the Thread timeline (spec §7.3; the URL is a
@@ -110,22 +135,92 @@ export function toneOfReport(status: ReportRow["status"]): Tone {
   return status === "done" ? "success" : "attention";
 }
 
+/** Issue #21 (spike-conclusions §2): whether this done report owes the consent gate — a
+ *  write task with commits that never left the machine. Nothing is pushed without the tap. */
+export function prConsentFor(report: ReportRow, worker: Pick<WorkerRow, "mode">): { branch: string; ahead: number } | null {
+  const git = report.git;
+  if (report.status !== "done" || worker.mode !== "write" || !git || git.pushed || git.ahead <= 0) return null;
+  return { branch: git.branch, ahead: git.ahead };
+}
+
 /** Assembles the deterministic done-class card for a processed `report` event. */
 export function reportCardFor(report: ReportRow, worker: WorkerRow, machineName: string, threadTitle: string, detailsUrl?: string) {
+  const consent = prConsentFor(report, worker);
   return renderReportCard({
     tone: toneOfReport(report.status),
     conclusion: report.summary,
     did: didBullets(report),
-    needsYou: needsYouOf(report),
+    // The consent ask replaces the generic next-step line when it applies: the decision the
+    // card exists to collect IS what the owner must do next.
+    needsYou: consent
+      ? `分支 ${consent.branch}（${consent.ahead} 个提交）还没推送。点「同意」我会推送并创建 PR；选「先不要」就先留在机器上。`
+      : needsYouOf(report),
     threadTitle,
     detailsUrl,
     footer: `Thread「${threadTitle}」 · ${worker.agent} @ ${machineName} · 引用回复可继续这个 Thread`,
+    ...(consent ? { buttons: [{ label: "同意", value: "pr_approve", primary: true }, { label: "先不要", value: "pr_decline" }] } : {}),
   });
 }
 
 /** The deterministic failure card for settled error / start-failure pushes. */
 export function failureCard(conclusion: string, needsYou: string, threadTitle: string, footer: string, detailsUrl?: string) {
   return renderReportCard({ tone: "failure", conclusion, did: [], needsYou, threadTitle, footer, detailsUrl });
+}
+
+/** The pr_created card (issue #21 AC2): the loop's closing message — the PR URL lands back
+ *  in the chat, as text (copyable) and as a button. */
+export function prCreatedCard(input: { url: string; branch: string; threadTitle: string; footer: string; detailsUrl?: string }) {
+  return renderReportCard({
+    tone: "success",
+    conclusion: "PR 已创建，等你审查",
+    did: [`分支 ${input.branch} 已推送到远端`],
+    needsYou: input.url,
+    threadTitle: input.threadTitle,
+    footer: input.footer,
+    detailsUrl: input.detailsUrl,
+    buttons: [{ label: "打开 PR", url: input.url, primary: true }],
+  });
+}
+
+/** The three-part failure report's needs-you for a pr_failed (issue #21 AC4): the fix is on
+ *  the machine (install/login gh) or in the repo (push rejection); the retry is the same
+ *  [同意] button on the original card — the gate re-arms after a failure. */
+export function prFailureNeedsYou(stage: string, message: string): string {
+  const retry = "处理好后回到原来那张汇报卡片再点一次「同意」即可重试。";
+  switch (stage) {
+    case "gh_missing":
+      return `这台机器上没有安装 GitHub CLI（gh）。安装后（macOS：brew install gh）${retry}`;
+    case "auth":
+      return `gh 没有登录或凭证已过期（${message}）。在这台机器上运行 gh auth login，然后${retry}`;
+    case "push":
+      return `推送分支被拒绝：${message}。${retry}`;
+    case "command":
+      return `机器没有执行成功（${message}）。${retry}`;
+    case "delivery":
+      return `指令没能送到机器（${message}）。机器上线后${retry}`;
+    default:
+      return `gh pr create 失败：${message}。${retry}`;
+  }
+}
+
+/** The pr_worker command's title/body, built deterministically from the report the user
+ *  consented to (issue #21): data only, no LLM anywhere on this path. */
+export function prCommandArgs(input: { report: ReportRow | null; threadTitle: string; branch: string }): { title: string; body: string } {
+  const report = input.report;
+  const title = (report?.summary ?? input.threadTitle).trim().slice(0, 70);
+  const lines: string[] = [];
+  if (report) {
+    lines.push(report.summary);
+    const changes = report.changes ?? [];
+    if (changes.length > 0) lines.push("", "做了什么：", ...changes.slice(0, 10).map((c) => `- ${c}`));
+    if (report.tests?.ran) {
+      lines.push("", `测试：${report.tests.passed === false ? "未通过" : "通过"}${report.tests.note ? `（${report.tests.note}）` : ""}`);
+    }
+    const leftovers = report.leftovers ?? [];
+    if (leftovers.length > 0) lines.push("", "遗留：", ...leftovers.slice(0, 10).map((l) => `- ${l}`));
+  }
+  lines.push("", `由 Shepherd 派发的 worker 在分支 ${input.branch} 上完成。`);
+  return { title, body: lines.join("\n") };
 }
 
 /** The deterministic stall-reminder card (steward.md §8.4 / §6.2 source 1): attention, not
