@@ -1024,23 +1024,36 @@ describe("notes forgetting: retention, pins, pressure (issue #19)", () => {
     });
   });
 
-  it("a pinned target can never be spent as room in replaces — even by a same-claim draft", async () => {
+  it("a pinned target is refused in replaces regardless of capacity (review finding 1)", async () => {
     await inNotesDo((n) => {
+      // Escape (a): the layer has ROOM — the old code archived the pinned target anyway.
+      const lone = n.commit({ text: "唯一的旧偏好", kind: "preference", source: "user_said", layer: "resident" });
+      if (!lone.ok) throw new Error("fixture failed");
+      n.pin(lone.note.noteId, true);
+      const withRoom = n.commit(
+        { text: "一条无关的新偏好", kind: "preference", source: "user_said", layer: "resident" },
+        { replaces: [lone.note.noteId] },
+      );
+      expect(withRoom.ok).toBe(false);
+      if (!withRoom.ok) {
+        expect(withRoom.code).toBe("invalid");
+        expect(withRoom.message).toContain("置顶");
+      }
+      expect(n.get(lone.note.noteId)).toMatchObject({ layer: "resident", status: "active", pinned: true });
+
+      // Escape (b): near-cap, mixed targets — the unpinned ones alone cover the deficit.
+      // The old code skipped the pinned check and the loop archived the pinned note as 'evicted'.
       const created = fillLayer(n, "resident", 2360, 20);
       const pinned = created[5]!;
       n.pin(pinned.noteId, true);
-      // A different claim whose only "room" would be the pinned entry: refused — pins leave
-      // only by the owner's unpin, never by eviction-shaped replaces (spec §10.2).
-      const done = n.commit(
+      const mixed = n.commit(
         { text: `${"另".repeat(40)}一条新偏好`, kind: "preference", source: "user_said", layer: "resident" },
-        { replaces: [pinned.noteId] },
+        { replaces: [created[0]!.noteId, pinned.noteId] },
       );
-      expect(done.ok).toBe(false);
-      if (!done.ok) {
-        expect(done.code).toBe("capacity");
-        expect(done.message).toContain("置顶");
-      }
-      expect(n.get(pinned.noteId)).toMatchObject({ layer: "resident", pinned: true });
+      expect(mixed.ok).toBe(false);
+      if (!mixed.ok) expect(mixed.code).toBe("invalid");
+      expect(n.get(pinned.noteId)).toMatchObject({ layer: "resident", status: "active", pinned: true });
+      expect(n.get(created[0]!.noteId)).toMatchObject({ layer: "resident", status: "active" }); // untouched too
     });
   });
 
@@ -1104,6 +1117,128 @@ describe("notes forgetting: retention, pins, pressure (issue #19)", () => {
       // The cap holds after the pass.
       const bytes = sql<{ total: number }>`SELECT COALESCE(SUM(bytes),0) AS total FROM sh_note WHERE layer='resident' AND status='active'`[0]!.total;
       expect(bytes).toBeLessThanOrEqual(2400);
+    });
+  });
+
+  it("an unrelated successful write does not silently delete the parked promise (review finding 2)", async () => {
+    await inNotesDo((n, _ledger, sql) => {
+      fillLayer(n, "resident", 2360, 20);
+      const refused = n.commit({ text: `${"长".repeat(55)}的一条用户偏好`, kind: "preference", source: "user_said", layer: "resident" });
+      expect(refused.ok).toBe(false);
+      expect(sql`SELECT COUNT(*) AS n FROM sh_note_pressure`[0]!.n).toBe(1);
+
+      // An UNRELATED small write fits without touching the parked request's room.
+      const small = n.commit({ text: "短偏好", kind: "preference", source: "user_said", layer: "resident" });
+      if (!small.ok) throw new Error(small.message);
+      expect(sql`SELECT COUNT(*) AS n FROM sh_note_pressure`[0]!.n).toBe(1); // the promise survives
+
+      // The daily pass still honours it — evicting by score, writing, reporting both halves.
+      const changes = n.maintenance(Date.now());
+      expect(changes.map((c) => c.op)).toContain("noted");
+      expect(changes.map((c) => c.op)).toContain("evicted");
+      const noted = changes.find((c) => c.op === "noted")!;
+      expect(noted.text).toContain("的一条用户偏好");
+      expect(sql`SELECT COUNT(*) AS n FROM sh_note_pressure`[0]!.n).toBe(0);
+    });
+  });
+
+  it("two distinct parked requests are both honoured — latest-wins no longer erases one (review finding 3)", async () => {
+    await inNotesDo((n, _ledger, sql) => {
+      fillLayer(n, "resident", 2360, 20);
+      const first = n.commit({ text: `${"甲".repeat(55)}的第一条偏好`, kind: "preference", source: "user_said", layer: "resident" });
+      const second = n.commit({ text: `${"乙".repeat(55)}的第二条偏好`, kind: "preference", source: "user_said", layer: "resident" });
+      expect(first.ok).toBe(false);
+      expect(second.ok).toBe(false);
+      expect(sql`SELECT COUNT(*) AS n FROM sh_note_pressure`[0]!.n).toBe(2);
+      // The identical retry is a true no-op for the log too (the log-dup minor).
+      n.commit({ text: `${"乙".repeat(55)}的第二条偏好`, kind: "preference", source: "user_said", layer: "resident" });
+      expect(sql`SELECT COUNT(*) AS n FROM sh_note_log WHERE op = 'room_needed'`[0]!.n).toBe(2);
+
+      const changes = n.maintenance(Date.now());
+      const noted = changes.filter((c) => c.op === "noted").map((c) => c.text);
+      expect(noted).toHaveLength(2);
+      expect(noted.some((t) => t.includes("的第一条偏好"))).toBe(true);
+      expect(noted.some((t) => t.includes("的第二条偏好"))).toBe(true);
+      expect(sql`SELECT COUNT(*) AS n FROM sh_note_pressure`[0]!.n).toBe(0);
+    });
+  });
+
+  it("a parked correction supersedes its named predecessor — not score-evicts around it (review finding 4)", async () => {
+    await inNotesDo((n, _ledger, sql) => {
+      const predecessor = n.commit({ text: "汇报一律用英文写", kind: "preference", source: "user_said", layer: "resident" });
+      if (!predecessor.ok) throw new Error("fixture failed");
+      fillLayer(n, "resident", 2360 - predecessor.note.text.length, 20);
+      // The correction names its predecessor but the reworded text still does not fit.
+      const correction = n.commit(
+        { text: `汇报一律用中文写，${"包".repeat(50)}括标题`, kind: "preference", source: "user_said", layer: "resident" },
+        { replaces: [predecessor.note.noteId] },
+      );
+      expect(correction.ok).toBe(false);
+
+      const changes = n.maintenance(Date.now());
+      expect(changes.map((c) => c.op)).toContain("superseded");
+      const superseded = changes.find((c) => c.op === "superseded")!;
+      expect(superseded.noteId).toBe(predecessor.note.noteId);
+      const noted = changes.find((c) => c.op === "noted")!;
+      expect(noted.text).toContain("汇报一律用中文写");
+      // The predecessor sank as a historical version of the correction — both-active is gone.
+      expect(n.get(predecessor.note.noteId)).toMatchObject({
+        layer: "archive",
+        status: "superseded",
+        supersededBy: noted.noteId,
+      });
+      expect(n.get(noted.noteId)).toMatchObject({ layer: "resident", status: "active" });
+      expect(sql`SELECT COUNT(*) AS n FROM sh_note_pressure`[0]!.n).toBe(0);
+    });
+  });
+
+  it("the saved note is reported by the daily delivery, not stranded as reply-class (review finding 5)", async () => {
+    await inNotesDo((n, _ledger, sql) => {
+      fillLayer(n, "resident", 2360, 20);
+      n.commit({ text: `${"长".repeat(55)}的一条用户偏好`, kind: "preference", source: "user_said", layer: "resident" });
+      n.maintenance(Date.now());
+      const rows = sql<{ op: string; delivery: string }>`
+        SELECT op, delivery FROM sh_note_log WHERE op = 'noted' AND reason = 'user_said' ORDER BY id
+      `;
+      const saved = rows[rows.length - 1]!;
+      expect(saved.delivery).toBe("maintenance"); // rides the daily flush, both halves in one message
+    });
+  });
+
+  it("the owner's own archive tap leaves no redundant relay clause (review minor)", async () => {
+    await inNotesDo((n) => {
+      const res = n.commit({ text: "要归档的老偏好", kind: "preference", source: "user_said", layer: "resident" });
+      if (!res.ok) throw new Error("fixture failed");
+      n.drainPendingForReply(); // the「记住了」rode a reply before the tap
+      const done = n.demote(res.note.noteId, 0, "note_archive"); // the card tap's module call
+      expect(done.ok).toBe(true);
+      // The tap's reply WAS the report: no「长期未用，已移入档案」clause rides the next reply.
+      expect(n.renderPendingForReply().text).not.toContain("已移入档案");
+      expect(n.pendingChanges()).toHaveLength(0); // the log row exists but is already reported
+    });
+  });
+
+  it("an undecided suggestion never rides a reply and is never marked by one (review finding 6)", async () => {
+    await inNotesDo((n, _ledger, sql) => {
+      const res = n.commit({ text: "老全局偏好", kind: "preference", source: "user_said", layer: "resident" });
+      if (!res.ok) throw new Error("fixture failed");
+      n.drainPendingForReply(); // the fixture's own「记住了」rode a reply before the aging
+      sql`UPDATE sh_note SET lastUsedAt = ${Date.now() - 95 * 86_400_000} WHERE noteId = ${res.note.noteId}`;
+      n.maintenance(Date.now());
+
+      // A user reply arrives BEFORE the daily flush could send the card: the suggestion
+      // clause is absent from the relay (informational rows may ride — the ask may not).
+      const rendered = n.renderPendingForReply();
+      expect(rendered.text).not.toContain("建议归档");
+      expect(rendered.text).not.toContain("已 90 天未用"); // no plain-text swallow
+      n.markPendingReported(rendered.upTo);
+      const stillPending = sql<{ n: number }>`
+        SELECT COUNT(*) AS n FROM sh_note_log WHERE op = 'suggest_demote' AND reportedAt IS NULL
+      `[0]!.n;
+      expect(stillPending).toBe(1); // still waiting for its decision card
+
+      // The daily flush then delivers it as a card (module side: still pending maintenance).
+      expect(n.pendingMaintenance().map((p) => p.op)).toContain("suggest_demote");
     });
   });
 
@@ -1273,6 +1408,80 @@ describe("notes daily maintenance: the alarm, the ask, the reports (issue #19)",
     const reply = await waitForSentContaining("记住了「事件轮里记下的一条」");
     expect(reply).toContain("记账：");
   }, 20000);
+
+  it("one pass delivers at most one batch; the burst is bounded and the rest waits (review finding 7)", async () => {
+    // 25 same-vintage stale resident notes: same-vintage staleness is the natural shape
+    // (resident lastUsedAt only moves on re-proposal/confirm), not artificial seeding.
+    await runInDurableObject(ownerStub(), (instance: Steward) => {
+      const ledger = (instance as unknown as { ledger: Ledger }).ledger;
+      for (let i = 0; i < 25; i += 1) {
+        const done = ledger.notes.commit({ text: `偏好${String(i).padStart(4, "0")}号`, kind: "preference", source: "user_said", layer: "resident" });
+        if (!done.ok) throw new Error(done.message);
+      }
+      ledger.notes.drainPendingForReply();
+      const stale = Date.now() - 95 * 86_400_000;
+      (instance as unknown as { sql: <T = Record<string, unknown>>(s: TemplateStringsArray, ...v: unknown[]) => T[] }).sql`
+        UPDATE sh_note SET lastUsedAt = ${stale} WHERE layer = 'resident'
+      `;
+    });
+    await ownerStub().notesMaintenance();
+    await new Promise((r) => setTimeout(r, 400));
+    const rows = await ownerStub().outboundRows(60);
+    expect(rows.filter((r) => r.id.startsWith("noteask:")).length).toBe(20); // bounded, not 25
+    // The remaining 5 suggestions are still pending — tomorrow's pass (or a reply that is
+    // not allowed to swallow them) carries them; nothing is dropped.
+    const pending = await runInDurableObject(ownerStub(), (instance: Steward) => {
+      const ledger = (instance as unknown as { ledger: Ledger }).ledger;
+      return ledger.notes.pendingMaintenance().filter((p) => p.op === "suggest_demote").length;
+    });
+    expect(pending).toBe(5);
+    await ownerStub().notesMaintenance();
+    await new Promise((r) => setTimeout(r, 400));
+    expect((await ownerStub().outboundRows(60)).filter((r) => r.id.startsWith("noteask:")).length).toBe(25);
+  }, 25000);
+
+  it("keep on a note sunk since the card went out: honest reply, no renewal, ask settled (review finding 8)", async () => {
+    const noteId = await agedResidentNote("重活优先给 codex", 95);
+    await runMaintenanceUntil((rows) => rows.some((r) => r.id.startsWith(`noteask:${noteId}:`) && r.status === "sent" && r.providerMsgId), "the ask card (delivered)");
+    const rows = await ownerStub().outboundRows(50);
+    const ask = rows.find((r) => r.id.startsWith(`noteask:${noteId}:`) && r.kind === "card")!;
+    // The note sinks after the card exists (an eviction at commit time, say).
+    await runInDurableObject(ownerStub(), (instance: Steward) => {
+      (instance as unknown as { sql: <T = Record<string, unknown>>(s: TemplateStringsArray, ...v: unknown[]) => T[] }).sql`
+        UPDATE sh_note SET layer = 'archive' WHERE noteId = ${noteId}
+      `;
+    });
+    await postEvent({
+      schema: "2.0",
+      header: { event_id: `evt_nk2_${crypto.randomUUID().slice(0, 8)}`, event_type: "card.action.trigger", create_time: String(Date.now()), token: TEST_VERIFY_TOKEN, app_id: TEST_APP_ID },
+      event: { operator: { open_id: "ou_owner" }, action: { value: { action: "note_keep" } }, context: { open_message_id: ask.providerMsgId } },
+    });
+    await waitForSentContaining("已经不在常驻层");
+    const note = (await ownerStub().debugSnapshot()).notes.find((n) => n.noteId === noteId)!;
+    expect(note.layer).toBe("archive");
+    expect(note.lastUsedAt).toBeLessThan(Date.now() - 86_400_000); // no renewal of a sunk note
+  }, 25000);
+
+  it("a suggestion whose note sank before delivery gets no card — the ask settles as gone (review finding 8)", async () => {
+    // Seed a real undecided suggestion, then sink its note before any delivery ran.
+    const noteId = await agedResidentNote("一条会沉掉的偏好", 95);
+    await runInDurableObject(ownerStub(), (instance: Steward) => {
+      const ledger = (instance as unknown as { ledger: Ledger }).ledger;
+      ledger.notes.maintenance(Date.now()); // logs the suggestion; delivery NOT run yet
+      (instance as unknown as { sql: <T = Record<string, unknown>>(s: TemplateStringsArray, ...v: unknown[]) => T[] }).sql`
+        UPDATE sh_note SET layer = 'archive' WHERE noteId = ${noteId}
+      `;
+    });
+    await ownerStub().notesMaintenance(); // nothing new to log; the flush processes the pending row
+    await new Promise((r) => setTimeout(r, 400));
+    const rows = await ownerStub().outboundRows(50);
+    expect(rows.filter((r) => r.id.startsWith(`noteask:${noteId}:`)).length).toBe(0); // no card for a sunk note
+    const settled = await runInDurableObject(ownerStub(), (instance: Steward) => {
+      const raw = (instance as unknown as { sql: <T = Record<string, unknown>>(s: TemplateStringsArray, ...v: unknown[]) => T[] }).sql.bind(instance);
+      return raw`SELECT decision, reportedAt FROM sh_note_log WHERE op = 'suggest_demote'`[0] ?? null;
+    });
+    expect(settled).toMatchObject({ decision: "note_gone", reportedAt: expect.any(Number) });
+  }, 25000);
 
   it("maintenance reports its own actions (demotions, evictions) proactively — one coalesced message", async () => {
     // A 70-day-stale project note (auto-demoted) + ignored pressure (evicted-for + noted).

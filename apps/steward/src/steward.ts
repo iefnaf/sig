@@ -2578,38 +2578,48 @@ export class Steward extends Agent<Env> {
     await this.deliverNotesChanges().catch((err) => this.logChannel("notes_changes_failed", errorText(err)));
   }
 
-  /** Sends the pending maintenance-classed note changes; durable, idempotent, bounded.
-   *  One quiet bookkeeping message per pass (the 「记账」 voice, all rows batched) plus one
-   *  push card per open suggestion — spec §7.6 keeps ordinary bookkeeping off the phone. */
+  /** Delivers ONE bounded batch of the pending maintenance-classed note changes (PR #53
+   *  review finding 7: the loop used to drain everything — 118 stale notes meant 118 push
+   *  cards in a single invocation; same-vintage notes go stale together, so the burst is
+   *  reachable without artificial seeding). One quiet bookkeeping text for the batch's
+   *  informational rows plus one push card per still-open suggestion; the rest stays
+   *  pending for the next pass or the next reply — never dropped, never a burst. Durable
+   *  and idempotent: stable outbound ids, marked only in this delivery class. */
   private async deliverNotesChanges(): Promise<void> {
     const owner = this.ownerOpenIdSync();
     if (owner === null) return; // nobody to tell yet: rows stay pending for the first reply
-    for (;;) {
-      const batch = this.ledger.notes.pendingMaintenance();
-      if (batch.length === 0) return;
-      const bookkeeping = batch.filter((p) => p.op !== "suggest_demote");
-      if (bookkeeping.length > 0) {
-        await this.enqueueOutbound({
-          id: `notechg:${bookkeeping[bookkeeping.length - 1]!.id}`,
-          kind: "text",
-          to: owner,
-          urgency: "quiet",
-          text: renderChangeReports(bookkeeping.map((p) => ({ op: p.op, noteId: p.noteId ?? "", text: p.text, reason: p.reason }))),
-        });
-      }
-      for (const item of batch) {
-        if (item.op !== "suggest_demote" || item.noteId === null) continue;
-        await this.enqueueOutbound({
-          id: `noteask:${item.noteId}:${item.id}`,
-          kind: "card",
-          to: owner,
-          card: noteDecisionCard({ noteId: item.noteId, text: item.text }),
-          urgency: "push",
-        });
-      }
-      this.ledger.notes.markPendingMaintenanceReported(batch[batch.length - 1]!.id);
-      if (this.ledger.notes.pendingMaintenance().length === 0) return;
+    const batch = this.ledger.notes.pendingMaintenance();
+    if (batch.length === 0) return;
+    // Finding 8: a suggestion whose note sank since the pass (an eviction at commit time,
+    // an owner archive on another card) gets no card — the ask settles as gone instead of
+    // asking the owner to keep something that no longer exists.
+    const actionable: typeof batch = [];
+    for (const item of batch) {
+      if (item.op !== "suggest_demote" || item.noteId === null) continue;
+      const note = this.ledger.notes.get(item.noteId);
+      if (note && note.status === "active" && note.layer === "resident") actionable.push(item);
+      else this.ledger.notes.abandonAsk(item.id, item.noteId);
     }
+    const bookkeeping = batch.filter((p) => p.op !== "suggest_demote");
+    if (bookkeeping.length > 0) {
+      await this.enqueueOutbound({
+        id: `notechg:${bookkeeping[bookkeeping.length - 1]!.id}`,
+        kind: "text",
+        to: owner,
+        urgency: "quiet",
+        text: renderChangeReports(bookkeeping.map((p) => ({ op: p.op, noteId: p.noteId ?? "", text: p.text, reason: p.reason }))),
+      });
+    }
+    for (const item of actionable) {
+      await this.enqueueOutbound({
+        id: `noteask:${item.noteId}:${item.id}`,
+        kind: "card",
+        to: owner,
+        card: noteDecisionCard({ noteId: item.noteId!, text: item.text }),
+        urgency: "push",
+      });
+    }
+    this.ledger.notes.markPendingMaintenanceReported(batch[batch.length - 1]!.id);
   }
 
   // Card button callbacks (issue #5): the Thread is resolved from the card's providerMsgId —
@@ -2664,8 +2674,12 @@ export class Steward extends Agent<Env> {
       } else {
         // note_keep: the 90-day clock restarts (a renewal, not a pin — the pin exemption is
         // the owner's explicit call); a later maintenance pass may re-ask after another 90d.
-        this.ledger.notes.renew(noteId!, Number(logIdRaw));
-        reply = "好的，保留这条记忆；90 天未再提及会再问你一次。";
+        // A note sunk since the card went out cannot be kept — say so instead of promising
+        // a renewal that will never fire (PR #53 review finding 8); the ask settles either way.
+        const kept = this.ledger.notes.renew(noteId!, Number(logIdRaw));
+        reply = kept.ok
+          ? "好的，保留这条记忆；90 天未再提及会再问你一次。"
+          : "这条记忆已经不在常驻层了（可能已被归档或腾挪），无需保留。";
       }
     }
     await this.enqueueOutbound({ kind: "text", to: ownerOpenId, text: reply });
