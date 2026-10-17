@@ -47,11 +47,46 @@ from `spike-final` (ADR-0001 decision 1), labels A–G plus the relay cluster 10
 lists candidates counts as asking (`pass_text_ask`) — the tool with buttons is the product
 behavior, text-asking is not a routing failure — but it is reported so it stays visible.
 
-## Recorded runs (2026-10-16, this tree)
+## Recorded runs
 
-The stored DeepSeek key on the dev machine is invalid, so the deepseek-flash baseline could
-not be re-run from here — run `pnpm eval:routing` with a valid key to record it. The runs
-below used a local OpenAI-compatible router (`--endpoint`), same world, same prompts:
+### Default-model baseline: `deepseek-flash-baseline.json` (2026-10-17)
+
+The first successful real-model baseline (106 cases, 0 errors/timeouts):
+
+| pass | wrong-route | missed-ask | unnecessary-ask |
+|---|---|---|---|
+| 93/106 (87.7%) | **0 ✓** | 1/11 (9.1%) ✗ | 12/95 (12.6%) ✓ |
+
+Getting there required two fixes, both found by this run:
+
+1. **Tool schema** (`llm/extension.ts`): `notes_commit` parameters used `Type.Intersect`,
+   which serializes as bare `allOf` with no top-level `type: "object"` — DeepSeek rejects
+   that with 400 (`schema must be a JSON Schema of 'type: "object"', got 'type: null'`),
+   failing **every** turn on the default model. Replaced with a merged `Type.Object`.
+2. **Eval harness** (`eval/harness.ts`): `buildEvalContext` never wired `sendToWorker`/
+   `interruptWorker`, so the attach-and-steer path (the labeled outcome for the imperative
+   follow-up cases) threw `ctx.sendToWorker is not a function` and scored as `chat`. The
+   pre-fix run showed 4.7% wrong-route entirely from this artifact; after wiring it: 0%.
+
+Gate status: **red on missed-ask alone**. The threshold (< 3% of 11 ask cases) admits zero
+misses; the single miss is **#63 「网关那边有点慢，帮我看看」** — the dataset note itself
+marks the cluster ambiguous (网关簇 x2，日志开销也可能相关), and the model's behavior
+(dispatching a read-only diagnostics worker on the refactor thread) is defensible. The
+decision whether to recalibrate #63's label or to treat it as a real regression is the
+owner's; every other metric is green with zero misattachments.
+
+Spike baseline for comparison (deepseek-flash, 2026-10-14): 94.3% pass, wrong-route 1.9%,
+missed asks 0%, unnecessary 4.2% — with documented run-to-run variance of 88–93% (the spike
+README's regression protocol: a single run decides nothing; rerun and look for failure
+clusters). One run is recorded here so far; a second confirming run is warranted before
+treating #63 as pure noise.
+
+### Local-router runs (2026-10-16, pre-harness-fix)
+
+Before a valid DeepSeek key was available, three runs went through a local OpenAI-compatible
+router (`--endpoint`), same world, same prompts — but **before the `sendToWorker` harness
+wiring above**, so their wrong-route numbers carry the same chat-instead-of-steer artifact
+(missed-ask is unaffected; that path never involved the relay tools):
 
 | Run (file in `eval/results/`) | pass | wrong-route | missed-ask | unnecessary-ask |
 |---|---|---|---|---|
@@ -63,21 +98,16 @@ The runner's headline counts `pass + pass_text_ask` (the two glm runs are 93 + 2
 文字反问, listed separately in each JSON's `summary`); an earlier revision of this table
 double-counted them as "95+2".
 
-**No in-tree baseline passes the gate as configured**: the missed-ask threshold (< 3%) is
-failed by every recorded run (2/11 = 18.2%, the persistent cluster below), and both glm runs
-additionally miss the wrong-route bar. The exit code is therefore red on all three files —
-the default-model baseline (deepseek-flash, with a valid key) is the run that decides the
-gate, per ADR-0001 decision 14.
-
-Spike baseline for comparison (deepseek-flash, 2026-10-14): 94.3% pass, wrong-route 1.9%,
-missed asks 0%, unnecessary 4.2% — with documented run-to-run variance of 88–93% (the spike
-README's regression protocol: a single run decides nothing; rerun and look for failure
-clusters).
+**No in-tree baseline passes the gate as configured**: the default-model run above misses
+the missed-ask bar by exactly the #63 label-edge case (1/11 = 9.1% vs < 3%); the local-router
+runs below additionally carried the harness artifact. The exit code is therefore red on
+every recorded file — resolving #63 (label recalibration or a prompt fix) is what turns the
+gate green, per ADR-0001 decision 14.
 
 ### The persistent cluster
 
-Every run above misses the same handful, and the dataset's own notes mark them defensible
-under either label:
+The local-router runs miss the same handful, and the dataset's own notes mark them defensible
+under either label (the default-model baseline carries only #63 of these):
 
 - **#63 「网关那边有点慢」** (label: ask) — two gateway threads exist, but the model argues a
   performance investigation is neither the running refactor nor the logging thread, and

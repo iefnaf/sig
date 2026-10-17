@@ -745,13 +745,15 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
     name: "notes_commit",
     description:
       "写入记忆的第二步（唯一写入路径）。replaces：被取代/被腾挪的旧条目 id（旧条目进档案，可追溯）。常驻层的门是硬性的：evidence 必须指向用户真正说过的那条消息（user:<om_…>；用户消息触发的轮次里可省略，系统会用当轮消息）；worker_reported / inferred 要进常驻层必须先在项目层经 notes_confirm 确认（replaces 指向它），或当轮就是用户的确认消息（confirmEvidence=user:<om_…>）；connector 来源只能进项目层。写入会记入下一条回复的「记账」，无需在正文里复述。",
-    parameters: Type.Intersect([
-      noteDraftSchema,
-      Type.Object({
-        replaces: Type.Optional(Type.Array(Type.String(), { description: "notes_propose 给出的旧条目 id（同义取代或腾挪）" })),
-        confirmEvidence: Type.Optional(Type.String({ description: "用户确认消息：user:<om_…>（直接提升低信任来源时必填，须是当轮用户消息）" })),
-      }),
-    ]),
+    // Type.Object merge, not Type.Intersect: an intersect serializes as bare `allOf` with no
+    // top-level `type: "object"`, which DeepSeek's tool-schema validation rejects with 400
+    // (`schema must be a JSON Schema of 'type: "object"', got 'type: null'`) — found by the
+    // first real-model eval run (issue #7 baseline).
+    parameters: Type.Object({
+      ...noteDraftSchema.properties,
+      replaces: Type.Optional(Type.Array(Type.String(), { description: "notes_propose 给出的旧条目 id（同义取代或腾挪）" })),
+      confirmEvidence: Type.Optional(Type.String({ description: "用户确认消息：user:<om_…>（直接提升低信任来源时必填，须是当轮用户消息）" })),
+    }),
     // §4.3: commit is replay-safe — an exact-text duplicate absorbs the replay (bump only).
     replay: "safe",
     execute: async (args) => {

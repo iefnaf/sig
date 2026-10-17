@@ -142,6 +142,22 @@ export function buildEvalContext(ledger: Ledger, caseId: number, observation: Ob
       };
     },
     notifyUser: async () => {},
+    // The relay tools (#9) are part of routing: attaching to a running Thread and steering
+    // its worker is the labeled outcome for the imperative-follow-up cases, so a send must
+    // land in the observation like a dispatch does. Before this wiring the tool call threw
+    // `ctx.sendToWorker is not a function` and correct attaches scored as chat (found by the
+    // first real-model baseline run).
+    sendToWorker: async (input) => {
+      const worker = ledger.workers.get(input.workerId);
+      if (!worker) return { kind: "refused", reason: `worker ${input.workerId} 不存在` };
+      observation.dispatches.push({ threadId: worker.threadId, isNew: false });
+      return { kind: "sent", threadId: worker.threadId, delivery: input.intent === "now" ? "steer" : "follow_up", machineOffline: false };
+    },
+    interruptWorker: async (input) => {
+      const worker = ledger.workers.get(input.workerId);
+      if (!worker) return { kind: "refused", reason: `worker ${input.workerId} 不存在` };
+      return { kind: "interrupted", threadId: worker.threadId, machineOffline: false };
+    },
     askUser: async (input) => {
       observation.asks.push({ question: input.question, candidates: input.candidates });
     },
