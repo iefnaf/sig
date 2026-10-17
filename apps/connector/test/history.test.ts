@@ -42,7 +42,7 @@ afterEach(async () => {
 function conversationRun(userText: string, assistantText: string): ScenarioStep[] {
   return [
     { emit: { type: "agent_start" } },
-    { session: { id: "s1", parentId: null, type: "message", message: { role: "user", content: userText } } },
+    { session: { id: "s1", parentId: "e2", type: "message", message: { role: "user", content: userText } } },
     { emit: { type: "turn_start" } },
     {
       session: {
@@ -102,9 +102,11 @@ describe("WorkerManager.history source selection", () => {
     const scenario = writeScenario(dir, "scenario", [conversationRun("fix the login bug", "Done, tests pass")]);
     await startWorker(scenario);
 
-    // Idle-hot after settling: the process is alive, so get_entries serves the page.
+    // Idle-hot after settling: the process is alive, so get_entries serves the page. The
+    // leading e2 entry is the delivered prompt (fake-pi persists it with its §6.3 marker).
     const live = await app.manager.history(WORKER, undefined, 2 * 1024 * 1024);
     expect(live.entries).toEqual([
+      { id: "e2", role: "user", text: "do the thing" },
       { id: "s1", role: "user", text: "fix the login bug" },
       { id: "s2", role: "assistant", text: "Done, tests pass", tools: [{ name: "edit", args: "src/auth/session.ts" }] },
     ]);
@@ -118,7 +120,11 @@ describe("WorkerManager.history source selection", () => {
     // After the process is gone, the same page is parsed straight from the JSONL.
     await app.manager.stopProcess(WORKER);
     const cold = await app.manager.history(WORKER, undefined, 2 * 1024 * 1024);
-    expect(cold.entries).toEqual(live.entries);
+    expect(cold.entries).toEqual([
+      { id: "e2", role: "user", text: "do the thing" },
+      { id: "s1", role: "user", text: "fix the login bug" },
+      { id: "s2", role: "assistant", text: "Done, tests pass", tools: [{ name: "edit", args: "src/auth/session.ts" }] },
+    ]);
   }, 60_000);
 
   it("unknown workers answer not_found; known-but-never-started ones answer no_history", async () => {
@@ -163,9 +169,10 @@ describe("history_req over the real transport (§6.6)", () => {
     expect(last.done).toBe(true);
     expect(last.cursor).toBe("b199");
     expect(last.truncated).toBeUndefined(); // the whole transcript fit the 2 MB budget
-    // Nothing lost across the split.
+    // Nothing lost across the split. The leading e2 entry is the delivered prompt
+    // (fake-pi persists it with its §6.3 marker), so the transcript has 201 entries.
     const ids = chunks.flatMap((c) => (c.entries as Array<{ id: string }>).map((e) => e.id));
-    expect(ids).toEqual(Array.from({ length: 200 }, (_, i) => `b${i}`));
+    expect(ids).toEqual(["e2", ...Array.from({ length: 200 }, (_, i) => `b${i}`)]);
   }, 90_000);
 
   it("marks a budget-cut page truncated and resumes from the cursor on the next request", async () => {
@@ -192,7 +199,7 @@ describe("history_req over the real transport (§6.6)", () => {
       return got.length > 0 && got[got.length - 1]!.done === true ? got : undefined;
     }, 20_000, "tail page");
     const tailIds = tail.flatMap((c) => (c.entries as Array<{ id: string }>).map((e) => e.id));
-    expect(tailIds).toEqual(Array.from({ length: 20 }, (_, i) => `b${i}`).slice(delivered.length));
+    expect(tailIds).toEqual(["e2", ...Array.from({ length: 20 }, (_, i) => `b${i}`)].slice(delivered.length));
     expect(tail[tail.length - 1]!.truncated).toBeUndefined();
   }, 90_000);
 

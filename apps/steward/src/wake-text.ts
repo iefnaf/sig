@@ -147,8 +147,69 @@ export function queueReturnedWakeText(input: {
   ].join("\n");
 }
 
-/**
- * ⟦verify⟧ inputs (issue #7, spike-conclusions §2 “post-dispatch settle-time verification”):
+/** The ⟦event⟧ wake for an `external_activity` (connector-pi.md §10): the owner used the
+ *  worker's session at the keyboard; the steward folds a coarse account of it into the
+ *  Thread summary. Low priority by design (steward.md §5.3) — nothing is blocked on it. */
+export function externalActivityWakeText(input: {
+  thread: ThreadRow | null;
+  worker: WorkerRow;
+  machine: MachineRow | null;
+  count: number;
+  window: string | null;
+  changedFiles: string[];
+  summary: string;
+}): string {
+  const { thread, worker, machine } = input;
+  const lines = [
+    `${MARK_OPEN}event${MARK_CLOSE} thread=${thread?.threadId ?? "?"} 「${thread?.title ?? "已归档"}」`,
+    `- worker ${worker.workerId}（${worker.agent}@${machine?.name ?? worker.deviceId}）的会话在机器上被直接使用过：重连前新增 ${input.count} 条记录${input.window ? `（${input.window}）` : ""}。`,
+  ];
+  if (input.changedFiles.length > 0) lines.push(`  改动文件：${input.changedFiles.map(escapeMarkers).join("、")}`);
+  if (input.summary) lines.push(`  概要：${escapeMarkers(input.summary)}`);
+  lines.push("请把这段外部进展并入该 Thread 的摘要（update_thread），避免下次派发时丢失这段上下文；不要通知用户，也不要据此派发；无事可做用 no_action 结束。");
+  return lines.join("\n");
+}
+
+/** The ⟦event⟧ wake for a delivery-class failure the user must hear about (issue #15):
+ *  `session_in_use` (the owner is using the session at the keyboard) or `not_delivered`
+ *  (the connector provably never delivered it). `instruction` arrives pre-escaped. */
+export function commandAttentionWakeText(input: {
+  threadId: string;
+  workerId: string;
+  kind: string;
+  instruction: string;
+  code: string;
+  detail: string;
+}): string {
+  const sessionInUse = input.code === "session_in_use";
+  return [
+    `${MARK_OPEN}event${MARK_CLOSE} thread=${input.threadId}`,
+    `- 指向 worker ${input.workerId} 的命令（${input.kind}：「${input.instruction}」）失败：${input.detail}`,
+    sessionInUse
+      ? "请告知用户：那台机器上的这个会话正被他本人使用，稍后再试即可；需要时用 ask_user 问是否稍后重试。"
+      : "请告知用户这条指令没有送达（用户可能以为已发出）；要重发必须以用户的确认或回复为依据（basis=user_reply_to），不要自行重发。",
+  ].join("\n");
+}
+
+/** The ⟦event⟧ wake for a command the connector could only report `ambiguous` (issue #15,
+ *  connector-pi.md §6.3): delivery is unknowable — the connector crashed mid-`sending` — and
+ *  by design it will never re-send. Only the user can decide whether to re-issue it. */
+export function ambiguousWakeText(input: {
+  thread: ThreadRow | null;
+  worker: WorkerRow;
+  cmdId: string;
+  kind: string;
+  instruction: string;
+}): string {
+  const { thread, worker, kind, instruction } = input;
+  return [
+    `${MARK_OPEN}event${MARK_CLOSE} thread=${thread?.threadId ?? "?"} 「${thread?.title ?? "已归档"}」`,
+    `- 指向 worker ${worker.workerId} 的命令（${kind}：「${instruction}」）结果不确定：连接器在投递中崩溃，无法判断 worker 是否已收到，且按设计不会自动重发。`,
+    "请用 ask_user 问用户是否重新下达（附「重发」/「不用了」选项）；用户确认重发后，以其回复为依据（basis=user_reply_to）再调用对应工具。绝不自行重发。",
+  ].join("\n");
+}
+
+/** ⟦verify⟧ inputs (issue #7, spike-conclusions §2 “post-dispatch settle-time verification”):
  * the corrective follow-up when a user run claimed a dispatch that never happened. The
  * original user message's provenance rides on the run (replyTo), so the steward may still
  * dispatch — or must correct itself to the user via notify_user. The claimed phrase is

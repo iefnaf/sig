@@ -228,7 +228,13 @@ export class PiProcess {
     this.stderrTail = (this.stderrTail + text).slice(-this.stderrLimit);
     if (this.options.stderrFile) {
       // Diagnostics only, never session content (that flows over stdout); still redacted.
-      appendCapped(this.options.stderrFile, redactText(text), this.options.stderrFileMaxBytes ?? this.stderrLimit);
+      // Best-effort by contract: a late chunk after the log dir vanished (tests tearing
+      // down, disk removed) must never take the connector down with it.
+      try {
+        appendCapped(this.options.stderrFile, redactText(text), this.options.stderrFileMaxBytes ?? this.stderrLimit);
+      } catch {
+        // the in-memory tail above still carries it
+      }
     }
   }
 

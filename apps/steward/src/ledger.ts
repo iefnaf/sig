@@ -10,7 +10,7 @@ import type { GitFacts, HelloMessage } from "@shepherd/protocol";
 import { createBudget } from "./budget.ts";
 import { createNotes, type NoteRow } from "./notes.ts";
 import { assembleBrief, type BriefDecision, type HandoffBrief } from "./handoff.ts";
-import { eventWakeText, queueReturnedWakeText } from "./wake-text.ts";
+import { eventWakeText, externalActivityWakeText, queueReturnedWakeText } from "./wake-text.ts";
 import { createMachineStatus, type MachineReliability } from "./machine-status.ts";
 import type { StartWorkerInput } from "./dispatch.ts";
 
@@ -28,6 +28,8 @@ export const SUMMARY_VERSIONS_KEPT = 5;
 export const SUMMARY_REWRITE_EVERY = 10;
 /** The wake merge window (steward.md §5.1/§5.4): events within it become one steward input. */
 export const WAKE_MERGE_MS = 3_000;
+/** steward.md §5.3: external_activity wakes merge over a 10-minute window (low priority). */
+export const EXTERNAL_ACTIVITY_MERGE_MS = 10 * 60_000;
 /** Blocked reports give the steward this long before the core forwards the question. */
 export const QUESTION_WINDOW_MS = 90_000;
 
@@ -188,7 +190,7 @@ export interface WakeRow {
   kind: "event" | "routine" | "followup";
   dedupeKey: string;
   text: string;
-  priority: "normal" | "high";
+  priority: "low" | "normal" | "high";
   /** 'skipped' = the daily budget cap kept this wake from the model (issue #28, steward.md §12). */
   status: "pending" | "merged" | "submitted" | "skipped";
   dueAt: number;
@@ -1626,8 +1628,14 @@ export function createLedger(deps: LedgerDeps) {
         return;
       }
       const mergeMs = opts.mergeMs ?? WAKE_MERGE_MS;
+      // Merge only within the same window class: a 10-minute external_activity wake must not
+      // swallow a 3-second report wake (and vice versa) — their latencies answer different
+      // needs (steward.md §5.3/§5.4). dueAt - createdAt is the row's own merge window.
       const open = sql<{ id: number; text: string }>`
-        SELECT id, text FROM sh_wake WHERE kind = ${kind} AND status = 'pending' AND dueAt > ${ts} ORDER BY id LIMIT 1
+        SELECT id, text FROM sh_wake
+        WHERE kind = ${kind} AND status = 'pending' AND dueAt > ${ts}
+          AND dueAt - createdAt >= ${Math.max(mergeMs - 1, 1)} AND dueAt - createdAt <= ${mergeMs + 1}
+        ORDER BY id LIMIT 1
       `[0];
       if (open) {
         // §5.4: events within the window become ONE wake-up — append this block to the
@@ -2136,7 +2144,35 @@ export function createLedger(deps: LedgerDeps) {
         break;
       }
       case "external_activity": {
-        timeline.add(worker.threadId, "note", "检测到会话在机器上被直接使用过", { workerId, seq });
+        // §10: the connector compared the session tail against lastKnownEntryId before a
+        // relaunch and found entries it did not write — the owner used the session at the
+        // keyboard. Deterministic timeline note (counts, window, coarse summary); the steward
+        // is woken at low priority to fold the summary into the Thread (steward.md §5.3),
+        // merging over the §5.4 10-minute window.
+        const count = Number(event.entries ?? 0);
+        const changedFiles = (Array.isArray(event.changedFiles) ? event.changedFiles : []).map((f) => String(f));
+        const summary = str(event.summary) ?? "";
+        const window = [str(event.firstAt), str(event.lastAt)].filter((v) => v !== null).join(" ~ ");
+        timeline.add(
+          worker.threadId,
+          "note",
+          `会话在机器上被直接使用过：新增 ${count} 条记录${window ? `（${window}）` : ""}${changedFiles.length ? `，改动文件：${changedFiles.join("、")}` : ""}${summary ? `。${summary}` : ""}`,
+          { workerId, seq, entries: count, firstAt: event.firstAt ?? null, lastAt: event.lastAt ?? null, changedFiles },
+        );
+        wakes.queue(
+          "event",
+          `external_activity:${workerId}:${seq}`,
+          externalActivityWakeText({
+            thread: threads.get(worker.threadId),
+            worker: workers.get(workerId)!,
+            machine: machines.get(worker.deviceId),
+            count,
+            window: window || null,
+            changedFiles,
+            summary,
+          }),
+          { priority: "low", mergeMs: EXTERNAL_ACTIVITY_MERGE_MS },
+        );
         break;
       }
       default:
