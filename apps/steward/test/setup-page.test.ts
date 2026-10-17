@@ -108,9 +108,20 @@ describe("setup page: closing permanently on owner binding", () => {
     expect(res.status).toBe(200);
     expect((await ownerStub().setupState()).state).toBe("bound");
 
-    expect((await SELF.fetch(SETUP_URL)).status).toBe(404);
+    const closed = await SELF.fetch(SETUP_URL);
+    expect(closed.status).toBe(404);
+    // The deployer who opens the link right after a successful setup is told it is done, not
+    // handed a bare "not found" that reads like a failure.
+    const closedBody = await closed.text();
+    expect(closedBody).toContain("设置已完成");
+    expect(closedBody).toContain("/加机器");
+    expect(closed.headers.get("cache-control")).toBe("no-store");
     expect((await submitSetupCredentials("cli_other", "other-secret", "other-vt")).status).toBe(404);
     // And it stays closed.
     expect((await SELF.fetch(SETUP_URL)).status).toBe(404);
+    // Anyone without the token still learns nothing: the Worker answers before the DO is asked.
+    const stranger = await SELF.fetch("https://example.com/setup?token=wrong");
+    expect(stranger.status).toBe(404);
+    expect(await stranger.text()).toBe("not found");
   });
 });

@@ -91,6 +91,7 @@ import {
 } from "./llm/models.ts";
 import { createLedger, QUIET_MERGE_MS, type Ledger, type LedgerSql, type NotifyRow, type OutboundDeliveryRow, type QuestionRow, type RunRow, type WakeRow } from "./ledger.ts";
 import { renderChangeReports } from "./notes.ts";
+import { FAILED_RUN_NOTICE, failedRunNotice } from "./owner-notices.ts";
 import { RoutineService } from "./routines.ts";
 import {
   failureCard,
@@ -118,7 +119,7 @@ import {
 } from "./report-template.ts";
 import { MIGRATIONS, runMigrations } from "./schema.ts";
 import { openSecret, sealSecret } from "./secretbox.ts";
-import { renderSetupPage, type SetupView } from "./setup-page.ts";
+import { renderSetupClosedPage, renderSetupPage, type SetupView } from "./setup-page.ts";
 import { ambiguousWakeText, commandAttentionWakeText, escapeMarkers, verifyWakeText } from "./wake-text.ts";
 import { WebApp, linkTargetForThread, parseSessionCookie } from "./web.ts";
 
@@ -2658,7 +2659,15 @@ export class Steward extends Agent<Env> {
 
   private async handleSetup(request: Request): Promise<Response> {
     const cfg = await this.loadFeishuConfig();
-    if (cfg && this.setupClosed(cfg)) return new Response("not found", { status: 404 });
+    // Closed stays a 404 (ADR-0001 decision 8), but only a SETUP_TOKEN holder gets this far
+    // (the Worker answers everyone else), so the body can say why: a bare "not found" right
+    // after a successful setup reads like a failure.
+    if (cfg && this.setupClosed(cfg)) {
+      return new Response(renderSetupClosedPage(), {
+        status: 404,
+        headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
+      });
+    }
     const url = new URL(request.url);
     const origin = url.origin;
     // The page's origin is the deployment's public address: the PATCH's request_url and the
@@ -3282,7 +3291,8 @@ export class Steward extends Agent<Env> {
         // Issue #28: bring the counter current before the over-budget note reads it — the
         // run that just settled is the spend that may tip today over the cap.
         await this.syncUsageQuietly();
-        this.settleRun(run, result);
+        const failedNotice = run.kind === "user" && result.status !== "done" ? await this.noticeForFailedRun() : undefined;
+        this.settleRun(run, result, failedNotice);
       }
     } catch (err) {
       this.logChannel("poll_runs_failed", errorText(err));
@@ -3299,7 +3309,18 @@ export class Steward extends Agent<Env> {
     await this.schedule(RUN_POLL_S, "pollRuns", undefined, { idempotent: true });
   }
 
-  private settleRun(run: RunRow, result: { status: string; reason?: string; text?: string }): void {
+  /** What the owner is told when a user-triggered run did not complete. "Try again" is wrong
+   *  advice for a deployment that has no model key yet (owner-notices.ts); resolved here, in the
+   *  async poll, so settleRun stays synchronous. */
+  private async noticeForFailedRun(): Promise<string> {
+    try {
+      return failedRunNotice(await this.llmSelection());
+    } catch {
+      return FAILED_RUN_NOTICE;
+    }
+  }
+
+  private settleRun(run: RunRow, result: { status: string; reason?: string; text?: string }, failedNotice: string = FAILED_RUN_NOTICE): void {
     // §8.6: every fire leaves a result. An explicit in-run outcome (no_action) was recorded
     // during the run; the settle summary is the fallback for everything else.
     this.recordSettledProactiveOutcome(run, result);
@@ -3369,7 +3390,7 @@ export class Steward extends Agent<Env> {
       if (owner && result.status !== "done") {
         // No template exists for user replies; a one-line notice beats silence (the budget
         // cap and its degradation behavior are #28's to refine).
-        void reply(withRelay("⚠️ 总管这轮没有跑成（模型调用失败或被中断），这条消息我没能处理；稍后再试或重发一次。"));
+        void reply(withRelay(failedNotice));
         return;
       }
       if (owner && result.status === "done" && !hasText && !alreadyNotified) {

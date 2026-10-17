@@ -101,6 +101,40 @@ ${renderManualFallback(opts)}
 
 const DEPLOY_GUIDE = "https://github.com/iefnaf/shepherd/blob/main/docs/deploy.md";
 
+/** What a SETUP_TOKEN holder sees once onboarding is complete (ADR-0001 decision 8). The page
+ *  stays closed — nothing here configures anything — but it says so, and says what to do next. */
+export function renderSetupClosedPage(): string {
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Shepherd 设置已完成</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.7 -apple-system, "PingFang SC", "Segoe UI", sans-serif; margin: 0; padding: 32px 16px; }
+  main { max-width: 640px; margin: 0 auto; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; background: rgba(127,127,127,.15); padding: 1px 5px; border-radius: 4px; }
+  .card { border: 1px solid rgba(127,127,127,.35); border-radius: 10px; padding: 20px 24px; margin-top: 20px; }
+  .ok { color: #2ea86f; }
+  li { margin: 6px 0; }
+</style>
+</head>
+<body><main>
+<h1>Shepherd 设置已完成 <span class="ok">✓</span></h1>
+<p>飞书机器人已绑定，事件已通过 webhook 送达。引导按设计已<b>永久关闭</b>：这个页面不再提供任何配置入口（HTTP 状态码仍是 404），也就没人能用它重新配置你的机器人。</p>
+<div class="card">
+<b>接下来回到飞书，直接给机器人发消息：</b>
+<ul>
+<li><code>/网页</code>：拿到一次性登录链接（15 分钟、仅一次有效），查看任务时间线与机器管理；</li>
+<li><code>/加机器</code>：拿到配对码，用来连接你的电脑；</li>
+<li>想让它理解自然语言、派发任务，需要先给部署配置模型 key（<code>MODEL_KEY</code>），见<a href="${DEPLOY_GUIDE}#model-provider">部署指南 · 模型配置</a>。</li>
+</ul>
+</div>
+</main></body></html>`;
+}
+
 // Reachability self-check (issue #25, research §3 + §9.3). Shown on every phase: the host you
 // open the page on decides whether Feishu's servers (inside mainland China) can deliver
 // webhooks to this deployment. `*.workers.dev` is blocked there (DNS pollution + SNI reset,

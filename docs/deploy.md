@@ -171,3 +171,5 @@ The same pinning applies after ordinary code deploys: a resident isolate runs th
 - **Every steward request returns 1101 while plain Worker routes still answer** — a Cloudflare DO/platform incident (seen in the spike, §5): redeploying does not help; the connector's retry loop self-heals and no persisted data is lost. Wait it out.
 - **Connector reconnect-loops from a mainland machine** — same blocked-`workers.dev` cause; point it at the custom domain.
 - **A just-rotated secret "doesn't work"** — resident isolate; see [secrets and rotation](#secrets-and-rotation).
+- **The setup link now says "Shepherd 设置已完成" (or a bare `not found`)** — expected, not a fault. The first message that arrives over the webhook completes onboarding and closes the setup page permanently: with your `SETUP_TOKEN` the page says so (the HTTP status stays 404), without it you get a bare 404. Go back to Feishu — `/网页` and `/加机器` work without a model.
+- **The bot answers "⚠️ 还没有配置模型 key…"** — the deployment has no `MODEL_KEY` yet. Set it ([Model provider](#model-provider)) and send the message again. With a key present, a failed run says "⚠️ 总管这轮没有跑成…" instead.
