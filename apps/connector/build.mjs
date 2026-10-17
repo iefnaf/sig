@@ -8,6 +8,7 @@ import { build } from "esbuild";
 
 rmSync("dist", { recursive: true, force: true });
 mkdirSync("dist/ext", { recursive: true });
+mkdirSync("dist/mcp", { recursive: true });
 
 await build({
   entryPoints: ["src/cli.ts"],
@@ -26,6 +27,9 @@ await build({
 });
 
 copyFileSync("src/ext/shepherd-pi.ts", "dist/ext/shepherd-pi.ts");
+// The MCP report server is likewise loaded as a FILE (Claude Code spawns it per its
+// mcp-config), so it ships verbatim next to the extension (issue #17).
+copyFileSync("src/mcp/report-server.mjs", "dist/mcp/report-server.mjs");
 
 const pkg = JSON.parse(readFileSync("package.json", "utf8"));
 console.log(`built dist/cli.js (v${pkg.version}, ${(statSync("dist/cli.js").size / 1024).toFixed(0)} KiB)`);

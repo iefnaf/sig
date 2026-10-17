@@ -83,6 +83,8 @@ export class LocalStore {
       createdAt INTEGER NOT NULL,
       updatedAt INTEGER NOT NULL
     )`);
+    // Issue #17: which AgentAdapter owns the worker — set at start, immutable afterwards.
+    this.addColumnIfMissing("worker", "agent", "TEXT NOT NULL DEFAULT 'pi'");
     // The worktree base (§8.2) persisted so a restarted connector can still collect git
     // facts for a retroactive report (§9.1) — spikes kept it only in memory.
     this.addColumnIfMissing("worker", "base", "TEXT");
@@ -230,8 +232,8 @@ export class LocalStore {
   upsertWorker(worker: WorkerRow): void {
     this.db
       .prepare(
-        `INSERT INTO worker (workerId, threadId, repoId, mode, state, sessionId, sessionFile, lastKnownEntryId, branch, worktree, base, lastOutcome, createdAt, updatedAt)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO worker (workerId, threadId, repoId, mode, state, sessionId, sessionFile, lastKnownEntryId, branch, worktree, base, agent, lastOutcome, createdAt, updatedAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(workerId) DO UPDATE SET state = excluded.state, sessionId = excluded.sessionId,
            sessionFile = excluded.sessionFile, lastKnownEntryId = excluded.lastKnownEntryId,
            branch = excluded.branch, worktree = excluded.worktree,
@@ -249,6 +251,7 @@ export class LocalStore {
         worker.branch ?? null,
         worker.worktree ?? null,
         worker.base ?? null,
+        worker.agent ?? "pi",
         worker.lastOutcome ?? null,
         worker.createdAt ?? Date.now(),
         Date.now(),
@@ -259,7 +262,7 @@ export class LocalStore {
     return (
       (this.db
         .prepare(
-          `SELECT workerId, threadId, repoId, mode, state, sessionId, sessionFile, lastKnownEntryId, branch, worktree, base, worktreeCleanedAt, lastOutcome, createdAt, updatedAt
+          `SELECT workerId, threadId, repoId, mode, state, sessionId, sessionFile, lastKnownEntryId, branch, worktree, base, worktreeCleanedAt, agent, lastOutcome, createdAt, updatedAt
            FROM worker WHERE workerId = ?`,
         )
         .get(workerId) as WorkerRow | undefined) ?? null
@@ -283,7 +286,7 @@ export class LocalStore {
     // Creation order (workerId as tiebreak): the serial write queue drains FIFO on it.
     return this.db
       .prepare(
-        `SELECT workerId, threadId, repoId, mode, state, sessionId, sessionFile, lastKnownEntryId, branch, worktree, base, worktreeCleanedAt, lastOutcome, createdAt, updatedAt
+        `SELECT workerId, threadId, repoId, mode, state, sessionId, sessionFile, lastKnownEntryId, branch, worktree, base, worktreeCleanedAt, agent, lastOutcome, createdAt, updatedAt
          FROM worker ORDER BY createdAt, workerId`,
       )
       .all() as unknown as WorkerRow[];
@@ -409,6 +412,8 @@ export interface WorkerRow {
   repoId: string;
   mode: string;
   state: string;
+  /** Which agent owns the worker (issue #17); 'pi' for rows predating Claude Code. */
+  agent?: string | null;
   sessionId?: string | null;
   sessionFile?: string | null;
   /** §10: the last session entry id the connector saw (pre-launch external-change baseline). */

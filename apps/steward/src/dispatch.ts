@@ -109,6 +109,9 @@ export interface StartWorkerInput {
   /** Issue #8 (spec §5.3 case 2): the user asked for a fresh, unbiased look (e.g. an
    *  independent review) — always a new session, never a resume of the old context. */
   freshReview?: boolean;
+  /** Issue #17: which agent runs the task (hello.agents is the menu — e.g. 'claude-code').
+   *  Default 'pi'; a machine without the agent never sees the command. */
+  agent?: string;
   /** The authorizing run: `user:<msgId>` / `evt:…` / `routine:…` (steward.md §7.1). */
   provenance: string;
   /** `tool:<taskId>` — the idempotency key for replays (protocol §7.1). */
@@ -210,7 +213,7 @@ export interface DispatcherDeps {
   spendStatusText: () => Promise<string>;
 }
 
-const AGENT = "pi"; // the only agent the connector drives in the MVP (ADR-0001 decision 3)
+const DEFAULT_AGENT = "pi"; // ADR-0001 decision 3: pi first; Claude Code joins via issue #17 (hello.agents is the menu)
 
 export class Dispatcher {
   readonly #deps: DispatcherDeps;
@@ -266,7 +269,28 @@ export class Dispatcher {
         reason: `没有机器登记过仓库「${input.repoRef}」。请告诉用户先在那台机器上 shepherd add-repo 并重连，或换一个他提过的仓库。`,
       };
     }
-    const candidates: MachineCandidate[] = repoRows.map((row) => {
+    // Issue #17: the steward can target an agent (hello.agents is the menu) — but only
+    // machines that actually have it are candidates; an honest refusal beats a command the
+    // connector would bounce with unknown_agent.
+    const agent = input.agent ?? DEFAULT_AGENT;
+    const agentRows = repoRows.filter((row) => {
+      const machine = this.ledger.machines.get(row.deviceId);
+      return (machine?.agents.length ? machine.agents : [DEFAULT_AGENT]).includes(agent);
+    });
+    if (agentRows.length === 0) {
+      const listing = repoRows
+        .map((row) => {
+          const machine = this.ledger.machines.get(row.deviceId);
+          const agents = machine?.agents.length ? machine.agents : [DEFAULT_AGENT];
+          return `${machine?.name ?? row.deviceId}（${agents.join("、")}）`;
+        })
+        .join("；");
+      return {
+        kind: "refused",
+        reason: `有仓库「${input.repoRef}」的机器都没安装 ${agent}：${listing}。请换回已装的 agent，或让用户先安装再重连。`,
+      };
+    }
+    const candidates: MachineCandidate[] = agentRows.map((row) => {
       const machine = this.ledger.machines.get(row.deviceId);
       return {
         deviceId: row.deviceId,
@@ -286,7 +310,10 @@ export class Dispatcher {
       case "no_match":
         return {
           kind: "refused",
-          reason: `机器「${input.machineHint}」上没有仓库「${input.repoRef}」。可用的机器：${candidates.map((c) => c.name).join("、")}。`,
+          reason:
+            `机器「${input.machineHint}」上没有仓库「${input.repoRef}」` +
+            (agent !== DEFAULT_AGENT ? `或不支持 agent ${agent}` : "") +
+            `。可用的机器：${candidates.map((c) => c.name).join("、")}。`,
         };
       case "ask_which": {
         const listing = choice.candidates.map((c) => `${c.name}${c.online ? "" : "（离线）"}`).join("、");
@@ -325,6 +352,7 @@ export class Dispatcher {
           input.cmdId,
           input.mode ?? "write",
           input.freshReview === true,
+          agent,
         );
         if (offline) {
           this.ledger.questions.insert({
@@ -663,6 +691,7 @@ export class Dispatcher {
     cmdId: string,
     mode: "write" | "readonly",
     freshReview: boolean,
+    agent: string = DEFAULT_AGENT,
   ): Promise<StartWorkerContinuation | undefined> {
     // Review (other findings): a replayed call carrying a cmdId that already exists must not
     // re-register a second worker row (the outbox dedupes the command, but the ghost `starting`
@@ -670,13 +699,13 @@ export class Dispatcher {
     if (this.#deps.commandExists(cmdId)) return undefined;
     const decision = decideContinuation({
       previous: this.ledger.workers.latestOnThread(thread.threadId),
-      next: { agent: AGENT, deviceId, repoId, mode },
+      next: { agent, deviceId, repoId, mode },
       freshReview,
     });
     if (decision.action === "resume") {
       return this.resumeSession(thread, decision.worker.workerId, prompt, queued, provenance, cmdId);
     }
-    return this.startNewSession(thread, deviceId, repoId, prompt, queued, provenance, cmdId, mode, decision);
+    return this.startNewSession(thread, deviceId, repoId, prompt, queued, provenance, cmdId, mode, decision, agent);
   }
 
   /** The resume half: deliver the task into the existing session. `intent: "after"` when the
@@ -733,6 +762,7 @@ export class Dispatcher {
     cmdId: string,
     mode: "write" | "readonly",
     decision: { from: WorkerRow | null; reason?: NewSessionReason },
+    agent: string = DEFAULT_AGENT,
   ): Promise<StartWorkerContinuation> {
     const workerId = `w_${ulid()}`;
     // Relay (spec §5.3): base = the Thread's latest worker branch — skipping legs that never
@@ -755,7 +785,7 @@ export class Dispatcher {
       threadId: thread.threadId,
       deviceId,
       repoId,
-      agent: AGENT,
+      agent,
       mode,
       parentWorker: previous?.workerId,
     });
@@ -778,6 +808,7 @@ export class Dispatcher {
         repoId,
         mode,
         prompt: fullPrompt,
+        ...(agent !== DEFAULT_AGENT ? { agent } : {}),
         ...(baseWorker ? { base: baseWorker.branch! } : {}),
       },
       // A held offline command cannot run on reconnect before the owner answers. Only the

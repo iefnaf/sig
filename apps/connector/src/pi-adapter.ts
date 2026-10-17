@@ -13,7 +13,7 @@ import type {
   StartSpec,
   WorkerHandle,
 } from "./agent.ts";
-import { PartialInterruptError } from "./agent.ts";
+import { AdapterError, PartialInterruptError } from "./agent.ts";
 import { adjudicate, type RunWindow } from "./adjudication.ts";
 import { normalizeSessionEntries } from "./session-history.ts";
 import { observeSession } from "./session-observation.ts";
@@ -25,17 +25,6 @@ import type { HistoryPage } from "@shepherd/protocol";
 
 /** Must match COMMAND_NAME in ./ext/shepherd-pi.ts (locked together by a test). */
 const SHEPHERD_COMMAND = "shepherd";
-
-export class AdapterError extends Error {
-  constructor(
-    readonly code: string,
-    message: string,
-    readonly retriable = false,
-  ) {
-    super(message);
-    this.name = "AdapterError";
-  }
-}
 
 export interface PiAdapterOptions {
   stateDir: string;
@@ -566,7 +555,7 @@ function queueTexts(items: unknown): string[] {
 }
 
 /** First 80 chars of a path or command — never file contents or command output (§11.2). */
-function extractTarget(args: unknown): string | undefined {
+export function extractTarget(args: unknown): string | undefined {
   if (typeof args !== "object" || args === null) return undefined;
   const raw = args as Record<string, unknown>;
   for (const key of ["file_path", "path", "filename", "command", "pattern", "query", "url"]) {
