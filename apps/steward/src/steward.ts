@@ -81,8 +81,9 @@ import {
   type StewardModels,
 } from "./llm/models.ts";
 import { createLedger, type Ledger, type LedgerSql, type NotifyRow, type RunRow } from "./ledger.ts";
+import { renderChangeReports } from "./notes.ts";
 import { RoutineService } from "./routines.ts";
-import { failureCard, notifyCard, askUserCard, reportCardFor, stallCard, type AskCardButton } from "./report-template.ts";
+import { failureCard, notifyCard, askUserCard, reportCardFor, noteDecisionCard, stallCard, type AskCardButton } from "./report-template.ts";
 import { MIGRATIONS, runMigrations } from "./schema.ts";
 import { openSecret, sealSecret } from "./secretbox.ts";
 import { renderSetupPage, type SetupView } from "./setup-page.ts";
@@ -166,9 +167,9 @@ export const claimsDispatch = (text: string): boolean => DISPATCH_CLAIM_RE.test(
 // — bounded in time, so a long-dead fire is not a standing authorization. Generous enough
 // for a wake queued behind a busy harness (whenBusy: followUp), short enough to revoke.
 const PROVENANCE_FIRE_FRESHNESS_MS = 10 * 60_000;
-// steward.md §2.5 (issue #18): notes maintenance (decay, demotion suggestions, capacity
-// backstop) runs once a day via alarm; its ChangeReports relay with the next user reply.
-const NOTES_MAINTENANCE_DAY_S = 86_400;
+// The steward's daily notes lifecycle pass (issue #19, steward.md §2.5) runs at 02:00 UTC:
+// one cron, idempotent by expression — armNotesMaintenance/notesMaintenance both use it.
+const NOTES_MAINTENANCE_CRON = "0 2 * * *";
 // Sent when the first event lands on the webhook after the QR switch: only a delivered event
 // proves the transport actually moved (research §8.2 — the API's callback_type report stays
 // out of sync with real delivery until the console republish lands).
@@ -246,10 +247,10 @@ export class Steward extends Agent<Env> {
     // a multi-statement rebuild can never persist half of itself, and the ledger write
     // cannot lag the commit (the copy-drop-rename migrations are not re-runnable).
     runMigrations(this.sql.bind(this), MIGRATIONS, (fn) => this.ctx.storage.transactionSync(fn));
-    // Notes maintenance is daily and idempotent (steward.md §2.5): arming at boot covers a
-    // fresh deployment; the handler re-arms itself with the review-#1 cancel-then-schedule
-    // pattern so the chain never dies with an evicted isolate.
-    void this.schedule(NOTES_MAINTENANCE_DAY_S, "notesMaintenance", undefined, { idempotent: true });
+    // Notes maintenance is daily (steward.md §2.5, issue #19): a 02:00 UTC cron, idempotent
+    // by expression — re-arming at boot dedups onto the same row and never postpones it,
+    // so the chain cannot die (or drift) with an evicted isolate.
+    this.armNotesMaintenance();
     // A DO restart clears the in-memory arm-dedupe while storage alarms keep their own
     // clock: re-arm maintenance so a restart never strands active workers unwatched.
     this.armWorkerSweeps();
@@ -2599,21 +2600,67 @@ export class Steward extends Agent<Env> {
   }
 
   /**
-   * The notes lifecycle pass (issue #18, steward.md §2.5): 60-day project demotions, 90-day
-   * resident demotion *suggestions* (never automatic — resident entries have broad impact),
-   * and the capacity backstop. Deterministic; its ChangeReports land in sh_note_log and
-   * reach the user with the next reply (spec §10.3) — no wake, no push of their own.
+   * The notes lifecycle pass (issues #18/#19, steward.md §2.5): 60-day project demotions,
+   * 90-day resident demotion *suggestions* (never automatic — resident entries have broad
+   *  impact), the capacity backstop, and the pressure record left by a commit that ignored
+   * `needsEviction` (evict lowest-score first, then write — reported in both cases). All
+   *  deterministic; every result lands in sh_note_log. Afterwards, this pass delivers what
+   *  accumulated since the owner's last reply: one bookkeeping message, and an archive-or-
+   *  keep card per open suggestion (spec §10.2/§10.3 — the ask must actually reach the
+   *  owner, not wait silently for the next conversation).
    */
-  async notesMaintenance(_payload?: unknown, schedule?: { id: string }): Promise<void> {
+  async notesMaintenance(_payload?: unknown): Promise<void> {
     try {
       this.ledger.notes.maintenance(Date.now());
     } catch (err) {
       this.logChannel("notes_maintenance_failed", errorText(err));
+      return;
     }
-    // Rearm daily (review #1's pattern: cancel the running job's schedule first, else the
-    // idempotent insert dedups onto a job the driver deletes when this handler returns).
-    if (schedule !== undefined) await this.cancelSchedule(schedule.id).catch(() => {});
-    await this.schedule(NOTES_MAINTENANCE_DAY_S, "notesMaintenance", undefined, { idempotent: true });
+    await this.deliverNotesChanges().catch((err) => this.logChannel("notes_changes_failed", errorText(err)));
+  }
+
+  /** Delivers ONE bounded batch of the pending maintenance-classed note changes (PR #53
+   *  review finding 7: the loop used to drain everything — 118 stale notes meant 118 push
+   *  cards in a single invocation; same-vintage notes go stale together, so the burst is
+   *  reachable without artificial seeding). One quiet bookkeeping text for the batch's
+   *  informational rows plus one push card per still-open suggestion; the rest stays
+   *  pending for the next pass or the next reply — never dropped, never a burst. Durable
+   *  and idempotent: stable outbound ids, marked only in this delivery class. */
+  private async deliverNotesChanges(): Promise<void> {
+    const owner = this.ownerOpenIdSync();
+    if (owner === null) return; // nobody to tell yet: rows stay pending for the first reply
+    const batch = this.ledger.notes.pendingMaintenance();
+    if (batch.length === 0) return;
+    // Finding 8: a suggestion whose note sank since the pass (an eviction at commit time,
+    // an owner archive on another card) gets no card — the ask settles as gone instead of
+    // asking the owner to keep something that no longer exists.
+    const actionable: typeof batch = [];
+    for (const item of batch) {
+      if (item.op !== "suggest_demote" || item.noteId === null) continue;
+      const note = this.ledger.notes.get(item.noteId);
+      if (note && note.status === "active" && note.layer === "resident") actionable.push(item);
+      else this.ledger.notes.abandonAsk(item.id, item.noteId);
+    }
+    const bookkeeping = batch.filter((p) => p.op !== "suggest_demote");
+    if (bookkeeping.length > 0) {
+      await this.enqueueOutbound({
+        id: `notechg:${bookkeeping[bookkeeping.length - 1]!.id}`,
+        kind: "text",
+        to: owner,
+        urgency: "quiet",
+        text: renderChangeReports(bookkeeping.map((p) => ({ op: p.op, noteId: p.noteId ?? "", text: p.text, reason: p.reason }))),
+      });
+    }
+    for (const item of actionable) {
+      await this.enqueueOutbound({
+        id: `noteask:${item.noteId}:${item.id}`,
+        kind: "card",
+        to: owner,
+        card: noteDecisionCard({ noteId: item.noteId!, text: item.text }),
+        urgency: "push",
+      });
+    }
+    this.ledger.notes.markPendingMaintenanceReported(batch[batch.length - 1]!.id);
   }
 
   // Card button callbacks (issue #5): the Thread is resolved from the card's providerMsgId —
@@ -2634,7 +2681,49 @@ export class Steward extends Agent<Env> {
       await this.handleAskCardAction(ev, action, ev.cardMsgId);
       return;
     }
+    if (action === "note_archive" || action === "note_keep") {
+      await this.handleNoteDecisionCard(action, ev.cardMsgId, ownerOpenId);
+      return;
+    }
     await this.dispatcher.handleCardAction({ operatorId: ev.operatorId, action, cardMsgId: ev.cardMsgId });
+  }
+
+  /**
+   * A resident-note suggestion card's button (issue #19, spec §10.2): the outbound row id
+   * is `noteask:<noteId>:<logId>` — resolved via providerMsgId, never button data (the
+   * §3.1 rule). The tap is the owner's own decision; the module keeps its invariants
+   * (archive is refused on a pinned note; the state settles the ask either way).
+   */
+  private async handleNoteDecisionCard(action: string, cardMsgId: string, ownerOpenId: string): Promise<void> {
+    const row = this.ledger.outbound.rowForProviderMsg(cardMsgId);
+    const ask = row !== null && row.id.startsWith("noteask:") ? /^noteask:(n_[^:]+):(\d+)$/.exec(row.id) : null;
+    let reply: string;
+    if (!ask) {
+      reply = "这张记忆卡片已失效（没有待决定的建议）。";
+    } else {
+      const [, noteId, logIdRaw] = ask;
+      if (action === "note_archive") {
+        const note = this.ledger.notes.get(noteId!);
+        if (!note || note.status !== "active" || note.layer !== "resident") {
+          reply = "这条建议已处理过（或记忆已不在常驻层）。";
+        } else if (note.pinned) {
+          reply = "这条记忆已置顶，不会自动腾挪；先取消置顶才能归档。";
+        } else {
+          this.ledger.notes.demote(noteId!, Number(logIdRaw), "note_archive");
+          reply = "已归档；需要时可随时搜索找回。";
+        }
+      } else {
+        // note_keep: the 90-day clock restarts (a renewal, not a pin — the pin exemption is
+        // the owner's explicit call); a later maintenance pass may re-ask after another 90d.
+        // A note sunk since the card went out cannot be kept — say so instead of promising
+        // a renewal that will never fire (PR #53 review finding 8); the ask settles either way.
+        const kept = this.ledger.notes.renew(noteId!, Number(logIdRaw));
+        reply = kept.ok
+          ? "好的，保留这条记忆；90 天未再提及会再问你一次。"
+          : "这条记忆已经不在常驻层了（可能已被归档或腾挪），无需保留。";
+      }
+    }
+    await this.enqueueOutbound({ kind: "text", to: ownerOpenId, text: reply });
   }
 
   /**
@@ -2903,6 +2992,29 @@ export class Steward extends Agent<Env> {
     this.ctx.storage.sql.exec("DELETE FROM sh_followup");
     this.ctx.storage.sql.exec("DELETE FROM sh_routine_offer");
     this.routineService_ = undefined;
+  }
+
+  /** Queues the daily lifecycle pass (issue #19) to run at the next 02:00 UTC. Idempotent
+   *  by expression, so a restart never postpones it. */
+  private armNotesMaintenance(): void {
+    void this.schedule(NOTES_MAINTENANCE_CRON, "notesMaintenance", undefined).catch((err) =>
+      this.logChannel("notes_maintenance_arm_failed", errorText(err)),
+    );
+  }
+
+  /** Test read: the notes-maintenance schedule row (empty before arming). */
+  async notesMaintenanceSchedulesForTest(): Promise<Array<{ id: string; type: string; cron: string | null; time: number }>> {
+    return (await this.listSchedules())
+      .filter((s) => s.callback === "notesMaintenance")
+      .map((s) => ({ id: s.id, type: s.type, cron: (s as { cron?: string }).cron ?? null, time: s.time }));
+  }
+
+  /** Test-only: clears the notes tables (the daily cron stays armed — a stray fire is
+   *  idempotent and finds nothing pending; cancelling it would leave nothing to assert). */
+  async resetNotesStateForTests(): Promise<void> {
+    this.ctx.storage.sql.exec("DELETE FROM sh_note");
+    this.ctx.storage.sql.exec("DELETE FROM sh_note_log");
+    this.ctx.storage.sql.exec("DELETE FROM sh_note_pressure");
   }
 
   // Scheduled callback (also fired inline after each enqueue): claims due rows, sends them

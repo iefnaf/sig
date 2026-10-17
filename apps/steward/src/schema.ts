@@ -681,14 +681,37 @@ export const MIGRATIONS: readonly Migration[] = [
     },
   },
   {
+    id: "013_notes_maintenance",
+    up: (sql) => {
+      // A refused write must not break the hard cap. Remember the request for room instead
+      // (one row per distinct request — PR #53 review finding 3); the daily pass frees it
+      // even if the model gives up.
+      sql`CREATE TABLE IF NOT EXISTS sh_note_pressure (
+        layer TEXT NOT NULL, scope_repoId TEXT NOT NULL, text TEXT NOT NULL, chars INTEGER NOT NULL,
+        kind TEXT NOT NULL DEFAULT 'fact', evidence TEXT, replaces TEXT,
+        PRIMARY KEY (layer, scope_repoId, text)
+      )`;
+      ignoringDuplicateColumn(() => {
+        sql`ALTER TABLE sh_note_log ADD COLUMN delivery TEXT NOT NULL DEFAULT 'reply'`;
+      });
+      ignoringDuplicateColumn(() => {
+        sql`ALTER TABLE sh_note_log ADD COLUMN decision TEXT`;
+      });
+      // Lifecycle reports have their own durable delivery, including actionable resident
+      // suggestions. Upgrade any unreported lifecycle rows left by #18 as well.
+      sql`UPDATE sh_note_log SET delivery = 'maintenance'
+          WHERE reportedAt IS NULL AND (op IN ('demoted', 'suggest_demote') OR reason = 'maintenance_cap')`;
+    },
+  },
+  {
     // Relay: handoff briefs and continuing on the previous branch (issue #8, spec §5.3,
     // steward.md §2.6). The worker rows learn their relay parent and the last-reported
     // context usage; summary updates become versioned (last 5 kept; every 10th update is
     // prompted as a from-scratch rewrite — steward.md §2.6's anti-drift rule). Existing
     // threads keep their current summary: it enters history as version 1 on the next
     // update, so the cumulative counter never reads zero on a thread with a past.
-    // Numbered 014: main's #46 took 013_reap_reconcile; ids are unique, which is what the
-    // ledger keys on — the number keeps the order readable.
+    // Numbered 014: main's #46 took 013_reap_reconcile and #19 took 013_notes_maintenance;
+    // ids are unique, which is what the ledger keys on — the number keeps the order readable.
     id: "014_relay_handoff",
     up: (sql) => {
       ignoringDuplicateColumn(() => {

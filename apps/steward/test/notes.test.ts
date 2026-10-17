@@ -6,7 +6,7 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import type { Steward } from "../src/steward.ts";
+import type { ShOutboundRow, Steward } from "../src/steward.ts";
 import type { Ledger } from "../src/ledger.ts";
 import type { NoteDraft, NoteRow, Notes } from "../src/notes.ts";
 import { PROJECT_CAP_PER_REPO, RESIDENT_CAP, renderChangeReports, retentionScore } from "../src/notes.ts";
@@ -23,6 +23,8 @@ import {
   resetLedgerState,
   scriptModel,
   waitRunsSettled,
+  TEST_APP_ID,
+  TEST_VERIFY_TOKEN,
 } from "./helpers.ts";
 
 // The DO-side surface the unit tests reach through (private fields are typed away, the same
@@ -1000,5 +1002,513 @@ describe("notes trust gates: the evidence rules (PR #44 review finding 3)", () =
     const refusal = requests.find((r) => r.lastToolResult.includes("触发本轮的那条用户消息"));
     expect(refusal).toBeDefined();
     expect((await ownerStub().debugSnapshot()).notes.filter((n) => n.layer === "resident")).toHaveLength(0);
+  });
+});
+
+// ---- forgetting and daily maintenance (issue #19, steward.md §2.5, spec §10.2) ----------------------
+
+describe("notes forgetting: retention, pins, pressure (issue #19)", () => {
+  it("the retention score weighs recency, usage, source, and confirmation (§2.5 formula)", async () => {
+    await inNotesDo(() => {
+      const now = Date.now();
+      const base: NoteRow = { noteId: "n_x", layer: "resident", scopeRepoId: null, kind: "preference", text: "t", bytes: 1, source: "user_said", evidence: null, confirmedBy: null, confirmed: true, pinned: false, createdAt: now, lastUsedAt: now, useCount: 0, status: "active", supersededBy: null };
+      const fresh = { ...base, lastUsedAt: now - 1 * 86_400_000 };
+      const stale = { ...base, lastUsedAt: now - 80 * 86_400_000 };
+      expect(retentionScore(fresh, now)).toBeGreaterThan(retentionScore(stale, now));
+      const used = { ...base, useCount: 5 };
+      const unused = { ...base, useCount: 0 };
+      expect(retentionScore(used, now)).toBeGreaterThan(retentionScore(unused, now));
+      const confirmed: NoteRow = { ...base, source: "worker_reported", confirmed: true };
+      const unconfirmed: NoteRow = { ...base, source: "worker_reported", confirmed: false };
+      expect(retentionScore(unconfirmed, now)).toBe(retentionScore(confirmed, now) / 2);
+    });
+  });
+
+  it("a pinned target is refused in replaces regardless of capacity (review finding 1)", async () => {
+    await inNotesDo((n) => {
+      // Escape (a): the layer has ROOM — the old code archived the pinned target anyway.
+      const lone = n.commit({ text: "唯一的旧偏好", kind: "preference", source: "user_said", layer: "resident" });
+      if (!lone.ok) throw new Error("fixture failed");
+      n.pin(lone.note.noteId, true);
+      const withRoom = n.commit(
+        { text: "一条无关的新偏好", kind: "preference", source: "user_said", layer: "resident" },
+        { replaces: [lone.note.noteId] },
+      );
+      expect(withRoom.ok).toBe(false);
+      if (!withRoom.ok) {
+        expect(withRoom.code).toBe("invalid");
+        expect(withRoom.message).toContain("置顶");
+      }
+      expect(n.get(lone.note.noteId)).toMatchObject({ layer: "resident", status: "active", pinned: true });
+
+      // Escape (b): near-cap, mixed targets — the unpinned ones alone cover the deficit.
+      // The old code skipped the pinned check and the loop archived the pinned note as 'evicted'.
+      const created = fillLayer(n, "resident", 2360, 20);
+      const pinned = created[5]!;
+      n.pin(pinned.noteId, true);
+      const mixed = n.commit(
+        { text: `${"另".repeat(40)}一条新偏好`, kind: "preference", source: "user_said", layer: "resident" },
+        { replaces: [created[0]!.noteId, pinned.noteId] },
+      );
+      expect(mixed.ok).toBe(false);
+      if (!mixed.ok) expect(mixed.code).toBe("invalid");
+      expect(n.get(pinned.noteId)).toMatchObject({ layer: "resident", status: "active", pinned: true });
+      expect(n.get(created[0]!.noteId)).toMatchObject({ layer: "resident", status: "active" }); // untouched too
+    });
+  });
+
+  it("a user_said write over cap records pressure; a low-trust write does not", async () => {
+    await inNotesDo((n, _ledger, sql) => {
+      fillLayer(n, "project", PROJECT_CAP_PER_REPO - 10, 20, "repo-a");
+      const refused = n.commit({ text: "用 vitest 跑测试，报告要带截图", kind: "convention", source: "user_said", layer: "project", scopeRepoId: "repo-a" });
+      expect(refused.ok).toBe(false);
+      const rows = sql<{ layer: string; scope_repoId: string; text: string }>`SELECT layer, scope_repoId, text FROM sh_note_pressure`;
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ layer: "project", scope_repoId: "repo-a", text: "用 vitest 跑测试，报告要带截图" });
+
+      // Low-trust sources are never worth the room: no pressure row, plain refusal.
+      const lowTrust = n.commit({ text: "低信任来源的满层写入", kind: "convention", source: "worker_reported", layer: "project", scopeRepoId: "repo-a" });
+      expect(lowTrust.ok).toBe(false);
+      expect(sql`SELECT COUNT(*) AS n FROM sh_note_pressure`[0]!.n).toBe(1);
+
+      // A retry with the named victim succeeds — and clears the pressure row.
+      const propose = n.propose({ text: "用 vitest 跑测试，报告要带截图", kind: "convention", source: "user_said", layer: "project", scopeRepoId: "repo-a" });
+      const done = n.commit(
+        { text: "用 vitest 跑测试，报告要带截图", kind: "convention", source: "user_said", layer: "project", scopeRepoId: "repo-a" },
+        { replaces: [propose.needsEviction[0]!.noteId] },
+      );
+      expect(done.ok).toBe(true);
+      expect(sql`SELECT COUNT(*) AS n FROM sh_note_pressure`[0]!.n).toBe(0);
+    });
+  });
+
+  it("maintenance resolves ignored pressure by score: evicts, then writes, then reports both", async () => {
+    await inNotesDo((n, _ledger, sql) => {
+      const created = fillLayer(n, "resident", 2360, 20); // user_said, equal scores → oldest first
+      // The lowest-value entry: inferred beats user_said only when confirmed — sink an
+      // unconfirmed worker_reported project note as the expected victim? No: different layer.
+      // Instead: mark note #2 inferred-origin by rewriting its row (source column is the weight).
+      // Sink every other entry's clock to "freshly used" and make this one the stale,
+      // unconfirmed worker_reported entry: the lowest retention score by construction.
+      const stale = Date.now() - 80 * 86_400_000;
+      const fresh = Date.now();
+      for (const [idx, row] of created.entries()) {
+        sql`UPDATE sh_note SET lastUsedAt = ${idx === 1 ? stale : fresh}, useCount = ${idx === 1 ? 0 : 3},
+               source = ${idx === 1 ? "worker_reported" : "user_said"}, confirmed = ${idx === 1 ? 0 : 1}
+             WHERE noteId = ${row.noteId}`;
+      }
+      const asked = `${"报".repeat(55)}必须中文`; // 59 chars: 2360 + 59 > 2400 → refused, pressure recorded
+      n.commit({ text: asked, kind: "preference", source: "user_said", layer: "resident", evidence: "user:om_pressure_1" });
+      expect(sql`SELECT COUNT(*) AS n FROM sh_note_pressure`[0]!.n).toBe(1);
+
+      const changes = n.maintenance(Date.now());
+      // The ignored request was honoured: one note written, one entry evicted for it.
+      expect(changes.map((c) => c.op)).toContain("noted");
+      expect(changes.map((c) => c.op)).toContain("evicted");
+      const evicted = changes.find((c) => c.op === "evicted")!;
+      // The victim is the unconfirmed worker_reported entry — the lowest score, not the oldest.
+      expect(evicted!.noteId).toBe(created[1]!.noteId);
+      const noted = changes.find((c) => c.op === "noted")!;
+      expect(noted!.text).toBe(asked);
+      // The deferred write keeps the draft's shape and its verified provenance.
+      expect(n.get(noted!.noteId)).toMatchObject({ kind: "preference", evidence: "user:om_pressure_1", source: "user_said" });
+      expect(n.get(evicted!.noteId)).toMatchObject({ layer: "archive", supersededBy: expect.any(String) });
+      expect(sql`SELECT COUNT(*) AS n FROM sh_note_pressure`[0]!.n).toBe(0);
+      // The cap holds after the pass.
+      const bytes = sql<{ total: number }>`SELECT COALESCE(SUM(bytes),0) AS total FROM sh_note WHERE layer='resident' AND status='active'`[0]!.total;
+      expect(bytes).toBeLessThanOrEqual(2400);
+    });
+  });
+
+  it("an unrelated successful write does not silently delete the parked promise (review finding 2)", async () => {
+    await inNotesDo((n, _ledger, sql) => {
+      fillLayer(n, "resident", 2360, 20);
+      const refused = n.commit({ text: `${"长".repeat(55)}的一条用户偏好`, kind: "preference", source: "user_said", layer: "resident" });
+      expect(refused.ok).toBe(false);
+      expect(sql`SELECT COUNT(*) AS n FROM sh_note_pressure`[0]!.n).toBe(1);
+
+      // An UNRELATED small write fits without touching the parked request's room.
+      const small = n.commit({ text: "短偏好", kind: "preference", source: "user_said", layer: "resident" });
+      if (!small.ok) throw new Error(small.message);
+      expect(sql`SELECT COUNT(*) AS n FROM sh_note_pressure`[0]!.n).toBe(1); // the promise survives
+
+      // The daily pass still honours it — evicting by score, writing, reporting both halves.
+      const changes = n.maintenance(Date.now());
+      expect(changes.map((c) => c.op)).toContain("noted");
+      expect(changes.map((c) => c.op)).toContain("evicted");
+      const noted = changes.find((c) => c.op === "noted")!;
+      expect(noted.text).toContain("的一条用户偏好");
+      expect(sql`SELECT COUNT(*) AS n FROM sh_note_pressure`[0]!.n).toBe(0);
+    });
+  });
+
+  it("two distinct parked requests are both honoured — latest-wins no longer erases one (review finding 3)", async () => {
+    await inNotesDo((n, _ledger, sql) => {
+      fillLayer(n, "resident", 2360, 20);
+      const first = n.commit({ text: `${"甲".repeat(55)}的第一条偏好`, kind: "preference", source: "user_said", layer: "resident" });
+      const second = n.commit({ text: `${"乙".repeat(55)}的第二条偏好`, kind: "preference", source: "user_said", layer: "resident" });
+      expect(first.ok).toBe(false);
+      expect(second.ok).toBe(false);
+      expect(sql`SELECT COUNT(*) AS n FROM sh_note_pressure`[0]!.n).toBe(2);
+      // The identical retry is a true no-op for the log too (the log-dup minor).
+      n.commit({ text: `${"乙".repeat(55)}的第二条偏好`, kind: "preference", source: "user_said", layer: "resident" });
+      expect(sql`SELECT COUNT(*) AS n FROM sh_note_log WHERE op = 'room_needed'`[0]!.n).toBe(2);
+
+      const changes = n.maintenance(Date.now());
+      const noted = changes.filter((c) => c.op === "noted").map((c) => c.text);
+      expect(noted).toHaveLength(2);
+      expect(noted.some((t) => t.includes("的第一条偏好"))).toBe(true);
+      expect(noted.some((t) => t.includes("的第二条偏好"))).toBe(true);
+      expect(sql`SELECT COUNT(*) AS n FROM sh_note_pressure`[0]!.n).toBe(0);
+    });
+  });
+
+  it("a parked correction supersedes its named predecessor — not score-evicts around it (review finding 4)", async () => {
+    await inNotesDo((n, _ledger, sql) => {
+      const predecessor = n.commit({ text: "汇报一律用英文写", kind: "preference", source: "user_said", layer: "resident" });
+      if (!predecessor.ok) throw new Error("fixture failed");
+      fillLayer(n, "resident", 2360 - predecessor.note.text.length, 20);
+      // The correction names its predecessor but the reworded text still does not fit.
+      const correction = n.commit(
+        { text: `汇报一律用中文写，${"包".repeat(50)}括标题`, kind: "preference", source: "user_said", layer: "resident" },
+        { replaces: [predecessor.note.noteId] },
+      );
+      expect(correction.ok).toBe(false);
+
+      const changes = n.maintenance(Date.now());
+      expect(changes.map((c) => c.op)).toContain("superseded");
+      const superseded = changes.find((c) => c.op === "superseded")!;
+      expect(superseded.noteId).toBe(predecessor.note.noteId);
+      const noted = changes.find((c) => c.op === "noted")!;
+      expect(noted.text).toContain("汇报一律用中文写");
+      // The predecessor sank as a historical version of the correction — both-active is gone.
+      expect(n.get(predecessor.note.noteId)).toMatchObject({
+        layer: "archive",
+        status: "superseded",
+        supersededBy: noted.noteId,
+      });
+      expect(n.get(noted.noteId)).toMatchObject({ layer: "resident", status: "active" });
+      expect(sql`SELECT COUNT(*) AS n FROM sh_note_pressure`[0]!.n).toBe(0);
+    });
+  });
+
+  it("the saved note is reported by the daily delivery, not stranded as reply-class (review finding 5)", async () => {
+    await inNotesDo((n, _ledger, sql) => {
+      fillLayer(n, "resident", 2360, 20);
+      n.commit({ text: `${"长".repeat(55)}的一条用户偏好`, kind: "preference", source: "user_said", layer: "resident" });
+      n.maintenance(Date.now());
+      const rows = sql<{ op: string; delivery: string }>`
+        SELECT op, delivery FROM sh_note_log WHERE op = 'noted' AND reason = 'user_said' ORDER BY id
+      `;
+      const saved = rows[rows.length - 1]!;
+      expect(saved.delivery).toBe("maintenance"); // rides the daily flush, both halves in one message
+    });
+  });
+
+  it("the owner's own archive tap leaves no redundant relay clause (review minor)", async () => {
+    await inNotesDo((n) => {
+      const res = n.commit({ text: "要归档的老偏好", kind: "preference", source: "user_said", layer: "resident" });
+      if (!res.ok) throw new Error("fixture failed");
+      n.drainPendingForReply(); // the「记住了」rode a reply before the tap
+      const done = n.demote(res.note.noteId, 0, "note_archive"); // the card tap's module call
+      expect(done.ok).toBe(true);
+      // The tap's reply WAS the report: no「长期未用，已移入档案」clause rides the next reply.
+      expect(n.renderPendingForReply().text).not.toContain("已移入档案");
+      expect(n.pendingChanges()).toHaveLength(0); // the log row exists but is already reported
+    });
+  });
+
+  it("an undecided suggestion never rides a reply and is never marked by one (review finding 6)", async () => {
+    await inNotesDo((n, _ledger, sql) => {
+      const res = n.commit({ text: "老全局偏好", kind: "preference", source: "user_said", layer: "resident" });
+      if (!res.ok) throw new Error("fixture failed");
+      n.drainPendingForReply(); // the fixture's own「记住了」rode a reply before the aging
+      sql`UPDATE sh_note SET lastUsedAt = ${Date.now() - 95 * 86_400_000} WHERE noteId = ${res.note.noteId}`;
+      n.maintenance(Date.now());
+
+      // A user reply arrives BEFORE the daily flush could send the card: the suggestion
+      // clause is absent from the relay (informational rows may ride — the ask may not).
+      const rendered = n.renderPendingForReply();
+      expect(rendered.text).not.toContain("建议归档");
+      expect(rendered.text).not.toContain("已 90 天未用"); // no plain-text swallow
+      n.markPendingReported(rendered.upTo);
+      const stillPending = sql<{ n: number }>`
+        SELECT COUNT(*) AS n FROM sh_note_log WHERE op = 'suggest_demote' AND reportedAt IS NULL
+      `[0]!.n;
+      expect(stillPending).toBe(1); // still waiting for its decision card
+
+      // The daily flush then delivers it as a card (module side: still pending maintenance).
+      expect(n.pendingMaintenance().map((p) => p.op)).toContain("suggest_demote");
+    });
+  });
+
+  it("maintenance writes the parked request without eviction when room appeared meanwhile", async () => {
+    await inNotesDo((n, _ledger, sql) => {
+      fillLayer(n, "project", PROJECT_CAP_PER_REPO - 10, 20, "repo-a");
+      const refused = n.commit({ text: "用 vitest 跑测试，报告要带截图", kind: "convention", source: "user_said", layer: "project", scopeRepoId: "repo-a" });
+      expect(refused.ok).toBe(false);
+      // Room appears before the daily pass: the owner removed two entries.
+      const rows = n.list({ layer: "project", scopeRepoId: "repo-a" }).slice(0, 2);
+      for (const row of rows) n.remove(row.noteId);
+
+      const changes = n.maintenance(Date.now());
+      expect(changes.map((c) => c.op)).toEqual(["noted"]);
+      expect(changes[0]!.text).toBe("用 vitest 跑测试，报告要带截图");
+      expect(sql`SELECT COUNT(*) AS n FROM sh_note_pressure`[0]!.n).toBe(0);
+    });
+  });
+
+  it("maintenance drops pressure it cannot honour (all pinned) and reports it honestly", async () => {
+    await inNotesDo((n, _ledger, sql) => {
+      const created = fillLayer(n, "resident", 2360, 20);
+      // Room exists while the request lands: the pressure row is recorded.
+      const over = n.commit({ text: `${"新".repeat(55)}的一条用户偏好`, kind: "preference", source: "user_said", layer: "resident" });
+      expect(over.ok).toBe(false);
+      expect(sql`SELECT COUNT(*) AS n FROM sh_note_pressure`[0]!.n).toBe(1);
+      // Then the owner pins everything: the room evaporates before the daily pass.
+      for (const row of created) n.pin(row.noteId, true);
+
+      const changes = n.maintenance(Date.now());
+      expect(changes.map((c) => c.op)).toContain("room_refused");
+      expect(sql`SELECT COUNT(*) AS n FROM sh_note_pressure`[0]!.n).toBe(0);
+      // Nothing was evicted and every pin held.
+      expect(n.list({ layer: "resident" })).toHaveLength(118);
+      expect(n.list({ layer: "resident" }).every((row) => row.pinned)).toBe(true);
+    });
+  });
+
+  it("an ignored-need eviction relay reads in the 「为腾空间我忘了…」 voice", () => {
+    const rendered = renderChangeReports([
+      { op: "evicted", noteId: "n_a", text: "旧偏好甲", reason: "ignored_needsEviction" },
+      { op: "noted", noteId: "n_b", text: "新偏好乙", reason: "user_said" },
+    ]);
+    expect(rendered).toContain("为腾空间我忘了「旧偏好甲」");
+    expect(rendered).toContain("记住了「新偏好乙」");
+  });
+});
+
+describe("notes daily maintenance: the alarm, the ask, the reports (issue #19)", () => {
+  beforeEach(async () => {
+    await ownerStub().resetNotesStateForTests();
+  });
+
+  /** Runs the daily pass and waits until its outbound rows exist (delivery is async). */
+  async function runMaintenanceUntil(pred: (rows: ShOutboundRow[]) => boolean, what: string): Promise<void> {
+    await ownerStub().notesMaintenance();
+    const deadline = Date.now() + 8000;
+    for (;;) {
+      const rows = await ownerStub().outboundRows(50);
+      if (pred(rows)) return;
+      if (Date.now() > deadline) {
+        const dump = await runInDurableObject(ownerStub(), (instance: Steward) => {
+          const ledger = (instance as unknown as { ledger: Ledger }).ledger;
+          const raw = (instance as unknown as { sql: <T = Record<string, unknown>>(s: TemplateStringsArray, ...v: unknown[]) => T[] }).sql.bind(instance);
+          return {
+            notes: raw`SELECT noteId, layer, lastUsedAt, pinned, status FROM sh_note`,
+            log: raw`SELECT id, op, noteId, delivery, reportedAt, ts FROM sh_note_log ORDER BY id`,
+            channel: raw`SELECT reason, detail FROM sh_channel_log ORDER BY seq DESC LIMIT 8`,
+          };
+        });
+        throw new Error(`maintenance did not produce: ${what} (rows: ${JSON.stringify(rows.map((r) => r.id))}) state: ${JSON.stringify(dump)}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+
+  /** A resident note whose lastUsedAt is `days` old (closure capture — runInDurableObject
+   *  forwards no arguments). */
+  async function agedResidentNote(text: string, days: number): Promise<string> {
+    return runInDurableObject(ownerStub(), (instance: Steward) => {
+      const ledger = (instance as unknown as { ledger: Ledger }).ledger;
+      const done = ledger.notes.commit({ text, kind: "preference", source: "user_said", layer: "resident" });
+      if (!done.ok) throw new Error(done.message);
+      ledger.notes.drainPendingForReply();
+      const stale = Date.now() - days * 86_400_000;
+      (instance as unknown as { sql: <T = Record<string, unknown>>(s: TemplateStringsArray, ...v: unknown[]) => T[] }).sql`
+        UPDATE sh_note SET lastUsedAt = ${stale} WHERE noteId = ${done.note.noteId}
+      `;
+      return done.note.noteId;
+    });
+  }
+
+  it("arms exactly one idempotent 02:00 UTC cron; running the pass does not stack another", async () => {
+    // Any first RPC into the DO runs onStart, which arms the cron.
+    await ownerStub().notesMaintenance();
+    const schedules = await ownerStub().notesMaintenanceSchedulesForTest();
+    expect(schedules.filter((s) => s.type === "cron" && s.cron === "0 2 * * *")).toHaveLength(1);
+    // A second pass (a restart re-running onStart included) dedups onto the same row.
+    await ownerStub().notesMaintenance();
+    expect((await ownerStub().notesMaintenanceSchedulesForTest()).length).toBe(1);
+  });
+
+  it("a 90-day-unused resident note gets an archive-or-keep card — never a demotion; the taps decide", { timeout: 25000 }, async () => {
+    const noteId = await agedResidentNote("报告保持简短", 95);
+    await runMaintenanceUntil((rows) => rows.some((r) => r.id.startsWith(`noteask:${noteId}:`) && r.status === "sent" && r.providerMsgId), "the ask card (delivered)");
+
+    // The ask went out as its own card, id keyed to the note + log row (no button data).
+    const rows = await ownerStub().outboundRows(50);
+    const ask = rows.find((r) => r.id.startsWith(`noteask:${noteId}:`) && r.kind === "card");
+    expect(ask).toBeDefined();
+    expect((await ownerStub().debugSnapshot()).notes.find((n) => n.noteId === noteId)?.layer).toBe("resident");
+
+    // 归档: sinks to the archive, logged, and the reply confirms it is searchable.
+    await postEvent({
+      schema: "2.0",
+      header: { event_id: `evt_na_${crypto.randomUUID().slice(0, 8)}`, event_type: "card.action.trigger", create_time: String(Date.now()), token: TEST_VERIFY_TOKEN, app_id: TEST_APP_ID },
+      event: { operator: { open_id: "ou_owner" }, action: { value: { action: "note_archive" } }, context: { open_message_id: ask!.providerMsgId } },
+    });
+    await waitForSentContaining("已归档");
+    expect((await ownerStub().debugSnapshot()).notes.find((n) => n.noteId === noteId)?.layer).toBe("archive");
+  });
+
+  it("保留 renews the 90-day clock (a renewal, not a pin); the ask does not re-fire", { timeout: 25000 }, async () => {
+    const noteId = await agedResidentNote("重活优先给 codex", 95);
+    await runMaintenanceUntil((rows) => rows.some((r) => r.id.startsWith(`noteask:${noteId}:`) && r.status === "sent" && r.providerMsgId), "the ask card (delivered)");
+    const rows = await ownerStub().outboundRows(50);
+    const ask = rows.find((r) => r.id.startsWith(`noteask:${noteId}:`) && r.kind === "card");
+    expect(ask).toBeDefined();
+
+    await postEvent({
+      schema: "2.0",
+      header: { event_id: `evt_nk_${crypto.randomUUID().slice(0, 8)}`, event_type: "card.action.trigger", create_time: String(Date.now()), token: TEST_VERIFY_TOKEN, app_id: TEST_APP_ID },
+      event: { operator: { open_id: "ou_owner" }, action: { value: { action: "note_keep" } }, context: { open_message_id: ask!.providerMsgId } },
+    });
+    await waitForSentContaining("保留这条记忆");
+    const note = (await ownerStub().debugSnapshot()).notes.find((n) => n.noteId === noteId);
+    expect(note).toMatchObject({ layer: "resident", pinned: false });
+    expect(note!.lastUsedAt).toBeGreaterThan(Date.now() - 60_000);
+
+    // The next pass does not re-ask (the clock restarted — lastUsedAt is fresh again).
+    await ownerStub().notesMaintenance();
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const after = (await ownerStub().outboundRows(50)).filter((r) => r.id.startsWith("noteask:"));
+    expect(after).toHaveLength(1); // still just the original ask — no re-ask, no duplicate
+  });
+
+  it("the daily flush never swallows a pending reply-class row: it still rides the next reply", async () => {
+    // An event-run-style write leaves a pending 'noted' row; an aged resident note adds a
+    // maintenance-class suggestion. The daily pass delivers only its own class.
+    const noteId = await agedResidentNote("重活优先给 codex", 95); // drains its own「记账」
+    await runInDurableObject(ownerStub(), (instance: Steward) => {
+      const ledger = (instance as unknown as { ledger: Ledger }).ledger;
+      const done = ledger.notes.commit({ text: "事件轮里记下的一条", kind: "fact", source: "user_said", layer: "resident" });
+      if (!done.ok) throw new Error(done.message);
+      // deliberately NOT drained: the reply has not happened yet
+    });
+    await runMaintenanceUntil((rows) => rows.some((r) => r.id.startsWith(`noteask:${noteId}:`) && r.status === "sent"), "the ask card (delivered)");
+
+    const pending = await runInDurableObject(ownerStub(), (instance: Steward) => {
+      const ledger = (instance as unknown as { ledger: Ledger }).ledger;
+      return { reply: ledger.notes.pendingChanges().filter((c) => c.text === "事件轮里记下的一条").length };
+    });
+    expect(pending.reply).toBe(1); // still waiting for the owner's next reply
+    // …and when that reply comes, the announcement rides it.
+    await scriptModel(fauxAssistantMessage([fauxText("好。")]));
+    await dm("知道了", "om_reply_class");
+    const reply = await waitForSentContaining("记住了「事件轮里记下的一条」");
+    expect(reply).toContain("记账：");
+  }, 20000);
+
+  it("one pass delivers at most one batch; the burst is bounded and the rest waits (review finding 7)", async () => {
+    // 25 same-vintage stale resident notes: same-vintage staleness is the natural shape
+    // (resident lastUsedAt only moves on re-proposal/confirm), not artificial seeding.
+    await runInDurableObject(ownerStub(), (instance: Steward) => {
+      const ledger = (instance as unknown as { ledger: Ledger }).ledger;
+      for (let i = 0; i < 25; i += 1) {
+        const done = ledger.notes.commit({ text: `偏好${String(i).padStart(4, "0")}号`, kind: "preference", source: "user_said", layer: "resident" });
+        if (!done.ok) throw new Error(done.message);
+      }
+      ledger.notes.drainPendingForReply();
+      const stale = Date.now() - 95 * 86_400_000;
+      (instance as unknown as { sql: <T = Record<string, unknown>>(s: TemplateStringsArray, ...v: unknown[]) => T[] }).sql`
+        UPDATE sh_note SET lastUsedAt = ${stale} WHERE layer = 'resident'
+      `;
+    });
+    await ownerStub().notesMaintenance();
+    await new Promise((r) => setTimeout(r, 400));
+    const rows = await ownerStub().outboundRows(60);
+    expect(rows.filter((r) => r.id.startsWith("noteask:")).length).toBe(20); // bounded, not 25
+    // The remaining 5 suggestions are still pending — tomorrow's pass (or a reply that is
+    // not allowed to swallow them) carries them; nothing is dropped.
+    const pending = await runInDurableObject(ownerStub(), (instance: Steward) => {
+      const ledger = (instance as unknown as { ledger: Ledger }).ledger;
+      return ledger.notes.pendingMaintenance().filter((p) => p.op === "suggest_demote").length;
+    });
+    expect(pending).toBe(5);
+    await ownerStub().notesMaintenance();
+    await new Promise((r) => setTimeout(r, 400));
+    expect((await ownerStub().outboundRows(60)).filter((r) => r.id.startsWith("noteask:")).length).toBe(25);
+  }, 25000);
+
+  it("keep on a note sunk since the card went out: honest reply, no renewal, ask settled (review finding 8)", async () => {
+    const noteId = await agedResidentNote("重活优先给 codex", 95);
+    await runMaintenanceUntil((rows) => rows.some((r) => r.id.startsWith(`noteask:${noteId}:`) && r.status === "sent" && r.providerMsgId), "the ask card (delivered)");
+    const rows = await ownerStub().outboundRows(50);
+    const ask = rows.find((r) => r.id.startsWith(`noteask:${noteId}:`) && r.kind === "card")!;
+    // The note sinks after the card exists (an eviction at commit time, say).
+    await runInDurableObject(ownerStub(), (instance: Steward) => {
+      (instance as unknown as { sql: <T = Record<string, unknown>>(s: TemplateStringsArray, ...v: unknown[]) => T[] }).sql`
+        UPDATE sh_note SET layer = 'archive' WHERE noteId = ${noteId}
+      `;
+    });
+    await postEvent({
+      schema: "2.0",
+      header: { event_id: `evt_nk2_${crypto.randomUUID().slice(0, 8)}`, event_type: "card.action.trigger", create_time: String(Date.now()), token: TEST_VERIFY_TOKEN, app_id: TEST_APP_ID },
+      event: { operator: { open_id: "ou_owner" }, action: { value: { action: "note_keep" } }, context: { open_message_id: ask.providerMsgId } },
+    });
+    await waitForSentContaining("已经不在常驻层");
+    const note = (await ownerStub().debugSnapshot()).notes.find((n) => n.noteId === noteId)!;
+    expect(note.layer).toBe("archive");
+    expect(note.lastUsedAt).toBeLessThan(Date.now() - 86_400_000); // no renewal of a sunk note
+  }, 25000);
+
+  it("a suggestion whose note sank before delivery gets no card — the ask settles as gone (review finding 8)", async () => {
+    // Seed a real undecided suggestion, then sink its note before any delivery ran.
+    const noteId = await agedResidentNote("一条会沉掉的偏好", 95);
+    await runInDurableObject(ownerStub(), (instance: Steward) => {
+      const ledger = (instance as unknown as { ledger: Ledger }).ledger;
+      ledger.notes.maintenance(Date.now()); // logs the suggestion; delivery NOT run yet
+      (instance as unknown as { sql: <T = Record<string, unknown>>(s: TemplateStringsArray, ...v: unknown[]) => T[] }).sql`
+        UPDATE sh_note SET layer = 'archive' WHERE noteId = ${noteId}
+      `;
+    });
+    await ownerStub().notesMaintenance(); // nothing new to log; the flush processes the pending row
+    await new Promise((r) => setTimeout(r, 400));
+    const rows = await ownerStub().outboundRows(50);
+    expect(rows.filter((r) => r.id.startsWith(`noteask:${noteId}:`)).length).toBe(0); // no card for a sunk note
+    const settled = await runInDurableObject(ownerStub(), (instance: Steward) => {
+      const raw = (instance as unknown as { sql: <T = Record<string, unknown>>(s: TemplateStringsArray, ...v: unknown[]) => T[] }).sql.bind(instance);
+      return raw`SELECT decision, reportedAt FROM sh_note_log WHERE op = 'suggest_demote'`[0] ?? null;
+    });
+    expect(settled).toMatchObject({ decision: "note_gone", reportedAt: expect.any(Number) });
+  }, 25000);
+
+  it("maintenance reports its own actions (demotions, evictions) proactively — one coalesced message", async () => {
+    // A 70-day-stale project note (auto-demoted) + ignored pressure (evicted-for + noted).
+    await runInDurableObject(ownerStub(), (instance: Steward) => {
+      const ledger = (instance as unknown as { ledger: Ledger }).ledger;
+      const done = ledger.notes.commit({ text: "老的仓库约定", kind: "convention", source: "user_said", layer: "project", scopeRepoId: "repo-old" });
+      if (!done.ok) throw new Error(done.message);
+      ledger.notes.drainPendingForReply();
+      const stale = Date.now() - 70 * 86_400_000;
+      (instance as unknown as { sql: <T = Record<string, unknown>>(s: TemplateStringsArray, ...v: unknown[]) => T[] }).sql`
+        UPDATE sh_note SET lastUsedAt = ${stale} WHERE noteId = ${done.note.noteId}
+      `;
+    });
+    await runMaintenanceUntil((rows) => rows.some((r) => r.id.startsWith("notechg:") && r.status === "sent"), "the bookkeeping notice (delivered)");
+
+    const sent = await ownerStub().outboundRows(50);
+    const notice = sent.find((r) => r.id.startsWith("notechg:") && r.status === "sent");
+    expect(notice).toBeDefined();
+    const payload = JSON.parse(notice!.payload as string) as { text?: string };
+    expect(payload.text).toContain("已移入档案");
+
+    // Once sent, the rows are marked — a later user reply does not repeat the announcement.
+    await scriptModel(fauxAssistantMessage([fauxText("好。")]));
+    await dm("知道了");
+    await waitRunsSettled();
+    const replies = (await ownerStub().outboundRows(50)).filter((r) => r.kind === "text" && r.status === "sent");
+    expect(replies.some((r) => (JSON.parse(r.payload as string) as { text?: string }).text?.includes("老的仓库约定 已移入档案") ?? false)).toBe(false);
+    expect(replies.some((r) => r.id.startsWith("notechg:"))).toBe(true); // the notice itself is untouched
   });
 });

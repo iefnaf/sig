@@ -244,6 +244,45 @@ export function askUserCard(input: { question: string; threadTitle?: string; but
 
 // ---- proactive behavior (issue #20, steward.md §8; spike-conclusions §2 "digest routines") ----
 
+/**
+ * The resident-note suggestion card (issue #19, steward.md §2.5 rule 3): a 90-day-unused
+ * resident entry is proposed to the owner — archived or kept by their tap, never demoted
+ * automatically. Button values carry only the action; the note is resolved server-side
+ * from the card's providerMsgId (§3.1's rule).
+ */
+export function noteDecisionCard(input: { noteId: string; text: string }): {
+  config: unknown;
+  header: unknown;
+  elements: unknown[];
+} {
+  return {
+    config: { wide_screen_mode: true },
+    header: {
+      template: "turquoise",
+      title: { tag: "plain_text", content: "🧠 一条记忆很久没用了" },
+    },
+    elements: [
+      {
+        tag: "div",
+        text: { tag: "lark_md", content: `「${clip(input.text, 120)}」\n已经 90 天没有被用过（常驻层，影响所有对话）。要归档吗？` },
+      },
+      {
+        tag: "action",
+        actions: [
+          { tag: "button", text: { tag: "plain_text", content: "归档" }, type: "primary", value: { action: "note_archive" } },
+          { tag: "button", text: { tag: "plain_text", content: "保留" }, type: "default", value: { action: "note_keep" } },
+        ],
+      },
+      {
+        tag: "note",
+        elements: [
+          { tag: "plain_text", content: "归档不删除，随时可搜索找回；点「保留」会再等 90 天。" },
+        ],
+      },
+    ],
+  };
+}
+
 /** What a digest renders from — collected deterministically from the ledger, no LLM. */
 export interface DigestData {
   running: Array<{ threadId: string; title: string; machineName: string; agent: string }>;
