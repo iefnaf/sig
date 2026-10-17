@@ -120,9 +120,15 @@ sh_note(noteId, layer, scope_repoId?, kind, text, bytes,
         source, evidence, confirmed, pinned,
         createdAt, lastUsedAt, useCount, status, supersededBy)
 sh_note_fts(text)                     -- FTS5
-sh_note_log(id, ts, op, noteId, text, reason, reportedAt)
+sh_note_log(id, ts, op, noteId, text, reason, delivery, decision, reportedAt)
                                        -- all changes (text = snapshot for the relay);
-                                       -- reportedAt marks "already relayed with a reply" (issue #18)
+                                       -- reportedAt marks "already relayed with a reply" (issue #18);
+                                       -- delivery = 'reply' | 'maintenance' and decision settle the
+                                       --   90-day ask cards (issue #19)
+sh_note_pressure(layer, scope_repoId, text, chars, kind, evidence)
+                                       -- the latest user request for room per placement that a
+                                       --   refused commit left behind (issue #19); PRIMARY KEY
+                                       --   (layer, scope_repoId) — the daily pass resolves it
 ```
 
 | Layer | `layer` | Contents | Capacity | How it loads |
@@ -151,7 +157,9 @@ The module is deterministic and **semantic judgment is left to the steward**, so
 1. `notes.propose(draft)`: the module normalizes and dedupes (an exact match only bumps `useCount`) and uses FTS to find the closest few existing entries, returning `ProposeResult { duplicate?: NoteId, similar: Note[], needsEviction?: Note[] }`.
 2. The steward reviews the candidates and decides on `commit(draft, { replaces })`: same-meaning entries supersede the old one (the old entry moves to the archive, preserving the historical version); different ones coexist.
 
-Capacity handling: if a write would push the resident layer past 2,400 characters, `propose` returns `needsEviction` (sorted by the §2.5 score, lowest first, **pinned entries excluded**); the steward picks which to evict and carries them in `commit.replaces`. The module enforces the cap and rejects anything over it. If the steward does not handle it, `maintenance` evicts the lowest-scoring entry automatically by the same score and emits a `ChangeReport`.
+Capacity handling: if a write would push the resident layer past 2,400 characters, `propose` returns `needsEviction` (sorted by the §2.5 score, lowest first, **pinned entries excluded**); the steward picks which to evict and carries them in `commit.replaces`. The module enforces the cap and rejects anything over it. **Pinned entries are never spendable as room**: a `replaces` target that is pinned is refused outright — the pin leaves only by the owner's unpin (spec §10.2's exemption covers every eviction shape, however it is dressed up).
+
+If the steward does not handle it (issue #19): a **user_said** refusal records the request in `sh_note_pressure` — one row per **distinct request** (latest-wins must never erase an earlier promise without a report), carrying the draft's `kind`/`evidence` and its `replaces` intent; low-trust sources are never worth the room and stay plain refusals. The refusal message says so. The next daily `maintenance` honours each parked request deterministically: supersede its named `replaces` targets first (a parked correction must not score-evict *around* its predecessor; a target pinned in the meantime is skipped — the pin wins), then evict the lowest-scored unpinned entries by the same score, then write what was asked for, reporting both halves (「为腾空间我忘了 xx；记住了 yy」) through the daily delivery. If even that cannot free enough, the request is reported as unmet (`room_refused`) instead of rotting silently. A parked row is cleared only when a same-claim write lands (an *unrelated* successful write never clears it — a write consumes room, it does not make any).
 
 ### 2.5 Forgetting
 
@@ -159,9 +167,9 @@ Three triggers (spec §10.2):
 
 1. **Capacity pressure**: eviction at write time (above). Eviction = demotion to `archive`, not deletion.
 2. **Conflict supersession**: `replaces`. The old entry's `supersededBy` points to the new entry.
-3. **Long unused**: `maintenance` runs once a day via alarm, with these rules:
+3. **Long unused**: `maintenance` runs once a day via a 02:00 UTC cron (idempotent by expression — restarts dedup onto the same schedule row instead of postponing it), with these rules:
    - A project-layer entry whose `lastUsedAt` is over 60 days old and not pinned → demoted to the archive.
-   - A resident-layer entry unused for over 90 days and not pinned → emits a `ChangeReport` suggesting demotion but **does not demote automatically**; the steward asks the user (resident-layer entries have broad impact).
+   - A resident-layer entry unused for over 90 days and not pinned → **proposed to the owner, never demoted automatically** (resident-layer entries have broad impact): the daily pass sends an archive-or-keep card (「已经 90 天没有被用过…要归档吗？」); 归档 sinks the note (still searchable), 保留 renews `lastUsedAt` — a renewal, not a pin; the pin exemption stays the owner's explicit call. An unanswered ask re-fires at most every 30 days.
 
 Retention score (used to pick eviction victims; the lower, the earlier evicted):
 
@@ -171,9 +179,11 @@ sourceWeight: user_said 1.0 | connector 0.9 | worker_reported 0.4 | inferred 0.3
 pinned entries do not participate
 ```
 
-`lastUsedAt` is updated when an entry is assembled into the steward's context; this approximates "being used", which is good enough for the MVP.
+`lastUsedAt` is updated when an entry is assembled into the steward's context (`notes.context`, and `get_thread`'s project-note fetch via `forRepos`); this approximates "being used", which is good enough for the MVP. The always-rendered resident **section** deliberately does not count as use (PR #44 review finding 2) — every resident entry would then be "used" every turn and the 90-day rule would be dead code.
 
 Every change is written to `sh_note_log`, and `ChangeReport`s are generated from it. The user's edits, deletions, and pins on the web memory page go through the same interface and are logged the same way.
+
+**Delivery of the changes (issue #19)** — nothing sinks or is forgotten silently (spec §10.3): conversation-time changes ride the owner's next reply (「记账」 relay). The daily pass's own changes (demotions, evictions, the notes it saved from parked pressure, unmet pressure, 90-day suggestions) get their **own durable delivery** right after the pass: one quiet coalesced 「记账」 message for the bookkeeping and one push card per open suggestion, both through `sh_outbound` with stable ids (`notechg:<logId>`, `noteask:<noteId>:<logId>` — the card's tap resolves through its `providerMsgId`, §3.1's rule, and `decision`/`reportedAt` settle the ask). Three guards keep the classes honest: rows are marked reported only in their own delivery class (a pending `reply` row still rides the next reply); an **undecided suggestion never rides a reply** — plain text would report it while its card has never existed, and the 30-day quiet window would then block the re-ask; and one pass delivers at most **one bounded batch** (the rest stays pending for the next pass — same-vintage notes go stale together, and an unbounded flush would burst). Suggestions are logged **last** in the pass and re-validated at delivery time, so a note sunk by the pass itself (or between passes) never gets a card — its ask settles as gone. Without a bound owner, the rows simply wait for the first reply.
 
 ### 2.6 Summaries and handoff briefs
 
@@ -446,7 +456,7 @@ Everything sent to the user goes through `sh_outbound`; a delivery task (alarm-d
 
 Only three sources:
 
-1. **Core templates**: `done` reports, fallback pushes, stall reminders, machine status. Content comes from data, generated deterministically, with no dependence on the LLM.
+1. **Core templates**: `done` reports, fallback pushes, stall reminders, machine status, and the notes maintenance reports (issue #19 — forgetting is reported even with no LLM and no pending conversation). Content comes from data, generated deterministically, with no dependence on the LLM.
 2. **`notify_user` / `ask_user`**: explicit calls by the steward.
 3. **Replies to user messages**: in runs triggered by a user message, the final text reply is sent automatically (`sh_run.kind = user`).
 
@@ -645,7 +655,7 @@ Legend: ✓ verified in the protocol spike; ◦ seen only in docs or type declar
 | `input` with a custom `entry` (distinguishing user vs event) | ? `pi-durable@1.1.0` types disallow it, the repo README allows it; `PiHarness.submit` does not expose it. The MVP uses content markers (§4.2) |
 | DO SQLite supports FTS5 and JSON functions | ✓ (issue #7): the trigram tokenizer works in workerd and node:sqlite; the sh_thread_fts triggers (insert / title-goal-summary update / delete / report insert) keep the index current — verified by probe and `test/schema.test.ts` (migration 010). ✓ (issue #18): external-content FTS5 with the `trigram` tokenizer verified by test in workerd — insert/update/delete triggers stay in sync, CJK substring `MATCH` works; the default unicode61 tokenizer would have collapsed Chinese sentences into single tokens |
 | `ctx.storage.transactionSync` | ◦ (DO storage API) |
-| `this.schedule(cron, ...)` idempotent | ✓ (issue #20: cron dedups by expression+payload, one-shots opt in with `idempotent: true`; verified by tests incl. lost-schedule reconciliation) |
+| `this.schedule(cron, ...)` idempotent | ✓ (issue #20: cron dedups by expression+payload, one-shots opt in with `idempotent: true`; verified by tests incl. lost-schedule reconciliation). ✓ (issue #19): the daily notes-maintenance cron reuses it — arming at every `onStart` dedups onto the same row (restarts never postpone or stack it), replacing #18's 24h one-shot chain |
 | Feishu: QR-code creation (`registerApp` device flow) | ◦ official SDK source; no live scan performed |
 | Feishu: long-connection protocol, message send / reply / card update, rate limits and lengths | ◦ official SDK source and comments; not exercised live |
 | Feishu: switching a QR-created app to webhook, publish review, personal-account limits, long-connection stability inside the DO | ? unverified; see [feishu-channel.md](../research/feishu-channel.md) §6 |
