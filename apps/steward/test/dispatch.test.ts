@@ -78,14 +78,14 @@ describe("chooseMachine: ADR-0001 decision 6, deterministic", () => {
     expect(choice).toEqual({ kind: "machine", deviceId: "b", queued: false });
   });
 
-  it("the user-named machine wins over everything, online or not", () => {
+  it("the user-named machine wins over everything — and offline means the wait/switch ask (protocol §7.3)", () => {
     const choice = chooseMachine({
       candidates: [candidate("a"), candidate("b", { name: "mac-b", online: false })],
       machineHint: "mac-b",
       lastMachine: "a",
       continuation: true,
     });
-    expect(choice).toEqual({ kind: "machine", deviceId: "b", queued: true });
+    expect(choice).toEqual({ kind: "ask_offline", deviceId: "b" });
   });
 
   it("an unmatched @machine is reported, never guessed around", () => {
@@ -98,14 +98,14 @@ describe("chooseMachine: ADR-0001 decision 6, deterministic", () => {
     expect(choice).toEqual({ kind: "no_match" });
   });
 
-  it("a continuation goes back to the Thread's last machine and queues while it is offline (bug 4)", () => {
+  it("a continuation goes back to the Thread's last machine; offline it asks instead of silently queueing (bug 4 → §7.3)", () => {
     const choice = chooseMachine({
       candidates: [candidate("a"), candidate("b", { online: false })],
       machineHint: null,
       lastMachine: "b",
       continuation: true,
     });
-    expect(choice).toEqual({ kind: "machine", deviceId: "b", queued: true });
+    expect(choice).toEqual({ kind: "ask_offline", deviceId: "b" });
   });
 
   it("among several online machines the most free slots wins; a tie asks", () => {
@@ -171,7 +171,7 @@ describe("the dispatch service (Dispatcher.startWorker)", () => {
     fake.close();
   });
 
-  it("asks with buttons when the only machine with the repo is offline, creating the Thread", async () => {
+  it("asks with buttons when the only machine with the repo is offline, holding the command (protocol §7.3)", async () => {
     const fake = await pairFakeConnector("mac-studio", { run: null });
     await fake.connect();
     await new Promise((resolve) => setTimeout(resolve, 100));
@@ -186,11 +186,19 @@ describe("the dispatch service (Dispatcher.startWorker)", () => {
     expect(outcome).toMatchObject({ kind: "asked_offline", machineName: "mac-studio" });
     const snap = await ownerStub().debugSnapshot();
     expect(snap.threads).toHaveLength(1); // the ask created the Thread and set affinity
-    expect(snap.threads[0]!.workers).toHaveLength(0); // nothing dispatched: ask, don't decide
+    // The command is parked: registered + enqueued but HELD until the owner answers.
+    expect(snap.threads[0]!.workers).toHaveLength(1);
+    expect(snap.threads[0]!.workers[0]!.state).toBe("starting");
     expect(snap.threads[0]!.lastMachine).toBe(fake.deviceId);
+    // The command is written (protocol §7.3) but held — never delivered without an answer.
+    const worker = snap.threads[0]!.workers[0]!;
+    const cmdRow = await ownerStub().outboxRow(worker.cmdId!);
+    expect(cmdRow?.state).toBe("queued");
+    expect(cmdRow?.notAfter).not.toBeNull();
     await waitWhileOutboundPending();
     const cards = (await ownerStub().outboundRows(10)).filter((r) => r.kind === "card" && r.status === "sent");
-    expect(JSON.stringify(cards[0]?.payload)).toContain("排队等上线");
+    expect(JSON.stringify(cards[0]?.payload)).toContain("等它上线");
+    fake.close();
   });
 
   it("attaches to an existing thread on the same machine and resumes the previous session (issue #8)", async () => {

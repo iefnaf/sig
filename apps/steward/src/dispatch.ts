@@ -8,10 +8,9 @@
 // providerMsgId, never from data stuffed into the button.
 import { ulid } from "@shepherd/protocol";
 import { isSpendQuery } from "./budget.ts";
-import type { Ledger, ThreadRow } from "./ledger.ts";
 import { decideContinuation, renderHandoffBrief, type NewSessionReason } from "./handoff.ts";
-import type { WorkerRow } from "./ledger.ts";
-import { offlineAskCard } from "./report-template.ts";
+import type { Ledger, OfflineDispatchRow, ThreadRow, WorkerRow } from "./ledger.ts";
+import { offlineAskCard, askUserCard } from "./report-template.ts";
 
 const ADD_MACHINE_RE = /^\/(?:加机器|添加机器|add-machine|addmachine)\s*$/;
 const WEB_RE = /^\/(?:网页|web|login)\s*$/;
@@ -54,18 +53,28 @@ export function chooseMachine(input: {
   lastMachine: string | null;
   continuation: boolean;
 }): MachineChoice {
-  const { candidates, machineHint, lastMachine, continuation } = input;
+  const { machineHint, lastMachine, continuation } = input;
+  const candidates = [...new Map(input.candidates.map((c) => [c.deviceId, c])).values()];
+  const selected = (c: MachineCandidate): MachineChoice => c.online
+    ? { kind: "machine", deviceId: c.deviceId, queued: false }
+    : { kind: "ask_offline", deviceId: c.deviceId };
   if (candidates.length === 0) return { kind: "no_match" };
 
   if (machineHint) {
-    const named = candidates.find((c) => c.name === machineHint || c.deviceId === machineHint);
-    if (!named) return { kind: "no_match" };
-    return { kind: "machine", deviceId: named.deviceId, queued: !named.online };
+    const byId = candidates.find((c) => c.deviceId === machineHint);
+    if (byId) return selected(byId);
+    const named = candidates.filter((c) => c.name === machineHint);
+    if (named.length === 0) return { kind: "no_match" };
+    // One repo row per machine: a name hit can list the same machine twice (multi-repo
+    // rows), which is one machine — dedupe on deviceId before treating it as a tie.
+    const namedDevices = [...new Set(named.map((c) => c.deviceId))];
+    if (namedDevices.length > 1) return { kind: "ask_which", candidates: named };
+    return selected(named[0]!);
   }
 
   if (continuation && lastMachine) {
     const remembered = candidates.find((c) => c.deviceId === lastMachine);
-    if (remembered) return { kind: "machine", deviceId: remembered.deviceId, queued: !remembered.online };
+    if (remembered) return selected(remembered);
   }
 
   const online = candidates.filter((c) => c.online);
@@ -133,7 +142,7 @@ export type StartWorkerOutcome =
       /** Issue #8 (spec §5.3): how this dispatch continues the Thread. */
       continuation?: StartWorkerContinuation;
     }
-  /** The only machine with the repo is offline: the wait/cancel card went out (spec §9). */
+  /** The target is offline: the command is held until the wait/switch answer (spec §9). */
   | { kind: "asked_offline"; threadId: string; machineName: string }
   | { kind: "refused"; reason: string };
 
@@ -179,16 +188,16 @@ export interface DispatcherDeps {
     deviceId: string,
     kind: string,
     args: Record<string, unknown>,
-    opts: { workerId?: string; notAfter?: number | null; cmdId?: string },
+    opts: { workerId?: string; notAfter?: number | null; cmdId?: string; held?: boolean },
   ) => Promise<{ cmdId: string }>;
   /** Withdraws a still-queued command; false once it has left the DO. */
   cancelQueuedCommand: (cmdId: string) => boolean;
-  /** Whether the Thread still has a start_worker that can be delivered (queued or sent). */
-  hasDeliverableStart: (threadId: string) => boolean;
   /** Whether a command with this id already exists (replay dedup, protocol §7.1). */
   commandExists: (cmdId: string) => boolean;
+  /** Releases a held command with no expiry; refuses if it already left the DO. */
+  waitForCommand: (cmdId: string) => boolean;
   sendText: (text: string, threadId?: string | null) => Promise<void>;
-  sendCard: (card: unknown, threadId: string) => Promise<void>;
+  sendCard: (card: unknown, threadId: string, id?: string) => Promise<void>;
   /** Issues a one-time pairing code (protocol §5.2) for `/加机器`. */
   createPairing: () => Promise<{ code: string }>;
   /** The deployment's public origin for the connect command; null until a request revealed it. */
@@ -222,6 +231,28 @@ export class Dispatcher {
    */
   async startWorker(input: StartWorkerInput): Promise<StartWorkerOutcome> {
     if (input.prompt.trim().length === 0) return { kind: "refused", reason: "prompt 为空" };
+    const existing = this.ledger.workers.byCommand(input.cmdId);
+    if (existing) {
+      const machineName = this.ledger.machines.get(existing.deviceId)?.name ?? existing.deviceId;
+      const ask = this.ledger.offlineDispatches.get(input.cmdId);
+      if (ask?.status === "offered") {
+        if (existing.repoId !== null) {
+          // The card is idempotent on its `offline:<cmdId>` outbound id: an insert that
+          // finds the row sent does nothing, and the crash window (row written, card never
+          // enqueued) heals instead of stranding a held command nobody was asked about
+          // (PR #51 review finding 9).
+          await this.#deps.sendCard(
+            offlineAskCard(ask.input.repoRef, machineName, this.ledger.threads.get(existing.threadId)?.title ?? existing.threadId,
+              this.alternativeNames(ask.input.repoRef, ask.deviceId)),
+            existing.threadId,
+            `offline:${input.cmdId}`,
+          );
+        }
+        return { kind: "asked_offline", threadId: existing.threadId, machineName };
+      }
+      return { kind: "dispatched", workerId: existing.workerId, threadId: existing.threadId,
+        machineName, repoId: existing.repoId!, queued: !this.ledger.machines.get(existing.deviceId)?.online, created: false };
+    }
     const attach = input.threadId ? this.ledger.threads.get(input.threadId) : null;
     if (input.threadId && !attach) return { kind: "refused", reason: `Thread ${input.threadId} 不存在（可能已归档）` };
     if (!attach && !input.newTitle) {
@@ -264,26 +295,7 @@ export class Dispatcher {
           reason: `多台机器都有「${input.repoRef}」：${listing}。请用 ask_user 让用户指定一台（或让他在任务里带上 @机器名）。`,
         };
       }
-      case "ask_offline": {
-        // spec §9: offline at dispatch time is the user's call — ask with buttons, never
-        // decide silently. The Thread exists from here on; affinity is set for the callback.
-        const machine = this.ledger.machines.get(choice.deviceId)!;
-        const thread =
-          attach ??
-          this.ledger.threads.create({
-            title: input.newTitle!,
-            goal: input.goal ?? input.prompt,
-            createdFromMsg: input.createdFromMsg ?? undefined,
-            repoIds: [repoRows.find((r) => r.deviceId === choice.deviceId)!.repoId],
-          });
-        if (!attach) {
-          this.ledger.timeline.add(thread.threadId, "user_instruction", input.prompt, { provenance: input.provenance });
-        }
-        this.ledger.threads.setLastMachine(thread.threadId, choice.deviceId);
-        this.ledger.recomputeThreadState(thread.threadId);
-        await this.#deps.sendCard(offlineAskCard(input.repoRef, machine.name, thread.title), thread.threadId);
-        return { kind: "asked_offline", threadId: thread.threadId, machineName: machine.name };
-      }
+      case "ask_offline":
       case "machine": {
         const machine = this.ledger.machines.get(choice.deviceId)!;
         const repoId = repoRows.find((r) => r.deviceId === choice.deviceId)!.repoId;
@@ -299,24 +311,43 @@ export class Dispatcher {
           this.ledger.timeline.add(thread.threadId, "user_instruction", input.prompt, { provenance: input.provenance });
           created = true;
         }
+        const offline = choice.kind === "ask_offline";
+        if (offline) this.ledger.offlineDispatches.create(input, thread.threadId, choice.deviceId);
+        // `queued` here is the offline ask: continueThread parks the command HELD (issue #14,
+        // protocol §7.3) instead of main's silent notAfter-null queue.
         const continuation = await this.continueThread(
           thread,
           choice.deviceId,
           repoId,
           input.prompt,
-          choice.queued,
+          offline,
           input.provenance,
           input.cmdId,
           input.mode ?? "write",
           input.freshReview === true,
         );
+        if (offline) {
+          this.ledger.questions.insert({
+            qid: `offline:${input.cmdId}`,
+            threadId: thread.threadId,
+            text: `${machine.name} 不在线：等它上线，还是换台机器？`,
+          });
+          this.ledger.recomputeThreadState(thread.threadId);
+          const alternatives = candidates.filter((c) => c.deviceId !== choice.deviceId).map((c) => c.name);
+          await this.#deps.sendCard(
+            offlineAskCard(input.repoRef, machine.name, thread.title, alternatives),
+            thread.threadId,
+            `offline:${input.cmdId}`,
+          );
+          return { kind: "asked_offline", threadId: thread.threadId, machineName: machine.name };
+        }
         return {
           kind: "dispatched",
           workerId: this.ledger.workers.latestOnThread(thread.threadId)!.workerId,
           threadId: thread.threadId,
           machineName: machine.name,
           repoId,
-          queued: choice.queued,
+          queued: false,
           created,
           ...(continuation !== undefined ? { continuation } : {}),
         };
@@ -472,6 +503,11 @@ export class Dispatcher {
       await this.#deps.onOfferTap(outboundRow.id.slice("offer:".length), input.action);
       return;
     }
+    if (outboundRow?.id.startsWith("offline:") || outboundRow?.id.startsWith("switch:")) {
+      const cmdId = outboundRow.id.slice(outboundRow.id.indexOf(":") + 1);
+      await this.handleOfflineAction(cmdId, input.action);
+      return;
+    }
     const threadId = this.ledger.outbound.threadIdForProviderMsg(input.cardMsgId);
     const thread = threadId ? this.ledger.threads.get(threadId) : null;
     if (!thread) {
@@ -480,64 +516,128 @@ export class Dispatcher {
     }
     this.ledger.threads.markRead(threadId!); // a click is both read and a reply (§6.5)
 
-    if (input.action === "wait_online") {
-      if (this.hasLiveWorker(threadId!)) {
-        await this.#deps.sendText("已经在跑或已在排队了，不用再点。", threadId);
-        return;
-      }
-      const repoId = this.ledger.threads.repoIds(threadId!)[0];
-      const machine = thread.lastMachine ? this.ledger.machines.get(thread.lastMachine) : null;
-      if (!repoId || !machine) {
-        await this.#deps.sendText("排队信息不完整，请重新派发一次。", threadId);
-        return;
-      }
-      const prompt = thread.goal ?? thread.title;
-      await this.continueThread(thread, machine.deviceId, repoId, prompt, true, `card:${input.cardMsgId}`, `card:${input.cardMsgId}:${thread.threadId}`, "write", false);
-      await this.#deps.sendText(`已排队：${machine.name} 上线后自动开始，完成后汇报。`, threadId);
-      return;
-    }
-
-    if (input.action === "cancel") {
-      const latest = this.ledger.workers.latestOnThread(threadId!);
-      if (!latest) {
-        // The ask card's cancel: nothing was ever enqueued, the Thread just stays put.
-        this.ledger.timeline.add(threadId!, "note", "用户取消：等机器上线的派发已撤回", null);
-        await this.#deps.sendText("已取消。想再派发时直接说即可。", threadId);
-        return;
-      }
-      if (latest.cmdId && this.#deps.cancelQueuedCommand(latest.cmdId)) {
-        // Route by what the withdrawn command was (PR #54 review, blocker 2): a start_worker
-        // withdrawal closes the never-started worker now (issue #13 review finding 3 — the
-        // Thread is free for a fresh dispatch right away); a resume-send withdrawal reverts
-        // the resume-pending worker quietly (issue #8 — the session itself is intact). A
-        // never-started worker has no sessionId; a resumed one always does.
-        if (latest.sessionId === null) {
-          this.ledger.workers.settleWithdrawnStart(latest.workerId);
-        } else {
-          this.ledger.workers.markResumeCancelled(latest.workerId, latest.cmdId);
-        }
-        this.ledger.timeline.add(threadId!, "note", "用户取消：命令在送出前撤回", null);
-        await this.#deps.sendText("已取消。想再派发时直接说即可。", threadId);
-        return;
-      }
-      await this.#deps.sendText("它已经上路了，撤不回运行中的任务；等它跑完看汇报吧。", threadId);
+    if (input.action === "wait_online" || input.action === "switch_machine" || input.action === "cancel") {
+      await this.#deps.sendText("这张旧卡片已失效，请重新说明要派发的任务。", threadId);
       return;
     }
 
     await this.#deps.sendText(`已收到按钮「${input.action}」。`, threadId);
   }
 
-  private hasLiveWorker(threadId: string): boolean {
-    return (
-      this.ledger.workers
-        .listByThread(threadId)
-        .some((w) => w.state === "queued" || w.state === "starting" || w.state === "running" || w.state === "recovering") ||
-      // A start_worker still in flight (queued for an offline machine, or sent and un-acked)
-      // is just as live — the run exists and has merely not reached the worker yet. Keying
-      // the guard on the pending command too keeps a reap from opening duplicate dispatches
-      // (issue #13 review finding 3).
-      this.#deps.hasDeliverableStart(threadId)
-    );
+  /** Retires the worker behind a withdrawn HELD command, routing by what the command was
+   *  (PR #54 review, blocker 2, applied to the offline ask): a start_worker withdrawal
+   *  closes the never-started worker (settleWithdrawnStart — the Thread frees immediately);
+   *  a resume-send withdrawal reverts the resume-pending worker quietly (the session itself
+   *  is intact). A never-started worker has no sessionId; a resumed one always does. */
+  private retireHeld(worker: { workerId: string; sessionId: string | null }, cmdId: string, note: string): void {
+    if (worker.sessionId === null) this.ledger.workers.settleWithdrawnStart(worker.workerId);
+    else this.ledger.workers.markResumeCancelled(worker.workerId, cmdId);
+    this.ledger.timeline.add(this.ledger.workers.get(worker.workerId)?.threadId ?? "", "note", note, { cmdId });
+  }
+
+  /** Machine names (other than `except`) that currently register `repoRef` — the switch button's label. */
+  private alternativeNames(repoRef: string, except: string): string[] {
+    return [
+      ...new Set(this.ledger.repos.machinesHaving(repoRef).filter((r) => r.deviceId !== except).map((r) => r.deviceId)),
+    ].map((id) => this.ledger.machines.get(id)?.name ?? id);
+  }
+
+  /** Card identity selects the command; Thread changes and old/racing taps cannot retarget it. */
+  private async handleOfflineAction(cmdId: string, action: string): Promise<void> {
+    const offer = this.ledger.offlineDispatches.get(cmdId);
+    const worker = this.ledger.workers.byCommand(cmdId);
+    if (!offer || !worker) return;
+    const threadId = offer.threadId;
+    this.ledger.threads.markRead(threadId);
+    if (action === "wait_online" && offer.status === "offered") {
+      if (!this.#deps.waitForCommand(cmdId)) {
+        await this.#deps.sendText("这条派发已经失效，请重新派发。", threadId);
+        return;
+      }
+      this.ledger.offlineDispatches.transition(cmdId, "offered", "waiting");
+      this.ledger.questions.close(`offline:${cmdId}`, "等机器上线");
+      await this.#deps.sendText(`已排队：${this.ledger.machines.get(offer.deviceId)?.name ?? offer.deviceId} 上线后自动开始。`, threadId);
+      return;
+    }
+    if (action === "wait_online" && offer.status === "waiting") {
+      await this.#deps.sendText("已在排队等它上线，不用再点。", threadId);
+      return;
+    }
+    if (action === "cancel" && (offer.status === "offered" || offer.status === "waiting")) {
+      if (!this.#deps.cancelQueuedCommand(cmdId)) {
+        // The command already left the DO (wait tapped, machine returned, start delivered):
+        // mirroring the switch branch — never claim a cancellation that did not happen
+        // (PR #51 review finding 6).
+        await this.#deps.sendText("它已经上路了，撤不回运行中的任务；等它跑完看汇报吧。", threadId);
+        return;
+      }
+      // `expired` is exactly the user-withdrawal state (main's #46 semantics): the sweep
+      // closes the never-started worker quietly via settleWithdrawnStart.
+      this.ledger.workers.settleWithdrawnStart(worker.workerId);
+      this.ledger.offlineDispatches.transition(cmdId, offer.status, "cancelled");
+      this.ledger.questions.close(`offline:${cmdId}`, "算了");
+      await this.#deps.sendText("已取消。想再派发时直接说即可。", threadId);
+      return;
+    }
+    if (action === "switch_machine" && (offer.status === "offered" || offer.status === "waiting")) {
+      const rows = this.ledger.repos.machinesHaving(offer.input.repoRef).filter((r) => r.deviceId !== offer.deviceId);
+      const candidates = [...new Set(rows.map((r) => r.deviceId))].map((id) => {
+        const m = this.ledger.machines.get(id)!;
+        return { deviceId: id, name: m.name, online: m.online, freeSlots: Math.max(0, m.maxWorkers - this.ledger.machines.runningCount(id)) };
+      });
+      if (candidates.length === 0) {
+        // Nothing to switch to (protocol §7.3): keep the held command untouched — the
+        // owner can still wait — and say so instead of destroying the only dispatch.
+        await this.#deps.sendText(
+          "暂时没有别的机器登记这个仓库，没法换。原任务仍扣着：点「等它上线」继续等，或「算了」撤回。",
+          threadId,
+        );
+        return;
+      }
+      if (!this.#deps.cancelQueuedCommand(cmdId)) {
+        await this.#deps.sendText("任务已经送到机器，不能再换机重派；请先确认运行状态。", threadId);
+        return;
+      }
+      this.ledger.workers.settleWithdrawnStart(worker.workerId);
+      const choice = chooseMachine({ candidates, machineHint: null, lastMachine: null, continuation: false });
+      const choices = choice.kind === "ask_which" ? choice.candidates : candidates;
+      this.ledger.offlineDispatches.transition(cmdId, offer.status, "switching", choices.map((c) => c.deviceId));
+      this.ledger.questions.close(`offline:${cmdId}`, "换机器");
+      if (choice.kind === "machine") {
+        await this.switchTo(offer, choice.deviceId);
+        return;
+      }
+      this.ledger.questions.insert({ qid: `switch:${cmdId}`, threadId, text: "原派发已撤回，请选择另一台机器。" });
+      this.ledger.recomputeThreadState(threadId);
+      await this.#deps.sendCard(askUserCard({ question: "原派发已撤回。要换到哪台机器？离线的机器仍需选择是否等待。",
+        buttons: choices.slice(0, 3).map((c, i) => ({ label: `${c.name}${c.online ? "" : "（离线）"}`, action: `machine:${i}` })),
+      }), threadId, `switch:${cmdId}`);
+      return;
+    }
+    if (action.startsWith("machine:") && offer.status === "switching") {
+      const index = Number(action.slice("machine:".length));
+      const deviceId = Number.isInteger(index) ? offer.choices[index] : undefined;
+      if (deviceId) { await this.switchTo(offer, deviceId); return; }
+    }
+    await this.#deps.sendText("这个选择已经处理过了。", threadId);
+  }
+
+  private async switchTo(offer: OfflineDispatchRow, deviceId: string): Promise<void> {
+    // markSwitched/reopen never rewrite `choices`: the picker's buttons index into them.
+    if (!this.ledger.offlineDispatches.markSwitched(offer.cmdId)) return;
+    const result = await this.startWorker({ ...offer.input, threadId: offer.threadId, newTitle: undefined,
+      machineHint: deviceId, cmdId: `switch:${offer.cmdId}` });
+    if (result.kind === "dispatched") {
+      this.ledger.questions.close(`switch:${offer.cmdId}`, "已换机器");
+      await this.#deps.sendText(`已放到 ${result.machineName} 上。`, offer.threadId);
+    } else if (result.kind === "refused") {
+      // The repo snapshot changed since the card was sent. Re-open the choice so the tap
+      // can be answered again once the world changed back — otherwise the offer sits
+      // `switched` with its command already expired and only a from-scratch dispatch
+      // remains (PR #51 review finding 8).
+      this.ledger.offlineDispatches.markSwitched(offer.cmdId, "switching"); // choices stay for the re-tap
+      await this.#deps.sendText(result.reason, offer.threadId);
+    }
   }
 
   /**
@@ -603,9 +703,9 @@ export class Dispatcher {
       worker.deviceId,
       "send",
       { workerId, text: prompt, intent },
-      // notAfter null: an offline machine gets the task at its next hello, exactly like a
-      // queued start (the user was told it would continue when the machine returns).
-      { workerId, notAfter: queued ? null : undefined, cmdId },
+      // Held while the offline ask is open (issue #14, protocol §7.3) — the wait tap is
+      // what clears the deadline, exactly like a held start.
+      { workerId, held: queued, cmdId },
     );
     // Resume-pending bookkeeping: the Thread reads running-shaped immediately; a failed send
     // reverts through markResumeFailed (the worker row still points at this cmdId).
@@ -659,6 +759,13 @@ export class Dispatcher {
       mode,
       parentWorker: previous?.workerId,
     });
+    // A machine switch lands the same repo under a different repoId (one row per machine):
+    // link it so the Thread's repo set — and relaySource's repo filter — stay complete.
+    // A parked offline dispatch registers like any other start (`starting`): sweepWorkers'
+    // starting-branch then owns its closure — command terminal ⇒ withdrawn quietly
+    // (`expired`, the user's own cancel/switch) or markStartFailed with a push
+    // (`failed/not_after`/`idle`, PR #51 review findings 2/3 and 10).
+    this.ledger.threads.addRepo(thread.threadId, repoId);
     this.ledger.threads.setLastMachine(thread.threadId, deviceId);
     this.ledger.recomputeThreadState(thread.threadId);
     const machineName = this.ledger.machines.get(deviceId)?.name ?? deviceId;
@@ -673,9 +780,9 @@ export class Dispatcher {
         prompt: fullPrompt,
         ...(baseWorker ? { base: baseWorker.branch! } : {}),
       },
-      // Offline queueing is exactly `notAfter: null` (protocol §4.2): no expiry, delivered at
-      // the next hello; the idle sweep still fails it after ~30 min of the machine not returning.
-      { workerId, notAfter: queued ? null : undefined, cmdId },
+      // A held offline command cannot run on reconnect before the owner answers. Only the
+      // wait callback removes the deadline (protocol §7.3).
+      { workerId, held: queued, cmdId },
     );
     this.ledger.workers.setCmdId(workerId, finalCmdId);
     const reasonText =
@@ -685,7 +792,7 @@ export class Dispatcher {
     this.ledger.timeline.add(
       thread.threadId,
       "dispatch",
-      `派发给 ${machineName}${queued ? "（离线排队）" : ""}${reasonText}：${prompt}`,
+      `派发给 ${machineName}${queued ? "（离线：命令已扣住，等用户选「等它上线／换台机器／算了」" : ""}${reasonText}：${prompt}`,
       { workerId, cmdId: finalCmdId, repoId, provenance, ...(baseWorker ? { base: baseWorker.branch } : {}) },
     );
     return {
