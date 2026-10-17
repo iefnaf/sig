@@ -245,6 +245,16 @@ function jsonByteLength(value: unknown): number {
   return new TextEncoder().encode(JSON.stringify(value)).length;
 }
 
+/** The connector's pr_worker error codes (worker-manager.ts) → the failure card's stages
+ *  (review finding 3): lets the failed-cmd_result path keep the stage-specific fix text
+ *  even when it wins the race against the classified pr_failed event. */
+const PR_ERROR_CODE_TO_STAGE: Readonly<Record<string, string>> = {
+  gh_missing: "gh_missing",
+  gh_auth: "auth",
+  push_rejected: "push",
+  pr_create_failed: "create",
+};
+
 /** The pr notify intents' render inputs (issue #21): JSON written by the reducer, read here;
  *  malformed/absent payload degrades to empty strings, never a thrown render. */
 function parseNotifyPayload(payload: string | null): { url?: string; branch?: string; stage?: string; message?: string } {
@@ -1295,6 +1305,7 @@ export class Steward extends Agent<Env> {
     for (const pending of hello.pendingAcks) {
       if (pending.state === "ambiguous") {
         this.sql`UPDATE outbox SET state = 'ambiguous' WHERE cmdId = ${pending.cmdId} AND state NOT IN ('done', 'failed', 'expired', 'ambiguous')`;
+        this.markPrWorkerAmbiguous(pending.cmdId, true);
       } else if (pending.state === "done" || pending.state === "failed") {
         this.sql`
           UPDATE outbox SET state = ${pending.state}, result = ${JSON.stringify({ source: "pendingAck" })}
@@ -1358,6 +1369,7 @@ export class Steward extends Agent<Env> {
     } else if (ack.status === "ambiguous") {
       // protocol §4.2: a crash during `sending`, undecidable — no automatic re-send.
       this.sql`UPDATE outbox SET state = 'ambiguous' WHERE cmdId = ${ack.re}`;
+      this.markPrWorkerAmbiguous(ack.re, true);
     }
   }
 
@@ -1369,13 +1381,27 @@ export class Steward extends Agent<Env> {
       UPDATE outbox SET state = ${result.ok ? "done" : "failed"}, result = ${JSON.stringify(result.ok ? result.data ?? null : result.error ?? null)}
       WHERE cmdId = ${result.re}
     `;
-    if (!result.ok) {
-      const error = (result.error ?? {}) as { code?: unknown; message?: unknown };
-      const reason = [typeof error.code === "string" ? error.code : null, typeof error.message === "string" ? error.message : null]
-        .filter((part): part is string => part !== null)
-        .join("：") || "未知原因";
-      this.noteCommandFailure(result.re, reason);
+    if (result.ok) {
+      // Review finding 4: a pr_worker settles with the URL even when its pr_created event
+      // was lost (the connector's emit raced a shutdown). This backstop delivers the card
+      // from the command result; idempotent against the event path — whichever lands first
+      // wins, the other no-ops on the already-set url.
+      const row = this.sql<{ workerId: string | null; kind: string }>`
+        SELECT workerId, kind FROM outbox WHERE cmdId = ${result.re}
+      `[0];
+      const data = (result.data ?? {}) as { url?: unknown; branch?: unknown };
+      if (row?.kind === "pr_worker" && row.workerId && typeof data.url === "string" && data.url !== "") {
+        if (this.ledger.prConsent.settleFromCommand(result.re, data.url, typeof data.branch === "string" ? data.branch : "")) {
+          void this.drainNotifications();
+        }
+      }
+      return;
     }
+    const error = (result.error ?? {}) as { code?: unknown; message?: unknown };
+    const reason = [typeof error.code === "string" ? error.code : null, typeof error.message === "string" ? error.message : null]
+      .filter((part): part is string => part !== null)
+      .join("：") || "未知原因";
+    this.noteCommandFailure(result.re, reason);
   }
 
   // A start_worker the connector could not run: the worker lands `broken`, the failure reaches
@@ -1396,13 +1422,54 @@ export class Steward extends Agent<Env> {
     // pr_failed events (which call the same sink — the first one wins, no double card); this
     // path covers rejections at the door and results the event stream already reported.
     if (row.kind === "pr_worker") {
-      if (this.ledger.prConsent.fail({ workerId: row.workerId, cmdId, stage: "command", message: reason })) {
+      // Review finding 3: the result's error code carries the connector's classification —
+      // map it back so the card keeps the stage-specific fix even when this path wins the
+      // race against the pr_failed event (fail() dedupes whichever lands second).
+      const resultRaw = this.sql<{ result: string | null }>`SELECT result FROM outbox WHERE cmdId = ${cmdId}`[0]?.result;
+      let code: string | null = null;
+      let message: string | null = null;
+      try {
+        const parsed = resultRaw ? (JSON.parse(resultRaw) as { code?: unknown; message?: unknown }) : null;
+        if (typeof parsed?.code === "string") code = parsed.code;
+        if (typeof parsed?.message === "string" && parsed.message !== "") message = parsed.message;
+      } catch {
+        // result unreadable — the generic reason stands
+      }
+      const stage = PR_ERROR_CODE_TO_STAGE[code ?? ""] ?? "command";
+      if (this.ledger.prConsent.fail({ workerId: row.workerId, cmdId, stage, message: message ?? reason })) {
         void this.drainNotifications();
       }
       return;
     }
     if (row.kind !== "start_worker") return;
     if (this.ledger.workers.markStartFailed(row.workerId, cmdId, reason)) {
+      void this.drainNotifications();
+    }
+  }
+
+  /**
+   * Review finding 2: an ambiguous pr_worker (the connector crashed mid-send; protocol §4.2
+   * never re-delivers it) must not wedge the consent row in "in flight" forever. The
+   * outcome is undecidable — the PR may or may not exist — which is itself an answer the
+   * owner needs; a later replayed pr_created (persist-first §11.3) heals the row with the
+   * URL. Called from both ambiguous paths: the live cmd_ack and hello.pendingAcks.
+   * `alreadySettled` = the caller already wrote the outbox's ambiguous state.
+   */
+  private markPrWorkerAmbiguous(cmdId: string, alreadySettled: boolean): void {
+    const row = this.sql<{ workerId: string | null; kind: string; state: string }>`
+      SELECT workerId, kind, state FROM outbox WHERE cmdId = ${cmdId}
+    `[0];
+    if (!row || row.kind !== "pr_worker" || !row.workerId) return;
+    if (!alreadySettled && (row.state === "done" || row.state === "failed" || row.state === "expired" || row.state === "ambiguous")) return;
+    if (!alreadySettled) this.sql`UPDATE outbox SET state = 'ambiguous' WHERE cmdId = ${cmdId}`;
+    if (
+      this.ledger.prConsent.fail({
+        workerId: row.workerId,
+        cmdId,
+        stage: "ambiguous",
+        message: "连接器在执行中途失联，PR 是否已创建无法确定",
+      })
+    ) {
       void this.drainNotifications();
     }
   }
@@ -3252,13 +3319,17 @@ export class Steward extends Agent<Env> {
     }
     this.ledger.threads.markRead(worker.threadId); // a click is both read and a reply (§6.5)
     const consent = this.ledger.prConsent.get(workerId, seq);
+    // Cross-card truth (review finding 5): rows are per report, the PR is per worker/branch —
+    // any of this worker's cards' outcomes answers for this tap, so two done cards can never
+    // race two pr_worker commands onto one branch.
+    const branch = this.ledger.prConsent.branchState(workerId);
 
     if (action === "pr_decline") {
-      if (consent?.url) {
-        await reply(`PR 已经创建过了：${consent.url}；这次就不再动了。`);
+      if (branch.url) {
+        await reply(`PR 已经创建过了：${branch.url}；这次就不再动了。`);
         return;
       }
-      if (consent?.decision === "approved" && consent.failure === null) {
+      if (branch.pending && this.commandInFlight(branch.pendingCmdId)) {
         // An approve is already in flight; the honest answer is that it cannot be recalled.
         await reply("已经在推送并创建 PR 了，停不下来；结果稍后回到这里。不想要的话可以去仓库关掉它。");
         return;
@@ -3270,14 +3341,17 @@ export class Steward extends Agent<Env> {
     }
 
     // pr_approve
-    if (consent?.url) {
-      await reply(`PR 已经创建过了：${consent.url}`);
+    if (branch.url) {
+      await reply(`PR 已经创建过了：${branch.url}`);
       return;
     }
-    if (consent?.decision === "approved" && consent.failure === null) {
+    if (branch.pending && this.commandInFlight(branch.pendingCmdId)) {
       await reply("正在推送并创建 PR，稍等结果回到这里。");
       return;
     }
+    // A pending row whose command is provably dead (crash between the consent record and the
+    // enqueue, or an ambiguous that never reached us) is a wedge, not an in-flight run — fall
+    // through: this tap becomes the retry, and the attempt counter keeps the history honest.
     if (!worker.branch) {
       await reply("这个 worker 没有分支（可能是只读任务），无法创建 PR；重新描述一下需求即可。");
       return;
@@ -3310,6 +3384,18 @@ export class Steward extends Agent<Env> {
       threadId: worker.threadId,
       urgency: "push",
     });
+  }
+
+  /** Whether a consent-pending command is still deliverable (review finding 2): queued,
+   *  sent, or accepted. Terminal states (done/failed/ambiguous/expired) and rows that never
+   *  came to exist (the record-then-enqueue crash window) are "dead" — the pending consent
+   *  row they left behind is a wedge this tap is allowed to break by retrying.
+   *  done-with-url rows never read as pending (branchState saw the url), so a done row here
+   *  means its result carried no url — dead for our purposes. */
+  private commandInFlight(cmdId: string | null): boolean {
+    if (cmdId === null) return false;
+    const state = this.sql<{ state: string }>`SELECT state FROM outbox WHERE cmdId = ${cmdId}`[0]?.state;
+    return state === "queued" || state === "sent" || state === "accepted";
   }
 
   /**

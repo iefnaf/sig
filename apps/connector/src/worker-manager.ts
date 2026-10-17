@@ -778,23 +778,36 @@ export class WorkerManager {
     if (SERIAL_SLOT_STATES.has(worker.state)) {
       throw new CommandError(
         "worker_running",
-        `worker ${workerId} is ${worker.state}; let the run settle before opening a PR`,
+        `worker ${workerId} is ${worker.state}${
+          worker.state === "lost"
+            ? " (crashed; its automatic resume is pending)"
+            : ""
+        }; let the run settle before opening a PR`,
       );
     }
     if (!this.store.getRepo(worker.repoId)) {
       throw new CommandError("not_registered_repo", `repo '${worker.repoId}' is not registered on this machine`);
     }
+    // No per-worker mutex is needed here: the steward's cross-card guard (branchState) means
+    // at most one pr_worker per worker is ever in flight, and redeliveries dedupe on cmdId
+    // (§6.3) before reaching this method.
+    //
+    // `gh pr create` deliberately gets no `--base`: relay legs are cut from shepherd/*
+    // branches that are typically unpushed (the whole point of this gate), so targeting one
+    // would fail with "base branch not found". The repo's default branch shows the thread's
+    // whole stacked work — the PR the user expects to review.
+    let url: string;
     try {
-      const { url } = await openPr({
-        worktree: worker.worktree,
-        branch: worker.branch,
-        title: title || worker.branch,
-        body,
-        ...(this.prOptions?.exec !== undefined ? { exec: this.prOptions.exec } : {}),
-        ...(this.prOptions?.timeoutMs !== undefined ? { timeoutMs: this.prOptions.timeoutMs } : {}),
-      });
-      await this.emitEvent(workerId, "pr_created", { cmdId: commandId, url, branch: worker.branch });
-      return { url, branch: worker.branch };
+      url = (
+        await openPr({
+          worktree: worker.worktree,
+          branch: worker.branch,
+          title: title || worker.branch,
+          body,
+          ...(this.prOptions?.exec !== undefined ? { exec: this.prOptions.exec } : {}),
+          ...(this.prOptions?.timeoutMs !== undefined ? { timeoutMs: this.prOptions.timeoutMs } : {}),
+        })
+      ).url;
     } catch (err) {
       // The failure card's inputs (issue #21 AC4): the event carries the classified stage;
       // the command still fails loudly so the steward's outbox row settles. The emit is
@@ -810,8 +823,16 @@ export class WorkerManager {
             : stage === "push"
               ? "push_rejected"
               : "pr_create_failed";
-      throw new CommandError(code, message);
+      // create-stage failures are the unclassified residue (timeouts included) — plausibly
+      // transient, so the result says a retry is reasonable.
+      throw new CommandError(code, message, stage === "create");
     }
+    // Review finding 4: the PR exists from here on — a failing success-emit (store closed at
+    // shutdown) must NOT be reported as a PR failure. Best-effort only: the cmd_result still
+    // carries the URL, and the steward's ok-result backstop delivers the card without the
+    // event.
+    await this.emitEvent(workerId, "pr_created", { cmdId: commandId, url, branch: worker.branch }).catch(() => undefined);
+    return { url, branch: worker.branch };
   }
 
   // --- §6.1/§6.2: send and interrupt -----------------------------------------------------------

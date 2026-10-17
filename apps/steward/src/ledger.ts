@@ -1452,6 +1452,21 @@ export function createLedger(deps: LedgerDeps) {
       `[0];
       return row ? viewPrConsent(row) : null;
     },
+    /** Cross-card view of one worker's PR (review finding 5): consent rows are per report,
+     *  but the PR is per worker/branch — any row's url answers for every card of that worker,
+     *  and any approved-but-unresolved row means a dispatch is in flight. `pendingCmdId`
+     *  names the in-flight command so a tap can prove liveness against the outbox. */
+    branchState(workerId: string): { url: string | null; pending: boolean; pendingCmdId: string | null } {
+      const rows = sql<{ url: string | null; decision: string; failure: string | null; cmdId: string | null }>`
+        SELECT url, decision, failure, cmdId FROM sh_pr_consent WHERE workerId = ${workerId}
+      `;
+      const pendingRow = rows.find((r) => r.decision === "approved" && r.url === null && r.failure === null);
+      return {
+        url: rows.find((r) => r.url !== null)?.url ?? null,
+        pending: pendingRow !== undefined,
+        pendingCmdId: pendingRow?.cmdId ?? null,
+      };
+    },
     /** Records the user's tap. An upsert, never a silent re-create: a declined row may be
      *  approved later, and a failed approved row re-approved for another attempt (which
      *  clears the failure — the retry gets a fresh command id). */
@@ -1479,6 +1494,27 @@ export function createLedger(deps: LedgerDeps) {
         WHERE workerId = ${workerId} AND seq = ${seq}
       `;
     },
+    /** The cmd_result(ok) backstop (review finding 4): the connector settles pr_worker with
+     *  the URL even when the pr_created event was lost (its emit raced a shutdown). This
+     *  delivers the card without the event; idempotent against the event path — whichever
+     *  lands first wins, the other no-ops on the already-set url. */
+    settleFromCommand(cmdId: string, url: string, branch: string): boolean {
+      const row = prConsent.byCmd(cmdId);
+      if (!row || (row.url !== null && row.url !== "")) return false;
+      prConsent.settleUrl(row.workerId, row.seq, url);
+      notifications.queue(
+        `pr_created:cmd:${cmdId}`,
+        "pr_created",
+        row.threadId,
+        row.workerId,
+        null,
+        JSON.stringify({ url, branch }),
+      );
+      timeline.add(row.threadId, "note", `PR 已创建：${url}${branch ? `（分支 ${branch}）` : ""}`, { workerId: row.workerId, cmdId });
+      sql`UPDATE sh_thread SET unread = 1 WHERE threadId = ${row.threadId}`;
+      recomputeThreadState(row.threadId);
+      return true;
+    },
     /** The failure sink both paths share — the pr_failed event AND a failed pr_worker
      *  command row (rejected at the door, or never delivered to an offline machine).
      *  Idempotent: only the FIRST failure on a decided row notifies; the duplicate that
@@ -1486,14 +1522,20 @@ export function createLedger(deps: LedgerDeps) {
      *  push a second card. */
     fail(input: { workerId: string; cmdId?: string | null; stage: string; message: string }): boolean {
       const row = (input.cmdId ? prConsent.byCmd(input.cmdId) : null) ?? prConsent.latestForWorker(input.workerId);
-      if (!row || row.failure !== null) return false;
+      // url set = the PR exists: not a failure, whatever a racing duplicate says (it would
+      // also clobber the good url with failure/NULL).
+      if (!row || row.failure !== null || row.url !== null) return false;
       const message = input.message.slice(0, 280);
       sql`
         UPDATE sh_pr_consent SET failure = ${message}, url = NULL, updatedAt = ${now()}
         WHERE workerId = ${row.workerId} AND seq = ${row.seq}
       `;
       notifications.queue(
-        `prfail:${row.workerId}:${row.seq}`,
+        // Attempt-scoped (review finding 1): the retry's failure must reach the owner too —
+        // the row-level `failure IS NULL` guard alone deduped both attempts onto one card
+        // because record() clears the marker between them. Both sinks of ONE attempt (the
+        // pr_failed event and the failed cmd_result) still share this key: one card each.
+        `prfail:${row.workerId}:${row.seq}:${row.attempts}`,
         "pr_failed",
         row.threadId,
         row.workerId,
@@ -2168,6 +2210,9 @@ export function createLedger(deps: LedgerDeps) {
         const url = str(event.url) ?? "";
         const branch = str(event.branch);
         const consentRow = (str(event.cmdId) ? prConsent.byCmd(str(event.cmdId)!) : null) ?? prConsent.latestForWorker(workerId);
+        // Review finding 4: the cmd_result(ok) backstop may have settled this URL already
+        // (the event was lost once and replayed, or the two simply raced) — one card per PR.
+        if (consentRow && url !== "" && consentRow.url === url) break;
         if (consentRow) prConsent.settleUrl(consentRow.workerId, consentRow.seq, url);
         timeline.add(
           worker.threadId,

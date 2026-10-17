@@ -76,7 +76,9 @@ export async function openPr(opts: OpenPrOptions): Promise<{ url: string }> {
     if ((err as { code?: string }).code === "ENOENT") {
       throw new PrError("gh_missing", "the GitHub CLI (`gh`) is not installed on this machine");
     }
-    throw new PrError("gh_missing", `could not run gh: ${stderrOf(err)}`);
+    // Installed but unresponsive (e.g. a timeout) is NOT "install gh" advice — classify as a
+    // generic create-stage failure whose retry contract fits a transient hiccup.
+    throw new PrError("create", `gh did not respond: ${stderrOf(err)}`);
   }
 
   // 2. gh must be authenticated — the failure the owner fixes with `gh auth login` locally.

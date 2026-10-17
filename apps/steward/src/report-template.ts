@@ -194,6 +194,9 @@ export function prFailureNeedsYou(stage: string, message: string): string {
       return `gh 没有登录或凭证已过期（${message}）。在这台机器上运行 gh auth login，然后${retry}`;
     case "push":
       return `推送分支被拒绝：${message}。${retry}`;
+    case "ambiguous":
+      // Review finding 2: the connector died mid-pr_worker — the PR may or may not exist.
+      return `上一次结果不确定：${message}。先去仓库确认是否已有 PR；若没有，${retry}`;
     case "command":
       return `机器没有执行成功（${message}）。${retry}`;
     case "delivery":

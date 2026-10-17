@@ -17,6 +17,8 @@ let repo: string;
 let store: LocalStore;
 let manager: WorkerManager;
 let events: Array<Record<string, unknown>>;
+/** Every manager created in a test — afterEach stops them all. */
+const managers: WorkerManager[] = [];
 
 /** A scripted command runner: `script[file]` maps an args prefix to an outcome. */
 function scriptedExec(script: Record<string, { stdout?: string; stderr?: string; exit?: number } | "enoent">): PrExec {
@@ -46,13 +48,15 @@ const HAPPY: Record<string, { stdout?: string; stderr?: string } | "enoent"> = {
 
 function newManager(exec?: PrExec): WorkerManager {
   events = [];
-  return new WorkerManager({
+  const m = new WorkerManager({
     store,
     stateDir,
     adapter: fakePiAdapter(stateDir, writeScenario(dir, "noop", [])),
     emit: (workerId, fields) => events.push({ workerId, ...fields }),
     ...(exec ? { pr: { exec } } : {}),
   });
+  managers.push(m);
+  return m;
 }
 
 /** A settled write worker with a worktree and branch — the state after a done report. */
@@ -80,7 +84,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  manager?.stop();
+  for (const m of managers) m.stop();
   store.close();
   rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
 });
@@ -135,6 +139,14 @@ describe("openPr (issue #21)", () => {
   it("a create failure without a URL on stdout is a create-stage error", async () => {
     const exec = scriptedExec({ ...HAPPY, "gh pr create": { stdout: "Opening github.com/example/repo-a in your browser" } });
     await expect(openPr({ worktree: "/wt", branch: "b", title: "t", body: "", exec })).rejects.toBeInstanceOf(PrError);
+  });
+
+  it("an unresponsive gh (timeout, not ENOENT) is create-stage, not install-gh advice", async () => {
+    const exec = scriptedExec({ "gh --version": { exit: 1, stderr: "spawn timed out" } });
+    await expect(openPr({ worktree: "/wt", branch: "b", title: "t", body: "", exec })).rejects.toMatchObject({
+      stage: "create",
+      message: expect.stringContaining("gh did not respond"),
+    });
   });
 });
 
@@ -207,12 +219,37 @@ describe("pr_worker command (issue #21 AC2/AC4)", () => {
     expect(events).toEqual([]);
   });
 
-  it("refuses while the worker is still in flight", async () => {
+  it("refuses while the worker is still in flight, and names the lost state for what it is", async () => {
     manager = newManager(scriptedExec(HAPPY));
     seedWorker("w-pr-run", { state: "running" });
     await expect(manager.handleCommand("cmd-pr-run", "pr_worker", { workerId: "w-pr-run" }, "w-pr-run")).rejects.toMatchObject({
       code: "worker_running",
     });
+    seedWorker("w-pr-lost", { state: "lost" });
+    await expect(manager.handleCommand("cmd-pr-lost", "pr_worker", { workerId: "w-pr-lost" }, "w-pr-lost")).rejects.toMatchObject({
+      code: "worker_running",
+      message: expect.stringContaining("automatic resume is pending"),
+    });
+  });
+
+  it("review #4: a failing success-emit is NOT a PR failure — the command still settles with the URL", async () => {
+    const events2: Array<Record<string, unknown>> = [];
+    const manager2 = new WorkerManager({
+      store,
+      stateDir,
+      adapter: fakePiAdapter(stateDir, writeScenario(dir, "noop2", [])),
+      emit: (workerId, fields) => {
+        if (fields.type === "pr_created") throw new Error("store closed");
+        events2.push({ workerId, ...fields });
+      },
+      pr: { exec: scriptedExec(HAPPY) },
+    });
+    managers.push(manager2);
+    seedWorker("w-pr-emit");
+    const result = await manager2.handleCommand("cmd-pr-emit", "pr_worker", { workerId: "w-pr-emit" }, "w-pr-emit");
+    // The PR exists; the command says so. No pr_failed may be manufactured for it.
+    expect(result).toMatchObject({ url: "https://github.com/example/repo-a/pull/7" });
+    expect(events2).toEqual([]);
   });
 
   it("runs against a real repo: git push is real, only gh is scripted", async () => {

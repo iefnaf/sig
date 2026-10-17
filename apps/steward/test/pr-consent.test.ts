@@ -6,6 +6,7 @@
 // gate re-arms so the same button retries. Everything runs the production path — real
 // webhook clicks, real reducer, real outbox — with the model scripted through faux.
 import { beforeEach, describe, expect, it } from "vitest";
+import { runInDurableObject } from "cloudflare:test";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import type { ShOutboundRow } from "../src/steward.ts";
 import {
@@ -83,6 +84,14 @@ async function waitFor<T>(get: () => T | Promise<T>, pred: (v: T) => boolean, wh
     if (Date.now() > deadline) throw new Error(`condition not reached (${what}): ${JSON.stringify(value)}`);
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
+}
+
+/** The (only) thread's id — for scripting the second report's bookkeeping wake. */
+async function threadIdOf(workerId: string): Promise<string> {
+  const snap = await ownerStub().debugSnapshot();
+  const thread = snap.threads.find((t) => t.workers.some((w) => w.workerId === workerId));
+  if (!thread) throw new Error(`no thread for worker ${workerId}`);
+  return thread.threadId;
 }
 
 interface DoneRun {
@@ -327,6 +336,180 @@ describe("failures come back as a three-part failure report (AC4)", () => {
     );
     expect(failureCards.length).toBeGreaterThan(0);
     void fake;
+  });
+});
+
+describe("review round 1 findings", () => {
+  /** approve → the classified pr_failed event → the failed cmd_result, like the connector sends. */
+  async function failAttempt(fake: FakeConnector, workerId: string, prCmdId: unknown, stage: string, message: string): Promise<void> {
+    await fake.emit("pr_failed", workerId, { type: "pr_failed", cmdId: prCmdId, stage, message });
+    fake.send({ t: "cmd_ack", re: prCmdId as string, status: "accepted" });
+    fake.send({ t: "cmd_result", re: prCmdId as string, ok: false, error: { code: stage, message } });
+  }
+
+  async function failureCards(): Promise<SentCard[]> {
+    return (await sentCards()).filter((c) => JSON.stringify(c.payload).includes("推送 / 创建 PR 失败"));
+  }
+
+  it("#1: a retry's failure reaches the owner too — one card per attempt, not per report", async () => {
+    const { fake, workerId, card } = await doneReport();
+    await postEvent(cardActionEvent(card.providerMsgId!, "pr_approve"));
+    const first = await waitFor(
+      () => fake.cmds.find((c) => c.kind === "pr_worker"),
+      (c) => c !== undefined,
+      "attempt 1 sent",
+    )!;
+    await failAttempt(fake, workerId, first!.id, "auth", "gh is not authenticated");
+    await waitFor(() => failureCards(), (c) => c.length === 1, "first failure card");
+
+    // The re-tap (retry): fresh cmdId, and its failure must land as a SECOND card — the
+    // prfail: dedupe key is attempt-scoped now (review #1's bug: INSERT OR IGNORE swallowed it).
+    await postEvent(cardActionEvent(card.providerMsgId!, "pr_approve", "evt_card_r2"));
+    const second = await waitFor(
+      () => fake.cmds.filter((c) => c.kind === "pr_worker")[1],
+      (c) => c !== undefined,
+      "attempt 2 sent",
+    )!;
+    expect(second!.id).not.toBe(first!.id);
+    await failAttempt(fake, workerId, second!.id, "push", "pre-receive hook declined");
+    await waitFor(() => failureCards(), (c) => c.length === 2, "second failure card");
+    const secondCard = await failureCards();
+    expect(JSON.stringify(secondCard[1]!.payload)).toContain("推送分支被拒绝");
+  });
+
+  it("#2: an ambiguous pr_worker gets an honest card and never wedges the consent row", async () => {
+    const { fake, workerId, card } = await doneReport();
+    await postEvent(cardActionEvent(card.providerMsgId!, "pr_approve"));
+    const first = await waitFor(() => fake.cmds.find((c) => c.kind === "pr_worker"), (c) => c !== undefined, "cmd sent")!;
+    // The connector crashed mid-send: cmd_ack ambiguous, nothing else ever comes.
+    fake.send({ t: "cmd_ack", re: first!.id, status: "ambiguous" });
+    const ambiguousCards = await waitFor(() => failureCards(), (c) => c.length === 1, "ambiguous card");
+    expect(JSON.stringify(ambiguousCards[0]!.payload)).toContain("结果不确定");
+    const snap = await waitFor(
+      () => ownerStub().debugSnapshot(),
+      (s) => s.prConsent.some((c) => c.workerId === workerId && c.failure !== null),
+      "failure recorded",
+    );
+    expect(snap.prConsent.find((c) => c.workerId === workerId)!.url).toBeNull();
+
+    // The wedge is broken: a re-tap retries (fresh attempt) instead of "in flight" forever.
+    await postEvent(cardActionEvent(card.providerMsgId!, "pr_approve", "evt_card_amb2"));
+    const second = await waitFor(
+      () => fake.cmds.filter((c) => c.kind === "pr_worker")[1],
+      (c) => c !== undefined,
+      "post-ambiguous retry sent",
+    )!;
+    expect(second!.id).not.toBe(first!.id);
+  });
+
+  it("#2 (wedge variant): a pending consent row whose command never existed is retried, not stuck", async () => {
+    const { fake, workerId, card } = await doneReport();
+    // A crash between prConsent.record and enqueue leaves exactly this debris: an approved
+    // row with a cmdId that has no outbox row. Inject it through the ledger, inside the DO.
+    await runInDurableObject(ownerStub(), (instance: unknown) => {
+      const inst = instance as {
+        sql: <T extends Record<string, unknown>>(strings: TemplateStringsArray, ...values: unknown[]) => T[];
+        ledger: { prConsent: { record: (input: Record<string, unknown>) => void } };
+      };
+      const w = inst.sql<{ workerId: string; threadId: string }>`SELECT workerId, threadId FROM sh_worker ORDER BY createdAt DESC LIMIT 1`[0]!;
+      inst.ledger.prConsent.record({
+        workerId: w.workerId,
+        seq: 99,
+        threadId: w.threadId,
+        decision: "approved",
+        cmdId: "pr:ghost:99:1",
+        attempts: 1,
+      });
+    });
+    // The live tap must NOT answer "in flight" — the ghost is provably dead; it dispatches.
+    await postEvent(cardActionEvent(card.providerMsgId!, "pr_approve"));
+    await waitFor(
+      () => fake.cmds.find((c) => c.kind === "pr_worker"),
+      (c) => c !== undefined,
+      "tap dispatched despite ghost pending row",
+    );
+    const texts = await sentTexts();
+    expect(texts.some((t) => t.includes("正在推送并创建 PR，稍等结果"))).toBe(false);
+  });
+
+  it("#3: a failed cmd_result winning the race still renders the stage-specific fix", async () => {
+    const { fake, card } = await doneReport();
+    await postEvent(cardActionEvent(card.providerMsgId!, "pr_approve"));
+    const prCmd = await waitFor(() => fake.cmds.find((c) => c.kind === "pr_worker"), (c) => c !== undefined, "cmd sent")!;
+    // No pr_failed event at all — the failed result arrives alone (e.g. the event was lost).
+    fake.send({ t: "cmd_ack", re: prCmd!.id, status: "accepted" });
+    fake.send({ t: "cmd_result", re: prCmd!.id, ok: false, error: { code: "gh_auth", message: "gh is not authenticated" } });
+    const cards = await waitFor(() => failureCards(), (c) => c.length === 1, "failure card from cmd_result alone");
+    expect(JSON.stringify(cards[0]!.payload)).toContain("gh auth login");
+    expect(JSON.stringify(cards[0]!.payload)).not.toContain("机器没有执行成功");
+  });
+
+  it("#4: a lost pr_created event is backstopped by the ok cmd_result; the replay adds no second card", async () => {
+    const { fake, workerId, threadId, card } = await doneReport();
+    await postEvent(cardActionEvent(card.providerMsgId!, "pr_approve"));
+    const prCmd = await waitFor(() => fake.cmds.find((c) => c.kind === "pr_worker"), (c) => c !== undefined, "cmd sent")!;
+    // The connector's emit raced a shutdown: only the command result carries the URL.
+    fake.send({ t: "cmd_ack", re: prCmd!.id, status: "accepted" });
+    fake.send({ t: "cmd_result", re: prCmd!.id, ok: true, data: { url: "https://github.com/example/repo-a/pull/9", branch: "shepherd/login-1" } });
+    const urlCards = await waitFor(
+      () => sentCards().then((all) => all.filter((c) => JSON.stringify(c.payload).includes("pull/9"))),
+      (c) => c.length === 1,
+      "URL card from cmd_result backstop",
+    );
+    expect(urlCards[0]!.threadId).toBe(threadId);
+    // The event replays later (it was persisted after all): exactly one card per PR, ever.
+    await fake.emit("pr_created", workerId, {
+      type: "pr_created",
+      cmdId: prCmd!.id,
+      url: "https://github.com/example/repo-a/pull/9",
+      branch: "shepherd/login-1",
+    });
+    await waitWhileOutboundPending();
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect((await sentCards()).filter((c) => JSON.stringify(c.payload).includes("pull/9"))).toHaveLength(1);
+    const settled = await waitFor(
+      () => ownerStub().debugSnapshot(),
+      (s) => s.prConsent.some((c) => c.workerId === workerId && c.url === "https://github.com/example/repo-a/pull/9"),
+      "url on consent row",
+    );
+    expect(settled.prConsent.find((c) => c.workerId === workerId)!.failure).toBeNull();
+  });
+
+  it("#5: two done cards for one worker — the second tap answers honestly, no second command", { timeout: 60_000 }, async () => {
+    const { fake, workerId, card: card1 } = await doneReport();
+    // A resumed run reports done again: a second consent card for the SAME branch.
+    await fake.emit("started", workerId, { sessionId: workerId });
+    await fake.emit("report", workerId, {
+      type: "report",
+      status: "done",
+      summary: "第二轮也完成",
+      changes: ["又改了一处"],
+      git: { branch: "shepherd/login-1", base: "main", ahead: 3, dirty: 0, filesChanged: 2, insertions: 8, deletions: 1, pushed: false },
+    });
+    await fake.emit("settled", workerId, { type: "settled", outcome: "reported" });
+    await scriptModel(
+      fauxAssistantMessage([fauxToolCall("update_thread", { threadId: await threadIdOf(workerId), summary: "两轮都完成" })], { stopReason: "toolUse" }),
+      fauxAssistantMessage([fauxText("记账完成。")]),
+    );
+    await waitRunsSettled();
+    await waitWhileOutboundPending();
+    const card2 = await waitFor(
+      () => sentCards(),
+      (cards) => cards.some((c) => JSON.stringify(c.payload).includes("第二轮也完成")),
+      "second done card",
+    ).then((cards) => cards.find((c) => JSON.stringify(c.payload).includes("第二轮也完成"))!);
+    expect(consentButtonsOf(card2).length).toBe(2);
+
+    // Approve card 1 → PR created; approve card 2 → the honest cross-card answer, no race.
+    await postEvent(cardActionEvent(card1.providerMsgId!, "pr_approve"));
+    const prCmd = await waitFor(() => fake.cmds.find((c) => c.kind === "pr_worker"), (c) => c !== undefined, "cmd sent")!;
+    await fake.emit("pr_created", workerId, { type: "pr_created", cmdId: prCmd!.id, url: "https://github.com/example/repo-a/pull/11", branch: "shepherd/login-1" });
+    await waitFor(() => sentCards(), (cs) => cs.some((c) => JSON.stringify(c.payload).includes("pull/11")), "first PR card");
+    await postEvent(cardActionEvent(card2.providerMsgId!, "pr_approve", "evt_card_c2"));
+    await waitWhileOutboundPending();
+    expect(fake.cmds.filter((c) => c.kind === "pr_worker")).toHaveLength(1);
+    const texts = await sentTexts();
+    expect(texts.some((t) => t.includes("PR 已经创建过了") && t.includes("pull/11"))).toBe(true);
   });
 });
 
