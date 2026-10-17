@@ -7,6 +7,7 @@
 // stay deterministic too (steward.md §3.1 signal 1): the Thread is resolved from the card's
 // providerMsgId, never from data stuffed into the button.
 import { ulid } from "@shepherd/protocol";
+import { isSpendQuery } from "./budget.ts";
 import type { Ledger, ThreadRow } from "./ledger.ts";
 import { decideContinuation, renderHandoffBrief, type NewSessionReason } from "./handoff.ts";
 import type { WorkerRow } from "./ledger.ts";
@@ -15,13 +16,15 @@ import { offlineAskCard } from "./report-template.ts";
 const ADD_MACHINE_RE = /^\/(?:加机器|添加机器|add-machine|addmachine)\s*$/;
 const WEB_RE = /^\/(?:网页|web|login)\s*$/;
 
-export type OwnerCommand = { kind: "add_machine" } | { kind: "web_link" };
+export type OwnerCommand = { kind: "add_machine" } | { kind: "web_link" } | { kind: "spend" };
 
-/** Parses `/加机器` and `/网页` (exact phrases). Everything else → null, i.e. the LLM's. */
+/** Parses `/加机器`, `/网页` (exact phrases), and the spend query (budget.ts — `/花费` plus
+ *  whole-message natural forms). Everything else → null, i.e. the LLM's. */
 export function parseOwnerCommand(text: string): OwnerCommand | null {
   const trimmed = text.trim();
   if (ADD_MACHINE_RE.test(trimmed)) return { kind: "add_machine" };
   if (WEB_RE.test(trimmed)) return { kind: "web_link" };
+  if (isSpendQuery(trimmed)) return { kind: "spend" };
   return null;
 }
 
@@ -194,6 +197,8 @@ export interface DispatcherDeps {
   webLinkUrl: (target: string) => Promise<string | null>;
   /** A tap on a routine-suggestion card (`offer:` outbound ids, issue #20). */
   onOfferTap: (offerId: string, action: string) => Promise<void>;
+  /** Renders the daily-spend readout for the deterministic spend query (issue #28). */
+  spendStatusText: () => Promise<string>;
 }
 
 const AGENT = "pi"; // the only agent the connector drives in the MVP (ADR-0001 decision 3)
@@ -417,6 +422,12 @@ export class Dispatcher {
   async handleOwnerCommand(command: OwnerCommand): Promise<void> {
     if (command.kind === "add_machine") {
       await this.addMachine();
+      return;
+    }
+    if (command.kind === "spend") {
+      // Counter readout, no LLM (steward.md §0.2/§12): free to ask, exact by construction,
+      // and it answers even when the model is unreachable or the day is capped.
+      await this.#deps.sendText(await this.#deps.spendStatusText());
       return;
     }
     const url = await this.#deps.webLinkUrl("home");

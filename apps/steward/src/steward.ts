@@ -69,6 +69,15 @@ import {
   pollDeviceFlow as pollDeviceFlowOnce,
 } from "./channel/registration.ts";
 import { RetriableChannelError, type Brand, type InboundEvent } from "./channel/types.ts";
+import {
+  formatUsd,
+  renderOverBudgetNote,
+  renderSpendStatus,
+  resolveBudgetConfig,
+  sumUsage,
+  type BudgetConfig,
+  type BudgetState,
+} from "./budget.ts";
 import { Dispatcher, parseOwnerCommand } from "./dispatch.ts";
 import { buildSituationBrief } from "./llm/brief.ts";
 import { buildStewardExtension, type StewardExtensionContext } from "./llm/extension.ts";
@@ -80,7 +89,7 @@ import {
   type FauxRequestRecord,
   type StewardModels,
 } from "./llm/models.ts";
-import { createLedger, type Ledger, type LedgerSql, type NotifyRow, type QuestionRow, type RunRow } from "./ledger.ts";
+import { createLedger, type Ledger, type LedgerSql, type NotifyRow, type QuestionRow, type RunRow, type WakeRow } from "./ledger.ts";
 import { renderChangeReports } from "./notes.ts";
 import { RoutineService } from "./routines.ts";
 import { failureCard, notifyCard, askUserCard, reportCardFor, noteDecisionCard, stallCard, workerQuestionCard, didBullets, type AskCardButton } from "./report-template.ts";
@@ -222,6 +231,15 @@ export interface ShOutboundRow {
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+/** pi-durable's invocation Context is structural (an abort signal, keyed values, a name), and
+ *  chord's own BACKGROUND_CONTEXT lives in a dev-only dependency of this package — so, like
+ *  agents/harness/pi, we carry the same never-cancelled value rather than import it. */
+const BACKGROUND_CONTEXT: Parameters<Harness["usage"]>[0] = Object.freeze({
+  abortSignal: undefined,
+  value: () => undefined,
+  toString: () => "[Context steward background]",
+});
+
 /** UTF-8 size of a serialized relay message — the byte meter is numbers only, never content. */
 function jsonByteLength(value: unknown): number {
   return new TextEncoder().encode(JSON.stringify(value)).length;
@@ -253,6 +271,10 @@ export class Steward extends Agent<Env> {
     // by expression — re-arming at boot dedups onto the same row and never postpones it,
     // so the chain cannot die (or drift) with an evicted isolate.
     this.armNotesMaintenance();
+    // Issue #28: the usage cursor is seeded FIRST — queued ahead of everything below that can
+    // start a model call — so the first reading is the boot baseline (pi's history ≠ today's
+    // spend, budget.ts observe()). Void: onStart must not gate startup on pi.
+    void this.syncUsageQuietly("budget_baseline_failed");
     // §5.3 (issue #10): a blocked report's question is durably deadlined — the fallback
     // forwards it even if this isolate never saw the report arrive.
     void this.armQuestionFallback();
@@ -289,6 +311,59 @@ export class Steward extends Agent<Env> {
   /** The deploy-config selection (vars.STEWARD_MODEL; deepseek/deepseek-flash default). */
   private get modelVarsConfig(): ReturnType<typeof resolveModelConfig> {
     return resolveModelConfig(this.env.STEWARD_MODEL);
+  }
+
+  // Issue #28 (steward.md §12): the resolved daily budget. Tests swap it on the live DO
+  // instance (setBudgetForTest) to sit right under/over the cap without page-scale token
+  // counts; production reads it from vars.DAILY_BUDGET_USD once per isolate.
+  private budgetConfig_?: BudgetConfig;
+
+  private get budgetConfig(): BudgetConfig {
+    if (this.budgetConfig_ === undefined) {
+      const config = resolveBudgetConfig(this.env.DAILY_BUDGET_USD);
+      if (config.error !== undefined) this.logChannel("budget_config_error", config.error);
+      this.budgetConfig_ = config;
+    }
+    return this.budgetConfig_;
+  }
+
+  /** Today's counter against the cap; the one read every gate and readout uses. */
+  private budgetState(): BudgetState {
+    return this.ledger.budget.state(this.budgetConfig);
+  }
+
+  // Usage syncs serialize here (budget.ts observe() demands it: a stale pi.usage read
+  // landing after a newer one must never be folded twice). Same chain shape as
+  // notifyChain/deliveryChain.
+  private usageSyncChain: Promise<void> = Promise.resolve();
+
+  /**
+   * Folds pi's cumulative session usage into today's counter; resolves once the write landed.
+   *
+   * Nothing feeds the counter in the background, on purpose. A pi commit listener has to be
+   * attached from `conversationCreated`, which pi runs only when it CREATES the root — an
+   * isolate that restarts onto an existing root (every Durable Object eviction) never gets
+   * one, and a second writer next to this sweep double-charges the same spend. So the
+   * counter is brought current exactly where a decision reads it: the wake drain (before the
+   * gate), run settlement (before the over-budget note), and the spend readout.
+   */
+  private syncUsage(): Promise<void> {
+    const run = this.usageSyncChain.then(async () => {
+      const pi = await this.piHarness.pi();
+      this.ledger.budget.observe(sumUsage(await pi.usage(BACKGROUND_CONTEXT)));
+    });
+    this.usageSyncChain = run.catch(() => {});
+    return run;
+  }
+
+  /** syncUsage for decision points: a failed read must not take the decision down with it —
+   *  the persisted counter is stale-but-honest and the failure is on the channel log. */
+  private async syncUsageQuietly(reason = "budget_sync_failed"): Promise<void> {
+    try {
+      await this.syncUsage();
+    } catch (err) {
+      this.logChannel(reason, errorText(err));
+    }
   }
 
   /**
@@ -423,6 +498,15 @@ export class Steward extends Agent<Env> {
       webLinkUrl: (target) => this.web.linkUrl(target),
       // Routine suggestion cards (`offer:` outbound ids) route their taps here (§8.5).
       onOfferTap: (offerId, action) => this.routineService.handleOfferTap(offerId, action),
+      // Issue #28: the deterministic spend readout ("how much today?") — counter, no LLM.
+      spendStatusText: async () => {
+        await this.syncUsageQuietly();
+        const state = this.budgetState();
+        // Asking is hearing: the explicit readout carries the same information the daily
+        // note would, so it satisfies "noted once" for today too (no double notice).
+        if (state.over && state.overNotedAt === null) this.ledger.budget.markNoted(state.day);
+        return renderSpendStatus(state);
+      },
     }));
   }
 
@@ -2706,6 +2790,9 @@ export class Steward extends Agent<Env> {
           }
           continue;
         }
+        // Issue #28: bring the counter current before the over-budget note reads it — the
+        // run that just settled is the spend that may tip today over the cap.
+        await this.syncUsageQuietly();
         this.settleRun(run, result);
       }
     } catch (err) {
@@ -2738,7 +2825,14 @@ export class Steward extends Agent<Env> {
       // silent one. `upTo` bounds the marking: a change landing between render and mark
       // stays pending and rides the reply after it.
       const relay = this.ledger.notes.renderPendingForReply();
-      const withRelay = (text: string): string => (relay.text === "" ? text : `${text}\n${relay.text}`);
+      // Issue #28 (steward.md §12 "with the budget state noted"): over the cap, a one-line
+      // notice rides exactly ONE reply per day — same durability discipline as the relay
+      // (rendered here, marked only after the reply row is durably enqueued; a crash in the
+      // window costs a duplicate line at worst, never a lost one). Null when under budget or
+      // already noted today, so normal days never see it.
+      const budgetNote = this.pendingBudgetNote();
+      const withRelay = (text: string): string =>
+        [text, ...(relay.text === "" ? [] : [relay.text]), ...(budgetNote === null ? [] : [budgetNote.text])].join("\n");
       // Review #9: a `done` run with no final text is legitimate when the model already
       // produced user-facing output (ask_user terminates the turn right after its push;
       // notify_user cards went out mid-run). Only a silent empty answer is treated as a
@@ -2759,6 +2853,7 @@ export class Steward extends Agent<Env> {
             urgency: "push",
           });
           this.ledger.notes.markPendingReported(relay.upTo);
+          if (budgetNote !== null) this.ledger.budget.markNoted(budgetNote.day);
           this.ledger.runs.settle(run.operationId, result, id);
         } catch (err) {
           // Nothing durable went out: the run stays open and the next poll retries, with the
@@ -2798,6 +2893,13 @@ export class Steward extends Agent<Env> {
     // Event/routine/follow-up runs, and user runs that already reached the user: the text is
     // kept for audit and nothing more is sent (§6.2).
     this.ledger.runs.settle(run.operationId, result);
+  }
+
+  /** The over-budget notice when it has not ridden a reply yet today; null otherwise. */
+  private pendingBudgetNote(): (BudgetState & { text: string }) | null {
+    const state = this.budgetState();
+    if (!state.over || state.overNotedAt !== null) return null;
+    return { ...state, text: renderOverBudgetNote(state) };
   }
 
   /** The settle-time lastResult for routine/follow-up runs (§8.6), when none was recorded. */
@@ -2849,7 +2951,21 @@ export class Steward extends Agent<Env> {
   async drainWakes(_payload?: unknown, schedule?: { id: string }): Promise<void> {
     let submitted = false;
     try {
-      for (const wake of this.ledger.wakes.due(Date.now())) {
+      // The budget gate (issue #28, steward.md §12): today's spend has reached the cap →
+      // event/routine/follow-up wakes are skipped, not submitted — while their deterministic
+      // halves (done cards, fallback pushes, digest routines) already ran and never depended
+      // on the model. The counter syncs first (a failed read degrades to the last honest
+      // number rather than skipping the drain) and a single check before the loop is the
+      // boundary: wakes submitted in one drain may overshoot the cap by the batch's spend,
+      // and the next drain stops — the soft cap bounds a runaway, it is not a prepaid meter.
+      const due = this.ledger.wakes.due(Date.now());
+      if (due.length > 0) await this.syncUsageQuietly();
+      const budget = this.budgetState();
+      for (const wake of due) {
+        if (budget.over) {
+          this.skipWake(wake, budget);
+          continue;
+        }
         this.ledger.runs.open(wake.operationId, wake.kind, wake.text);
         try {
           await this.ensureRootModel();
@@ -2880,6 +2996,37 @@ export class Steward extends Agent<Env> {
       this.drainWakeScheduleId = scheduled?.id;
     }
     if (submitted) void this.pollRuns();
+  }
+
+  /** One wake the cap kept from the model: skip it, count it, leave every audit trail (§8.6). */
+  private skipWake(wake: WakeRow, budget: BudgetState): void {
+    this.ledger.wakes.markSkipped(wake.id);
+    this.ledger.budget.recordSkip();
+    this.logChannel(
+      "budget_skip_wake",
+      `${wake.operationId} kind=${wake.kind} spent=${formatUsd(budget.costUsd)} cap=${formatUsd(budget.budgetUsd)}`,
+    );
+    const reason = `skipped:超出每日预算（${formatUsd(budget.costUsd)} / ${formatUsd(budget.budgetUsd)}，${budget.day} 00:00 UTC 重置）`;
+    // A fire's row owns an outcome either way (§8.6): list_schedules shows the skip instead
+    // of a stale "已交给总管执行", and the timeline says the fire never reached the model.
+    const routine = /^routine:(r_.+):\d+$/.exec(wake.operationId);
+    if (routine) {
+      const row = this.ledger.routines.get(routine[1]!);
+      this.ledger.routines.recordOutcome(routine[1]!, reason);
+      this.ledger.timeline.add(row?.threadId ?? null, "routine", `例行任务 ${routine[1]!} 触发：超出每日预算，未唤醒总管`, {
+        routineId: routine[1]!,
+        operationId: wake.operationId,
+      });
+      return;
+    }
+    const followup = /^followup:(f_.+)$/.exec(wake.operationId);
+    if (followup) {
+      const row = this.ledger.followups.get(followup[1]!);
+      this.ledger.followups.recordOutcome(followup[1]!, reason);
+      this.ledger.timeline.add(row?.threadId ?? null, "followup", `定时回看 ${followup[1]!} 到期：超出每日预算，未唤醒总管`, {
+        followupId: followup[1]!,
+      });
+    }
   }
 
   /**
@@ -3213,6 +3360,66 @@ export class Steward extends Agent<Env> {
     this.sql`UPDATE sh_thread SET lastActivityAt = ${Date.now() - days * 86_400_000} WHERE threadId = ${threadId}`;
 }
 
+  // ---- Daily budget (issue #28): the RPC surface tests and future web pages read --------------
+
+  /** Today's counter against the cap, synced to pi's usage ledger first. */
+  async budgetStatus(): Promise<BudgetState & { text: string }> {
+    await this.syncUsage();
+    const state = this.budgetState();
+    return { ...state, text: renderSpendStatus(state) };
+  }
+
+  /** Test-only: pi's own session-wide usage total — the number the counter must agree with. */
+  async piUsageForTest(): Promise<{ costUsd: number; tokens: number }> {
+    return sumUsage(await (await this.piHarness.pi()).usage(BACKGROUND_CONTEXT));
+  }
+
+  /** Test-only: swaps the cap (setBudgetForTest(0.5)); undefined restores the deploy config. */
+  async setBudgetForTest(usd?: number): Promise<void> {
+    this.budgetConfig_ = usd === undefined ? undefined : resolveBudgetConfig(usd);
+  }
+
+  /** Test-only: attributes spend to a day directly (faux's price is $0 — models.ts). */
+  async spendForTest(usd: number, tokens = 0, at = Date.now()): Promise<void> {
+    this.ledger.budget.add({ costUsd: usd, tokens }, at);
+  }
+
+  /** Test-only: the persisted days, newest first. */
+  async usageDaysForTest(): Promise<Array<{ day: string; costUsd: number; tokens: number; skippedWakes: number; overNotedAt: number | null }>> {
+    return this.sql<{
+      day: string; costUsd: number; tokens: number; skippedWakes: number; overNotedAt: number | null;
+    }>`SELECT day, costUsd, tokens, skippedWakes, overNotedAt FROM sh_usage_day ORDER BY day DESC`;
+  }
+
+  /** Test-only: wipes the cursors only — pi history stays, so the next sync must re-baseline. */
+  async resetCursorsForTest(): Promise<void> {
+    this.ctx.storage.sql.exec("DELETE FROM sh_usage_cursor");
+    await this.syncUsage();
+  }
+
+  /** Test-only: every budget test starts virgin — no day rows, cursor parked at zero. One
+   *  transaction on purpose: a cursor deleted-but-not-yet-reseeded reads as never-seen to a
+   *  racing background sync, which then baseline-seeds it at pi's CURRENT total and swallows
+   *  the run the test is about to measure. */
+  async resetBudgetForTest(): Promise<void> {
+    const now = Date.now();
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec("DELETE FROM sh_usage_day");
+      this.ctx.storage.sql.exec("DELETE FROM sh_usage_cursor");
+      this.ctx.storage.sql.exec(`INSERT INTO sh_usage_cursor (id, costUsd, tokens, updatedAt) VALUES (1, 0, 0, ${now})`);
+    });
+  }
+
+  /** Test-only: the never-seen state — the next observation baselines instead of charging. */
+  async resetCursorForTest(): Promise<void> {
+    this.ctx.storage.sql.exec("DELETE FROM sh_usage_cursor");
+  }
+
+  /** Test-only: marks a past day's over-budget note as sent. */
+  async noteBudgetForTest(day: string): Promise<void> {
+    this.ledger.budget.markNoted(day, Date.now());
+  }
+
   /** Test entry into the intervention half of the dispatch service (send/interrupt). */
   async sendForTest(
     input: Omit<import("./dispatch.ts").SendToWorkerInput, "provenance" | "cmdId"> & { cmdId?: string },
@@ -3308,6 +3515,14 @@ export class Steward extends Agent<Env> {
     for (const table of tables) this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS "${table}"`);
     this.ctx.storage.sql.exec("DELETE FROM sh_run");
     this.ctx.storage.sql.exec("DELETE FROM sh_wake");
+    // Issue #28: pi's usage tables are gone, so the next conversation starts from zero — the
+    // counters must follow, and the cursor row must EXIST at zero: an absent row would make
+    // the next sync treat the first run's spend as a never-seen baseline and swallow it.
+    this.ctx.storage.sql.exec("DELETE FROM sh_usage_day");
+    this.ctx.storage.sql.exec("DELETE FROM sh_usage_cursor");
+    this.ctx.storage.sql.exec(
+      "INSERT INTO sh_usage_cursor (id, costUsd, tokens, updatedAt) VALUES (1, 0, 0, " + Date.now() + ")",
+    );
     if (this.llmModels.faux) this.llmModels.faux.reset();
   }
 
