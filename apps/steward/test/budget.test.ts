@@ -72,7 +72,7 @@ async function connectedMachine(name = "mac-studio"): Promise<FakeConnector> {
 }
 
 /** Dispatches one worker through the LLM tool path and returns (connector, workerId). */
-async function dispatchOne(prompt = "修复登录 bug"): Promise<{ fake: FakeConnector; workerId: string }> {
+async function dispatchOne(prompt = "修复登录 bug"): Promise<{ fake: FakeConnector; workerId: string; threadId: string }> {
   const fake = await connectedMachine();
   await scriptModel(
     fauxAssistantMessage([fauxToolCall("start_worker", { prompt, repoRef: "repo-a", newTitle: prompt, basis: "user_explicit" })], { stopReason: "toolUse" }),
@@ -81,11 +81,12 @@ async function dispatchOne(prompt = "修复登录 bug"): Promise<{ fake: FakeCon
   await dm(`请处理：${prompt}`);
   const [cmd] = await fake.waitForCmds(1);
   const workerId = String((cmd!.args as Record<string, unknown>).workerId);
+  const threadId = String((cmd!.args as Record<string, unknown>).threadId);
   fake.send({ t: "cmd_ack", re: cmd!.id, status: "accepted" });
   fake.send({ t: "cmd_result", re: cmd!.id, ok: true, data: { sessionId: workerId, branch: "shepherd/x-1" } });
   await fake.emit("started", workerId, { sessionId: workerId, branch: "shepherd/x-1" });
   await waitRunsSettled();
-  return { fake, workerId };
+  return { fake, workerId, threadId };
 }
 
 /** The persisted counter as a decision would read it — deliberately NOT through budgetStatus(),
@@ -334,8 +335,8 @@ describe("over budget: wakes skipped, templates still send (steward.md §12)", (
     fake.close();
   }, 30_000);
 
-  it("fallback pushes (needs_decision) still reach the user over budget", async () => {
-    const { fake, workerId } = await dispatchOne();
+  it("the §5.3 fallback still forwards a blocked question over budget (window expiry, no LLM)", async () => {
+    const { fake, workerId, threadId } = await dispatchOne();
     await ownerStub().setBudgetForTest(0.5);
     await ownerStub().spendForTest(0.5);
     await fake.emit("report", workerId, { type: "report", status: "needs_decision", summary: "卡住了", question: "回滚还是升级？" });
@@ -343,9 +344,24 @@ describe("over budget: wakes skipped, templates still send (steward.md §12)", (
       () => ownerStub().debugSnapshot(),
       (s) => s.wakes.some((w) => w.status === "skipped"),
     );
+    expect(snap.questions.some((q) => q.workerId === workerId && q.status === "open")).toBe(true);
+    // #10's 90-second window (§5.3): over budget the steward never runs, so the window can
+    // only expire — expire it now (main's worker-questions tests do the same) and sweep.
+    // The deterministic fallback forwards the worker's question verbatim; no LLM anywhere.
+    await runInDurableObject(
+      ownerStub(),
+      (_instance: Steward, state: { storage: { sql: { exec: (q: string) => unknown } } }) => {
+        state.storage.sql.exec(
+          `UPDATE sh_question SET fallbackDueAt = askedAt WHERE workerId = '${workerId}' AND status = 'open'`,
+        );
+      },
+    );
+    await ownerStub().sweepQuestionFallbackForTest();
     await waitWhileOutboundPending();
     const cards = await sentCards();
     expect(JSON.stringify(cards)).toContain("回滚还是升级");
+    // And the model was never woken for it.
+    expect((await llmState()).runs.filter((r) => r.kind === "event")).toHaveLength(0);
     fake.close();
   }, 30_000);
 });
