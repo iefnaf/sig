@@ -86,7 +86,7 @@ import { failureCard, notifyCard, askUserCard, reportCardFor, type AskCardButton
 import { MIGRATIONS, runMigrations } from "./schema.ts";
 import { openSecret, sealSecret } from "./secretbox.ts";
 import { renderSetupPage, type SetupView } from "./setup-page.ts";
-import { ambiguousWakeText, escapeMarkers, verifyWakeText } from "./wake-text.ts";
+import { ambiguousWakeText, commandAttentionWakeText, escapeMarkers, verifyWakeText } from "./wake-text.ts";
 import { WebApp, linkTargetForThread, parseSessionCookie } from "./web.ts";
 
 interface ConnState {
@@ -1068,10 +1068,24 @@ export class Steward extends Agent<Env> {
       if (pending.state === "ambiguous") {
         this.markCommandAmbiguous(pending.cmdId, "hello.pendingAcks");
       } else if (pending.state === "done" || pending.state === "failed") {
+        // The connector resolved the command from session-tail evidence before connecting:
+        // settle the row from the snapshot (its stored result rode hello as a duplicate-ack
+        // payload; here the state is what matters). A recovered not_delivered surfaces like
+        // any delivery failure — except start_worker, whose worker-break event (emitted by
+        // the connector's own §9.1 reconciliation) already tells the user.
         this.sql`
-          UPDATE outbox SET state = ${pending.state}, result = ${JSON.stringify({ source: "pendingAck" })}
+          UPDATE outbox SET state = ${pending.state}
           WHERE cmdId = ${pending.cmdId} AND state NOT IN ('done', 'failed', 'expired', 'ambiguous')
         `;
+        const changed = this.sql<{ changes: number }>`SELECT changes() AS changes`[0]!.changes > 0;
+        if (changed && pending.state === "failed" && pending.code === "not_delivered") {
+          const row = this.sql<{ workerId: string | null; kind: string }>`
+            SELECT workerId, kind FROM outbox WHERE cmdId = ${pending.cmdId}
+          `[0];
+          if (row?.workerId && row.kind !== "start_worker") {
+            this.noteCommandAttention(pending.cmdId, "not_delivered", "connector restarted before the command reached the agent");
+          }
+        }
       }
     }
     this.redeliverOutbox(auth.deviceId);
@@ -1130,11 +1144,12 @@ export class Steward extends Agent<Env> {
     const parsed = CmdResultMessageSchema.safeParse(raw);
     if (!parsed.success) return;
     const result = parsed.data;
+    const wasFailed = this.sql<{ state: string }>`SELECT state FROM outbox WHERE cmdId = ${result.re}`[0]?.state === "failed";
     this.sql`
       UPDATE outbox SET state = ${result.ok ? "done" : "failed"}, result = ${JSON.stringify(result.ok ? result.data ?? null : result.error ?? null)}
       WHERE cmdId = ${result.re}
     `;
-    if (!result.ok) {
+    if (!result.ok && !wasFailed) {
       const error = (result.error ?? {}) as { code?: unknown; message?: unknown };
       const reason = [typeof error.code === "string" ? error.code : null, typeof error.message === "string" ? error.message : null]
         .filter((part): part is string => part !== null)
@@ -1162,21 +1177,25 @@ export class Steward extends Agent<Env> {
     const worker = this.ledger.workers.get(row.workerId);
     if (!worker) return;
     const instruction = commandInstruction(row.kind, row.payload);
+    // The instruction is model- or user-authored text: marker-escape it everywhere it is
+    // embedded (the ⟦…⟧ policy every wake builder follows — review #48 finding 5).
+    const safe = escapeMarkers(instruction);
     const text =
       code === "session_in_use"
-        ? `「${instruction}」没有送达：这个会话此刻正被机器上的另一个 pi 进程使用（可能是本人在键盘上继续）。`
-        : `「${instruction}」没有送达：连接器在投递前重启了，worker 从未收到这条指令。`;
+        ? `「${safe}」没有送达：这个会话此刻正被机器上的另一个 pi 进程使用（可能是本人在键盘上继续）。`
+        : `「${safe}」没有送达：连接器在投递前重启了，worker 从未收到这条指令。`;
     this.ledger.timeline.add(worker.threadId, "note", text, { cmdId, workerId: row.workerId, code });
     this.ledger.wakes.queue(
       "event",
       `attention:${cmdId}`,
-      [
-        `⟦event⟧ thread=${worker.threadId}`,
-        `- 指向 worker ${worker.workerId} 的命令（${row.kind}：「${instruction}」）失败：${text}`,
-        code === "session_in_use"
-          ? "请告知用户：那台机器上的这个会话正被他本人使用，稍后再试即可；需要时用 ask_user 问是否稍后重试。"
-          : "请告知用户这条指令没有送达（用户可能以为已发出）；要重发必须以用户的确认或回复为依据（basis=user_reply_to），不要自行重发。",
-      ].join("\n"),
+      commandAttentionWakeText({
+        threadId: worker.threadId,
+        workerId: worker.workerId,
+        kind: row.kind,
+        instruction: safe,
+        code,
+        detail: text,
+      }),
       { priority: "high" },
     );
     void this.drainWakes();
@@ -1199,22 +1218,20 @@ export class Steward extends Agent<Env> {
    *  `sending` — delivery unknowable). Mark the outbox row ambiguous (never re-sent) and wake
    *  the steward to ask the user; idempotent on the cmdId via the wake's dedupeKey. */
   private markCommandAmbiguous(cmdId: string, via: string): void {
-    this.sql`UPDATE outbox SET state = 'ambiguous' WHERE cmdId = ${cmdId} AND state NOT IN ('done', 'failed', 'expired', 'ambiguous')`;
-    const settled = this.sql<{ state: string }>`SELECT state FROM outbox WHERE cmdId = ${cmdId}`[0]?.state;
-    // Idempotency gate: the wake/note fire only when this call actually transitioned the row
-    // (a duplicate cmd_ack or hello.pendingAcks replays find it already ambiguous).
-    if (settled !== "ambiguous") return;
-    const seen = this.sql<{ n: number }>`
-      SELECT COUNT(*) AS n FROM sh_timeline WHERE refs IS NOT NULL AND refs LIKE ${'%"ambiguous":true%'} AND refs LIKE ${`%"cmdId":"${cmdId}"%`}
-    `[0]!.n;
-    if (seen > 0) return;
+    // Idempotency gate: the wake/note fire only when this call actually transitioned the
+    // row (duplicate cmd_acks and repeated hellos find it already ambiguous).
+    this.sql`
+      UPDATE outbox SET state = 'ambiguous' WHERE cmdId = ${cmdId} AND state NOT IN ('done', 'failed', 'expired', 'ambiguous')
+    `;
+    const changed = this.sql<{ changes: number }>`SELECT changes() AS changes`[0]!.changes > 0;
+    if (!changed) return;
     const row = this.sql<{ workerId: string | null; kind: string; payload: string }>`
       SELECT workerId, kind, payload FROM outbox WHERE cmdId = ${cmdId}
     `[0];
     if (!row || !row.workerId) return;
     const worker = this.ledger.workers.get(row.workerId);
     if (!worker) return;
-    const instruction = commandInstruction(row.kind, row.payload);
+    const instruction = escapeMarkers(commandInstruction(row.kind, row.payload));
     this.ledger.timeline.add(
       worker.threadId,
       "note",

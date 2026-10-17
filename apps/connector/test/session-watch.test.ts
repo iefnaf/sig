@@ -138,7 +138,8 @@ describe("command recovery (§6.3: delivered / not_delivered / ambiguous, never 
       userEntry("u1", null, "do it"),
     ]);
     const log = new CommandLog(store.database);
-    log.begin("cmd-delivered", { kind: "send", workerId: "w-rec-1", sessionFile, markerExpected: true });
+    log.begin("cmd-delivered", { kind: "send", workerId: "w-rec-1" });
+    log.expectMarker("cmd-delivered", { sessionFile });
     log.markSending("cmd-delivered");
     seededWorker("w-rec-1", sessionFile, null);
 
@@ -167,7 +168,8 @@ describe("command recovery (§6.3: delivered / not_delivered / ambiguous, never 
       assistantEntry("a0", "u0", [textBlock("done")]),
     ]);
     const log = new CommandLog(store.database);
-    log.begin("cmd-lost", { kind: "send", workerId: "w-rec-2", sessionFile, markerExpected: true });
+    log.begin("cmd-lost", { kind: "send", workerId: "w-rec-2" });
+    log.expectMarker("cmd-lost", { sessionFile });
     log.markSending("cmd-lost");
     seededWorker("w-rec-2", sessionFile, null);
 
@@ -191,9 +193,9 @@ describe("command recovery (§6.3: delivered / not_delivered / ambiguous, never 
   it("a command with no marker expectation stays honestly ambiguous; an unstarted one is not delivered", async () => {
     const sessionFile = writeChainedSession("w-rec-3", [userEntry("u0", null, "x")]);
     const log = new CommandLog(store.database);
-    log.begin("cmd-stop", { kind: "stop_process", workerId: "w-rec-3", sessionFile }); // no marker possible
+    log.begin("cmd-stop", { kind: "stop_process", workerId: "w-rec-3" }); // no marker possible
     log.markSending("cmd-stop");
-    log.begin("cmd-never", { kind: "send", workerId: "w-rec-3", sessionFile });
+    log.begin("cmd-never", { kind: "send", workerId: "w-rec-3" });
     // left in `accepted`: the handler never began, so nothing was sent.
 
     await bootApp(null).start();

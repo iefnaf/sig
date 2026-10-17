@@ -95,8 +95,10 @@ describe("command dedup (at-least-once from the DO, exactly-once execution here)
     restarted.stop();
   });
 
-  it("reports ambiguous for a command whose sending was interrupted by a crash, and never re-runs it", async () => {
-    // The handler never settles: simulates the connector dying mid-`sending`.
+  it("recovers a launch-kind command crashed mid-`sending` before any pi write as not_delivered, never re-runs it", async () => {
+    // The handler never settles: simulates the connector dying mid-`sending`. For the
+    // marker-bearing kinds (§6.3) that window is now decidable: the write-ahead had not
+    // armed, so nothing was ever written to pi — failed(not_delivered), not ambiguous.
     const gate = new Promise<never>(() => {});
     const client = connectClient({ handleCommand: () => gate });
     await mock.waitConnected();
@@ -108,18 +110,21 @@ describe("command dedup (at-least-once from the DO, exactly-once execution here)
 
     const restarted = connectClient({
       handleCommand: async () => {
-        throw new Error("must not re-run an ambiguous command");
+        throw new Error("must not re-run a crashed command");
       },
     });
     await mock.waitConnected();
     await mock.waitHello(2); // the RESTART's hello is the second frame (CI flake guard)
-    // The restart's hello carries the crashed command as ambiguous in pendingAcks.
-    const hello = mock.hellos().at(-1) as { pendingAcks: Array<{ cmdId: string; state: string; recovered?: boolean }> };
-    expect(hello.pendingAcks).toContainEqual(expect.objectContaining({ cmdId, state: "ambiguous" }));
+    // The restart's hello carries the crashed command as recovered failed(not_delivered).
+    const hello = mock.hellos().at(-1) as { pendingAcks: Array<{ cmdId: string; state: string; code?: string }> };
+    expect(hello.pendingAcks).toContainEqual(expect.objectContaining({ cmdId, state: "failed", code: "not_delivered" }));
 
-    mock.sendCmd("start_worker", {}, cmdId); // DO redelivery: answered ambiguous, never executed
+    mock.sendCmd("start_worker", {}, cmdId); // DO redelivery: answered duplicate, never executed
     await wait(200);
-    expect(mock.acksFor(cmdId)).toMatchObject({ status: "ambiguous" });
+    expect(mock.acksFor(cmdId)).toMatchObject({
+      status: "duplicate",
+      result: { ok: false, error: { code: "not_delivered" } },
+    });
     restarted.stop();
   });
 

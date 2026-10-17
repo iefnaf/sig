@@ -1577,7 +1577,7 @@ export function createLedger(deps: LedgerDeps) {
         );
         wakes.queue(
           "event",
-          `external_activity:${workerId}`,
+          `external_activity:${workerId}:${seq}`,
           externalActivityWakeText({
             thread: threads.get(worker.threadId),
             worker: workers.get(workerId)!,

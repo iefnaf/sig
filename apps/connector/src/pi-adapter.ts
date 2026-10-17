@@ -199,22 +199,21 @@ export class PiAdapter implements AgentAdapter {
           `sessionId mismatch: expected ${spec.workerId}, got ${String(state.sessionId)}`,
         );
       }
-      const sessionFile = typeof state.sessionFile === "string" ? state.sessionFile : undefined;
-      if (sessionFile) {
-        // §6.3/§10: the session file and its current tail are on record BEFORE the prompt is
-        // sent, so a crash anywhere past this point leaves decidable evidence (the marker
-        // entry for this command, and the external-activity baseline it is diffed against).
-        const observation = observeSession(sessionFile);
-        try {
-          spec.onSession?.(sessionFile, observation.lastEntryId);
-        } catch {
-          // observation bookkeeping must never fail a launch
-        }
+      const sessionFile = typeof state.sessionFile === "string" ? state.sessionFile : null;
+      // §6.3/§10: the session file and its current tail are on record BEFORE the prompt is
+      // sent, so a crash anywhere past this point leaves decidable evidence (the marker
+      // entry for this command, and the external-activity baseline it is diffed against).
+      // Fires even with no session file: the write-ahead must precede the prompt regardless.
+      const observation = sessionFile ? observeSession(sessionFile) : null;
+      try {
+        spec.onSession?.(sessionFile, observation?.lastEntryId ?? null);
+      } catch {
+        // observation bookkeeping must never fail a launch
       }
       const handle: WorkerHandle = {
         workerId: spec.workerId,
         sessionId: String(state.sessionId),
-        sessionFile,
+        sessionFile: sessionFile ?? undefined,
         cwd: spec.cwd,
       };
 
@@ -251,7 +250,7 @@ export class PiAdapter implements AgentAdapter {
 
   async send(
     id: string,
-    input: { text: string; images?: { data: string; mimeType: string }[]; commandId?: string; markerExpected?: boolean },
+    input: { text: string; images?: { data: string; mimeType: string }[]; commandId?: string },
     how: Delivery,
   ): Promise<{ effect?: string }> {
     const runtime = this.require(id);
@@ -264,10 +263,11 @@ export class PiAdapter implements AgentAdapter {
       return {};
     }
     // §6.3: a queued steer/follow_up cannot carry the `/shepherd` wrapper (pi forbids
-    // extension commands on steer/follow_up), so the commandId travels as an input preamble —
-    // persisted by pi as part of the user message exactly when it is delivered.
+    // extension commands there), so the commandId travels as an input preamble. pi's input
+    // handler runs before queueing: it strips the preamble and appends the custom entry, so
+    // the marker is on disk from the moment pi ACCEPTS the message into its queue.
     const type = how === "steer" ? "steer" : "follow_up";
-    const message = input.markerExpected && input.commandId ? markerPreamble(input.commandId, input.text) : input.text;
+    const message = input.commandId ? markerPreamble(input.commandId, input.text) : input.text;
     await runtime.process.rpc({ type, message, images });
     // §6.2: steer takes effect after the current tool batch finishes.
     return { effect: how === "steer" ? "after_current_tools" : undefined };
@@ -292,14 +292,13 @@ export class PiAdapter implements AgentAdapter {
     return { returned };
   }
 
-  async resume(id: string, reason: string, options: { commandId?: string; markerExpected?: boolean } = {}): Promise<void> {
+  async resume(id: string, reason: string, options: { commandId?: string } = {}): Promise<void> {
     const runtime = this.runtimes.get(id);
     if (runtime && !runtime.process.hasExited) {
       // §6.3: the resume prompt on a live process carries the marker like any other prompt,
       // so a crash mid-`sending` is decidable from the session tail.
       const commandId = options.commandId ?? `resume-${Date.now()}`;
-      const message = options.markerExpected !== false ? wrapPrompt(commandId, `${RESUME_PROMPT}\n\nReason: ${reason}`) : `${RESUME_PROMPT}\n\nReason: ${reason}`;
-      await runtime.process.rpc({ type: "prompt", message });
+      await runtime.process.rpc({ type: "prompt", message: wrapPrompt(commandId, `${RESUME_PROMPT}\n\nReason: ${reason}`) });
       return;
     }
     // Relaunch with the same session id and send the fixed resume prompt (§9.2).

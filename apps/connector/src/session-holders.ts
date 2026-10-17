@@ -128,6 +128,7 @@ export async function findSessionHolders(
     if (!referencesSession(proc.args, workerId, sessionFile)) continue;
     const first = (proc.args.split(/\s+/)[0] ?? "").split("/").pop() ?? "";
     if (NON_SESSION_COMMANDS.has(first)) continue; // a viewer, not a session user
+    if (proc.args.includes("fake-pi.mjs")) continue; // this repo's test double, never a session user
     holders.push({ pid: proc.pid, args: proc.args });
   }
   return holders;

@@ -39,9 +39,6 @@ export interface ClientOptions {
   /** L3 raw-history loader (connector-pi.md §11.4): when set, `history_req` messages are
    *  answered with windowed `history_chunk` streams; without it they get `error{unsupported}`. */
   loadHistory?: (workerId: string, since: string | undefined, maxBytes: number) => Promise<HistoryPage>;
-  /** Called when a command's handler starts, so the app can enrich the row's recovery
-   *  context (session file, marker expectations) before delivery decides them (§6.3). */
-  onCommandSending?: (cmdId: string) => void;
   pingIntervalMs?: number;
   pongTimeoutMs?: number;
   deadAfterMs?: number;
@@ -84,7 +81,6 @@ export class ConnectorClient {
   private flushTimer?: NodeJS.Timeout;
   /** §6.6 history streams for the current connection; reset whenever the socket dies. */
   private readonly history: HistoryStreams | undefined;
-  private readonly marker: ((cmdId: string) => void) | undefined;
 
   constructor(options: ClientOptions) {
     this.options = options;
@@ -113,7 +109,6 @@ export class ConnectorClient {
           load: options.loadHistory,
         })
       : undefined;
-    this.marker = options.onCommandSending;
     // A crash mid-`sending` is adjudicated from the persisted evidence at the next boot
     // (§6.3): marker commands become delivered/not_delivered from the session tail; the rest
     // stay honestly ambiguous. All outcomes ride hello.pendingAcks (protocol §6.1).
@@ -300,14 +295,22 @@ export class ConnectorClient {
 
   private async runHandler(ws: WebSocket, handler: CommandHandler, cmd: CmdMessage): Promise<void> {
     this.commands.markSending(cmd.id);
-    this.marker?.(cmd.id);
     let result: CommandResult;
     try {
       result = await handler(cmd);
     } catch (err) {
       result = { ok: false, error: { code: "internal", message: err instanceof Error ? err.message : String(err) } };
     }
-    this.commands.settle(cmd.id, result);
+    // A zombie continuation (the handler outliving a shutdown/crash in tests; a stopping
+    // daemon racing its last command in production) must not crash the process on the way
+    // out: the restarted connector's recovery already owns the row, and the socket is gone.
+    try {
+      this.commands.settle(cmd.id, result);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ERR_INVALID_STATE") throw err;
+      console.error("[shepherd] late command settle skipped (store closed):", cmd.id);
+      return;
+    }
     this.send(ws, { t: "cmd_result", re: cmd.id, ok: result.ok, data: result.data, error: result.error });
   }
 

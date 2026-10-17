@@ -22,15 +22,13 @@ export interface CommandMeta {
   /** The worker the command addresses (envelope or args), when one is known. */
   workerId?: string | null;
   kind?: string | null;
-  /** Recovery evidence (§6.3): the session a commandId marker lands in, and the entry id
-   * that closes the tail window a marker must appear after to prove absence. */
-  sessionFile?: string | null;
-  afterEntryId?: string | null;
-  /** True when delivery puts the commandId into the session as a custom entry. */
-  markerExpected?: boolean;
 }
 
 const TERMINAL: ReadonlySet<CommandState> = new Set(["done", "failed", "ambiguous"]);
+
+/** Kinds whose every delivery path writes the commandId marker into the session: for these,
+ *  `markerExpected = 0` at crash time means delivery never began (§6.3 write-ahead). */
+const WRITE_AHEAD_KINDS: ReadonlySet<string> = new Set(["start_worker", "send", "resume"]);
 
 export class CommandLog {
   private readonly db: DatabaseSync;
@@ -51,28 +49,19 @@ export class CommandLog {
   // the two still leaves evidence for post-restart reconciliation.
   begin(cmdId: string, meta: CommandMeta): void {
     this.db.prepare(
-      `INSERT OR IGNORE INTO command (cmdId, state, result, createdAt, workerId, kind, sessionFile, afterEntryId, markerExpected)
-       VALUES (?, 'accepted', NULL, ?, ?, ?, ?, ?, ?)`,
-    ).run(
-      cmdId,
-      Date.now(),
-      meta.workerId ?? null,
-      meta.kind ?? null,
-      meta.sessionFile ?? null,
-      meta.afterEntryId ?? null,
-      meta.markerExpected ? 1 : 0,
-    );
+      `INSERT OR IGNORE INTO command (cmdId, state, result, createdAt, workerId, kind)
+       VALUES (?, 'accepted', NULL, ?, ?, ?)`,
+    ).run(cmdId, Date.now(), meta.workerId ?? null, meta.kind ?? null);
   }
 
-  marker(
-    cmdId: string,
-    meta: { sessionFile?: string | null; afterEntryId?: string | null; markerExpected?: boolean } = {},
-  ): void {
+  /** §6.3 write-ahead: arm the marker expectation (and record where the marker must appear)
+   *  before anything is written to pi. */
+  expectMarker(cmdId: string, meta: { sessionFile?: string | null; afterEntryId?: string | null }): void {
     this.db
       .prepare(
-        "UPDATE command SET sessionFile = COALESCE(?, sessionFile), afterEntryId = COALESCE(?, afterEntryId), markerExpected = MAX(markerExpected, ?) WHERE cmdId = ?",
+        "UPDATE command SET sessionFile = COALESCE(?, sessionFile), afterEntryId = COALESCE(?, afterEntryId), markerExpected = 1 WHERE cmdId = ?",
       )
-      .run(meta.sessionFile ?? null, meta.afterEntryId ?? null, meta.markerExpected ? 1 : 0, cmdId);
+      .run(meta.sessionFile ?? null, meta.afterEntryId ?? null, cmdId);
   }
 
   markSending(cmdId: string): void {
@@ -114,6 +103,10 @@ export class CommandLog {
         recovery = "not_delivered";
       } else if (row.markerExpected === 1) {
         recovery = inspectCommandDelivery(row.sessionFile, row.cmdId, row.afterEntryId);
+      } else if (row.kind !== null && WRITE_AHEAD_KINDS.has(row.kind)) {
+        // The write-ahead invariant: for these kinds the marker expectation is armed before
+        // ANY write to pi, so an unarmed row at crash time proves nothing was written.
+        recovery = "not_delivered";
       }
       const result: CommandResult | null =
         recovery === "delivered"
@@ -137,11 +130,25 @@ export class CommandLog {
 
   // hello.pendingAcks (protocol §6.1): every command not yet terminally settled, so the DO can
   // resolve rows whose cmd_ack/cmd_result were lost with the crash.
-  pendingAcks(): Array<{ cmdId: string; state: CommandState; recovered?: boolean }> {
-    return (
-      this.db
-        .prepare("SELECT cmdId, state, recovered FROM command WHERE state NOT IN ('done', 'failed') OR recovered = 1")
-        .all() as Array<{ cmdId: string; state: CommandState; recovered: number }>
-    ).map((row) => ({ cmdId: row.cmdId, state: row.state, ...(row.recovered ? { recovered: true } : {}) }));
+  pendingAcks(): Array<{ cmdId: string; state: CommandState; code?: string; recovered?: boolean }> {
+    const rows = this.db
+      .prepare(
+        `SELECT cmdId, state, result, recovered FROM command WHERE state NOT IN ('done', 'failed') OR recovered = 1`,
+      )
+      .all() as Array<{ cmdId: string; state: CommandState; result: string | null; recovered: number }>;
+    return rows.map((row) => {
+      // A recovered failure carries its error code so the DO can surface not_delivered
+      // without waiting for (or relying on) a cmd_result that died with the crash.
+      let code: string | undefined;
+      if (row.recovered === 1 && row.state === "failed" && row.result) {
+        try {
+          const parsed = (JSON.parse(row.result) as CommandResult).error as { code?: unknown } | undefined;
+          if (typeof parsed?.code === "string") code = parsed.code;
+        } catch {
+          // unreadable result: the state still travels
+        }
+      }
+      return { cmdId: row.cmdId, state: row.state, ...(code ? { code } : {}), ...(row.recovered ? { recovered: true } : {}) };
+    });
   }
 }

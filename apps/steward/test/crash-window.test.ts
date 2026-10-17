@@ -270,3 +270,138 @@ describe("delivery-class failures reach the user (session_in_use / not_delivered
     }
   });
 });
+
+describe("recovered failures riding hello.pendingAcks (protocol §6.1, issue #15)", () => {
+  it("a not_delivered send settles the row, notes the thread, and wakes the steward — once per cmdId", async () => {
+    const seed = await seedAmbiguousWorker("pendingack-machine");
+    try {
+      // The steward sent an instruction; the connector crashed mid-`sending` before any pi
+      // write, and its restart resolved the row failed(not_delivered).
+      const send = await ownerStub().enqueue(seed.deviceId, "send", { workerId: seed.workerId, text: "补上测试" }, { workerId: seed.workerId });
+      const cmd = await seed.reader.nextWhere((m) => m.t === "cmd" && m.id === send.cmdId);
+      seed.ws.send(JSON.stringify({ t: "cmd_ack", re: cmd.id, status: "accepted" }));
+      seed.ws.close();
+
+      const second = await connectAndHello(seed.deviceId, seed.token, 2, {
+        pendingAcks: [{ cmdId: send.cmdId, state: "failed", code: "not_delivered", workerId: seed.workerId }],
+      });
+      try {
+        expect((await ownerStub().outboxRow(send.cmdId))?.state).toBe("failed");
+        let snap = await ownerStub().debugSnapshot();
+        expect(snap.timelineRecent.some((e) => e.text.includes("没有送达"))).toBe(true);
+        expect(snap.wakes.filter((w) => w.text.includes("没有送达"))).toHaveLength(1);
+
+        // A duplicate hello must not re-wake or re-note.
+        const third = await connectAndHello(seed.deviceId, seed.token, 3, {
+          pendingAcks: [{ cmdId: send.cmdId, state: "failed", code: "not_delivered", workerId: seed.workerId }],
+        });
+        try {
+          snap = await ownerStub().debugSnapshot();
+          expect(snap.wakes.filter((w) => w.text.includes("没有送达"))).toHaveLength(1);
+          expect(snap.timelineRecent.filter((e) => e.text.includes("没有送达"))).toHaveLength(1);
+        } finally {
+          third.ws.close();
+        }
+      } finally {
+        second.ws.close();
+      }
+    } finally {
+      seed.ws.close();
+    }
+  });
+
+  it("a not_delivered start_worker settles the row silently — the worker-break event tells the user", async () => {
+    const seed = await seedAmbiguousWorker("pendingack-start-machine");
+    try {
+      const second = await connectAndHello(seed.deviceId, seed.token, 2, {
+        pendingAcks: [{ cmdId: seed.cmdId, state: "failed", code: "not_delivered", workerId: seed.workerId }],
+      });
+      try {
+        expect((await ownerStub().outboxRow(seed.cmdId))?.state).toBe("failed");
+        const snap = await ownerStub().debugSnapshot();
+        expect(snap.wakes.some((w) => w.text.includes("没有送达"))).toBe(false);
+      } finally {
+        second.ws.close();
+      }
+    } finally {
+      seed.ws.close();
+    }
+  });
+
+  it("a re-transmitted session_in_use cmd_result wakes once, not per retransmission", async () => {
+    const seed = await seedAmbiguousWorker("retransmit-machine");
+    try {
+      const send = await ownerStub().enqueue(seed.deviceId, "send", { workerId: seed.workerId, text: "改用 pnpm" }, { workerId: seed.workerId });
+      const cmd = await seed.reader.nextWhere((m) => m.t === "cmd" && m.id === send.cmdId);
+      const failure = JSON.stringify({
+        t: "cmd_result",
+        re: send.cmdId,
+        ok: false,
+        error: { code: "session_in_use", message: "held by another live pi process", retriable: true },
+      });
+      seed.ws.send(JSON.stringify({ t: "cmd_ack", re: cmd.id, status: "accepted" }));
+      seed.ws.send(failure);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      seed.ws.send(failure); // the connector retransmits after an ack-timeout
+      await new Promise((resolve) => setTimeout(resolve, 150));
+
+      const snap = await ownerStub().debugSnapshot();
+      expect(snap.wakes.filter((w) => w.text.includes("另一个 pi 进程使用"))).toHaveLength(1);
+      expect(snap.timelineRecent.filter((e) => e.text.includes("另一个 pi 进程使用"))).toHaveLength(1);
+    } finally {
+      seed.ws.close();
+    }
+  });
+});
+
+describe("wake merging stays within its window class (steward.md §5.3/§5.4)", () => {
+  it("two external_activity events wake twice; a report wake is not swallowed by one", async () => {
+    const connector = await connectedMachine("merge-machine");
+    const { ws, reader } = connector;
+    try {
+      const outcome = await ownerStub().dispatchForTest({ prompt: "修一下登录 bug", repoRef: "repo-a", newTitle: "修一下登录 bug" });
+      expect(outcome.kind).toBe("dispatched");
+      const cmd = await reader.nextWhere((m) => m.t === "cmd" && m.kind === "start_worker");
+      const workerId = String((cmd.args as { workerId: unknown }).workerId);
+      ws.send(JSON.stringify({ t: "cmd_ack", re: cmd.id, status: "accepted" }));
+      ws.send(JSON.stringify({ t: "cmd_result", re: cmd.id, ok: true, data: { sessionId: workerId } }));
+      const activity = (seq: number) =>
+        ws.send(
+          JSON.stringify({
+            t: "events",
+            id: `evt-${seq}`,
+            batch: [
+              { workerId, seq, ts: Date.now(), type: "external_activity", entries: 1, firstAt: "2026-10-16T10:00:00.000Z", lastAt: "2026-10-16T10:00:01.000Z", summary: "User messages: 一次" },
+            ],
+          }),
+        );
+      activity(1);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      activity(2);
+      // A report settle lands while the second activity wake is still pending.
+      ws.send(
+        JSON.stringify({
+          t: "events",
+          id: "evt-3",
+          batch: [
+            { workerId, seq: 3, ts: Date.now(), type: "report", status: "done", summary: "完成", git: { branch: "shepherd/t-1", base: "main", ahead: 1, dirty: 0, filesChanged: 1, insertions: 1, deletions: 0, pushed: false } },
+            { workerId, seq: 4, ts: Date.now(), type: "settled", outcome: "reported" },
+          ],
+        }),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      const snap = await ownerStub().debugSnapshot();
+      const activityWakes = snap.wakes.filter((w) => w.text.includes("被直接使用过"));
+      expect(activityWakes).toHaveLength(2); // both events wake (unique per seq)
+      expect(activityWakes.every((w) => w.priority === "low")).toBe(true);
+      // The report wake stands alone: not merged into a 10-minute activity window.
+      const reportWake = snap.wakes.find((w) => w.text.includes("汇报 done"));
+      expect(reportWake).toBeDefined();
+      expect(reportWake!.mergedInto).toBeNull(); // never merged into an activity wake
+      expect(activityWakes.every((w) => w.mergedInto === null || w.mergedInto !== reportWake!.id)).toBe(true);
+    } finally {
+      ws.close();
+    }
+  });
+});

@@ -54,7 +54,7 @@ export class ConnectorApp {
         this.log?.("worker_event", { workerId, type: fields.type });
         this.client.emit(workerId, fields);
       },
-      noteCommandContext: (cmdId, meta) => this.commandLog.marker(cmdId, meta),
+      onExpectMarker: (cmdId, meta) => this.commandLog.expectMarker(cmdId, meta),
     });
 
     this.client = new ConnectorClient({
@@ -62,11 +62,6 @@ export class ConnectorApp {
       machineName: options.machineName,
       WebSocketImpl: options.WebSocketImpl,
       handleCommand: (cmd: CmdMessage) => this.runCommand(cmd),
-      onCommandSending: (cmdId) => {
-        const workerId = this.manager.commandWorkerId(cmdId);
-        const worker = workerId ? this.store.getWorker(workerId) : null;
-        this.commandLog.marker(cmdId, { sessionFile: worker?.sessionFile ?? null, afterEntryId: worker?.lastKnownEntryId ?? null });
-      },
       snapshot: () => this.snapshot(),
       workersSnapshot: () => this.workersSnapshot(),
       // L3 raw-history reads (§11.4): live get_entries while the process runs, the session

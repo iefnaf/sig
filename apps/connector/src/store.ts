@@ -266,9 +266,11 @@ export class LocalStore {
     );
   }
 
+  /** §10: refresh the worker's session file and external-activity baseline. */
   setSessionObservation(workerId: string, sessionFile: string, lastKnownEntryId: string | null): void {
-    this.db.prepare("UPDATE worker SET sessionFile = ?, sessionId = workerId, lastKnownEntryId = ? WHERE workerId = ?")
-      .run(sessionFile, lastKnownEntryId, workerId);
+    this.db
+      .prepare("UPDATE worker SET sessionFile = ?, lastKnownEntryId = ?, updatedAt = ? WHERE workerId = ?")
+      .run(sessionFile, lastKnownEntryId, Date.now(), workerId);
   }
 
   setWorkerState(workerId: string, state: string, lastOutcome?: string): void {

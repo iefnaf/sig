@@ -36,11 +36,10 @@ export interface StartSpec {
   prompt: string;
   /** Correlates the run window with the steward command (ADR-0001 marker). */
   commandId: string;
-  /** §6.3 recovery evidence: called with the session file as soon as get_state answers,
-   *  before the prompt is sent, so a crash in between is still decidable from the tail. */
-  onSession?: (sessionFile: string, lastKnownEntryId: string | null) => void;
-  /** Set when the prompt's commandId must land in the session as a custom entry. */
-  markerExpected?: boolean;
+  /** §6.3/§10 recovery evidence: fires exactly once after get_state answers and BEFORE the
+   *  prompt is sent — with the session file and its current tail entry id (null file when
+   *  the agent reports none), so a crash anywhere past this point stays decidable. */
+  onSession?: (sessionFile: string | null, lastKnownEntryId: string | null) => void;
   /** approveProject (§13): the repo's local trust flag — pi runs with --approve. Never
    * taken from the command; set by the WorkerManager from the LocalStore's repo row. */
   approveProject?: boolean;
@@ -143,11 +142,11 @@ export interface AgentAdapter {
   start(spec: StartSpec): Promise<WorkerHandle>; // must
   send(
     id: string,
-    input: { text: string; images?: { data: string; mimeType: string }[]; commandId?: string; markerExpected?: boolean },
+    input: { text: string; images?: { data: string; mimeType: string }[]; commandId?: string },
     how: Delivery,
   ): Promise<{ effect?: string }>; // must
   interrupt(id: string): Promise<InterruptResult>; // must
-  resume(id: string, reason: string, options?: { commandId?: string; markerExpected?: boolean }): Promise<void>; // must
+  resume(id: string, reason: string, options?: { commandId?: string }): Promise<void>; // must
   stopProcess(id: string): Promise<void>; // must; frees memory, the session stays on disk
   on(event: "worker-event", fn: (e: RawAdapterEvent) => void): void;
   /** Whether the worker's process is alive (idle-hot counts). Used to pick the resume path (§9.2). */
