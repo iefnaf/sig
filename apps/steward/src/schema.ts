@@ -661,14 +661,34 @@ export const MIGRATIONS: readonly Migration[] = [
     },
   },
   {
+    // Issue #13 review: when hello.workers reconciliation is gated behind undelivered events
+    // (snap.lastSeq > processedUpTo), the DO remembers the pending verdict for a reaped
+    // worker and applies it once the event stream catches up — otherwise a worker reaped
+    // while its machine was offline stays `lost` forever even though it is alive (the events
+    // that would prove it are exactly the ones that blocked the reconcile). Numbered 013:
+    // main's #23 took 009/010, #20 took 011, #7 kept 010_routing, #18 took 012_notes; ids
+    // are unique, which is what the ledger keys on — the number keeps the order readable.
+    id: "013_reap_reconcile",
+    up: (sql) => {
+      sql`CREATE TABLE IF NOT EXISTS sh_reap_pending (
+        workerId TEXT PRIMARY KEY,
+        threadId TEXT NOT NULL,
+        snapState TEXT NOT NULL,
+        lastSeq INTEGER NOT NULL,
+        createdAt INTEGER NOT NULL
+      )`;
+    },
+  },
+  {
     id: "013_notes_maintenance",
     up: (sql) => {
-      // A refused write must not break the hard cap. Remember the latest request for room
-      // per placement instead; the daily pass can free it even if the model gives up.
+      // A refused write must not break the hard cap. Remember the request for room instead
+      // (one row per distinct request — PR #53 review finding 3); the daily pass frees it
+      // even if the model gives up.
       sql`CREATE TABLE IF NOT EXISTS sh_note_pressure (
         layer TEXT NOT NULL, scope_repoId TEXT NOT NULL, text TEXT NOT NULL, chars INTEGER NOT NULL,
-        kind TEXT NOT NULL DEFAULT 'fact', evidence TEXT,
-        PRIMARY KEY (layer, scope_repoId)
+        kind TEXT NOT NULL DEFAULT 'fact', evidence TEXT, replaces TEXT,
+        PRIMARY KEY (layer, scope_repoId, text)
       )`;
       ignoringDuplicateColumn(() => {
         sql`ALTER TABLE sh_note_log ADD COLUMN delivery TEXT NOT NULL DEFAULT 'reply'`;

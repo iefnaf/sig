@@ -1,9 +1,11 @@
 // WorkerManager, docs/design/connector-pi.md §2/§4.4/§5/§6/§8/§9/§11: worker lifecycle,
 // command handling with dedup, locks, worktrees, event normalization into persisted
 // WorkerEvents (seq per worker, written to LocalStore BEFORE send), the merge of GitFacts
-// into the `report` event, and the §9 failure/recovery slice — orphan cleanup from
-// descendant snapshots (§9.3), startup reconciliation with the session-tail check (§9.1),
-// and automatic resume with the fixed prompt, 30 s backoff, and the ≤2/hour budget (§9.2).
+// into the `report` event, the §9 failure/recovery slice — orphan cleanup from descendant
+// snapshots (§9.3), startup reconciliation with the session-tail check (§9.1), and automatic
+// resume with the fixed prompt, 30 s backoff, and the ≤2/hour budget (§9.2) — and the stall
+// watchdog (issue #13, ADR-0001): silent + cold-CPU workers get one in-place respawn, then
+// settle as error:stall.
 import type { AgentAdapter, Delivery, ErrorClass, RawAdapterEvent, StartSpec, WorkerHandle, WorkerMode } from "./agent.ts";
 import { PartialInterruptError } from "./agent.ts";
 import { classifyError } from "./adjudication.ts";
@@ -16,6 +18,7 @@ import { inspectSessionTail, type SessionTail } from "./session-tail.ts";
 import { readSessionHistory } from "./session-history.ts";
 import type { HistoryPage } from "@shepherd/protocol";
 import type { LocalStore, RegisteredRepo, WorkerRow } from "./store.ts";
+import { StallWatchdog, stallContinueNote, type StallWatchdogOptions, type WatchdogCandidate } from "./watchdog.ts";
 import { WorktreeManager } from "./worktree.ts";
 import { join } from "node:path";
 
@@ -129,6 +132,8 @@ export interface WorkerManagerOptions {
   emit?: (workerId: string, fields: Record<string, unknown>) => void;
   now?: () => number;
   recovery?: RecoveryOptions;
+  /** Stall-watchdog knobs (tests shrink timers and inject CPU samples). */
+  watchdog?: StallWatchdogOptions;
 }
 
 /** workerId must satisfy pi's --session-id restrictions (§4.2). */
@@ -194,6 +199,15 @@ export class WorkerManager {
   private readonly abortWaiters = new Map<string, Set<() => void>>();
   private readonly abortSettleTimeoutMs: number;
 
+  // --- stall watchdog (issue #13) -----------------------------------------------------------
+  private readonly watchdog: StallWatchdog;
+  /**
+   * The original task prompt per worker, so a stall respawn can resend it with the
+   * continuation note. Survives process_exit (the process dies before the respawn); a new
+   * start_worker for the same id overwrites it.
+   */
+  private readonly runPrompts = new Map<string, string>();
+
   constructor(options: WorkerManagerOptions) {
     this.store = options.store;
     this.stateDir = options.stateDir;
@@ -211,6 +225,10 @@ export class WorkerManager {
     this.listDescendantsFn = recovery.listDescendants ?? listDescendants;
     this.killOrphansFn = recovery.killOrphans ?? killOrphans;
     this.inspectTailFn = recovery.inspectTail ?? inspectSessionTail;
+    this.watchdog = new StallWatchdog(options.watchdog ?? {}, {
+      candidates: () => this.watchdogCandidates(),
+      onStrike: (workerId, strike, why) => this.handleStallStrike(workerId, strike, why),
+    });
     this.adapter.on("worker-event", (event) => {
       void this.onAdapterEvent(event).catch((err) => {
         // Event handling must never take the connector down (e.g. store closed at shutdown).
@@ -274,6 +292,8 @@ export class WorkerManager {
     if (!WORKER_ID_RE.test(args.workerId)) {
       throw new CommandError("bad_worker_id", `workerId '${args.workerId}' is not a valid pi session id (§4.2)`);
     }
+    // A fresh task: any leftover strike/prompt state from a previous run of this id is void.
+    this.watchdog.forget(args.workerId);
     if (typeof args.prompt !== "string" || args.prompt.length === 0) {
       throw new CommandError("bad_request", "prompt is required");
     }
@@ -377,6 +397,9 @@ export class WorkerManager {
       }
 
       this.active.set(args.workerId, { repoId: args.repoId, worktree, branch, base });
+      // The original task prompt, so a stall respawn can resend it with the continuation
+      // note (issue #13); cleared when the run ends or the launch fails.
+      this.runPrompts.set(args.workerId, args.prompt);
 
       const spec: StartSpec = {
         workerId: args.workerId,
@@ -426,6 +449,7 @@ export class WorkerManager {
         base,
       });
       this.startSnapshotLoop();
+      this.watchdog.start();
       // `started` (§11.1): successful start — the run is live, progress follows.
       await this.emitEvent(args.workerId, "started", {
         sessionId: handle.sessionId,
@@ -436,6 +460,8 @@ export class WorkerManager {
     } catch (err) {
       releaseLock(this.stateDir, args.workerId);
       this.active.delete(args.workerId);
+      // The launch failed (or was aborted by a stop): the original prompt is void either way.
+      this.runPrompts.delete(args.workerId);
       if (err instanceof CommandError && err.code === "aborted") {
         // A stop settled this worker (idle + settled:aborted) while the launch was in
         // flight; the launch must not overwrite that with broken/running state or events.
@@ -517,6 +543,10 @@ export class WorkerManager {
     await this.cleanupOrphans(workerId);
     if (inFlight) {
       this.store.setWorkerState(workerId, "idle", "stopped");
+      // The run ended at the user's word: stall strikes and the stall-respawn prompt are
+      // void (a later strike on a fresh run of this id must start at strike 1 again).
+      this.watchdog.forget(workerId);
+      this.runPrompts.delete(workerId);
       await this.emitEvent(workerId, "settled", { outcome: "aborted" });
       // §8.2: the serial write slot freed with the runner.
       this.pumpQueuedWorkers();
@@ -1314,6 +1344,7 @@ export class WorkerManager {
         base: worker.base,
       });
       this.startSnapshotLoop();
+      this.watchdog.start();
       await this.emitEvent(workerId, "resumed", { reason, count });
     } catch (err) {
       releaseLock(this.stateDir, workerId);
@@ -1335,6 +1366,8 @@ export class WorkerManager {
    * the signal the steward routes to the user (auth-class failures tell them to fix
    * credentials on the machine; everything else asks for a decision). */
   private async breakWorker(workerId: string, errorClass: ErrorClass, detail: string, lastOutcome: string): Promise<void> {
+    this.watchdog.forget(workerId);
+    this.runPrompts.delete(workerId);
     this.store.setWorkerState(workerId, "broken", lastOutcome);
     // A broken worker can never deliver what is still queued on it (§6.2): settle those
     // commands now instead of leaving them pending until a restart marks them ambiguous.
@@ -1348,6 +1381,144 @@ export class WorkerManager {
     await this.emitEvent(workerId, "settled", { outcome: "error", errorClass, lastText: detail });
     // §8.2: a broken write worker frees the repo's serial slot for the next queued one.
     this.pumpQueuedWorkers();
+  }
+
+  // --- Stall watchdog (issue #13, ADR-0001) --------------------------------------------------
+
+  /** Live processes in lifecycle states the watchdog may declare stalled. */
+  private watchdogCandidates(): WatchdogCandidate[] {
+    if (this.crashed) return [];
+    return (this.adapter.workerActivity?.() ?? []).filter(({ workerId }) => {
+      const worker = this.store.getWorker(workerId);
+      return worker !== null && (worker.state === "running" || worker.state === "recovering");
+    });
+  }
+
+  /**
+   * A confirmed stall (silent past the threshold on two cold CPU samples). Strike 1: respawn
+   * in place — same worktree, same session id, the original prompt plus a continuation note.
+   * Strike 2 (the respawned run stalled too): terminal `error:stall`, routed to the user by
+   * the settled event. The stall detection itself rides a `progress` event out first so the
+   * ledger (and the DO's own stall alarm) sees the respawn as activity.
+   */
+  private async handleStallStrike(workerId: string, strike: 1 | 2, why: string): Promise<void> {
+    if (this.crashed) return;
+    const worker = this.store.getWorker(workerId);
+    if (!worker || (worker.state !== "running" && worker.state !== "recovering")) return; // run ended meanwhile
+    await this.emitEvent(workerId, "progress", { phase: "tool", tool: "stall-watchdog", target: why.slice(0, 80) });
+    if (strike === 1) {
+      this.store.setWorkerState(workerId, "recovering", "stall");
+      await this.reclaimStalledProcess(workerId); // expected exit: releases the lock, no lost/auto-resume
+      try {
+        // Inside withTransition (PR #46 review round 3): a send parked on `recovering` during
+        // the strike window drains the moment the respawn lands — without this the user's
+        // message would sit in pendingSends until the run settled hours later.
+        await this.withTransition(workerId, () => this.respawnStalled(workerId, why));
+      } catch (err) {
+        // A stop is not a transition and can settle the run mid-respawn (idle +
+        // settled:aborted); respawnStalled also aborts itself when its `recovering` was
+        // consumed. The user's stop is the verdict then — never a terminal error:stall on
+        // top of it (two settles for one run).
+        const settled = this.store.getWorker(workerId);
+        if (err instanceof CommandError && err.code === "aborted" && settled && settled.state !== "running" && settled.state !== "recovering") {
+          this.watchdog.forget(workerId);
+          this.runPrompts.delete(workerId);
+          return;
+        }
+        const message = err instanceof Error ? err.message : String(err);
+        await this.breakWorker(workerId, "stall", `stall watchdog respawn failed: ${message}`, "error:stall");
+      }
+      return;
+    }
+    await this.reclaimStalledProcess(workerId);
+    // The same stop-race guard as strike 1: if a stop settled this run while the wedged
+    // process was being reclaimed, its aborted settle is the verdict — not a stall error.
+    const settled = this.store.getWorker(workerId);
+    if (!settled || (settled.state !== "running" && settled.state !== "recovering")) {
+      this.watchdog.forget(workerId);
+      this.runPrompts.delete(workerId);
+      return;
+    }
+    await this.breakWorker(workerId, "stall", `${why}; still wedged after one automatic restart`, "error:stall");
+  }
+
+  /** The raw process reclaim the stall strikes need: close the process, sweep §9.3 orphans,
+   *  release the lock — and NOTHING else. The public stopProcess (issue #16/#9) additionally
+   *  settles an in-flight worker as `aborted`; for a stall respawn that settle would be a lie
+   *  (the run continues in place) and for strike 2 it would race the terminal error:stall
+   *  settle, so both paths bypass it. */
+  private async reclaimStalledProcess(workerId: string): Promise<void> {
+    this.cancelIdleReclaim(workerId);
+    const timer = this.resumeTimers.get(workerId);
+    if (timer) {
+      clearTimeout(timer);
+      this.resumeTimers.delete(workerId);
+    }
+    await this.adapter.stopProcess(workerId); // process_exit handler releases the lock
+    await this.cleanupOrphans(workerId);
+    // The process_exit handler's releaseLock rides a microtask; release again rather than
+    // race it — releaseLock on an already-removed file is a no-op.
+    releaseLock(this.stateDir, workerId);
+  }
+
+  /** Relaunches a stalled worker's session with the original task plus the continue note. */
+  private async respawnStalled(workerId: string, why: string): Promise<void> {
+    const worker = this.store.getWorker(workerId);
+    if (!worker) throw new CommandError("not_found", `worker ${workerId} is unknown on this machine`);
+    const repo = this.store.getRepo(worker.repoId);
+    const cwd = worker.worktree ?? repo?.path;
+    if (!cwd) throw new CommandError("startup_failed", `no worktree or repo path to respawn worker ${workerId} in`);
+    const lock = acquireLock(this.stateDir, workerId); // released by the expected process_exit above
+    if (!lock.ok) throw new CommandError("lock_held", `worker ${workerId} is locked by pid ${lock.pid}`, true);
+    const original = this.runPrompts.get(workerId) ?? RESUME_PROMPT;
+    const spec: StartSpec = {
+      workerId,
+      threadId: worker.threadId,
+      cwd,
+      mode: worker.mode === "readonly" ? "readonly" : "write",
+      prompt: `${original}\n\n${stallContinueNote(why)}`,
+      commandId: `stall-respawn-${this.now()}`,
+      // §13: reproduce the original launch's trust mode — the respawn is the same run.
+      approveProject: repo?.approved === true ? true : undefined,
+    };
+    this.active.set(workerId, {
+      repoId: worker.repoId,
+      worktree: worker.worktree ?? undefined,
+      branch: worker.branch ?? undefined,
+      base: worker.base ?? undefined,
+    });
+    try {
+      const handle = await this.adapter.start(spec);
+      // A stop is not a transition and can land while adapter.start is in flight: it settles
+      // the worker (idle + settled:aborted) and its verdict must survive (the resume path
+      // applies the same check). If this strike's `recovering` is gone the stop won the race
+      // — reclaim the just-spawned process, emit nothing, let the caller honor the stop
+      // (PR #46 review round 3, finding 2b).
+      const current = this.store.getWorker(workerId);
+      if (!current || current.state !== "recovering") {
+        await this.adapter.stopProcess(workerId).catch(() => undefined); // expected exit: no settle
+        throw new CommandError("aborted", `worker ${workerId} was stopped during the stall respawn`);
+      }
+      this.store.upsertWorker({
+        workerId,
+        threadId: worker.threadId,
+        repoId: worker.repoId,
+        mode: spec.mode,
+        state: "running",
+        sessionId: handle.sessionId,
+        sessionFile: handle.sessionFile ?? null,
+        branch: worker.branch,
+        worktree: worker.worktree,
+        base: worker.base,
+      });
+      this.startSnapshotLoop();
+      this.watchdog.start();
+      await this.emitEvent(workerId, "resumed", { reason: "stall", count: 1 });
+    } catch (err) {
+      releaseLock(this.stateDir, workerId);
+      this.active.delete(workerId);
+      throw err;
+    }
   }
 
   // --- Orphan cleanup (§9.3) ----------------------------------------------------------------
@@ -1401,6 +1572,7 @@ export class WorkerManager {
   stop(): void {
     this.crashed = true;
     this.stopSnapshotLoop();
+    this.watchdog.stop();
     for (const timer of this.resumeTimers.values()) clearTimeout(timer);
     this.resumeTimers.clear();
     for (const timer of this.idleTimers.values()) clearTimeout(timer);
@@ -1414,6 +1586,7 @@ export class WorkerManager {
   simulateCrash(): void {
     this.crashed = true;
     this.stopSnapshotLoop();
+    this.watchdog.stop();
     for (const timer of this.resumeTimers.values()) clearTimeout(timer);
     this.resumeTimers.clear();
     for (const timer of this.idleTimers.values()) clearTimeout(timer);
@@ -1469,6 +1642,8 @@ export class WorkerManager {
         for (const waiter of this.abortWaiters.get(event.workerId) ?? []) waiter();
         this.abortWaiters.delete(event.workerId);
         this.throttles.delete(event.workerId);
+        this.watchdog.forget(event.workerId);
+        this.runPrompts.delete(event.workerId);
         if (event.outcome === "error" && event.errorClass === "transient") {
           // §5.2/§9.2: one automatic resume for transient-class errors (backoff + budget apply).
           this.scheduleAutoResume(event.workerId, "error:transient");
@@ -1485,6 +1660,11 @@ export class WorkerManager {
         this.throttles.delete(event.workerId);
         this.active.delete(event.workerId);
         this.cancelIdleReclaim(event.workerId); // the process is gone; nothing to reclaim
+        // Deliberately NOT forgetting watchdog strikes here: an expected exit is often the
+        // stall respawn's own stop (forgetting would reset strike 2 to strike 1 and loop
+        // forever), and after an unexpected exit + auto-resume the same task keeps its
+        // strikes (spike semantics). Strikes reset when the RUN ends: settled / broken /
+        // a fresh start_worker.
         const worker = this.store.getWorker(event.workerId);
         // An unexpected exit mid-run → lost (§9.1): sweep this worker's orphaned tool
         // children (§9.3), then try the automatic resume (§9.2).

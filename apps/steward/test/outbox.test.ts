@@ -93,11 +93,15 @@ describe("outbox: enqueue and delivery", () => {
     expect((await ownerStub().outboxRow(cmdId))?.state).toBe("ambiguous");
   });
 
-  it("notAfter already in the past at delivery time marks the command expired without sending", async () => {
+  it("notAfter already in the past at delivery time fails the command (not_after) without sending", async () => {
     const { deviceId, token } = await pairDevice("expired-machine");
     const { ws, reader } = await connectAndHello(deviceId, token);
-    const { state } = await ownerStub().enqueue(deviceId, "send", {}, { notAfter: Date.now() - 1000 });
-    expect(state).toBe("expired");
+    const { cmdId, state } = await ownerStub().enqueue(deviceId, "send", {}, { notAfter: Date.now() - 1000 });
+    // Issue #13 review finding 1: a lapsed delivery window is a queue timeout, NOT the
+    // user's cancellation — 'expired' belongs to the dispatcher's cancel path alone, so the
+    // reap sweep pushes for this row instead of quietly recording a withdrawal.
+    expect(state).toBe("failed");
+    expect((await ownerStub().outboxRow(cmdId))?.failReason).toBe("not_after");
 
     // Nothing was sent over the wire for it.
     ws.send(JSON.stringify({ t: "bogus", id: "p1" }));
