@@ -112,7 +112,10 @@ export class FeishuAdapter implements ChannelAdapter {
   constructor(opts: FeishuAdapterOptions) {
     this.#creds = opts.credentials;
     this.#tokens = opts.tokenStore;
-    this.#fetcher = opts.fetcher ?? fetch;
+    // Bind the global: a detached `fetch` reference throws "Illegal invocation" inside
+    // workerd (every local `wrangler dev` outbound died there until this — found by the
+    // 2026-10-17 local e2e). An injected test fetcher is used as-is.
+    this.#fetcher = opts.fetcher ?? fetch.bind(globalThis);
     this.#sendTimeoutMs = opts.sendTimeoutMs ?? SEND_TIMEOUT_MS;
     this.#now = opts.now ?? Date.now;
     this.#apiBase = opts.apiBase ?? FEISHU_API_BASE;

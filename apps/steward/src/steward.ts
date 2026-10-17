@@ -2578,7 +2578,10 @@ export class Steward extends Agent<Env> {
   // FEISHU_API exists only in tests (a service binding that mocks Feishu); production calls
   // the real endpoints via global fetch. Covers both the open API and the accounts device flow.
   private feishuFetcher(): typeof fetch {
-    return this.env.FEISHU_API ? (this.env.FEISHU_API.fetch.bind(this.env.FEISHU_API) as typeof fetch) : fetch;
+    // Bind the fallback: inside the Durable Object isolate a detached `fetch` reference
+    // throws workerd's "Illegal invocation" (every outbound died there in local dev until
+    // this — found by the 2026-10-17 local e2e). The service-binding branch is bound already.
+    return this.env.FEISHU_API ? (this.env.FEISHU_API.fetch.bind(this.env.FEISHU_API) as typeof fetch) : fetch.bind(globalThis);
   }
 
   protected newFeishuAdapter(
