@@ -1368,7 +1368,14 @@ export class Steward extends Agent<Env> {
     const row = this.sql<{ workerId: string | null; kind: string }>`
       SELECT workerId, kind FROM outbox WHERE cmdId = ${cmdId}
     `[0];
-    if (!row || row.kind !== "start_worker" || !row.workerId) return;
+    if (!row || !row.workerId) return;
+    // A failed resume send (issue #8): revert the resume-pending `starting` back to idle —
+    // the session itself is intact — and push the failure to the user.
+    if (row.kind === "send" && this.ledger.workers.markResumeFailed(row.workerId, cmdId, reason)) {
+      void this.drainNotifications();
+      return;
+    }
+    if (row.kind !== "start_worker") return;
     if (this.ledger.workers.markStartFailed(row.workerId, cmdId, reason)) {
       void this.drainNotifications();
     }
@@ -1536,6 +1543,15 @@ export class Steward extends Agent<Env> {
 
     // failure_push: either the start never happened or the run ended in a failure class that
     // needs a human (steward.md §5.3); the matching open question carries the specifics.
+    if (worker.lastOutcome?.startsWith("resume_failed:")) {
+      return failureCard(
+        `接续原会话失败`,
+        `${worker.lastOutcome.slice("resume_failed:".length)}。原会话未受影响，重新说一次要做什么即可。`,
+        thread.title,
+        footer,
+        detailsUrl ?? undefined,
+      );
+    }
     const needsYou =
       boundQuestion?.status === "open" && boundQuestion.text.trim().length > 0
         ? boundQuestion.text
@@ -1816,8 +1832,33 @@ export class Steward extends Agent<Env> {
           continue;
         }
         if (worker.state === "starting") {
-          const cmd = worker.cmdId ? this.commandState(worker.cmdId) : null;
-          if (cmd && (cmd.state === "failed" || cmd.state === "expired")) {
+          const cmdId = worker.cmdId;
+          const cmd = cmdId ? this.commandState(cmdId) : null;
+          // A resume-pending worker (issue #8): its cmdId points at the resume SEND, not a
+          // start_worker — markResumePending overwrote it. The session underneath is intact,
+          // so a failed/expired send must revert the worker to idle (never `broken`, never a
+          // "派发失败" push): the next dispatch can resume or re-dispatch freely. Without this
+          // routing the sweep would treat every failed resume send as a failed start (PR #54
+          // review, blocker 3) and break a healthy session.
+          if (cmd?.kind === "send") {
+            if (cmd.state === "failed") {
+              if (this.ledger.workers.markResumeFailed(worker.workerId, cmdId!, this.startFailureText(cmd))) reaped += 1;
+              continue;
+            }
+            if (cmd.state === "expired") {
+              // The dispatcher's cancel normally settled it already; the sweep is the backstop.
+              if (this.ledger.workers.markResumeCancelled(worker.workerId, cmdId!)) reaped += 1;
+              continue;
+            }
+            if (cmd.state === "queued" || cmd.state === "sent") {
+              // Still deliverable — the same wait-online rule as starts.
+              continue;
+            }
+            // done/accepted/ambiguous: the send may have reached the machine without an
+            // event ever landing — fall through to the horizon logic below, whose quiet
+            // lost+reaped is safe for a session worker too (a live event resurrects).
+          }
+          if (cmd && cmd.kind !== "send" && (cmd.state === "failed" || cmd.state === "expired")) {
             const settled =
               cmd.state === "expired"
                 ? // The user withdrew it (`expired` is the dispatcher's cancel state and its
@@ -1880,9 +1921,9 @@ export class Steward extends Agent<Env> {
   }
 
   /** The outbox row's state/failReason for a worker's start_worker command, if it exists. */
-  private commandState(cmdId: string): { state: string; failReason: string | null } | null {
-    return this.sql<{ state: string; failReason: string | null }>`
-      SELECT state, failReason FROM outbox WHERE cmdId = ${cmdId}
+  private commandState(cmdId: string): { state: string; failReason: string | null; kind: string } | null {
+    return this.sql<{ state: string; failReason: string | null; kind: string }>`
+      SELECT state, failReason, kind FROM outbox WHERE cmdId = ${cmdId}
     `[0] ?? null;
   }
 
@@ -3267,6 +3308,51 @@ export class Steward extends Agent<Env> {
       provenance: "test",
       cmdId: input.cmdId ?? `test:${ulid()}`,
     });
+  }
+
+  /** Test-only: force a worker's recorded context usage percent (the connector reports it
+   *  in settled.usage.contextUsage; issue #8's high-context rule reads it at dispatch). */
+  async setWorkerContextForTest(workerId: string, percent: number | null): Promise<void> {
+    this.sql`UPDATE sh_worker SET contextPercent = ${percent} WHERE workerId = ${workerId}`;
+  }
+
+  /** Test-only: set a worker's state + outcome directly (e.g. terminally broken). */
+  async setWorkerStateForTest(workerId: string, state: string, lastOutcome: string): Promise<void> {
+    this.sql`UPDATE sh_worker SET state = ${state}, lastOutcome = ${lastOutcome}, updatedAt = ${Date.now()} WHERE workerId = ${workerId}`;
+  }
+
+  /** Test-only: force a still-queued command into a terminal failure — the idle sweep's
+   *  queue-timeout shape (`failed/idle`), without waiting out the real ~30 min. */
+  async failQueuedForTest(cmdId: string, failReason: string): Promise<void> {
+    this.sql`UPDATE outbox SET state = 'failed', failReason = ${failReason} WHERE cmdId = ${cmdId}`;
+  }
+
+  /** Test-only: backdates a worker's lastEventAt (the sweep's silence clock). */
+  async backdateWorkerForTest(workerId: string, minutes: number): Promise<void> {
+    this.sql`UPDATE sh_worker SET lastEventAt = ${Date.now() - minutes * 60_000} WHERE workerId = ${workerId}`;
+  }
+
+  /** Test read of the memory module's handoff brief (issue #8, steward.md §2.6). */
+  async handoffForTest(
+    threadId: string,
+    fromWorker?: string,
+  ): Promise<import("./handoff.ts").HandoffBrief | null> {
+    return this.ledger.handoff.build(threadId, fromWorker);
+  }
+
+  /** Test read of the summary-version state (issue #8, steward.md §2.6). */
+  async summaryStateForTest(
+    threadId: string,
+  ): Promise<{ versions: Array<{ version: number; summary: string }>; status: { updates: number; rewriteDue: boolean } }> {
+    return {
+      versions: this.ledger.threads.summaryVersions(threadId).map((v) => ({ version: v.version, summary: v.summary })),
+      status: this.ledger.threads.summaryStatus(threadId),
+    };
+  }
+
+  /** Test-only: writes through the ledger's threads.update (the update_thread tool's path). */
+  async updateThreadForTest(threadId: string, patch: { title?: string; goal?: string; summary?: string }): Promise<boolean> {
+    return this.ledger.threads.update(threadId, patch);
   }
 
   /** Test-only: pushes a thread's lastActivityAt back `days` — the idle-attach band (#7). */

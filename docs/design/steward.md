@@ -206,6 +206,28 @@ Task at hand     ← written by the steward
 
 Briefs carry **pointers, not content** (connector-pi.md §5.3 / spec §5.3).
 
+> **Implemented (issue #8).** Summary versions live in `sh_thread_summary` (`(threadId, version)`
+> PK); the version number doubles as the cumulative update count, and blank or unchanged
+> re-saves move nothing. A thread that predates the table enters history with its then-current
+> summary as version 1, so the counter never reads zero on a thread with a past. The
+> from-scratch prompt fires where it is actionable: the ⟦event⟧ wake text and the
+> `update_thread` tool result both flag it when the NEXT update lands on the every-10th
+> boundary (the 10th, 20th, … update is the rewrite); `get_thread` always exposes
+> `summaryUpdates` / `summaryRewriteDue`. `handoff.build` (ledger.ts) gathers rows — goal,
+> summary, all the thread's reports oldest-first, the from-worker (default: the thread's
+> latest), and the thread's latest reported git facts — and `handoff.ts` assembles/renders
+> deterministically: decisions dedupe by normalized wording with the FIRST reporter credited,
+> leftovers come from the newest report that named any, pointers carry the connector-collected
+> branch/commits(≤20)/changed-files(≤100) plus an uncommitted-changes warning, and every item
+> renders as a single-line bullet so worker-reported text can never forge a brief section. The
+> resume-vs-new-session rule (spec §5.3) is deterministic in the dispatcher (`decideContinuation`):
+> the same agent on the same machine (healthy session, same repo, same mode, context usage
+> < 80%) resumes by sending the task into the existing session — the connector's idle-cold
+> relaunch is the resume mechanism; anything else (agent/machine/repo/mode switch, context
+> ≥ 80%, an explicit fresh-review request, a broken session) starts a new session on the
+> thread's latest worker branch with the brief prefixed and `parentWorker` recorded. The 80%
+> threshold stands in until real-world data exists (connector-pi.md §15.5).
+
 ## 3. Routing
 
 Goal (spec §0 and principles): better to ask one extra time than to route wrong.

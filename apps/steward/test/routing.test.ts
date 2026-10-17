@@ -63,7 +63,12 @@ async function oneIdleThread(title: string): Promise<{ fake: FakeConnector; thre
   if (outcome.kind !== "dispatched") throw new Error(`dispatch failed: ${JSON.stringify(outcome)}`);
   const threadId = outcome.threadId;
   const workerId = outcome.workerId;
-  fake.send({ t: "cmd_ack", re: (await fake.waitForCmds(1))[0]!.id, status: "accepted" });
+  const [cmd] = await fake.waitForCmds(1);
+  fake.send({ t: "cmd_ack", re: cmd!.id, status: "accepted" });
+  // A realistic leg: started (the session exists on the connector) → report → settled.
+  // Without the started event the worker has no sessionId and a follow-up correctly
+  // opens a NEW session instead of resuming (issue #8 / PR #54 review finding 1).
+  await fake.emit("started", workerId, { sessionId: workerId, branch: `shepherd/${title}-1` });
   await fake.emit("report", workerId, { type: "report", status: "done", summary: `${title}完成` });
   await fake.emit("settled", workerId, { type: "settled", outcome: "reported" });
   await waitRunsSettled();
@@ -199,8 +204,10 @@ describe("the routing confidence gate (steward.md §3.3 / §7.2, issue #7)", () 
     );
     await dm("把『定时清理临时文件』的保留期改成 7 天");
     const cmds = await fake.waitForCmds(2); // 1 = the seeding dispatch, 2 = the attach
-    expect(cmds[1]!.kind).toBe("start_worker");
-    expect(String((cmds[1]!.args as Record<string, unknown>).threadId)).toBe(threadId);
+    // Same machine + agent → the attach resumes the idle session (issue #8): the deliverable
+    // is a send into that worker. The gate under test never fired.
+    expect(cmds[1]!.kind).toBe("send");
+    expect(String((cmds[1]!.args as Record<string, unknown>).text)).toContain("保留期改成 7 天");
     await waitRunsSettled();
     expect(await sawToolResult("已续派")).not.toBeNull();
     expect(await sawToolResult("必须给出 routing")).toBeNull(); // the gate never fired
@@ -332,8 +339,8 @@ describe("ask_user candidate buttons and click routing (steward.md §3.3/§9.1, 
     const first = (card.card?.elements ?? []).flatMap((e) => e.actions ?? [])[0]!.value!.action!;
     await postEvent(cardActionEvent(askCards[0]!.providerMsgId!, first));
     const cmds = await fake.waitForCmds(2); // 1 = seeding, 2 = the click run's attach
-    expect(cmds[1]!.kind).toBe("start_worker");
-    expect(String((cmds[1]!.args as Record<string, unknown>).threadId)).toBe(threadId);
+    expect(cmds[1]!.kind).toBe("send"); // same-machine attach resumes (issue #8)
+    expect(String((cmds[1]!.args as Record<string, unknown>).text)).toContain("按方案A修");
     await waitRunsSettled();
     const runs = (await llmState()).runs;
     const clickRun = runs.find((r) => r.operationId.startsWith("user:evt_card_"));
@@ -452,8 +459,8 @@ describe("settle-time dispatch verification (spike-conclusions §2, issue #7)", 
     );
     await dm("再补几个单测", `om_vr_${crypto.randomUUID().slice(0, 6)}`, card!.providerMsgId!);
     const cmds = await fake.waitForCmds(2); // 1 = seeding, 2 = the corrective dispatch
-    expect(cmds[1]!.kind).toBe("start_worker");
-    expect(String((cmds[1]!.args as Record<string, unknown>).threadId)).toBe(threadId);
+    expect(cmds[1]!.kind).toBe("send"); // same-machine attach resumes (issue #8)
+    expect(String((cmds[1]!.args as Record<string, unknown>).text)).toContain("再补几个单测");
     await waitRunsSettled();
     const runs = (await llmState()).runs;
     const verify = runs.find((r) => r.kind === "verify");

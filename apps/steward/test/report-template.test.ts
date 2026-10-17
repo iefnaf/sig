@@ -43,9 +43,11 @@ const worker: WorkerRow = {
   sessionId: "w_test",
   branch: "shepherd/login-1",
   cmdId: "cmd_1",
+  parentWorker: null,
   lastOutcome: "reported:done",
   lastEventAt: 1,
   lastProgress: null,
+  contextPercent: null,
   createdAt: 1,
 };
 

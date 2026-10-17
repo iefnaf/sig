@@ -193,7 +193,7 @@ describe("the dispatch service (Dispatcher.startWorker)", () => {
     expect(JSON.stringify(cards[0]?.payload)).toContain("排队等上线");
   });
 
-  it("attaches to an existing thread and relays the previous branch as base", async () => {
+  it("attaches to an existing thread on the same machine and resumes the previous session (issue #8)", async () => {
     const fake = await pairFakeConnector("mac-studio", {
       run: { status: "done", summary: "第一段完成", branch: "shepherd/leg-1" },
     });
@@ -207,11 +207,24 @@ describe("the dispatch service (Dispatcher.startWorker)", () => {
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
     const threadId = (await ownerStub().debugSnapshot()).threads[0]!.threadId;
+    const leg1 = (await ownerStub().debugSnapshot()).threads[0]!.workers[0]!;
 
+    // Same agent + same machine + healthy session → the task goes INTO the old session
+    // (spec §5.3 case 1): a `send`, no new worker row, no base, no brief.
     const second = await ownerStub().dispatchForTest({ prompt: "第二段任务", repoRef: "repo-a", threadId });
-    expect(second).toMatchObject({ kind: "dispatched", created: false, threadId });
+    expect(second).toMatchObject({
+      kind: "dispatched",
+      created: false,
+      threadId,
+      continuation: { action: "resume", brief: false },
+    });
     const [, cmd2] = await fake.waitForCmds(2);
-    expect((cmd2!.args as Record<string, unknown>).base).toBe("shepherd/leg-1"); // relay (spec §5.3)
+    expect(cmd2!.kind).toBe("send"); // resume mechanism = the connector's §6.2 idle relaunch
+    expect(cmd2!.args).toMatchObject({ workerId: leg1.workerId, text: "第二段任务", intent: "auto" });
+    expect(cmd2!.args).not.toHaveProperty("base");
+    const snap = await ownerStub().debugSnapshot();
+    expect(snap.threads[0]!.workers).toHaveLength(1); // the same session, no second row
+    expect(snap.threads[0]!.workers[0]!.state).toBe("starting"); // resume-pending until `started`
     // cmdId = tool:<taskId> is asserted in llm-reply.test.ts, where the real tool runs
     fake.close();
   });

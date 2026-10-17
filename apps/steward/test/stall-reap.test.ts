@@ -440,6 +440,13 @@ describe("a queued start_worker is never reaped into a duplicate dispatch (issue
   it("keeps the wait_online queue intact through the reap window; the guard holds on the command", async () => {
     const fake = await connectMachine();
     fake.close(); // the machine goes offline before the dispatch
+    // Wait for the DO's onClose to land: the dispatch below must SEE the machine offline,
+    // or it legitimately dispatches-and-queues instead of asking (observed CI flake).
+    for (;;) {
+      const snap = await ownerStub().debugSnapshot();
+      if (snap.machines.every((m) => !m.online)) break;
+      await sleep(25);
+    }
 
     // Dispatch through the deterministic service (the start_worker tool's path): the only
     // machine with the repo is offline → the offline ask card, exactly like the LLM flow.

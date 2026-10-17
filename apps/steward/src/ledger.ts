@@ -6,9 +6,10 @@
 // sh_note* is reached only through the memory module. The situation brief's character
 // budget is brief.ts's.
 import { ulid } from "@shepherd/protocol";
-import type { HelloMessage } from "@shepherd/protocol";
+import type { GitFacts, HelloMessage } from "@shepherd/protocol";
 import { createBudget } from "./budget.ts";
 import { createNotes, type NoteRow } from "./notes.ts";
+import { assembleBrief, type BriefDecision, type HandoffBrief } from "./handoff.ts";
 import { eventWakeText, queueReturnedWakeText } from "./wake-text.ts";
 
 /** Tagged-template SQL over the DO's SQLite (same shape schema.ts migrations use). */
@@ -19,6 +20,10 @@ export type LedgerSql = <T = Record<string, unknown>>(
 
 /** Thread summaries are capped (steward.md §2.6). */
 export const MAX_THREAD_SUMMARY = 600;
+/** §2.6: the module keeps the last N summary versions per Thread. */
+export const SUMMARY_VERSIONS_KEPT = 5;
+/** §2.6: every Nth cumulative summary update is a from-scratch rewrite (anti-drift). */
+export const SUMMARY_REWRITE_EVERY = 10;
 /** The wake merge window (steward.md §5.1/§5.4): events within it become one steward input. */
 export const WAKE_MERGE_MS = 3_000;
 /** Blocked reports give the steward this long before the core forwards the question. */
@@ -30,6 +35,11 @@ export interface LedgerDeps {
   tx: <T>(fn: () => T) => T;
   now?: () => number;
 }
+
+// ---- relay (issue #8, spec §5.3) ------------------------------------------------------------------
+
+export type { HandoffBrief };
+export type { BriefDecision };
 
 // ---- domain shapes (subset of steward.md §2.2 columns) -----------------------------------------
 
@@ -63,9 +73,14 @@ export interface WorkerRow {
   sessionId: string | null;
   branch: string | null;
   cmdId: string | null;
+  /** The worker this one continues from — the relay relationship (issue #8, §2.2). */
+  parentWorker: string | null;
   lastOutcome: string | null;
   lastEventAt: number | null;
   lastProgress: string | null;
+  /** Last-reported context usage in percent (settled.usage.contextUsage) — the
+   *  resume-vs-new-session input for high context usage (issue #8, connector-pi §11.2). */
+  contextPercent: number | null;
   createdAt: number;
 }
 
@@ -84,17 +99,10 @@ export interface ReportRow {
   git: GitFacts | null;
 }
 
-/** Git facts merged into the report event by the connector (connector-pi.md §7.2). */
-export interface GitFacts {
-  branch: string;
-  base: string;
-  ahead: number;
-  dirty: number;
-  filesChanged: number;
-  insertions: number;
-  deletions: number;
-  pushed: boolean;
-}
+/** Git facts merged into the report event by the connector (connector-pi.md §7.2).
+ *  Imported from @shepherd/protocol so both ends share one shape (issue #8 adds the
+ *  pointer fields; they are optional for connectors predating relay briefs). */
+export type { GitFacts };
 
 export interface QuestionRow {
   qid: string;
@@ -372,6 +380,8 @@ export interface NewWorkerInput {
   agent: string;
   mode: string;
   cmdId?: string;
+  /** Relay (issue #8): the worker this session continues from. */
+  parentWorker?: string;
 }
 
 /** One event row lifted out of the protocol layer's `event_inbox`. */
@@ -423,9 +433,11 @@ const viewWorker = (r: Record<string, unknown>): WorkerRow => ({
   sessionId: (r.sessionId as string | null) ?? null,
   branch: (r.branch as string | null) ?? null,
   cmdId: (r.cmdId as string | null) ?? null,
+  parentWorker: (r.parentWorker as string | null) ?? null,
   lastOutcome: (r.lastOutcome as string | null) ?? null,
   lastEventAt: (r.lastEventAt as number | null) ?? null,
   lastProgress: (r.lastProgress as string | null) ?? null,
+  contextPercent: (r.contextPercent as number | null) ?? null,
   createdAt: r.createdAt as number,
 });
 
@@ -511,6 +523,31 @@ export function createLedger(deps: LedgerDeps) {
   // The daily budget counter (issue #28, steward.md §12): sh_usage_day / sh_usage_cursor.
   // Same SQL handle, same transaction wrapper.
   const budget = createBudget({ sql, tx, now });
+
+  /** §2.6 (issue #8): records one landed summary version, keeping the last
+   *  SUMMARY_VERSIONS_KEPT. The version number is also the cumulative update count;
+   *  `previous` (the summary before this update) backfills history for threads that
+   *  predate versioning. */
+  const recordSummaryVersion = (threadId: string, summary: string, previous: string | null): void => {
+    tx(() => {
+      const max =
+        sql<{ m: number }>`SELECT COALESCE(MAX(version), 0) AS m FROM sh_thread_summary WHERE threadId = ${threadId}`[0]!.m;
+      // Backfill: a thread that predates versioning enters history with its prior summary
+      // as version 1, so the counter never lies about how many updates landed.
+      if (max === 0 && previous !== null) {
+        sql`INSERT OR IGNORE INTO sh_thread_summary (threadId, version, summary, at) VALUES (${threadId}, 1, ${previous}, ${now()})`;
+      }
+      const next =
+        sql<{ m: number }>`SELECT COALESCE(MAX(version), 0) AS m FROM sh_thread_summary WHERE threadId = ${threadId}`[0]!.m + 1;
+      sql`INSERT INTO sh_thread_summary (threadId, version, summary, at) VALUES (${threadId}, ${next}, ${summary}, ${now()})`;
+      const stale = sql<{ version: number }>`
+        SELECT version FROM sh_thread_summary WHERE threadId = ${threadId} ORDER BY version DESC LIMIT -1 OFFSET ${SUMMARY_VERSIONS_KEPT}
+      `;
+      for (const row of stale) {
+        sql`DELETE FROM sh_thread_summary WHERE threadId = ${threadId} AND version = ${row.version}`;
+      }
+    });
+  };
 
   const threadFromRow = (r: Record<string, unknown>): ThreadRow => ({
     threadId: r.threadId as string,
@@ -627,11 +664,16 @@ export function createLedger(deps: LedgerDeps) {
     markRead(threadId: string): void {
       sql`UPDATE sh_thread SET unread = 0 WHERE threadId = ${threadId}`;
     },
-    /** The steward's bookkeeping update (§2.6): summaries capped at 600 characters. */
+    /** The steward's bookkeeping update (§2.6): summaries capped at 600 characters; each
+     *  landed summary is versioned (last 5 kept) and the Nth-bounded updates trigger the
+     *  from-scratch rewrite prompt. A blank or unchanged summary does not count as an
+     *  update — only real rewrites move the counter. */
     update(threadId: string, patch: { title?: string; goal?: string; summary?: string }): boolean {
       if (patch.summary !== undefined && patch.summary.length > MAX_THREAD_SUMMARY) return false;
+      if (patch.summary !== undefined && patch.summary.trim().length === 0) return false;
       const before = sql<ThreadRow>`SELECT * FROM sh_thread WHERE threadId = ${threadId}`[0];
       if (!before) return false;
+      const changedSummary = patch.summary !== undefined && patch.summary !== before.summary;
       sql`
         UPDATE sh_thread SET
           title = COALESCE(${patch.title ?? null}, title),
@@ -640,7 +682,22 @@ export function createLedger(deps: LedgerDeps) {
           summaryAt = CASE WHEN ${patch.summary ?? null} IS NULL THEN summaryAt ELSE ${now()} END
         WHERE threadId = ${threadId}
       `;
+      if (changedSummary) recordSummaryVersion(threadId, patch.summary!, before.summary);
       return true;
+    },
+    /** §2.6 (issue #8): the retained summary versions, newest first. */
+    summaryVersions(threadId: string): Array<{ version: number; summary: string; at: number }> {
+      return sql<{ version: number; summary: string; at: number }>`
+        SELECT version, summary, at FROM sh_thread_summary WHERE threadId = ${threadId} ORDER BY version DESC
+      `;
+    },
+    /** §2.6 (issue #8): cumulative summary updates so far, and whether the NEXT one lands on
+     *  the every-10th boundary that must be written from scratch (timeline + reports), not
+     *  edited out of the current summary — the anti-drift rule. */
+    summaryStatus(threadId: string): { updates: number; rewriteDue: boolean } {
+      const updates =
+        sql<{ m: number }>`SELECT COALESCE(MAX(version), 0) AS m FROM sh_thread_summary WHERE threadId = ${threadId}`[0]!.m;
+      return { updates, rewriteDue: (updates + 1) % SUMMARY_REWRITE_EVERY === 0 };
     },
 
     /**
@@ -784,9 +841,9 @@ export function createLedger(deps: LedgerDeps) {
     register(input: NewWorkerInput): WorkerRow {
       const ts = now();
       sql`
-        INSERT INTO sh_worker (workerId, threadId, deviceId, repoId, agent, mode, state, cmdId, createdAt, updatedAt)
+        INSERT INTO sh_worker (workerId, threadId, deviceId, repoId, agent, mode, state, cmdId, parentWorker, createdAt, updatedAt)
         VALUES (${input.workerId}, ${input.threadId}, ${input.deviceId}, ${input.repoId ?? null},
-                ${input.agent}, ${input.mode}, 'starting', ${input.cmdId ?? null}, ${ts}, ${ts})
+                ${input.agent}, ${input.mode}, 'starting', ${input.cmdId ?? null}, ${input.parentWorker ?? null}, ${ts}, ${ts})
       `;
       // A fresh run of this id: any deferred reap-reconcile verdict is void.
       sql`DELETE FROM sh_reap_pending WHERE workerId = ${input.workerId}`;
@@ -807,6 +864,36 @@ export function createLedger(deps: LedgerDeps) {
         SELECT * FROM sh_worker WHERE threadId = ${threadId} ORDER BY createdAt DESC, workerId DESC LIMIT 1
       `[0];
       return row ? viewWorker(row) : null;
+    },
+    /** The Thread's most recent worker that actually has a branch — the relay base when the
+     *  latest leg ran readonly or never started (issue #8, spec §5.3). `target` filters out
+     *  same-machine/different-repo rows: relaying repo-A's branch name into repo-B's clone
+     *  would just fail the start (PR #54 review finding 3); cross-machine rows stay — the
+     *  branch may exist there after a push+fetch, and the dispatch flags `crossMachine`. */
+    latestBranchOnThread(threadId: string, target?: { deviceId: string; repoId: string | null }): WorkerRow | null {
+      const row = target
+        ? sql<Record<string, unknown>>`
+            SELECT * FROM sh_worker WHERE threadId = ${threadId} AND branch IS NOT NULL
+              AND NOT (deviceId = ${target.deviceId} AND repoId IS NOT NULL AND ${target.repoId} IS NOT NULL AND repoId != ${target.repoId})
+            ORDER BY createdAt DESC, workerId DESC LIMIT 1
+          `[0]
+        : sql<Record<string, unknown>>`
+            SELECT * FROM sh_worker WHERE threadId = ${threadId} AND branch IS NOT NULL
+            ORDER BY createdAt DESC, workerId DESC LIMIT 1
+          `[0];
+      return row ? viewWorker(row) : null;
+    },
+    /** The worker a new relay session continues FROM (issue #8): the previous leg. Same
+     *  machine must also mean same repo — continuing a thread into another repository of
+     *  one machine silently relays the wrong repo's branch, so such a worker yields null
+     *  and the session starts fresh. */
+    relaySource(threadId: string, target: { deviceId: string; repoId: string | null }): WorkerRow | null {
+      const previous = workers.latestOnThread(threadId);
+      if (!previous) return null;
+      if (previous.deviceId === target.deviceId && previous.repoId !== null && target.repoId !== null && previous.repoId !== target.repoId) {
+        return null;
+      }
+      return previous;
     },
     reportsForWorker(workerId: string): ReportRow[] {
       return sql<Record<string, unknown>>`
@@ -893,6 +980,77 @@ export function createLedger(deps: LedgerDeps) {
           recomputeThreadState(worker.threadId);
         }
       }
+    },
+
+    /**
+     * A resume dispatch in flight (issue #8): the ledger flips an idle worker to `starting`
+     * when the continuation reuses its session, so the Thread reads running-shaped right
+     * away. `lost` stays lost — the connector's §9.2 resume owns that state, and the
+     * pending send queues behind it.
+     */
+    markResumePending(workerId: string, cmdId: string): void {
+      sql`
+        UPDATE sh_worker SET state = CASE WHEN state = 'idle' THEN 'starting' ELSE state END,
+                            cmdId = ${cmdId}, lastEventAt = ${now()}, updatedAt = ${now()}
+        WHERE workerId = ${workerId}
+      `;
+    },
+
+    /**
+     * A still-queued resume was withdrawn (the user cancelled, issue #8): revert the
+     * resume-pending `starting` back to `idle` silently — the user's own click, nothing to
+     * report. Same cmdId guard as markResumeFailed.
+     */
+    markResumeCancelled(workerId: string, cmdId: string): boolean {
+      const worker = workers.get(workerId);
+      if (!worker || worker.cmdId !== cmdId || worker.state !== "starting") return false;
+      sql`UPDATE sh_worker SET state = 'idle', updatedAt = ${now()} WHERE workerId = ${workerId}`;
+      timeline.add(worker.threadId, "note", "用户取消：接续指令在送出前撤回，原会话未受影响", { workerId, cmdId });
+      recomputeThreadState(worker.threadId);
+      return true;
+    },
+
+    /**
+     * The resume send failed at the connector (rejected / failed cmd_result / sweep, issue
+     * 8): a resume-pending `starting` worker reverts to `idle` — the session itself is intact
+     * — and the failure is surfaced. A resume sent into a still-`running` worker (intent
+     * "after") cannot revert the state (the run goes on); the undelivered task is still
+     * recorded on the timeline and pushed to the user — the promise "会汇报" must not
+     * silently evaporate (PR #54 review finding 8). Idempotent on the cmdId; only the
+     * command that the worker row still points at may settle it.
+     */
+    markResumeFailed(workerId: string, cmdId: string, reason: string): boolean {
+      const worker = workers.get(workerId);
+      if (!worker || worker.cmdId !== cmdId) return false;
+      if (worker.state === "starting") {
+        sql`
+          UPDATE sh_worker SET state = 'idle', lastOutcome = ${`resume_failed:${reason}`}, updatedAt = ${now()}
+          WHERE workerId = ${workerId}
+        `;
+        timeline.add(worker.threadId, "note", `接续原会话失败（${reason}）；原会话未受影响，重新派发即可`, {
+          workerId,
+          cmdId,
+        });
+        sql`UPDATE sh_thread SET unread = 1 WHERE threadId = ${worker.threadId}`;
+        notifications.queue(`resume_failed:${cmdId}`, "failure_push", worker.threadId, workerId);
+        recomputeThreadState(worker.threadId);
+        return true;
+      }
+      if (worker.state === "running" || worker.state === "recovering") {
+        // The current run is unaffected; only the queued-in task was lost. State stays; the
+        // outcome marker routes the deterministic failure card (and the next report/settled
+        // overwrites it).
+        sql`UPDATE sh_worker SET lastOutcome = ${`resume_failed:${reason}`}, updatedAt = ${now()} WHERE workerId = ${workerId}`;
+        timeline.add(worker.threadId, "note", `接续指令未送达（${reason}）；当前运行不受影响，但新任务没有交给它`, {
+          workerId,
+          cmdId,
+        });
+        sql`UPDATE sh_thread SET unread = 1 WHERE threadId = ${worker.threadId}`;
+        notifications.queue(`resume_failed:${cmdId}`, "failure_push", worker.threadId, workerId);
+        recomputeThreadState(worker.threadId);
+        return true;
+      }
+      return false;
     },
 
     /**
@@ -1051,6 +1209,50 @@ export function createLedger(deps: LedgerDeps) {
         SELECT * FROM sh_report WHERE workerId = ${workerId} ORDER BY seq DESC LIMIT 1
       `[0];
       return row ? viewReport(row) : null;
+    },
+    /** The Thread's reports, oldest first (receivedAt then arrival order — a same-ms burst
+     *  stays in the order the connector sent it). Raw material for handoff briefs (§2.6). */
+    listByThread(threadId: string): ReportRow[] {
+      return sql<Record<string, unknown>>`
+        SELECT * FROM sh_report WHERE threadId = ${threadId} ORDER BY receivedAt, rowid
+      `.map(viewReport);
+    },
+  };
+
+  // ---- handoff briefs (steward.md §2.6, issue #8) -------------------------------------------------
+
+  const handoff = {
+    /**
+     * Assembles the deterministic brief for a new session on a Thread (§2.6): goal,
+     * current state, deduped decisions with their source worker, the latest leftovers, and
+     * git pointers — pointers, not content. The steward adds only the task at hand
+     * afterwards (handoff.renderHandoffBrief leaves the section open for exactly that).
+     *
+     * `fromWorker` names the leg to continue from; it defaults to the Thread's latest
+     * worker. Pointers fall back to the Thread's latest reported git facts when that leg
+     * reported none (connector-pi.md §7.2: facts come from git, never the model).
+     */
+    build(threadId: string, fromWorker?: string): HandoffBrief | null {
+      const thread = threads.get(threadId);
+      if (!thread) return null;
+      const all = workers.listByThread(threadId);
+      if (all.length === 0) return null;
+      const named = fromWorker !== undefined ? all.find((w) => w.workerId === fromWorker) : undefined;
+      const fromWorkerRow = named ?? all.at(-1)!;
+      const threadReports = reports.listByThread(threadId);
+      const latestGit = threadReports.filter((r): r is ReportRow & { git: GitFacts } => r.git !== null).at(-1) ?? null;
+      // A readonly from-leg has no branch of its own: its predecessor's pointers carry the
+      // relay (finding 4) — same resolution the dispatcher uses for the base.
+      const pointerWorker = fromWorkerRow.branch ? fromWorkerRow : workers.latestBranchOnThread(threadId);
+      return assembleBrief({
+        threadId,
+        goal: thread.goal ?? thread.title,
+        state: thread.summary,
+        fromWorker: fromWorkerRow,
+        ...(pointerWorker ? { pointerWorker } : {}),
+        reports: threadReports,
+        latestGit,
+      });
     },
   };
 
@@ -1630,8 +1832,12 @@ export function createLedger(deps: LedgerDeps) {
         break;
       }
       case "started": {
+        // branch COALESCEs: a resumed session's started event carries no branch (the hot
+        // prompt path, connector-pi.md §6.2) and must not erase the branch the ledger
+        // already holds — it is the relay base for the next leg (issue #8).
         sql`
-          UPDATE sh_worker SET state = 'running', sessionId = ${str(event.sessionId)}, branch = ${str(event.branch)},
+          UPDATE sh_worker SET state = 'running', sessionId = ${str(event.sessionId)},
+                              branch = COALESCE(${str(event.branch)}, branch),
                               lastOutcome = CASE WHEN lastOutcome = 'reaped' THEN NULL ELSE lastOutcome END,
                               lastEventAt = ${ts}, updatedAt = ${now()}
           WHERE workerId = ${workerId}
@@ -1714,8 +1920,10 @@ export function createLedger(deps: LedgerDeps) {
               question: str(event.question),
               git: (event.git as ReportRow["git"]) ?? null,
             },
-            notified: status === 'done',
-            questionId: status === 'done' ? undefined : `q_${workerId}_${seq}`,
+            notified: status === "done",
+            // issue #8: the anti-drift rewrite prompt rides the done-bookkeeping wake.
+            ...(status === "done" && threads.summaryStatus(worker.threadId).rewriteDue ? { summaryRewriteDue: true } : {}),
+            ...(status !== "done" ? { questionId: `q_${workerId}_${seq}` } : {}),
           }),
           { priority: status === "done" ? "normal" : "high" },
         );
@@ -1766,6 +1974,19 @@ export function createLedger(deps: LedgerDeps) {
         }
         if (event.usage) {
           sql`UPDATE sh_worker SET lastProgress = ${JSON.stringify({ usage: event.usage })} WHERE workerId = ${workerId}`;
+          // issue #8: context usage in percent — the resume-vs-new-session input
+          // (connector-pi.md §11.2). percent wins; tokens/contextWindow stands in when
+          // the connector did not compute one.
+          const cu = (event.usage as { contextUsage?: { percent?: unknown; tokens?: unknown; contextWindow?: unknown } }).contextUsage;
+          const percent =
+            typeof cu?.percent === "number" && cu.percent >= 0
+              ? cu.percent
+              : typeof cu?.tokens === "number" && typeof cu.contextWindow === "number" && cu.contextWindow > 0
+                ? (cu.tokens / cu.contextWindow) * 100
+                : null;
+          if (percent !== null) {
+            sql`UPDATE sh_worker SET contextPercent = ${Math.round(percent)} WHERE workerId = ${workerId}`;
+          }
         }
         break;
       }
@@ -1945,7 +2166,7 @@ export function createLedger(deps: LedgerDeps) {
 
   return {
     machines, repos, threads, workers, reports, questions, timeline, notifications, outbound,
-    runs, wakes, notes, budget, routines, followups, offers, views, applyPendingEvents, recomputeThreadState, debug,
+    runs, wakes, notes, budget, routines, followups, offers, handoff, views, applyPendingEvents, recomputeThreadState, debug,
   };
 }
 
