@@ -704,11 +704,37 @@ export const MIGRATIONS: readonly Migration[] = [
     },
   },
   {
+    // Worker questions (issue #10, steward.md §5.2-5.3): the durable 90-second window and
+    // the question/message bindings the answer relay routes through. Numbered 014: main's
+    // #53 took 013_notes_maintenance; ids are unique strings, which is what the migration
+    // ledger keys on (same precedent as 009_web vs 009_history_relay) — the number just
+    // keeps the order readable, and this one applies after the notes migration either way.
+    id: "014_worker_questions",
+    up: (sql) => {
+      sql`ALTER TABLE sh_question ADD COLUMN kind TEXT NOT NULL DEFAULT 'steward'`;
+      sql`ALTER TABLE sh_question ADD COLUMN fallbackDueAt INTEGER`;
+      sql`ALTER TABLE sh_question ADD COLUMN handledAt INTEGER`;
+      sql`ALTER TABLE sh_notify ADD COLUMN questionId TEXT`;
+      sql`ALTER TABLE sh_outbound ADD COLUMN questionId TEXT`;
+      sql`ALTER TABLE sh_inbound ADD COLUMN ownerAuthorized INTEGER NOT NULL DEFAULT 0`;
+      sql`UPDATE sh_inbound SET ownerAuthorized = 1 WHERE EXISTS (
+        SELECT 1 FROM sh_run r WHERE r.kind = 'user' AND r.operationId = 'user:' || sh_inbound.msgId
+      )`;
+      sql`CREATE INDEX sh_question_fallback ON sh_question (status, handledAt, fallbackDueAt)`;
+      // Existing worker questions already had an immediate M1 push. Preserve their state
+      // without issuing a second notification on upgrade.
+      sql`UPDATE sh_question SET kind = CASE
+        WHEN EXISTS (SELECT 1 FROM sh_report r WHERE r.workerId = sh_question.workerId
+          AND sh_question.qid = 'q_' || r.workerId || '_' || r.seq) THEN 'report'
+        ELSE 'failure' END, handledAt = askedAt WHERE workerId IS NOT NULL`;
+    },
+  },
+  {
     // Daily budget soft cap (issue #28, steward.md §12, ADR-0001 decision 15): today's
     // counter and the cursor into pi's cumulative usage ledger. spend is an estimate derived
     // from token counts and catalog pricing — never a bill — and the day is the UTC calendar
-    // date (the same clock as routine cron expressions). Numbered 015: main's #13/#19 took
-    // 013, #13's review took 014.
+    // date (the same clock as routine cron expressions). Numbered 015: main's #19 took
+    // 013_notes_maintenance, #10 took 014_worker_questions, #13's review 014_reap_reconcile.
     id: "015_budget",
     up: (sql) => {
       // One row per UTC day that saw spend or a skip. costUsd accumulates pi.usage's

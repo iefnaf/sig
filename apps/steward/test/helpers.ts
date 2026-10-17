@@ -658,7 +658,7 @@ export class FakeConnector {
 
   /** Sends one worker event with the next seq for that worker (connector-persisted seqs). */
   async emit(
-    kind: "started" | "progress" | "report" | "settled" | "lost" | "resumed" | "queue_returned" | "queued",
+    kind: "started" | "progress" | "report" | "settled" | "lost" | "resumed" | "queue_returned" | "queued" | "broken",
     workerId: string,
     fields: Record<string, unknown>,
   ): Promise<void> {
