@@ -155,6 +155,8 @@ export interface DispatcherDeps {
   ) => Promise<{ cmdId: string }>;
   /** Withdraws a still-queued command; false once it has left the DO. */
   cancelQueuedCommand: (cmdId: string) => boolean;
+  /** Whether the Thread still has a start_worker that can be delivered (queued or sent). */
+  hasDeliverableStart: (threadId: string) => boolean;
   /** Whether a command with this id already exists (replay dedup, protocol §7.1). */
   commandExists: (cmdId: string) => boolean;
   sendText: (text: string, threadId?: string | null) => Promise<void>;
@@ -465,6 +467,9 @@ export class Dispatcher {
         return;
       }
       if (latest.cmdId && this.#deps.cancelQueuedCommand(latest.cmdId)) {
+        // Close the never-started worker now (not at the next sweep) so the Thread is free
+        // for a fresh dispatch right away (issue #13 review finding 3).
+        this.ledger.workers.settleWithdrawnStart(latest.workerId);
         this.ledger.timeline.add(threadId!, "note", "用户取消：命令在送出前撤回", null);
         await this.#deps.sendText("已取消。想再派发时直接说即可。", threadId);
         return;
@@ -477,9 +482,16 @@ export class Dispatcher {
   }
 
   private hasLiveWorker(threadId: string): boolean {
-    return this.ledger.workers
-      .listByThread(threadId)
-      .some((w) => w.state === "queued" || w.state === "starting" || w.state === "running" || w.state === "recovering");
+    return (
+      this.ledger.workers
+        .listByThread(threadId)
+        .some((w) => w.state === "queued" || w.state === "starting" || w.state === "running" || w.state === "recovering") ||
+      // A start_worker still in flight (queued for an offline machine, or sent and un-acked)
+      // is just as live — the run exists and has merely not reached the worker yet. Keying
+      // the guard on the pending command too keeps a reap from opening duplicate dispatches
+      // (issue #13 review finding 3).
+      this.#deps.hasDeliverableStart(threadId)
+    );
   }
 
   /**

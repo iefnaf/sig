@@ -14,6 +14,11 @@
 //   FAKE_PI_SESSIONS_DIR directory for session JSONL files (default /tmp/fake-sessions);
 //                       `session` steps append real entries so the connector's §9.1
 //                       session-tail reconciliation has true pi-shaped files to read
+//   FAKE_PI_RUNS_FILE    share the run index across processes (a plain file holding the
+//                       next run number): with it, runs[k] plays on the k-th prompt ANY
+//                       process receives — exactly what the stall-watchdog tests need,
+//                       since a respawn spawns a FRESH process that would otherwise
+//                       replay runs[0] (default: per-process counter)
 //
 // Scenario file:
 //   {
@@ -104,6 +109,16 @@ function logPrompt(entry) {
   if (process.env.FAKE_PI_LOG) appendFileSync(process.env.FAKE_PI_LOG, JSON.stringify(entry) + "\n");
 }
 
+// The run index: per process by default, shared across processes via FAKE_PI_RUNS_FILE so a
+// respawned process consumes the NEXT scripted run instead of replaying run 0.
+const sharedRunsFile = process.env.FAKE_PI_RUNS_FILE ?? null;
+function nextRunIndex() {
+  if (!sharedRunsFile) return promptCount++;
+  const current = Number.parseInt(readFileSync(sharedRunsFile, "utf8") || "0", 10) || 0;
+  writeFileSync(sharedRunsFile, String(current + 1));
+  return current;
+}
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** True while a scripted run is playing — aborts only take effect inside a run (PR #45
@@ -188,9 +203,8 @@ async function handle(command) {
         commandId = text.slice("/shepherd ".length, nl);
         text = text.slice(nl + 1);
       }
-      logPrompt({ commandId, text, at: Date.now() });
-      const run = scenario.runs?.[promptCount] ?? [];
-      promptCount += 1;
+      logPrompt({ commandId, text, cwd: process.cwd(), sessionId, pid: process.pid, at: Date.now() });
+      const run = scenario.runs?.[nextRunIndex()] ?? [];
       const failure = run.find((step) => typeof step.fail === "string");
       if (failure) {
         // The prompt RPC fails at the pi boundary (a wedged/broken pi): no run plays.

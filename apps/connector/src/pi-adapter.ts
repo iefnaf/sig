@@ -333,6 +333,18 @@ export class PiAdapter implements AgentAdapter {
     return normalizeSessionEntries(entries, { maxBytes });
   }
 
+  /** Live processes with their last stdout time — the stall watchdog's inputs (issue #13). */
+  workerActivity(): Array<{ workerId: string; pid: number; lastOutputAt: number }> {
+    const out: Array<{ workerId: string; pid: number; lastOutputAt: number }> = [];
+    for (const [workerId, runtime] of this.runtimes) {
+      const pid = runtime.process.pid;
+      if (!runtime.process.hasExited && pid !== undefined) {
+        out.push({ workerId, pid, lastOutputAt: runtime.process.lastOutputAt });
+      }
+    }
+    return out;
+  }
+
   /** Test support: emulate a connector crash — every child is SIGKILLed with no graceful
    * stop, lock files are left on disk exactly as a real crash leaves them, and exit events
    * are marked "expected" so a still-listening manager takes no recovery action. */

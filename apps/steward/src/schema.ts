@@ -661,11 +661,30 @@ export const MIGRATIONS: readonly Migration[] = [
     },
   },
   {
+    // Issue #13 review: when hello.workers reconciliation is gated behind undelivered events
+    // (snap.lastSeq > processedUpTo), the DO remembers the pending verdict for a reaped
+    // worker and applies it once the event stream catches up — otherwise a worker reaped
+    // while its machine was offline stays `lost` forever even though it is alive (the events
+    // that would prove it are exactly the ones that blocked the reconcile). Numbered 013:
+    // main's #23 took 009/010, #20 took 011, #7 kept 010_routing, #18 took 012_notes; ids
+    // are unique, which is what the ledger keys on — the number keeps the order readable.
+    id: "013_reap_reconcile",
+    up: (sql) => {
+      sql`CREATE TABLE IF NOT EXISTS sh_reap_pending (
+        workerId TEXT PRIMARY KEY,
+        threadId TEXT NOT NULL,
+        snapState TEXT NOT NULL,
+        lastSeq INTEGER NOT NULL,
+        createdAt INTEGER NOT NULL
+      )`;
+    },
+  },
+  {
     // Daily budget soft cap (issue #28, steward.md §12, ADR-0001 decision 15): today's
     // counter and the cursor into pi's cumulative usage ledger. spend is an estimate derived
     // from token counts and catalog pricing — never a bill — and the day is the UTC calendar
-    // date (the same clock as routine cron expressions).
-    id: "013_budget",
+    // date (the same clock as routine cron expressions). Numbered 014: main's #13 took 013.
+    id: "014_budget",
     up: (sql) => {
       // One row per UTC day that saw spend or a skip. costUsd accumulates pi.usage's
       // cost.total deltas; tokens its totalTokens deltas; skippedWakes counts the wakes the
@@ -680,23 +699,6 @@ export const MIGRATIONS: readonly Migration[] = [
       )`;
       // The last cumulative pi.usage total observed (budget.ts observe()): one row, and the
       // growth against it is what lands in today's row.
-      sql`CREATE TABLE IF NOT EXISTS sh_usage_cursor (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        costUsd REAL NOT NULL DEFAULT 0,
-        tokens INTEGER NOT NULL DEFAULT 0,
-        updatedAt INTEGER NOT NULL
-      )`;
-    },
-  },
-  {
-    // #28 follow-up, never shipped: the first cut of 013 keyed the cursor per conversation
-    // (a pi commit-listener design that double-charged and went blind across isolate
-    // restarts — see steward.ts syncUsage). The shipped shape is the single session cursor
-    // above. DOs that already ran the first cut (local test state only) migrate over; fresh
-    // databases skip straight past both.
-    id: "014_budget_session_cursor",
-    up: (sql) => {
-      sql`DROP TABLE IF EXISTS sh_usage_cursor`;
       sql`CREATE TABLE IF NOT EXISTS sh_usage_cursor (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         costUsd REAL NOT NULL DEFAULT 0,
