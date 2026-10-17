@@ -919,6 +919,17 @@ export function createNotes(deps: NotesDeps) {
     settleDecision(logId, "note_gone", noteId);
   };
 
+  /** Whether a demotion suggestion still waits for the owner: undecided, and the note it
+   *  names is still an active resident one. The workspace shows only such asks as pending. */
+  const askOpen = (noteId: string, logId: number): boolean => {
+    const undecided = sql<{ n: number }>`
+      SELECT COUNT(*) AS n FROM sh_note_log WHERE id = ${logId} AND noteId = ${noteId} AND op = 'suggest_demote' AND decision IS NULL
+    `[0]!.n;
+    if (undecided === 0) return false;
+    const note = noteById(noteId);
+    return note !== null && note.status === "active" && note.layer === "resident";
+  };
+
   /** Settles a suggestion log row: decision text + delivered marker (idempotent). */
   const settleDecision = (logId: number, decision: string, noteId: string): void => {
     sql`UPDATE sh_note_log SET decision = ${decision}, reportedAt = COALESCE(reportedAt, ${now()}) WHERE id = ${logId} AND noteId = ${noteId}`;
@@ -1082,6 +1093,7 @@ export function createNotes(deps: NotesDeps) {
     markPendingMaintenanceReported,
     drainPendingForReply,
     abandonAsk,
+    askOpen,
     maintenance,
   };
 }

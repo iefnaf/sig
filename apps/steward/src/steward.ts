@@ -121,7 +121,16 @@ import { MIGRATIONS, runMigrations } from "./schema.ts";
 import { openSecret, sealSecret } from "./secretbox.ts";
 import { renderSetupClosedPage, renderSetupPage, type SetupView } from "./setup-page.ts";
 import { ambiguousWakeText, commandAttentionWakeText, escapeMarkers, verifyWakeText } from "./wake-text.ts";
+import { WorkspaceError, cardOpen, cardView, type OwnerChannel, type WorkspaceActionInput, type WorkspaceInput } from "./workspace.ts";
+import { WorkspaceStream } from "./workspace-stream.ts";
 import { WebApp, linkTargetForThread, parseSessionCookie } from "./web.ts";
+
+/** Messages the workspace will queue before telling the owner to wait for Pip to catch up. */
+const MAX_OPEN_WEB_RUNS = 10;
+/** Connection tag of browsers that opened the workspace (`?role=web&view=workspace`). */
+const WORKSPACE_TAG = "workspace";
+/** How long a burst of ledger writes is coalesced into one `workspace_changed` frame. */
+const WORKSPACE_NUDGE_MS = 150;
 
 interface ConnState {
   /** Set on browser connections (the L3 stream consumers); connector connections carry deviceId. */
@@ -367,6 +376,7 @@ export class Steward extends Agent<Env> {
     // Routine/follow-up rows and their SDK schedules live in different stores — a crash
     // between INSERT and schedule() must not silently kill a routine (issue #20, §11).
     void this.reconcileRoutineSchedules();
+    void this.recoverWorkspaceInputs();
   }
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -536,15 +546,67 @@ export class Steward extends Agent<Env> {
   private ledger_?: Ledger;
   private get ledger(): Ledger {
     return (this.ledger_ ??= createLedger({
-      sql: this.sql.bind(this) as unknown as LedgerSql,
+      sql: this.watchedSql(),
       tx: (fn) => this.ctx.storage.transactionSync(fn),
       quietWindowMs: () => this.quietMergeMs,
     }));
   }
 
+  /** The ledger's SQL, with one addition: any write tells the connected workspaces that
+   *  something changed. The ledger owns every table the workspace shows, so this one seam
+   *  covers messages, decisions, Thread state and machines without a hook at each writer. */
+  private watchedSql(): LedgerSql {
+    const sql = this.sql.bind(this) as unknown as LedgerSql;
+    return ((strings: TemplateStringsArray, ...values: (string | number | boolean | null)[]) => {
+      const rows = sql(strings, ...values);
+      if (/^\s*(?:INSERT|UPDATE|DELETE|REPLACE)\b/i.test(strings[0] ?? "")) this.notifyWorkspaces();
+      return rows;
+    }) as LedgerSql;
+  }
+
+  private workspaceNudge: ReturnType<typeof setTimeout> | undefined;
+
+  /** Live reply text for the open workspaces (workspace-stream.ts): held only while one is connected. */
+  private workspaceStream_?: WorkspaceStream;
+  private get workspaceStream(): WorkspaceStream {
+    return (this.workspaceStream_ ??= new WorkspaceStream({
+      open: () => this.piHarness.session().events(),
+      audience: () => [...this.getConnections(WORKSPACE_TAG)].length,
+      // Only the owner's own conversation is shown live; event and routine runs write bookkeeping nobody is sent.
+      forOwner: async () => {
+        const run = await this.currentRunBinding();
+        return run !== null && (run.kind === "user" || run.kind === "verify") ? { threadId: run.routedThreadId } : null;
+      },
+      onRunEnd: () => { void this.pollRuns(); },
+      send: (frame) => { for (const connection of this.getConnections(WORKSPACE_TAG)) connection.send(frame); },
+      log: (reason, detail) => this.logChannel(reason, detail),
+    }));
+  }
+
+  /** Tells every open workspace to refetch. Bursts of writes (one event touches many rows)
+   *  collapse into a single frame; a workspace that missed one catches up on reconnect. */
+  private notifyWorkspaces(): void {
+    if (this.workspaceNudge !== undefined) return;
+    this.workspaceNudge = setTimeout(() => {
+      this.workspaceNudge = undefined;
+      const frame = JSON.stringify({ t: "workspace_changed" });
+      for (const connection of this.getConnections(WORKSPACE_TAG)) connection.send(frame);
+      this.workspaceStream.ensure(); // a Durable Object that woke after hibernation re-subscribes here
+    }, WORKSPACE_NUDGE_MS);
+  }
+
   private dispatcher_?: Dispatcher;
+  private webDispatcher_?: Dispatcher;
   private get dispatcher(): Dispatcher {
-    return (this.dispatcher_ ??= new Dispatcher({
+    return (this.dispatcher_ ??= this.buildDispatcher("feishu"));
+  }
+  /** Acknowledgements and cards from this dispatcher answer on `channel`: a tap made on the
+   *  web is answered on the web, a tap made in Feishu stays in Feishu. */
+  private dispatcherFor(channel: OwnerChannel): Dispatcher {
+    return channel === "web" ? (this.webDispatcher_ ??= this.buildDispatcher("web")) : this.dispatcher;
+  }
+  private buildDispatcher(channel: OwnerChannel): Dispatcher {
+    return new Dispatcher({
       ledger: this.ledger,
       enqueueCommand: (deviceId, kind, args, opts) => this.enqueue(deviceId, kind, args, opts),
       // Withdraw only what never left the DO (still `queued`); a sent command may already be
@@ -570,21 +632,21 @@ export class Steward extends Agent<Env> {
         }
       },
       commandExists: (cmdId) => this.sql`SELECT 1 AS one FROM outbox WHERE cmdId = ${cmdId}`.length > 0,
-      sendText: async (text, threadId) => {
+      sendText: async (text, threadId, opts) => {
         const owner = this.ownerOpenIdSync();
         if (!owner) return;
-        await this.enqueueOutbound({ kind: "text", to: owner, text, threadId: threadId ?? null, urgency: "push" });
+        await this.enqueueOutbound({ kind: "text", channel, to: owner, text, threadId: threadId ?? null, urgency: "push", ...(opts?.private ? { private: true } : {}) });
       },
       sendCard: async (card, threadId, id) => {
         const owner = this.ownerOpenIdSync();
         if (!owner) return;
-        await this.enqueueOutbound({ kind: "card", to: owner, card, threadId, urgency: "push", ...(id !== undefined ? { id } : {}) });
+        await this.enqueueOutbound({ kind: "card", channel, to: owner, card, threadId, urgency: "push", ...(id !== undefined ? { id } : {}) });
       },
       createPairing: () => this.createPairing(),
       deployOrigin: () => this.web.origin(),
       webLinkUrl: (target) => this.web.linkUrl(target),
       // Routine suggestion cards (`offer:` outbound ids) route their taps here (§8.5).
-      onOfferTap: (offerId, action) => this.routineService.handleOfferTap(offerId, action),
+      onOfferTap: (offerId, action) => this.routineService.handleOfferTap(offerId, action, channel),
       // Issue #28: the deterministic spend readout ("how much today?") — counter, no LLM.
       spendStatusText: async () => {
         await this.syncUsageQuietly();
@@ -594,7 +656,7 @@ export class Steward extends Agent<Env> {
         if (state.over && state.overNotedAt === null) this.ledger.budget.markNoted(state.day);
         return renderSpendStatus(state);
       },
-    }));
+    });
   }
 
   // The proactive-behavior service (issue #20, steward.md §8): routines, follow-ups, offers.
@@ -662,6 +724,12 @@ export class Steward extends Agent<Env> {
       revokeDevice: (deviceId) => void this.revoke(deviceId),
       machineConnected: (deviceId) => this.connFor(deviceId) !== undefined,
       audit: (reason, detail) => this.logChannel(reason, detail),
+      workspace: {
+        budget: () => this.budgetState(),
+        submitMessage: (input) => this.submitWorkspaceMessage(input),
+        submitAction: (input) => this.submitWorkspaceAction(input),
+      },
+      shell: () => this.env.ASSETS.fetch(new Request("https://assets.invalid/workspace.html")),
     }));
   }
 
@@ -680,7 +748,7 @@ export class Steward extends Agent<Env> {
         if (ref.startsWith("user:")) {
           const msgId = ref.slice("user:".length);
           if (msgId.length === 0) return false;
-          return this.sql`SELECT 1 AS one FROM sh_inbound WHERE channel = 'feishu' AND msgId = ${msgId}`.length > 0;
+          return this.sql`SELECT 1 AS one FROM sh_inbound WHERE channel IN ('feishu', 'web') AND msgId = ${msgId} AND ownerAuthorized = 1`.length > 0;
         }
         if (ref.startsWith("routine:")) {
           const routineId = ref.slice("routine:".length);
@@ -707,13 +775,13 @@ export class Steward extends Agent<Env> {
         if (msgId.length === 0) return null;
         return (
           this.sql<{ receivedAt: number }>`
-            SELECT receivedAt FROM sh_inbound WHERE channel = 'feishu' AND msgId = ${msgId}
+            SELECT receivedAt FROM sh_inbound WHERE channel IN ('feishu', 'web') AND msgId = ${msgId}
           `[0]?.receivedAt ?? null
         );
       },
       startWorker: async (input) => {
         const run = await this.currentRunBinding();
-        const outcome = await this.dispatcher.startWorker(input);
+        const outcome = await this.dispatcherFor(run?.channel === "web" ? "web" : "feishu").startWorker(input);
         // Review #8: a dispatch in this run picks/creates the Thread the conversation is now
         // about — backfill it onto the run so the run's reply (and quote-replies to it)
         // route to that Thread, exactly like an explicit quote-route does.
@@ -728,18 +796,19 @@ export class Steward extends Agent<Env> {
         return outcome;
       },
       sendToWorker: async (input) => {
-        const outcome = await this.dispatcher.sendToWorker(input);
+        const outcome = await this.dispatcherFor(await this.currentRunChannel()).sendToWorker(input);
         if (outcome.kind === "sent") await this.backfillRunThread(outcome.threadId);
         return outcome;
       },
       interruptWorker: async (input) => {
-        const outcome = await this.dispatcher.interruptWorker(input);
+        const outcome = await this.dispatcherFor(await this.currentRunChannel()).interruptWorker(input);
         if (outcome.kind === "interrupted") await this.backfillRunThread(outcome.threadId);
         return outcome;
       },
       notifyUser: async (input) => {
         const owner = this.ownerOpenIdSync();
         if (!owner) return;
+        const channel = await this.currentRunChannel();
         const thread = input.threadId ? this.ledger.threads.get(input.threadId) : null;
         const question = input.questionId !== undefined ? this.ledger.questions.get(input.questionId) : null;
         if (input.questionId !== undefined && (question === null || question.status !== "open" || question.workerId === null)) {
@@ -748,7 +817,7 @@ export class Steward extends Agent<Env> {
         }
         // §6.4: the timeline link is appended by the system, never by the model — the same
         // fresh one-time link the core-template cards carry (issue #22).
-        const detailsUrl = thread ? await this.web.linkUrl(linkTargetForThread(thread.threadId)) : null;
+        const detailsUrl = thread && channel === "feishu" ? await this.web.linkUrl(linkTargetForThread(thread.threadId)) : null;
         // Issue #11 (spec §7.6): push only what the model marks important — everything else
         // is quiet and merges over the 60-second window. Anything tied to `waiting_you` is
         // ALWAYS push: an open question binding, or a Thread sitting in waiting_you.
@@ -757,6 +826,7 @@ export class Steward extends Agent<Env> {
         await this.enqueueOutbound({
           id: input.dedupeId,
           kind: "card",
+          channel,
           to: owner,
           card: notifyCard({
             tone: input.tone,
@@ -768,7 +838,7 @@ export class Steward extends Agent<Env> {
           threadId: input.threadId ?? null,
           questionId: question !== null && question.status === "open" && question.workerId !== null ? question.qid : null,
           urgency,
-          ...(urgency === "quiet"
+          ...(urgency === "quiet" && channel === "feishu"
             ? {
                 part: {
                   kind: "report",
@@ -799,6 +869,7 @@ export class Steward extends Agent<Env> {
       askUser: async (input) => {
         const owner = this.ownerOpenIdSync();
         if (!owner) return;
+        const channel = await this.currentRunChannel();
         // §5.3 (issue #10): forwarding a worker's question BINDS that question — no second
         // row is created; the card's buttons and the quote-route resolve to the worker's qid,
         // and the 90-second fallback for it is cancelled (it reached the user).
@@ -848,6 +919,7 @@ export class Steward extends Agent<Env> {
         await this.enqueueOutbound({
           id: input.dedupeId,
           kind: "card",
+          channel,
           to: owner,
           card: askUserCard({
             question: input.question,
@@ -897,6 +969,7 @@ export class Steward extends Agent<Env> {
     kind: string;
     provenance: string;
     routedThreadId: string | null;
+    channel: string | null;
   } | null> {
     const running = (await this.piHarness.pending()).find((p) => p.status === "running");
     if (running) {
@@ -913,9 +986,16 @@ export class Steward extends Agent<Env> {
     kind: string;
     provenance: string;
     routedThreadId: string | null;
+    channel: string | null;
   } {
     const provenance = row.kind === "verify" && row.replyTo !== null ? `user:${row.replyTo}` : row.operationId;
-    return { operationId: row.operationId, kind: row.kind, provenance, routedThreadId: row.routedThreadId };
+    return { operationId: row.operationId, kind: row.kind, provenance, routedThreadId: row.routedThreadId, channel: row.channel };
+  }
+
+  /** The channel the executing run answers on: a run the owner started on the web keeps its
+   *  questions and notices on the web; everything else (events, routines) pushes to Feishu. */
+  private async currentRunChannel(): Promise<OwnerChannel> {
+    return (await this.currentRunBinding())?.channel === "web" ? "web" : "feishu";
   }
 
   /** Records that the *executing* run already produced user-facing output (review #9). */
@@ -943,7 +1023,7 @@ export class Steward extends Agent<Env> {
   /** The owner's message that authorizes answering a worker (§4.3/§7.2): null when the
    *  message never existed here or did not come from the bound owner. */
   private ownerMessageRef(msgId: string): string | null {
-    return this.sql`SELECT 1 AS one FROM sh_inbound WHERE channel = 'feishu' AND msgId = ${msgId} AND ownerAuthorized = 1`.length > 0
+    return this.sql`SELECT 1 AS one FROM sh_inbound WHERE channel IN ('feishu', 'web') AND msgId = ${msgId} AND ownerAuthorized = 1`.length > 0
       ? `user:${msgId}`
       : null;
   }
@@ -962,11 +1042,12 @@ export class Steward extends Agent<Env> {
    * Throwing (caught by the callers) means: this WAS a worker-question answer, but it could
    * not be delivered — the user is told, the question stays open.
    */
-  private async answerWorkerQuestion(input: { question: QuestionRow; answer: string; ref: string }): Promise<{
+  private async answerWorkerQuestion(input: { question: QuestionRow; answer: string; ref: string; channel?: OwnerChannel }): Promise<{
     workerId: string;
     delivery: string;
   } | null> {
     const { question, answer } = input;
+    const channel = input.channel ?? "feishu";
     // Review finding 1, defense in depth: only the WORKER's own question (kind 'report') is
     // answered deterministically. Failure/unreported questions are the system asking the
     // user to decide — their replies belong to the steward, never to a broken/idle worker.
@@ -995,6 +1076,7 @@ export class Steward extends Agent<Env> {
         await this.enqueueOutbound({
           id: `answer:${question.qid}`,
           kind: "text",
+          channel,
           to: owner,
           threadId: thread.threadId,
           text: `✅ 已把你的回答转给 ${worker.workerId}（${outcome.delivery === "steer" ? "不打断手头工具，当前批次结束后生效" : "按其状态尽快送达"}）。`,
@@ -1009,6 +1091,7 @@ export class Steward extends Agent<Env> {
       if (owner && thread) {
         await this.enqueueOutbound({
           kind: "text",
+          channel,
           to: owner,
           threadId: thread.threadId,
           text: `⚠️ 回答没有送达 ${worker.workerId}（${errorText(err)}）。问题保持打开，稍后再试一次。`,
@@ -1052,7 +1135,8 @@ export class Steward extends Agent<Env> {
   async getConnectionTags(_connection: Connection, ctx: ConnectionContext): Promise<string[]> {
     // §5.3: the role query param routes/tags the connection; legitimacy is decided by the
     // credential — device token for connectors (onConnect), session cookie for browsers.
-    if (new URL(ctx.request.url).searchParams.get("role") === "web") return ["web"];
+    const params = new URL(ctx.request.url).searchParams;
+    if (params.get("role") === "web") return params.get("view") === "workspace" ? ["web", WORKSPACE_TAG] : ["web"];
     const parsed = await parseToken(await this.serverKeys(), bearer(ctx.request));
     return parsed ? [`dev:${parsed.deviceId}`] : [];
   }
@@ -1078,6 +1162,7 @@ export class Steward extends Agent<Env> {
         return;
       }
       connection.setState({ role: "web", deviceId: "", epoch: 0, keyId: "" } satisfies ConnState);
+      if (new URL(ctx.request.url).searchParams.get("view") === "workspace") this.workspaceStream.ensure();
       return;
     }
     const parsed = await parseToken(await this.serverKeys(), bearer(ctx.request));
@@ -1109,6 +1194,8 @@ export class Steward extends Agent<Env> {
     if (state.role === "web") {
       // §6.6 termination: the browser closing its connection ends every stream it opened.
       this.sql`DELETE FROM history_relay WHERE webConnId = ${connection.id}`;
+      // Nobody left watching a workspace: let go of pi's event stream (the close may still list this socket).
+      if ([...this.getConnections(WORKSPACE_TAG)].every((other) => other.id === connection.id)) void this.workspaceStream_?.stop();
       return;
     }
     if (!state.deviceId) return;
@@ -3130,7 +3217,7 @@ export class Steward extends Agent<Env> {
         this.sql`UPDATE sh_qr_setup SET phase = 'done', updatedAt = ${Date.now()} WHERE id = 1`;
         this.logChannel("webhook_verified", `${parsed.eventType} ${parsed.eventId}`);
         if (cfg.ownerOpenId) {
-          await this.enqueueOutbound({ kind: "text", to: cfg.ownerOpenId, text: QR_SETUP_DONE_REPLY, urgency: "push" });
+          await this.enqueueOutbound({ kind: "text", to: cfg.ownerOpenId, text: QR_SETUP_DONE_REPLY, urgency: "push", private: true });
         }
       }
     }
@@ -3156,7 +3243,7 @@ export class Steward extends Agent<Env> {
       // can already reach this private bot can be here; first-DM-wins is the accepted design.
       this.sql`UPDATE sh_channel SET ownerOpenId = ${ev.senderId!}, boundAt = ${Date.now()} WHERE channel = 'feishu'`;
       this.logChannel("owner_bound", ev.senderId!);
-      await this.enqueueOutbound({ kind: "text", to: ev.senderId!, text: OWNER_BOUND_REPLY, urgency: "push" });
+      await this.enqueueOutbound({ kind: "text", to: ev.senderId!, text: OWNER_BOUND_REPLY, urgency: "push", private: true });
       return;
     }
     if (ev.senderId !== ownerOpenId) {
@@ -3190,7 +3277,7 @@ export class Steward extends Agent<Env> {
    * `prefilledNote`/`routedThreadId` serve the ask-card clicks (#7): the click's choice is
    * submitted as a system-noted user action already routed to the picked Thread. */
   private async submitUserMessage(
-    input: { msgId: string; text: string; parentId?: string; prefilledNote?: string; routedThreadId?: string | null },
+    input: { msgId: string; text: string; parentId?: string; prefilledNote?: string; routedThreadId?: string | null; channel?: "web" | "feishu" },
   ): Promise<void> {
     const operationId = `user:${input.msgId}`;
     // Signal 1 (§3.1): a quote of one of our messages routes to that Thread directly.
@@ -3200,10 +3287,13 @@ export class Steward extends Agent<Env> {
     // all seen).
     const quotedThreadIds = input.parentId ? this.ledger.outbound.threadIdsForProviderMsg(input.parentId) : [];
     for (const quotedThreadId of quotedThreadIds) this.ledger.threads.markRead(quotedThreadId);
-    const routed = quotedThreadIds.length === 1 ? quotedThreadIds[0]! : null;
+    const routed = input.routedThreadId ?? (quotedThreadIds.length === 1 ? quotedThreadIds[0]! : null);
     const routedRow = input.parentId ? this.ledger.outbound.rowForProviderMsg(input.parentId) : null;
     const routedThread = routed ? this.ledger.threads.get(routed) : null;
-    if (routedThread) {
+    // What the owner said belongs to the conversation the workspace shows: a typed message,
+    // a card choice, or an answer to a worker. Idempotent on (channel, msgId).
+    this.ledger.ownerInputs.record(input.channel ?? "feishu", input.msgId, input.text, routedThread?.threadId ?? null);
+    if (routedThread && input.parentId) {
       this.ledger.threads.markRead(routedThread.threadId); // a reply means the report was seen (§6.5)
       // Review #7: a reply routed to a Thread with an open question IS the answer — close it
       // (the deterministic path only closed on re-dispatch, leaving waiting_you stuck when
@@ -3220,7 +3310,7 @@ export class Steward extends Agent<Env> {
         const ref = this.ownerMessageRef(input.msgId);
         if (ref !== null) {
           try {
-            await this.answerWorkerQuestion({ question: quotedQuestion, answer: input.text, ref });
+            await this.answerWorkerQuestion({ question: quotedQuestion, answer: input.text, ref, channel: input.channel ?? "feishu" });
             return; // delivered to the worker; no LLM run for this message
           } catch {
             return; // the failure was already told to the user; the question stays open
@@ -3245,7 +3335,7 @@ export class Steward extends Agent<Env> {
             : "";
     const text = `${note}${escaped}`;
     const routedId = input.routedThreadId ?? routedThread?.threadId ?? null;
-    if (!this.ledger.runs.open(operationId, "user", text, { replyTo: input.msgId, channel: "feishu", routedThreadId: routedId })) {
+    if (!this.ledger.runs.open(operationId, "user", text, { replyTo: input.msgId, channel: input.channel ?? "feishu", routedThreadId: routedId })) {
       return; // already submitted (sh_inbound dedup normally catches this first)
     }
     try {
@@ -3256,6 +3346,96 @@ export class Steward extends Agent<Env> {
       // The row stays open: the poll's not_found path resubmits until it sticks (§11).
     }
     void this.pollRuns();
+  }
+
+  /** In-flight workspace requests by key, so a retry that arrives while the first attempt is
+   *  still running waits for it instead of racing it. */
+  private readonly webInputs = new Map<string, Promise<void>>();
+
+  /**
+   * An owner message typed in the workspace. The client's request id is the idempotency key:
+   * the same id and payload is one effect no matter how many times it is retried, and the
+   * same id with different content is refused rather than silently ignored.
+   */
+  private async submitWorkspaceMessage(input: WorkspaceInput): Promise<void> {
+    const payload = JSON.stringify(input);
+    const previous = this.ledger.webRequests.get(input.id);
+    if (previous && previous.payload !== payload) throw new WorkspaceError("id_conflict", 409);
+    if (previous?.status === "done") return;
+    const pending = this.webInputs.get(input.id);
+    if (pending) return pending;
+    const thread = input.threadId ? this.ledger.threads.get(input.threadId) : null;
+    if (input.threadId && !thread) throw new WorkspaceError("thread_not_found", 404);
+    // Answering a card or message quotes it, exactly like a Feishu quote-reply: the card's
+    // Thread (and a worker question bound to it) decide where the answer goes.
+    const quoted = input.replyTo ? this.ledger.outbound.row(input.replyTo) : null;
+    if (input.replyTo && !quoted) throw new WorkspaceError("reply_target_not_found", 404);
+    const parentId = typeof quoted?.providerMsgId === "string" ? quoted.providerMsgId : undefined;
+    if (!previous && this.ledger.runs.openRows().filter((r) => r.channel === "web").length >= MAX_OPEN_WEB_RUNS) {
+      throw new WorkspaceError("queue_full", 429);
+    }
+    const msgId = `web:${input.id}`;
+    this.ctx.storage.transactionSync(() => {
+      this.ledger.webRequests.start(input.id, payload);
+      this.ledger.ownerInputs.record("web", msgId, input.text, thread?.threadId ?? null);
+    });
+    const work = this.submitUserMessage({
+      msgId, text: input.text, channel: "web", ...(parentId ? { parentId } : {}),
+      routedThreadId: thread?.threadId ?? null,
+      ...(thread ? { prefilledNote: `（系统注：用户指定这条消息归属 Thread「${escapeMarkers(thread.title)}」（${thread.threadId}）。）\n` } : {}),
+    }).then(() => { this.ledger.webRequests.complete(input.id); }).finally(() => { this.webInputs.delete(input.id); });
+    this.webInputs.set(input.id, work);
+    return work;
+  }
+
+  /**
+   * A button pressed on a card in the workspace. It enters the same handlers a Feishu card
+   * callback does — the outbound row behind the card, not the browser, decides what the
+   * button means — and the handlers answer on the web. The button must be one the card
+   * really carries, and the decision must still be open: forged and stale taps are refused.
+   */
+  private async submitWorkspaceAction(input: WorkspaceActionInput): Promise<void> {
+    const key = `action:${input.id}`;
+    const payload = JSON.stringify(input);
+    const previous = this.ledger.webRequests.get(key);
+    if (previous && previous.payload !== payload) throw new WorkspaceError("id_conflict", 409);
+    if (previous?.status === "done") return;
+    const pending = this.webInputs.get(key);
+    if (pending) return pending;
+    const row = this.ledger.outbound.row(input.cardId);
+    if (!row || row.kind !== "card") throw new WorkspaceError("card_not_found", 404);
+    const view = cardView((JSON.parse(String(row.payload)) as { card?: unknown }).card);
+    if (!view.buttons.some((button) => button.action === input.action)) throw new WorkspaceError("bad_action", 400);
+    const questionId = typeof row.questionId === "string" ? row.questionId : null;
+    if (!previous && !cardOpen(this.ledger, { id: input.cardId, questionId }, view)) throw new WorkspaceError("already_handled", 409);
+    // Handlers find the card again through its provider message id; a Feishu card that has
+    // not been delivered yet has none, and a web card always has one.
+    const cardMsgId = typeof row.providerMsgId === "string" ? row.providerMsgId : null;
+    if (cardMsgId === null) throw new WorkspaceError("card_pending", 409);
+    const owner = this.ownerOpenIdSync();
+    if (owner === null) throw new WorkspaceError("not_ready", 409);
+    const eventId = `web:${input.id}`;
+    this.ctx.storage.transactionSync(() => {
+      this.ledger.webRequests.start(key, payload);
+      this.ledger.ownerInputs.record("web", eventId, null);
+    });
+    const work = this.dispatchCardAction(
+      { kind: "card_action", msgId: eventId, eventId, eventType: "web.card_action", operatorId: owner, action: input.action, cardMsgId, raw: null },
+      owner,
+      "web",
+    ).then(() => { this.ledger.webRequests.complete(key); }).finally(() => { this.webInputs.delete(key); });
+    this.webInputs.set(key, work);
+    return work;
+  }
+
+  private async recoverWorkspaceInputs(): Promise<void> {
+    for (const row of this.ledger.webRequests.pending()) {
+      // A card tap interrupted mid-way is not replayed: the card is still open if it did not
+      // land, and the owner can press again with a fresh request id.
+      if (row.id.startsWith("action:")) continue;
+      try { await this.submitWorkspaceMessage(JSON.parse(row.payload) as WorkspaceInput); }
+      catch (error) { this.logChannel("web_recovery_failed", `${row.id} ${errorText(error)}`); }
+    }
   }
 
   /**
@@ -3356,6 +3536,7 @@ export class Steward extends Agent<Env> {
         try {
           const { id } = await this.enqueueOutbound({
             id: `reply:${run.operationId}`,
+            channel: run.channel === "web" ? "web" : "feishu",
             kind: "text",
             to: owner!,
             text,
@@ -3607,7 +3788,7 @@ export class Steward extends Agent<Env> {
   // never from data stuffed into the button (steward.md §3.1, spike bug list). The ask-card
   // buttons (#7) are answered here instead: the click closes its question and routes back
   // into the steward as a user action with basis=user_reply_to.
-  private async dispatchCardAction(ev: InboundEvent, ownerOpenId: string | null): Promise<void> {
+  private async dispatchCardAction(ev: InboundEvent, ownerOpenId: string | null, channel: OwnerChannel = "feishu"): Promise<void> {
     if (ownerOpenId === null || !ev.operatorId || !ev.cardMsgId) {
       this.logChannel("ignored_card_no_owner", `${ev.eventId}`);
       return;
@@ -3618,18 +3799,18 @@ export class Steward extends Agent<Env> {
     }
     const action = ev.action ?? "";
     if (action.startsWith("ask:") || action.startsWith("asknew:")) {
-      await this.handleAskCardAction(ev, action, ev.cardMsgId);
+      await this.handleAskCardAction(ev, action, ev.cardMsgId, channel);
       return;
     }
     if (action === "note_archive" || action === "note_keep") {
-      await this.handleNoteDecisionCard(action, ev.cardMsgId, ownerOpenId);
+      await this.handleNoteDecisionCard(action, ev.cardMsgId, ownerOpenId, channel);
       return;
     }
     if (action === "pr_approve" || action === "pr_decline") {
-      await this.handlePrConsentCard(action, ev.cardMsgId, ownerOpenId);
+      await this.handlePrConsentCard(action, ev.cardMsgId, ownerOpenId, channel);
       return;
     }
-    await this.dispatcher.handleCardAction({ operatorId: ev.operatorId, action, cardMsgId: ev.cardMsgId });
+    await this.dispatcherFor(channel).handleCardAction({ operatorId: ev.operatorId, action, cardMsgId: ev.cardMsgId });
   }
 
   /**
@@ -3638,7 +3819,7 @@ export class Steward extends Agent<Env> {
    * §3.1 rule). The tap is the owner's own decision; the module keeps its invariants
    * (archive is refused on a pinned note; the state settles the ask either way).
    */
-  private async handleNoteDecisionCard(action: string, cardMsgId: string, ownerOpenId: string): Promise<void> {
+  private async handleNoteDecisionCard(action: string, cardMsgId: string, ownerOpenId: string, channel: OwnerChannel): Promise<void> {
     const row = this.ledger.outbound.rowForProviderMsg(cardMsgId);
     const ask = row !== null && row.id.startsWith("noteask:") ? /^noteask:(n_[^:]+):(\d+)$/.exec(row.id) : null;
     let reply: string;
@@ -3668,7 +3849,7 @@ export class Steward extends Agent<Env> {
       }
     }
     // The tap's ack is a direct response to the owner's action (issue #11): push.
-    await this.enqueueOutbound({ kind: "text", to: ownerOpenId, text: reply, urgency: "push" });
+    await this.enqueueOutbound({ kind: "text", channel, to: ownerOpenId, text: reply, urgency: "push" });
   }
 
   /**
@@ -3681,11 +3862,11 @@ export class Steward extends Agent<Env> {
    *   failure is a retry: a fresh command id, the failure marker cleared.
    * - [先不要] records the decision and does nothing else — the commits stay on the machine.
    */
-  private async handlePrConsentCard(action: string, cardMsgId: string, ownerOpenId: string): Promise<void> {
+  private async handlePrConsentCard(action: string, cardMsgId: string, ownerOpenId: string, channel: OwnerChannel): Promise<void> {
     const row = this.ledger.outbound.rowForProviderMsg(cardMsgId);
     const parsed = row !== null && row.id.startsWith("notify:report:") ? /^notify:report:([^:]+):(\d+)$/.exec(row.id) : null;
     const reply = async (text: string): Promise<void> => {
-      await this.enqueueOutbound({ kind: "text", to: ownerOpenId, text, threadId: row?.threadId ?? null, urgency: "push" });
+      await this.enqueueOutbound({ kind: "text", channel, to: ownerOpenId, text, threadId: row?.threadId ?? null, urgency: "push" });
     };
     if (!parsed || !row?.threadId) {
       await reply("这张汇报卡片已经失效（找不到对应的汇报）；直接回复文字说明想做什么即可。");
@@ -3760,6 +3941,7 @@ export class Steward extends Agent<Env> {
     });
     await this.enqueueOutbound({
       kind: "text",
+      channel,
       to: ownerOpenId,
       text: `好的，正在推送 ${worker.branch} 并创建 PR${retryNote}；结果稍后回到这里。`,
       threadId: worker.threadId,
@@ -3787,11 +3969,11 @@ export class Steward extends Agent<Env> {
    * submits unrouted, and a plain option submits the chosen text as the answer. The steward
    * conversation remembers its own question; the note gives it everything else.
    */
-  private async handleAskCardAction(ev: InboundEvent, action: string, cardMsgId: string): Promise<void> {
+  private async handleAskCardAction(ev: InboundEvent, action: string, cardMsgId: string, channel: OwnerChannel): Promise<void> {
     const [verb, qid, idxRaw] = action.split(":");
     const question = this.ledger.questions.get(qid ?? "");
     if (!question) {
-      await this.dispatcher.replyToCard(cardMsgId, "这张提问卡片关联的问题已不存在。");
+      await this.dispatcherFor(channel).replyToCard(cardMsgId, "这张提问卡片关联的问题已不存在。");
       return;
     }
     const payload = this.ledger.questions.payload(question.qid);
@@ -3800,14 +3982,14 @@ export class Steward extends Agent<Env> {
     const candidate = !isNew && payload ? payload.candidates[idx] ?? null : null;
     const option = !isNew && !candidate && payload ? payload.options[idx] ?? null : null;
     if (!isNew && !candidate && !option) {
-      await this.dispatcher.replyToCard(cardMsgId, "这个选项已经失效，直接回复文字说明即可。");
+      await this.dispatcherFor(channel).replyToCard(cardMsgId, "这个选项已经失效，直接回复文字说明即可。");
       return;
     }
 
     const chosenThread = candidate ? this.ledger.threads.get(candidate.threadId) : null;
     // Answered already (a racing click or a quote-reply got here first): say so, no second run.
     if (question.status === "answered") {
-      await this.dispatcher.replyToCard(cardMsgId, "这个问题已经回答过了。", chosenThread?.threadId);
+      await this.dispatcherFor(channel).replyToCard(cardMsgId, "这个问题已经回答过了。", chosenThread?.threadId);
       return;
     }
 
@@ -3817,16 +3999,16 @@ export class Steward extends Agent<Env> {
     // plain click flow: the decision goes to the steward, not into a broken/idle worker.
     if (!isNew && !candidate && question.workerId !== null && question.kind === "report") {
       if (option === null) {
-        await this.dispatcher.replyToCard(cardMsgId, "这个选项已经失效，直接回复文字说明即可。", question.threadId);
+        await this.dispatcherFor(channel).replyToCard(cardMsgId, "这个选项已经失效，直接回复文字说明即可。", question.threadId);
         return;
       }
       const ref = this.ownerMessageRef(ev.eventId);
       if (ref === null) {
-        await this.dispatcher.replyToCard(cardMsgId, "无法确认这次点击的来源，直接回复这张卡片即可。", question.threadId);
+        await this.dispatcherFor(channel).replyToCard(cardMsgId, "无法确认这次点击的来源，直接回复这张卡片即可。", question.threadId);
         return;
       }
       try {
-        const relayed = await this.answerWorkerQuestion({ question, answer: option, ref });
+        const relayed = await this.answerWorkerQuestion({ question, answer: option, ref, channel });
         if (relayed !== null) return; // answered and relayed; no steward run for the click
       } catch {
         return; // the failure was already told to the user; the question stays open
@@ -3870,6 +4052,7 @@ export class Steward extends Agent<Env> {
       text: label,
       prefilledNote: note,
       routedThreadId,
+      channel,
     });
   }
 
@@ -3893,6 +4076,7 @@ export class Steward extends Agent<Env> {
 
   async enqueueOutbound(input: {
     kind: "text" | "card";
+    channel?: "web" | "feishu";
     to: string;
     text?: string;
     card?: unknown;
@@ -3901,13 +4085,15 @@ export class Steward extends Agent<Env> {
     urgency?: "push" | "quiet";
     /** Structured merge section (issue #11) — carried in the payload for quiet rows. */
     part?: QuietSection;
+    /** Credential or channel-setup text: delivered, but never shown in the workspace. */
+    private?: boolean;
     /** Stable dedupe key (review #6): retries/replays of the same logical message converge on
      *  one row (INSERT OR IGNORE) — the id doubles as the provider-side uuid, so a repeated
      *  enqueue can never double-send. Omitted: a fresh one-of message. */
     id?: string;
   }): Promise<{ id: string }> {
     const id = this.ledger.outbound.enqueue(input);
-    void this.deliverOutbound();
+    if (input.channel !== "web") void this.deliverOutbound();
     return { id };
   }
 
@@ -4114,6 +4300,12 @@ export class Steward extends Agent<Env> {
     this.llmModels.faux.setSteps(steps);
   }
 
+  /** Makes scripted replies arrive word by word (tokens per second), so a live view can watch one being written. */
+  async fauxStreamAt(tokensPerSecond: number | undefined): Promise<void> {
+    if (!this.llmModels.faux) throw new Error("STEWARD_MODEL is not the faux provider");
+    this.llmModels.faux.streamAt(tokensPerSecond);
+  }
+
   /** The captured model requests (after beforeRequest): input texts + injected briefs. */
   async fauxRequests(): Promise<FauxRequestRecord[]> {
     if (!this.llmModels.faux) throw new Error("STEWARD_MODEL is not the faux provider");
@@ -4147,6 +4339,8 @@ export class Steward extends Agent<Env> {
 
   /** Test-only: wipes the pi conversation (dispose + drop pi_* tables) and the run/wake rows. */
   async resetLlmStateForTests(): Promise<void> {
+    await this.workspaceStream_?.stop();
+    this.workspaceStream_ = undefined;
     await this.piHarness.dispose();
     const tables = this.sql<{ name: string }>`
       SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'pi_%'

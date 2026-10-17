@@ -39,7 +39,7 @@ export interface StewardExtensionContext {
   /** The run currently generating: the pi submission an active run owns (review #3), not
    *  merely the oldest unsettled sh_run — a queued followUp starts executing the moment the
    *  previous run answers, before the 2s poll settles its row. */
-  currentRun(): Promise<{ operationId: string; kind: string; provenance: string; routedThreadId: string | null } | null>;
+  currentRun(): Promise<{ operationId: string; kind: string; provenance: string; routedThreadId: string | null; channel: string | null } | null>;
   /** The deterministic dispatch service (ADR-0001 decision 6). */
   startWorker(input: StartWorkerInput): Promise<StartWorkerOutcome>;
   /** In-chat intervention (issue #9, connector-pi.md §6.1): send/interrupt land in the same
@@ -1018,6 +1018,7 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
         ...spec.input,
         offerId: String(api.taskId),
         sourceMsg: run.provenance.slice("user:".length),
+        channel: run.channel === "web" ? "web" : "feishu",
       });
       if (!outcome.ok) return err(`refused: ${outcome.reason}`);
       return ok("已发送建议卡片（带按钮）。用户点「创建」后才会真正保存；本轮不要再调用 create_routine。");

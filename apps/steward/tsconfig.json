@@ -2,6 +2,8 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "outDir": "dist",
+    "allowJs": true,
+    "checkJs": false,
     "types": ["@cloudflare/vitest-plugin/types"]
   },
   "include": ["src", "test", "worker-configuration.d.ts"]

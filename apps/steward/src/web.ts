@@ -2,7 +2,8 @@
 // 7 and 12): the only door into the web app is a one-time link the steward itself sent to
 // the owner's chat — a report card's 查看详情 button, or the /网页 phrase. Opening it
 // exchanges the single-use, short-expiry token for a session cookie bound to the owner;
-// pages are then server-rendered HTML with no client JS and no build chain.
+// the session opens the Pip workspace (workspace.ts / workspace-api.ts: a static page that
+// talks to a small JSON API), plus the server-rendered machine and raw-process pages.
 //
 // Token formats (SERVER_KEY-signed, rotatable like every other MAC in the deployment):
 //   link    wl1.<target>.<expiresAt>.<nonce>.<mac>   one use, ≤15 min
@@ -13,8 +14,9 @@
 // Page content comes from the memory module's `views` (ledger.ts) and the protocol-layer
 // device list — never raw table SQL scattered in handlers. Write actions from the web (the
 // revoke button) are logged to the audit trail like every other management action.
-import type { Ledger, TimelineView, ThreadListEntry } from "./ledger.ts";
+import type { Ledger } from "./ledger.ts";
 import type { SqlExecutor } from "./schema.ts";
+import { handleWorkspaceApi, type WorkspaceApiDeps } from "./workspace-api.ts";
 
 export const LINK_TTL_MS = 15 * 60_000;
 export const SESSION_TTL_MS = 7 * 24 * 60 * 60_000;
@@ -124,8 +126,6 @@ export async function parseSessionCookie(secrets: readonly string[], value: stri
 
 // ---- views (rendered shapes — the data comes from ledger.views, steward.md §10) -----------------
 
-export type { TimelineView, ThreadListEntry };
-
 export interface DeviceView {
   deviceId: string;
   name: string;
@@ -149,6 +149,10 @@ export interface WebDeps {
   /** Whether the device has a live protocol connection — the L3 stream's precondition. */
   machineConnected(deviceId: string): boolean;
   audit(reason: string, detail: string): void;
+  /** The owner mutations behind the workspace API (steward.ts owns the conversation). */
+  workspace: Pick<WorkspaceApiDeps, "budget" | "submitMessage" | "submitAction">;
+  /** The workspace page: a static asset fetched through the Worker's assets binding. */
+  shell(): Promise<Response>;
   now?(): number;
 }
 
@@ -156,29 +160,6 @@ interface SessionRow {
   sid: string;
   csrf: string;
 }
-
-const KIND_LABELS: Record<string, string> = {
-  user_instruction: "指令",
-  dispatch: "派发",
-  started: "开始",
-  progress: "进展",
-  report: "汇报",
-  question: "问题",
-  settled: "结束",
-  lost: "失联",
-  resumed: "恢复",
-  machine_status: "机器",
-  note: "备注",
-  stall: "长时间静默",
-};
-
-/** Worker `lastOutcome` codes this feature adds, rendered in the UI's language; every other
- *  code keeps its raw form (the pre-existing pattern, e.g. `start_failed:…`). */
-const OUTCOME_LABELS: Record<string, string> = {
-  reaped: "失联（DO 回收）",
-  cancelled: "命令已撤回",
-  "error:stall": "挂死（重启一次仍无输出）",
-};
 
 function relTime(ts: number, now: number): string {
   const delta = Math.max(0, now - ts);
@@ -207,7 +188,7 @@ function layout(title: string, active: "threads" | "machines", content: string):
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
-<title>${esc(title)} · Shepherd</title>
+<title>${esc(title)} · Pip</title>
 <style>
   :root { color-scheme: light dark; }
   body { font: 15px/1.7 -apple-system, "PingFang SC", "Segoe UI", sans-serif; margin: 0; padding: 0 0 48px; }
@@ -243,7 +224,7 @@ function layout(title: string, active: "threads" | "machines", content: string):
 </style>
 </head>
 <body>
-<header><span class="brand">Shepherd</span>${nav("/app", "threads", "Threads")}${nav("/app/machines", "machines", "机器")}</header>
+<header><span class="brand">Pip</span>${nav("/app", "threads", "工作台")}${nav("/app/machines", "machines", "机器")}</header>
 <main>
 ${content}
 </main>
@@ -254,12 +235,12 @@ function loginPromptPage(message: string, status: number): Response {
   const html = `<!doctype html>
 <html lang="zh-CN">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex">
-<title>Shepherd</title>
+<title>Pip</title>
 <style>body{font:15px/1.7 -apple-system,"PingFang SC","Segoe UI",sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:0 16px}main{max-width:480px}</style>
 </head>
 <body><main>
 <p>${esc(message)}</p>
-<p class="hint">在飞书里对总管发 <code>/网页</code>，取一条新的一次性登录链接（15 分钟内有效，只能打开一次）。</p>
+<p class="hint">在飞书里对 Pip 发 <code>/网页</code>，取一条新的一次性登录链接（15 分钟内有效，只能打开一次）。</p>
 </main></body></html>`;
   return new Response(html, { status, headers: { "content-type": "text/html; charset=utf-8" } });
 }
@@ -377,14 +358,33 @@ export class WebApp {
   async handle(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const session = await this.#sessionFromRequest(request);
-    if (!session) return loginPromptPage("这一页需要先登录。", 401);
+    if (!session) {
+      return url.pathname.startsWith("/app/api/")
+        ? Response.json({ error: "auth_required" }, { status: 401, headers: { "cache-control": "no-store" } })
+        : loginPromptPage("这一页需要先登录。", 401);
+    }
 
-    if (url.pathname === "/app" && request.method === "GET") return this.threadListPage();
+    if (url.pathname.startsWith("/app/api/")) {
+      return handleWorkspaceApi(request, url, session, {
+        ledger: this.#ledger,
+        devices: () => this.#deviceViews().map(({ deviceId, name, online, revoked }) => ({ deviceId, name, online, revoked })),
+        now: () => this.#now(),
+        endSession: (sid) => void this.#sql`DELETE FROM sh_web_session WHERE sid = ${sid}`,
+        audit: (reason, detail) => this.#deps.audit(reason, detail),
+        ...this.#deps.workspace,
+      });
+    }
+
+    // The workspace: /app is the whole conversation; a Thread URL (the card links and the
+    // raw-process page's way back) opens the same page with that Thread selected.
+    if (request.method === "GET" && url.pathname === "/app") return this.workspaceShell(url);
+    const thread = /^\/app\/threads\/([\w-]+)$/.exec(url.pathname);
+    if (thread && request.method === "GET") {
+      return this.#ledger.threads.get(thread[1]!) ? this.workspaceShell(url) : new Response("not found", { status: 404 });
+    }
+
     if (url.pathname === "/app/machines" && request.method === "GET") return this.machinesPage(session);
     if (url.pathname === "/app/machines/revoke" && request.method === "POST") return this.revokeMachine(request, session);
-
-    const timeline = /^\/app\/threads\/([\w-]+)$/.exec(url.pathname);
-    if (timeline && request.method === "GET") return this.timelinePage(timeline[1]!);
 
     // L3 raw process (spec §7.4): the server-rendered shell plus the little vanilla JS that
     // streams chunks over a web-role WebSocket (ADR-0001 decision 12).
@@ -394,36 +394,33 @@ export class WebApp {
     return new Response("not found", { status: 404 });
   }
 
-  private threadListPage(): Response {
-    const entries = this.#ledger.views.threadList();
-    const now = this.#now();
-    const rows = entries.map((entry) => {
-      const w = entry.lastWorker;
-      const sub = [
-        w ? `${w.agent} @ ${w.machineName}` : null,
-        w?.lastProgress ? progressText(w.lastProgress) : null,
-        `最后活动 ${relTime(entry.thread.lastActivityAt, now)}`,
-      ]
-        .filter((p): p is string => p !== null)
-        .join(" · ");
-      return `<a class="row" href="/app/threads/${esc(entry.thread.threadId)}">
-<span class="title">${entry.thread.unread ? "● " : ""}${esc(entry.thread.title)}</span>${stateBadge(entry.thread.state)}
-<div class="sub">${esc(sub)}</div>
-</a>`;
+  /**
+   * The workspace page. Its script and styles are same-origin files, so the policy can forbid
+   * every inline script and every other origin: whatever an agent or a repository puts in the
+   * conversation can only ever be displayed, never executed.
+   */
+  private async workspaceShell(url: URL): Promise<Response> {
+    const page = await this.#deps.shell();
+    if (!page.ok) return new Response("workspace unavailable", { status: 503, headers: { "cache-control": "no-store" } });
+    const socket = `${url.protocol === "https:" ? "wss" : "ws"}://${url.host}`;
+    return new Response(page.body, {
+      headers: {
+        "content-type": "text/html; charset=utf-8",
+        "cache-control": "no-store",
+        "content-security-policy": [
+          "default-src 'none'",
+          "script-src 'self'",
+          "style-src 'self'",
+          "img-src 'self' data:",
+          `connect-src 'self' ${socket}`,
+          "base-uri 'none'",
+          "form-action 'self'",
+          "frame-ancestors 'none'",
+        ].join("; "),
+        "x-content-type-options": "nosniff",
+        "referrer-policy": "no-referrer",
+      },
     });
-    const content = `<h1>Threads</h1>
-<div class="threads">${rows.length > 0 ? rows.join("\n") : '<p class="empty">还没有任何 Thread。在飞书里发「/派发 &lt;repo&gt; &lt;要做的事&gt;」开始。</p>'}</div>`;
-    return html(layout("Threads", "threads", content));
-  }
-
-  private timelinePage(threadId: string): Response {
-    // §6.5: opening the Thread on the web clears unread — before the view is assembled, so
-    // the page never renders its own unread dot.
-    if (!this.#ledger.threads.get(threadId)) return new Response("not found", { status: 404 });
-    this.#ledger.threads.markRead(threadId);
-    const view = this.#ledger.views.timeline(threadId);
-    if (!view) return new Response("not found", { status: 404 });
-    return html(layout(view.thread.title, "threads", renderTimeline(view, this.#now())));
   }
 
   /**
@@ -697,58 +694,4 @@ function rawProcessScript(workerId: string): string {
 
   stream(null);
 })();`;
-}
-
-function progressText(lastProgress: string): string {
-  try {
-    const p = JSON.parse(lastProgress) as { phase?: unknown; tool?: unknown; target?: unknown };
-    const parts = [typeof p.phase === "string" ? p.phase : null, typeof p.tool === "string" ? p.tool : null, typeof p.target === "string" ? p.target : null];
-    const joined = parts.filter((x): x is string => x !== null).join(" ");
-    return joined.length > 0 ? `最近：${joined}` : "";
-  } catch {
-    return "";
-  }
-}
-
-/** The timeline body (L2): header + summary events, mobile-first single column (spec §7.4). */
-export function renderTimeline(view: TimelineView, now: number): string {
-  const { thread, entries, workers, openQuestion } = view;
-  // Review #40/#2: goal is model-writable (start_worker/update_thread) and machine names are
-  // connector-reported — every meta value goes through esc() like the rest of the page.
-  const meta = [
-    thread.goal ? `目标：${esc(thread.goal)}` : null,
-    workers.length > 0
-      ? [...new Set(workers.map((w) => `${esc(w.agent)} @ ${esc(w.machineName)}`))].join("、")
-      : null,
-    `建于 ${relTime(thread.createdAt, now)}`,
-  ]
-    .filter((p): p is string => p !== null)
-    .join("<br>");
-  const question = openQuestion
-    ? `<p class="badge waiting">❓ 等你</p><p style="margin-top:4px">${esc(openQuestion.text)}</p>`
-    : "";
-  const items = entries.map((entry) => {
-    const label = KIND_LABELS[entry.kind] ?? entry.kind;
-    return `<li><span class="k">${esc(label)}</span><span class="t">${esc(entry.text)}</span><span class="ts">${relTime(entry.ts, now)}</span></li>`;
-  });
-  const workerRows = workers.map((w) => {
-    const state =
-      w.state === "running" || w.state === "starting" || w.state === "recovering"
-        ? "▶"
-        : w.state === "queued"
-          ? "⏳"
-          : w.state === "broken"
-            ? "❌"
-            : "·";
-    const outcome = w.lastOutcome ? ` · ${esc(OUTCOME_LABELS[w.lastOutcome] ?? w.lastOutcome)}` : "";
-    const unreachableTag = w.unreachable ? " · 失联中" : "";
-    return `<li>${state} ${esc(w.agent)} @ ${esc(w.machineName)}${unreachableTag}${w.branch ? ` · 分支 ${esc(w.branch)}` : ""}${outcome} · <a href="/app/threads/${esc(view.thread.threadId)}/workers/${esc(w.workerId)}">原始过程</a></li>`;
-  });
-  return `<h1>${thread.unread ? "● " : ""}${esc(thread.title)}</h1>${stateBadge(thread.state)}
-<p class="meta">${meta}</p>
-${question}
-<ol class="timeline">
-${items.length > 0 ? items.join("\n") : '<li><span class="k"></span><span class="t empty">还没有事件。</span></li>'}
-</ol>
-${workers.length > 0 ? `<h1 style="font-size:16px">Workers</h1><ul style="padding-left:18px">${workerRows.join("")}</ul>` : ""}`;
 }

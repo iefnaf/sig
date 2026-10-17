@@ -16,7 +16,7 @@ function htmlPage(body: string, status = 200): Response {
 
 // The web's shared "get a fresh link" page (web.ts renders the full variant inside the DO;
 // this stateless twin answers rejected probes without waking it).
-const LINK_HINT = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex"><title>Shepherd</title><style>body{font:15px/1.7 -apple-system,"PingFang SC",sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:0 16px}main{max-width:480px}</style></head><body><main><p>链接无效或已过期。</p><p style="opacity:.75;font-size:13px">在飞书里对总管发 <code>/网页</code>，取一条新的一次性登录链接（15 分钟内有效，只能打开一次）。</p></main></body></html>`;
+const LINK_HINT = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex"><title>Pip</title><style>body{font:15px/1.7 -apple-system,"PingFang SC",sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:0 16px}main{max-width:480px}</style></head><body><main><p>链接无效或已过期。</p><p style="opacity:.75;font-size:13px">在飞书里对 Pip 发 <code>/网页</code>，取一条新的一次性登录链接（15 分钟内有效，只能打开一次）。</p></main></body></html>`;
 
 // Length-independent comparison so the setup gate does not leak the token byte-by-byte.
 function setupTokenMatches(got: string | null, want: string): boolean {
@@ -30,6 +30,19 @@ function setupTokenMatches(got: string | null, want: string): boolean {
 // rotation window (issue #27). Minting always uses [0].
 function webVerifyKeys(env: { SERVER_KEY: string; SERVER_KEY_PREVIOUS?: string }): string[] {
   return [env.SERVER_KEY, env.SERVER_KEY_PREVIOUS].filter((k): k is string => typeof k === "string" && k.length > 0);
+}
+
+// /app/assets/<name> → the file `<name>` in the Worker's static assets (apps/steward/ui). Only
+// flat file names: no directories, no dotfiles, so a request can never reach beyond the set
+// of files the workspace ships.
+async function serveAsset(env: Env, request: Request, url: URL): Promise<Response> {
+  const name = url.pathname.slice("/app/assets/".length);
+  if (!/^[A-Za-z0-9][\w.-]*$/.test(name)) return new Response("not found", { status: 404 });
+  const asset = await env.ASSETS.fetch(new Request(new URL(`/${name}`, url.origin), request));
+  const headers = new Headers(asset.headers);
+  headers.set("cache-control", "private, max-age=0, must-revalidate");
+  headers.set("x-content-type-options", "nosniff");
+  return new Response(asset.body, { status: asset.status, statusText: asset.statusText, headers });
 }
 
 export default {
@@ -102,7 +115,13 @@ export default {
     if ((url.pathname === "/app" || url.pathname.startsWith("/app/")) && (request.method === "GET" || request.method === "POST")) {
       const cookie = request.headers.get("cookie") ?? "";
       const raw = cookie.split(/;\s*/).find((part) => part.startsWith("shepherd_session="))?.slice("shepherd_session=".length) ?? null;
-      if (!(await parseSessionCookie(webVerifyKeys(env), raw))) return htmlPage(LINK_HINT.replace("链接无效或已过期。", "这一页需要先登录。"), 401);
+      if (!(await parseSessionCookie(webVerifyKeys(env), raw))) {
+        return url.pathname.startsWith("/app/api/")
+          ? Response.json({ error: "auth_required" }, { status: 401, headers: { "cache-control": "no-store" } })
+          : htmlPage(LINK_HINT.replace("链接无效或已过期。", "这一页需要先登录。"), 401);
+      }
+      // The workspace's script, styles and logo: static files behind the same cookie gate.
+      if (request.method === "GET" && url.pathname.startsWith("/app/assets/")) return serveAsset(env, request, url);
       const stub = await getAgentByName(env.Steward, "owner");
       return stub.fetch(request);
     }

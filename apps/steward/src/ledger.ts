@@ -36,6 +36,11 @@ export const QUIET_MERGE_MS = 60_000;
 export const EXTERNAL_ACTIVITY_MERGE_MS = 10 * 60_000;
 /** Blocked reports give the steward this long before the core forwards the question. */
 export const QUESTION_WINDOW_MS = 90_000;
+/** The workspace shows this many recent messages and per-Thread timeline entries; decisions
+ *  stay listed while they are open, but cards older than this window are never offered. */
+export const WORKSPACE_MESSAGES = 120;
+export const WORKSPACE_TIMELINE = 40;
+export const WORKSPACE_DECISION_WINDOW_MS = 60 * 86_400_000;
 
 /** Runs a synchronous closure atomically (`ctx.storage.transactionSync`, steward.md §1). */
 export interface LedgerDeps {
@@ -1461,6 +1466,12 @@ export function createLedger(deps: LedgerDeps) {
     list(threadId: string): TimelineRow[] {
       return sql<TimelineRow>`SELECT id, threadId, ts, kind, text FROM sh_timeline WHERE threadId = ${threadId} ORDER BY id`;
     },
+    /** The newest `limit` entries, oldest first — the workspace's compact view of a Thread. */
+    recent(threadId: string, limit: number): TimelineRow[] {
+      return sql<TimelineRow>`
+        SELECT id, threadId, ts, kind, text FROM sh_timeline WHERE threadId = ${threadId} ORDER BY id DESC LIMIT ${limit}
+      `.reverse();
+    },
   };
 
   const offlineDispatches = {
@@ -1662,6 +1673,7 @@ export function createLedger(deps: LedgerDeps) {
   const outbound = {
     enqueue(input: {
       kind: "text" | "card";
+      channel?: "feishu" | "web";
       to: string;
       threadId?: string | null;
       questionId?: string | null;
@@ -1671,10 +1683,22 @@ export function createLedger(deps: LedgerDeps) {
       /** Structured merge section (issue #11): carried in the payload so a quiet group folds
        *  into one card that keeps each thread's three parts. */
       part?: QuietSection;
+      /** The text carries a credential or is channel setup chatter: delivered, but kept out of
+       *  the workspace's conversation. */
+      private?: boolean;
       /** Stable dedupe key (review #6): same id → same row (INSERT OR IGNORE), never a second
        *  message; the id doubles as the provider-side uuid. Omitted: a fresh one-of message. */
       id?: string;
     }): string {
+      if (input.channel === "web") {
+        const id = input.id ?? ulid();
+        sql`
+          INSERT OR IGNORE INTO sh_outbound (id, channel, kind, receiveId, threadId, questionId, payload, urgency, status, attempts, nextAttemptAt, createdAt, sentAt, providerMsgId)
+          VALUES (${id}, 'web', ${input.kind}, ${input.to}, ${input.threadId ?? null}, ${input.questionId ?? null},
+            ${JSON.stringify({ text: input.text, card: input.card, ...(input.private ? { private: true } : {}) })}, 'push', 'sent', 0, ${now()}, ${now()}, ${now()}, ${`web-outbound:${id}`})
+        `;
+        return id;
+      }
       // Issue #11 (steward.md §6.4): `urgency: push` is due NOW; a quiet row holds for the
       // merge window, ANCHORED at the oldest still-open quiet row for this channel+receiver —
       // arrivals inside an open window join it, later ones start their own.
@@ -1688,7 +1712,7 @@ export function createLedger(deps: LedgerDeps) {
         `[0]?.at;
         dueAt = anchor !== null && anchor !== undefined ? anchor + windowMs : now() + windowMs;
       }
-      const payload = JSON.stringify({ text: input.text, card: input.card, part: input.part });
+      const payload = JSON.stringify({ text: input.text, card: input.card, part: input.part, ...(input.private ? { private: true } : {}) });
       if (input.id !== undefined) {
         sql`
           INSERT OR IGNORE INTO sh_outbound (id, channel, kind, receiveId, threadId, questionId, payload, urgency, status, attempts, nextAttemptAt, createdAt)
@@ -1728,6 +1752,20 @@ export function createLedger(deps: LedgerDeps) {
     },
     row(id: string): Record<string, unknown> | null {
       return sql<Record<string, unknown>>`SELECT * FROM sh_outbound WHERE id = ${id}`[0] ?? null;
+    },
+    /** Cards that may still hold a decision for the owner (the workspace's "Needs you"):
+     *  questions, routine offers, offline asks, memory suggestions and PR consent. The
+     *  caller decides which are still open; this only narrows the scan to what could be. */
+    decisionCards(sinceMs: number): Record<string, unknown>[] {
+      return sql<Record<string, unknown>>`
+        SELECT * FROM sh_outbound
+        WHERE kind = 'card' AND createdAt > ${sinceMs} AND (
+          id LIKE 'offer:%' OR id LIKE 'offline:%' OR id LIKE 'switch:%' OR id LIKE 'noteask:%'
+          OR (id LIKE 'notify:report:%' AND payload LIKE '%pr_approve%')
+          OR questionId IS NOT NULL OR payload LIKE '%"action":"ask:%' OR payload LIKE '%"action":"asknew:%'
+        )
+        ORDER BY createdAt, id
+      `;
     },
     rows(limit: number): Record<string, unknown>[] {
       return sql<Record<string, unknown>>`SELECT * FROM sh_outbound ORDER BY createdAt, id LIMIT ${limit}`;
@@ -1870,6 +1908,32 @@ export function createLedger(deps: LedgerDeps) {
      *  (plus sh_routine/sh_followup.lastResult for fires, which own an outcome either way). */
     markSkipped(id: number): void {
       sql`UPDATE sh_wake SET status = 'skipped', submittedAt = ${now()} WHERE id = ${id} AND status = 'pending'`;
+    },
+  };
+
+  const ownerInputs = {
+    record(channel: "web" | "feishu", msgId: string, text: string | null, threadId: string | null = null): void {
+      sql`
+        INSERT INTO sh_inbound (channel, msgId, eventId, eventType, receivedAt, ownerAuthorized, text, threadId)
+        VALUES (${channel}, ${msgId}, ${msgId}, 'message', ${now()}, 1, ${text}, ${threadId})
+        ON CONFLICT(channel, msgId) DO UPDATE SET text = COALESCE(sh_inbound.text, excluded.text),
+          threadId = COALESCE(sh_inbound.threadId, excluded.threadId), ownerAuthorized = 1
+      `;
+    },
+  };
+
+  const webRequests = {
+    get(id: string): { payload: string; status: string } | null {
+      return sql<{ payload: string; status: string }>`SELECT payload, status FROM sh_web_request WHERE id = ${id}`[0] ?? null;
+    },
+    start(id: string, payload: string): void {
+      sql`INSERT OR IGNORE INTO sh_web_request (id, payload, createdAt) VALUES (${id}, ${payload}, ${now()})`;
+    },
+    complete(id: string): void {
+      sql`UPDATE sh_web_request SET status = 'done' WHERE id = ${id}`;
+    },
+    pending(): Array<{ id: string; payload: string }> {
+      return sql<{ id: string; payload: string }>`SELECT id, payload FROM sh_web_request WHERE status = 'pending' ORDER BY createdAt`;
     },
   };
 
@@ -2466,6 +2530,35 @@ export function createLedger(deps: LedgerDeps) {
   });
 
   const views = {
+    /** Owner-facing data only: internal wake/run text and worker transcripts stay out. */
+    workspace() {
+      return {
+        threads: threads.list().map((thread) => ({
+          ...thread,
+          repoIds: threads.repoIds(thread.threadId),
+          workers: workers.listByThread(thread.threadId).map((worker) => ({
+            ...withMachineName(worker),
+            report: reports.latestForWorker(worker.workerId),
+            consent: prConsent.latestForWorker(worker.workerId),
+          })),
+          timeline: timeline.recent(thread.threadId, WORKSPACE_TIMELINE),
+        })),
+        machines: machines.list().map((machine) => ({ ...machine, running: machines.runningCount(machine.deviceId) })),
+        repos: repos.list(),
+        inputs: sql<{ id: string; text: string; threadId: string | null; at: number; channel: string }>`
+          SELECT i.msgId AS id, i.text, COALESCE(r.routedThreadId, i.threadId) AS threadId, i.receivedAt AS at, i.channel
+          FROM sh_inbound i LEFT JOIN sh_run r ON r.operationId = 'user:' || i.msgId
+          WHERE i.ownerAuthorized = 1 AND i.text IS NOT NULL ORDER BY i.receivedAt DESC, i.msgId DESC LIMIT ${WORKSPACE_MESSAGES}
+        `.reverse(),
+        outbound: sql<Record<string, unknown>>`
+          SELECT * FROM sh_outbound ORDER BY createdAt DESC, id DESC LIMIT ${WORKSPACE_MESSAGES}
+        `.reverse(),
+        decisionCards: outbound.decisionCards(now() - WORKSPACE_DECISION_WINDOW_MS),
+        activity: sql<TimelineRow>`SELECT id, threadId, ts, kind, text FROM sh_timeline ORDER BY id DESC LIMIT 20`.reverse(),
+        /** The steward is working on something the owner asked for. */
+        busy: runs.openRows().some((run) => run.kind === "user" || run.kind === "verify"),
+      };
+    },
     /** `views.timeline` — the L2 page: thread, summary events, workers, the open question. */
     timeline(threadId: string): TimelineView | null {
       const thread = threads.get(threadId);
@@ -2551,7 +2644,7 @@ export function createLedger(deps: LedgerDeps) {
 
   return {
     machines, machineStatus, offlineDispatches, repos, threads, workers, reports, questions, timeline, notifications, outbound,
-    runs, wakes, notes, budget, routines, followups, offers, handoff, views, applyPendingEvents, recomputeThreadState, debug,
+    runs, ownerInputs, webRequests, wakes, notes, budget, routines, followups, offers, handoff, views, applyPendingEvents, recomputeThreadState, debug,
     prConsent,
   };
 }

@@ -1,6 +1,6 @@
 // The web pages over real data (issue #22): the done-report card carries a 查看详情 one-time
-// link that lands on the Thread timeline (`views.timeline`, mobile viewport, no JS); the
-// machine page lists devices with live online state; its revoke button bumps the device
+// link that lands in the Pip workspace with that Thread selected (ADR-0002; the timeline is in
+// the workspace snapshot, `views.workspace`); the machine page lists devices with live online state; its revoke button bumps the device
 // epoch and closes the live connector connection with 4403 (protocol §5.1); /加机器 in chat
 // issues the pairing code and answers with the npx connect command, redeemable exactly once.
 import { CloseCode } from "@shepherd/protocol";
@@ -77,7 +77,7 @@ describe("report cards carry the one-time 查看详情 link", () => {
     const linkUrl = action.match(/https:\/\/example\.com\/link\/(\S+?)"/)![0]!.replace(/"$/, "");
     expect(linkUrl).toMatch(/^https:\/\/example\.com\/link\/wl1\.t\/t_\w+\.\d+\.[0-9a-f]{32}\.[0-9a-f]{64}$/);
 
-    // Opening the link logs in and lands directly on that Thread's timeline.
+    // Opening the link logs in and lands directly on that Thread.
     const open = await SELF.fetch(linkUrl, { redirect: "manual" });
     expect(open.status).toBe(303);
     const threadId = await ownerStub().debugSnapshot().then((s) => s.threads[0]!.threadId);
@@ -86,15 +86,18 @@ describe("report cards carry the one-time 查看详情 link", () => {
 
     const page = await SELF.fetch(`https://example.com${open.headers.get("location")!}`, { headers: { cookie } });
     expect(page.status).toBe(200);
-    const html = await page.text();
-    expect(html).toContain("修复登录 bug");
-    expect(html).toContain("指令");
-    expect(html).toContain("派发");
-    expect(html).toContain("汇报");
-    expect(html).toContain("登录 bug 修好，测试通过");
-    expect(html).toContain("mac-studio");
-    expect(html).toContain("shepherd/login");
-    expect(html).not.toContain("●"); // §6.5: opening the timeline cleared unread
+    expect(await page.text()).toContain('id="workspace"'); // the workspace shell; the page selects the Thread from the URL
+
+    // The Thread's timeline, worker and branch are what the workspace snapshot hands the page.
+    const workspace = (await (await SELF.fetch("https://example.com/app/api/workspace", { headers: { cookie } })).json()) as {
+      threads: Array<{ id: string; title: string; workers: Array<{ machine: string; branch: string | null }>; timeline: Array<{ kind: string; text: string }> }>;
+    };
+    const thread = workspace.threads.find((entry) => entry.id === threadId)!;
+    expect(thread.title).toBe("修复登录 bug");
+    expect(thread.timeline.map((entry) => entry.kind)).toEqual(expect.arrayContaining(["user_instruction", "dispatch", "report"]));
+    expect(thread.timeline.map((entry) => entry.text).join("\n")).toContain("登录 bug 修好，测试通过");
+    expect(thread.workers[0]).toMatchObject({ machine: "mac-studio" });
+    expect(thread.workers[0]!.branch).toContain("shepherd/login");
   });
 
   it("a failure card links to the timeline too", async () => {

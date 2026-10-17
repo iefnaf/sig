@@ -105,28 +105,29 @@ Sub-agent permission policy: fully automatic (yolo) by default in the MVP, with 
 
 ## 7. Interaction and Interface
 
-### 7.1 Main Entry: One Continuous Conversation with the Steward
+### 7.1 Main Entry: One Continuous Conversation with Pip
 
-The user always faces the same steward and the same conversation. Giving instructions, hearing reports, and making corrections all happen there. Threads flow behind the conversation, and the user never switches between chat windows. Reports appear directly in this conversation — there is no separate inbox; items that need the user are surfaced through push and flags.
+The personal agent is named **Pip** in the interface (the steward role in this document). The user always faces the same steward and the same conversation. Giving instructions, hearing reports, and making corrections all happen there. Threads flow behind the conversation, and the user never switches between chat windows. Reports appear directly in this conversation — there is no separate inbox; items that need the user are surfaced through push and flags.
 
 ### 7.2 Channels
 
-- **The first channel: Feishu.** After deployment completes, a QR code is generated and the user scans it to create a bot. The scanner is bound as the owner; only their direct messages are answered.
+- **Web workspace and Feishu.** The web is the everyday workspace; Feishu provides login, pairing, quick commands, and notifications. After deployment completes, the user creates the bot and is bound as the owner; only their direct messages are answered. Web-originated conversation replies and action acknowledgements return to the web.
 - Channels are abstracted as adapters; WeCom, Telegram, Slack, etc. can be added later.
 - Reports can take the form of **cards with buttons**; "waiting on you" decisions become a single tap.
 - No native app of our own, and no PWA first either. Important notifications are likewise carried by the IM; push reliability depends on the IM platform.
 
-### 7.3 Companion Web Pages (Detail Pages)
+### 7.3 Pip Web Workspace
 
-Content that does not fit in chat is viewed on the web via a link. The web is not the main entry:
+The approved workspace (see [ADR-0002](adr/0002-pip-web-workspace.md)) has a Thread sidebar, the continuous conversation, and a collapsible context panel. The default view shows all conversation activity and an overview. Selecting a Thread focuses related messages, explicitly routes new input to it, and shows its summary, timeline, workers, git facts, and PR state. Existing Thread URLs remain deep links into this workspace.
 
-- Thread timelines.
-- A worker's raw process (read-only).
-- Memory page (view, edit, delete, pin).
-- Routine and patrol list (view, pause, delete).
-- Machine management (pair, revoke).
+- Conversation replies stream live; input can queue while Pip is busy. Reconnecting or retrying a submission must not duplicate it.
+- Decisions stay actionable in their conversation cards. A persistent “Needs you” view aggregates questions, PR consent, offline dispatch, routine offers, and memory suggestions, including decisions without a Thread.
+- Only what Pip actually says to the owner appears in the conversation: the bookkeeping of event and routine runs is never shown, and credentials (login links, pairing commands) stay in Feishu.
+- The header shows online machines, running work, pending decisions, and today’s spend. Machine details show capabilities, repositories, and capacity. Worker raw process remains read-only.
+- English is the default UI language. An English/Chinese switch remembers the user’s choice without resetting their work; user input and agent output are never translated by the UI.
+- On mobile, conversation, Threads, and machines use a single-column layout; details open as a drawer.
 
-Login is handled by the IM: links the steward issues carry a one-time signature; opening one logs you in.
+Login remains an IM-issued one-time link exchanged for an owner session, with logout available in the workspace. Adding a machine remains a pairing command in Feishu. Memory management and routine/patrol management pages remain a later phase.
 
 ### 7.4 Visibility Layers
 

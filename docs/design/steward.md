@@ -639,16 +639,19 @@ Feishu is the first implementation. "QR-code creation", "long connection vs webh
 
 ## 10. The web read model
 
-The web app is the companion detail view (spec §7.3): read-only plus a few management actions, all through the memory module's `views` and management interfaces:
+The web app is the Pip workspace (spec §7.3, [ADR-0002](../adr/0002-pip-web-workspace.md)): the owner's conversation, the Threads and the decisions waiting for them, drawn from one snapshot (`workspace.ts`, assembled over the memory module's `views.workspace`) and kept current by a nudge — every ledger write tells connected workspaces to refetch, and the words of a reply being written follow over pi's event stream (`workspace-stream.ts`, the one place that touches that experimental API):
 
-| Page | Source |
+| Surface | Source |
 |---|---|
-| Thread list | `threads.list`, `views.situation` |
-| Timeline | `views.timeline` |
+| Conversation | `sh_inbound` (the owner's words, either channel) + `sh_outbound` (Pip's, either channel); credentials and setup chatter are `private` and never listed |
+| Needs you | Open cards: `questions` / `offers` / `offlineDispatches` / `notes.askOpen` / `prConsent`, decided per card kind by `cardOpen` |
+| Thread details | `views.workspace`: workers (git facts, PR consent), latest 40 timeline entries |
+| Machines | Protocol-layer devices + `sh_machine` (slots, agents, repos) |
 | Raw transcripts | Relayed from the protocol's `history`; not stored in the DO |
-| Memory page | `views.memoryPage`: listed by layer; edit, delete, and pin go through `notes.*` |
-| Routine list | `sh_routine`; can be paused and deleted |
-| Machine management | Protocol-layer devices; revocable |
+| Machine revoke | `/app/machines` (server-rendered) |
+| Memory page, routine list | Later phase |
+
+Owner actions come in over `/app/api` (session cookie + CSRF token + same origin + JSON): a message, a card button, "read", logout. Each carries a client request id (`sh_web_request`; the run is `user:web:<id>`), so a retry is one effect. A button is validated against the card's own buttons and its decision must still be open; it then enters the same handlers a Feishu callback does, answering on the web. Which channel an outbound row belongs to follows the run or tap it answers: a run the owner started on the web keeps its questions and cards on the web (`sh_run.channel`), events and routines push to Feishu as before.
 
 Login exchanges an IM-delivered one-time signed link for a session; it is designed in a separate document. Write operations issued from the web are likewise logged to `sh_note_log` / audit, keeping "forgetting and changes visible to the user".
 
@@ -663,6 +666,7 @@ There is no cross-store transaction between the two stores (our tables and pi-du
 | Steward tool replay | `cmdId = tool:<taskId>` | `unsafe` tools do not re-run; the replay yields the same command ID |
 | Crash between reducer and wake | `wake_request` persisted, `operationId` idempotent | Resumes from the queue after restart |
 | Outbound retry | `sh_outbound.id` | Each entry is sent only once; `providerMsgId` recorded on success |
+| Workspace message / card tap retry | `sh_web_request.id` (client request id), `operationId=user:web:<id>` | Same payload = same effect; a different payload under the same id is refused (409) |
 | Duplicate routine fire | `routine:<id>:<fireTime>` | Deduplicated |
 
 Note that pi-durable's `submit` returns only after the submission succeeds. If a crash happens between "queue row written" and "`submit` called", the row is still pending and will be submitted again; the `operationId` guarantees no duplication.

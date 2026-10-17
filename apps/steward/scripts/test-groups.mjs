@@ -50,6 +50,8 @@ const COST = {
   "alarm.test.ts": 4,
   "web-auth.test.ts": 4,
   "web-pages.test.ts": 4,
+  "web-workspace.test.ts": 20,
+  "web-workspace-cards.test.ts": 18,
 };
 const DEFAULT_COST = 3;
 

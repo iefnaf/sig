@@ -33,17 +33,19 @@ async function page(path: string, cookie: string): Promise<{ status: number; htm
   return { status: res.status, html: await res.text() };
 }
 
-describe("the timeline links to the raw process", () => {
-  it("each worker row carries a 原始过程 link to /app/threads/:t/workers/:w", async () => {
+describe("the workspace links to the raw process", () => {
+  it("each worker in the snapshot names the ids the page links /app/threads/:t/workers/:w with", async () => {
     const fake = await pairFakeConnector("mac-studio");
     await fake.connect();
     const { threadId, workerId } = await dispatchOneWorker(fake);
     const cookie = await webLogin();
 
-    const timeline = await page(`/app/threads/${threadId}`, cookie);
-    expect(timeline.status).toBe(200);
-    expect(timeline.html).toContain(`href="/app/threads/${threadId}/workers/${workerId}"`);
-    expect(timeline.html).toContain("原始过程");
+    const snapshot = await page("/app/api/workspace", cookie);
+    expect(snapshot.status).toBe(200);
+    const { threads } = JSON.parse(snapshot.html) as { threads: Array<{ id: string; workers: Array<{ id: string; sessionId: string | null }> }> };
+    expect(threads.find((thread) => thread.id === threadId)!.workers).toEqual([expect.objectContaining({ id: workerId, sessionId: workerId })]);
+    // …and that link opens the read-only raw process page.
+    expect((await page(`/app/threads/${threadId}/workers/${workerId}`, cookie)).status).toBe(200);
   });
 });
 

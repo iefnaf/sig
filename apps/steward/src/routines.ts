@@ -33,6 +33,8 @@ export interface RoutineServiceDeps {
   cancelSchedule(id: string): Promise<boolean>;
   enqueueOutbound(input: {
     kind: "text" | "card";
+    /** Where it is delivered; Feishu unless the owner's tap came from the web workspace. */
+    channel?: "feishu" | "web";
     to: string;
     text?: string;
     card?: unknown;
@@ -137,7 +139,7 @@ export class RoutineService {
   }
 
   /** suggest_routine: send the button card ONLY — creation waits for the tap (spec §8.3). */
-  async suggest(input: RoutineSpecInput & { offerId: string; sourceMsg: string }): Promise<{ ok: true } | { ok: false; reason: string }> {
+  async suggest(input: RoutineSpecInput & { offerId: string; sourceMsg: string; channel?: "feishu" | "web" }): Promise<{ ok: true } | { ok: false; reason: string }> {
     const violation = validateRoutineSpec(input, this.now());
     if (violation) return { ok: false, reason: violation };
     const owner = this.#deps.ownerOpenId();
@@ -161,6 +163,7 @@ export class RoutineService {
     await this.#deps.enqueueOutbound({
       id: outboundId,
       kind: "card",
+      channel: input.channel ?? "feishu",
       to: owner,
       card: routineOfferCard({ schedule: describeScheduleFromSpec(input), instruction: spec.instruction }),
       threadId: input.threadId ?? null,
@@ -170,26 +173,27 @@ export class RoutineService {
   }
 
   /** The tap (dispatch.ts routes `offer:` cards here): the consent that creates the routine. */
-  async handleOfferTap(offerId: string, action: string): Promise<void> {
+  async handleOfferTap(offerId: string, action: string, channel: "feishu" | "web" = "feishu"): Promise<void> {
     const offer = this.ledger.offers.consume(offerId, action === "routine_accept" ? "accepted" : "dismissed");
     if (!offer) {
-      await this.#sendOwner("这张建议卡已经处理过了。");
+      await this.#sendOwner("这张建议卡已经处理过了。", null, channel);
       return;
     }
     if (action !== "routine_accept") {
-      await this.#sendOwner("好的，没有创建。想创建的时候再和我说。", offer.spec.threadId ?? null);
+      await this.#sendOwner("好的，没有创建。想创建的时候再和我说。", offer.spec.threadId ?? null, channel);
       return;
     }
     const routineId = `r_${ulid()}`;
     const outcome = await this.create({ ...offer.spec, routineId, createdFromMsg: offer.sourceMsg });
     if (!outcome.ok) {
-      await this.#sendOwner(`创建失败：${outcome.reason}`);
+      await this.#sendOwner(`创建失败：${outcome.reason}`, null, channel);
       return;
     }
     this.#deps.audit("routine_created_from_offer", `${routineId} <- ${offer.sourceMsg}`);
     await this.#sendOwner(
       `已创建例行任务（${describeSchedule(outcome.routine)}）：${outcome.routine.instruction}\n随时说「暂停/恢复/取消这个例行任务」即可管理。`,
       offer.spec.threadId ?? null,
+      channel,
     );
   }
 
@@ -472,10 +476,10 @@ export class RoutineService {
     await this.#deps.cancelSchedule(scheduleId).catch(() => {});
   }
 
-  async #sendOwner(text: string, threadId?: string | null): Promise<void> {
+  async #sendOwner(text: string, threadId?: string | null, channel: "feishu" | "web" = "feishu"): Promise<void> {
     const owner = this.#deps.ownerOpenId();
     if (!owner) return;
-    await this.#deps.enqueueOutbound({ kind: "text", to: owner, text, threadId: threadId ?? null, urgency: "push" });
+    await this.#deps.enqueueOutbound({ kind: "text", channel, to: owner, text, threadId: threadId ?? null, urgency: "push" });
   }
 }
 

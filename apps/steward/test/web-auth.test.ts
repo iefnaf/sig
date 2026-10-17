@@ -106,9 +106,9 @@ describe("/网页 → one-time link → session cookie → /app", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("text/html");
     const html = await res.text();
-    expect(html).toContain('<meta name="viewport" content="width=device-width, initial-scale=1">'); // mobile
-    expect(html).toContain("Threads");
-    expect(html).toContain("/app/machines");
+    expect(html).toContain('name="viewport"'); // mobile
+    expect(html).toContain('id="workspace"'); // the Pip workspace shell (ADR-0002)
+    expect(html).toContain("/app/assets/workspace.js");
   });
 
   it("marks the cookie HttpOnly, SameSite=Lax, Secure, 7-day Max-Age", async () => {

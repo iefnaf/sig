@@ -27,6 +27,10 @@
   "main": "apps/steward/src/index.ts",
   "compatibility_date": "2026-10-10",
   "compatibility_flags": ["nodejs_compat"],
+  // The Pip web workspace (ADR-0002): plain HTML/CSS/JS files, no frontend build. The Worker
+  // runs first for every request so /app/assets/* stays behind the same session-cookie gate
+  // as the rest of /app, then serves the files through the ASSETS binding.
+  "assets": { "directory": "./apps/steward/ui", "binding": "ASSETS", "run_worker_first": true },
   "durable_objects": {
     "bindings": [{ "name": "Steward", "class_name": "Steward" }]
   },

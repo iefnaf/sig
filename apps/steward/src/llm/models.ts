@@ -96,6 +96,9 @@ export interface FauxScripting {
   setSteps(steps: AssistantMessage[]): void;
   requests(): FauxRequestRecord[];
   reset(): void;
+  /** Replies arrive word by word at this rate (tokens per second) instead of all at once — what a live
+   *  view needs to see a reply being written. `undefined` restores the instant default. */
+  streamAt(tokensPerSecond: number | undefined): void;
 }
 
 export interface StewardModels {
@@ -138,7 +141,8 @@ const textOf = (content: unknown): string => {
  */
 export function buildStewardModels(config: StewardModelConfig, apiKey: string | undefined): StewardModels {
   if (config.provider === "faux") {
-    const faux: FauxProviderHandle = fauxProvider({ models: [{ id: config.modelId, name: "Faux" }] });
+    const makeFaux = (tokensPerSecond?: number): FauxProviderHandle =>
+      fauxProvider({ models: [{ id: config.modelId, name: "Faux" }], ...(tokensPerSecond === undefined ? {} : { tokensPerSecond }) });
     const steps: AssistantMessage[] = [];
     const requests: FauxRequestRecord[] = [];
     const factory = async (context: TranscriptContext): Promise<AssistantMessage> => {
@@ -196,9 +200,13 @@ export function buildStewardModels(config: StewardModelConfig, apiKey: string | 
     };
     // Faux consumes one response entry per provider call: register many copies of the same
     // recording factory (the spike did the same), so it never runs out mid-conversation.
-    faux.setResponses(Array.from({ length: 1000 }, () => factory));
+    const install = (tokensPerSecond?: number): void => {
+      const faux = makeFaux(tokensPerSecond);
+      faux.setResponses(Array.from({ length: 1000 }, () => factory));
+      models.setProvider(faux.provider);
+    };
     const models = createModels();
-    models.setProvider(faux.provider);
+    install();
     return {
       models,
       config,
@@ -208,7 +216,9 @@ export function buildStewardModels(config: StewardModelConfig, apiKey: string | 
         reset: () => {
           steps.splice(0, steps.length);
           requests.splice(0, requests.length);
+          install(); // back to instant replies
         },
+        streamAt: (tokensPerSecond) => install(tokensPerSecond),
       },
     };
   }

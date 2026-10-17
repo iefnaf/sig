@@ -97,7 +97,7 @@ Two exact phrases stay deterministic and never reach the model — they mint cre
 | Phrase | What it does |
 |---|---|
 | `/加机器` (also `/添加机器`, `/add-machine`) | Issues a one-time pairing code and replies with `npx @iefnaf/shepherd connect <url> <code>` to run on the new machine |
-| `/网页` (also `/web`, `/login`) | Replies with a one-time login link (15 min, single use) to the companion web |
+| `/网页` (also `/web`, `/login`) | Replies with a one-time login link (15 min, single use) to the Pip workspace |
 
 Quote-replying to a report card attaches your message to that Thread (resolved from the card's message id, never through the model's judgment) and the next worker starts from the previous worker's branch. Report cards' buttons (e.g. "排队等上线" while a machine is offline) resolve the Thread the same way; an `ask_user` card's candidate buttons settle routing with one tap, and the choice routes back as a reply to that Thread.
 
@@ -105,8 +105,12 @@ Quote-replying to a report card attaches your message to that Thread (resolved f
 
 Routing quality has a measurable bar: a fixed 106-case set (ported from the spike) run against the real steward extension. Any change to the steward prompt, the tool definitions, `findCandidates`, or the model must re-run it and meet the thresholds before merge — `pnpm --filter @shepherd/steward eval:routing` exits non-zero when they are missed. See [docs/routing-eval.md](docs/routing-eval.md) for the metrics, the recorded baselines, and the no-model selftest.
 
-## The companion web
+## The Pip workspace
 
-Report cards carry a **查看详情** button: a one-time signed link (15 min, single use) that logs the owner in and opens the Thread timeline (L2: instructions, dispatches, reports, questions — mobile-friendly, server-rendered, no JS). While logged in (`/网页` for a fresh link), `/app` lists all Threads and `/app/machines` lists paired machines with live online state; the 撤销 button bumps a machine's device epoch and closes its connection (4403), so a stolen token dies instantly (protocol §5.1). The chat-issued `/加机器` command is the only pairing path.
+The web is the everyday place to talk to Pip ([ADR-0002](docs/adr/0002-pip-web-workspace.md), spec §7.3). A one-time signed link — `/网页` in Feishu, or the **查看详情** button on a report card (15 min, single use) — logs the owner in and opens `/app`: the same continuous conversation as in Feishu, with the Threads beside it and the decisions waiting for you ("Needs you") on the right. Pick a Thread and the conversation, the details and your next message all follow it; Pip's replies, its questions and its cards arrive live, and a card's buttons (approve a PR, wait for an offline machine, accept a routine, archive a memory) are the same handlers a Feishu tap reaches — answered on the web. Acknowledgements and replies to what you did on the web stay on the web; alerts that arrive on their own still push to Feishu.
+
+English is the default; the **EN / 中文** switch remembers your choice and changes only the interface — what you and Pip wrote is shown as written. (Text the system itself generates — report cards, timeline lines — is still written in Chinese.) The page is plain HTML, CSS and JavaScript in [`apps/steward/ui`](apps/steward/ui), served by the Worker as static assets behind the same session check; there is no frontend build. Nothing the conversation contains is ever parsed as HTML, and the page's content-security policy forbids inline script and any other origin.
+
+`/app/machines` lists paired machines with live online state; its 撤销 button bumps a machine's device epoch and closes its connection (4403), so a stolen token dies instantly (protocol §5.1). The chat-issued `/加机器` command is the only pairing path.
 
 Each worker on a timeline links to its **原始过程** (L3 raw process, spec §7.4): the full conversation and tool calls, streamed from the machine through the Durable Object over a browser WebSocket — never stored or logged server-side (protocol doc §6.6). The connector serves it from the live pi process (`get_entries`) or, once the process is gone, by parsing the session JSONL along the current branch; entries are normalized and truncated with a 2 MB per-stream cap and a cursor for paging. Offline machines answer `machine_offline` with an explanation instead of a stream: the transcript lives on that machine only.

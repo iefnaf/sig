@@ -312,4 +312,33 @@ describe("migration 010 (routing, issue #7)", () => {
       expect(sql<{ n: number }>`SELECT COUNT(*) AS n FROM sh_question`[0]!.n).toBe(1);
     });
   });
+
+  it("019_web_workspace: past messages reappear in the transcript from their runs, less the routing note", async () => {
+    const id = env.Steward.idFromName(`test-migrations-${crypto.randomUUID()}`);
+    const stub = env.Steward.get(id);
+    await runInDurableObject(stub, async (instance: Steward) => {
+      const sql = (instance as unknown as { sql: SqlExecutor }).sql.bind(instance);
+      const tx = <T>(fn: () => T): T =>
+        (instance as unknown as { ctx: DurableObjectState }).ctx.storage.transactionSync(fn);
+
+      // A deployment from before the workspace: messages recorded for dedup only, their text
+      // living in the run each one started (with the steward's routing note in front).
+      runMigrations(sql, MIGRATIONS.filter((m) => m.id !== "019_web_workspace"), tx);
+      for (const [msgId, at] of [["om_plain", 1], ["om_routed", 2], ["om_unanswered", 3]] as const) {
+        sql`INSERT INTO sh_inbound (channel, msgId, eventId, eventType, receivedAt, ownerAuthorized) VALUES ('feishu', ${msgId}, ${msgId}, 'message', ${at}, 1)`;
+      }
+      sql`INSERT INTO sh_run (operationId, kind, text, status, createdAt) VALUES ('user:om_plain', 'user', '修一下登录', 'settled', 1)`;
+      sql`INSERT INTO sh_run (operationId, kind, text, status, createdAt) VALUES ('user:om_routed', 'user', ${"（系统注：这条消息是对 Thread「登录」（t_1）消息的回复，已确定归属该 Thread。）\n继续"}, 'settled', 2)`;
+      sql`INSERT INTO sh_run (operationId, kind, text, status, createdAt) VALUES ('event:x', 'event', '⟦event⟧ a worker finished', 'settled', 3)`;
+
+      runMigrations(sql, MIGRATIONS, tx);
+      expect(sql<{ msgId: string; text: string | null }>`SELECT msgId, text FROM sh_inbound ORDER BY msgId`).toEqual([
+        { msgId: "om_plain", text: "修一下登录" },
+        { msgId: "om_routed", text: "继续" },
+        { msgId: "om_unanswered", text: null }, // nothing to restore it from: it stays out of the transcript
+      ]);
+      expect(sql<{ n: number }>`SELECT COUNT(*) AS n FROM sh_web_request`[0]!.n).toBe(0);
+      expect(() => runMigrations(sql, MIGRATIONS, tx)).not.toThrow();
+    });
+  });
 });
