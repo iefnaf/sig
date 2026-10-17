@@ -4,6 +4,7 @@
 // (natural language reaches the LLM); the two that remain (issue #22) and everything else
 // deterministic stay tested deterministically.
 import { beforeEach, describe, expect, it } from "vitest";
+import { isSpendQuery } from "../src/budget.ts";
 import { chooseMachine, parseOwnerCommand, type MachineCandidate } from "../src/dispatch.ts";
 import {
   configureAndBind,
@@ -14,8 +15,8 @@ import {
   waitWhileOutboundPending,
 } from "./helpers.ts";
 
-describe("parseOwnerCommand: the two deterministic chat commands (issue #22)", () => {
-  it("parses the add-machine and web-link phrases", () => {
+describe("parseOwnerCommand: the deterministic chat commands (issue #22 + #28's spend query)", () => {
+  it("parses the add-machine, web-link, and spend phrases", () => {
     expect(parseOwnerCommand("/加机器")).toEqual({ kind: "add_machine" });
     expect(parseOwnerCommand("/添加机器 ")).toEqual({ kind: "add_machine" });
     expect(parseOwnerCommand("/add-machine")).toEqual({ kind: "add_machine" });
@@ -23,15 +24,42 @@ describe("parseOwnerCommand: the two deterministic chat commands (issue #22)", (
     expect(parseOwnerCommand("/网页")).toEqual({ kind: "web_link" });
     expect(parseOwnerCommand("/web ")).toEqual({ kind: "web_link" });
     expect(parseOwnerCommand("/login")).toEqual({ kind: "web_link" });
+    expect(parseOwnerCommand("/花费")).toEqual({ kind: "spend" });
+    expect(parseOwnerCommand("/usage")).toEqual({ kind: "spend" });
+    expect(parseOwnerCommand("今天花了多少钱？")).toEqual({ kind: "spend" });
+    expect(parseOwnerCommand("How much have you spent today?")).toEqual({ kind: "spend" });
     // Trailing content means it is not the fixed phrase — it falls through to the LLM.
     expect(parseOwnerCommand("/加机器 现在")).toBeNull();
     expect(parseOwnerCommand("/网页 login.html")).toBeNull();
+    expect(parseOwnerCommand("/花费 和 /预算 都看看")).toBeNull();
   });
 
   it("everything else is the steward LLM's, including the retired M1 phrases", () => {
     expect(parseOwnerCommand("帮我把登录 bug 修一下")).toBeNull();
     expect(parseOwnerCommand("/派发 repo-a 修复登录 bug")).toBeNull();
     expect(parseOwnerCommand("/状态")).toBeNull();
+    // #28: a spend *question* matches whole-message only — compound tasks fall through.
+    expect(parseOwnerCommand("今天把这个登录 bug 修一下，花多少钱都行")).toBeNull();
+    expect(parseOwnerCommand("查一下今天花了多少时间修那个 bug")).toBeNull();
+    expect(parseOwnerCommand("how much did the refactor cost today?")).toBeNull();
+  });
+
+  it("isSpendQuery: the natural forms it answers, and the ones it must not touch", () => {
+    for (const yes of [
+      "/花费", "/用量", "/预算", "/spend", "/usage", "/budget",
+      "今天花了多少钱？", "你今天花了多少钱", "总管今日一共用了多少", "今天用了多少 token",
+      "今天的费用是多少", "今日预算还剩多少", "how much have you spent today",
+      "How much did you spend so far today?", "what's today's spend", "today's usage",
+    ]) {
+      expect(isSpendQuery(yes), yes).toBe(true);
+    }
+    for (const no of [
+      "", "在吗", "顺便问下今天花了多少钱之外再修个 bug",
+      "帮我记下今天花了多少顿饭钱", "今天花了多少时间修 bug",
+      "how much is the login bug refactor", "今天把登录 bug 修一下",
+    ]) {
+      expect(isSpendQuery(no), JSON.stringify(no)).toBe(false);
+    }
   });
 });
 

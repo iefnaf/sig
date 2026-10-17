@@ -665,10 +665,11 @@ export const MIGRATIONS: readonly Migration[] = [
     // (snap.lastSeq > processedUpTo), the DO remembers the pending verdict for a reaped
     // worker and applies it once the event stream catches up — otherwise a worker reaped
     // while its machine was offline stays `lost` forever even though it is alive (the events
-    // that would prove it are exactly the ones that blocked the reconcile). Numbered 013:
-    // main's #23 took 009/010, #20 took 011, #7 kept 010_routing, #18 took 012_notes; ids
-    // are unique, which is what the ledger keys on — the number keeps the order readable.
-    id: "013_reap_reconcile",
+    // that would prove it are exactly the ones that blocked the reconcile). Numbered 014:
+    // main's #23 took 009/010, #20 took 011, #7 kept 010_routing, #18 took 012_notes, #19
+    // took 013; ids are unique, which is what the ledger keys on — the number keeps the
+    // order readable.
+    id: "014_reap_reconcile",
     up: (sql) => {
       sql`CREATE TABLE IF NOT EXISTS sh_reap_pending (
         workerId TEXT PRIMARY KEY,
@@ -726,6 +727,35 @@ export const MIGRATIONS: readonly Migration[] = [
         WHEN EXISTS (SELECT 1 FROM sh_report r WHERE r.workerId = sh_question.workerId
           AND sh_question.qid = 'q_' || r.workerId || '_' || r.seq) THEN 'report'
         ELSE 'failure' END, handledAt = askedAt WHERE workerId IS NOT NULL`;
+    },
+  },
+  {
+    // Daily budget soft cap (issue #28, steward.md §12, ADR-0001 decision 15): today's
+    // counter and the cursor into pi's cumulative usage ledger. spend is an estimate derived
+    // from token counts and catalog pricing — never a bill — and the day is the UTC calendar
+    // date (the same clock as routine cron expressions). Numbered 015: main's #19 took
+    // 013_notes_maintenance, #10 took 014_worker_questions, #13's review 014_reap_reconcile.
+    id: "015_budget",
+    up: (sql) => {
+      // One row per UTC day that saw spend or a skip. costUsd accumulates pi.usage's
+      // cost.total deltas; tokens its totalTokens deltas; skippedWakes counts the wakes the
+      // cap kept from the model; overNotedAt marks the one reply the note rode that day.
+      sql`CREATE TABLE IF NOT EXISTS sh_usage_day (
+        day TEXT PRIMARY KEY,
+        costUsd REAL NOT NULL DEFAULT 0,
+        tokens INTEGER NOT NULL DEFAULT 0,
+        skippedWakes INTEGER NOT NULL DEFAULT 0,
+        overNotedAt INTEGER,
+        updatedAt INTEGER NOT NULL
+      )`;
+      // The last cumulative pi.usage total observed (budget.ts observe()): one row, and the
+      // growth against it is what lands in today's row.
+      sql`CREATE TABLE IF NOT EXISTS sh_usage_cursor (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        costUsd REAL NOT NULL DEFAULT 0,
+        tokens INTEGER NOT NULL DEFAULT 0,
+        updatedAt INTEGER NOT NULL
+      )`;
     },
   },
 ];
