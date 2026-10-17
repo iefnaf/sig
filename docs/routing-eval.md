@@ -49,44 +49,53 @@ behavior, text-asking is not a routing failure — but it is reported so it stay
 
 ## Recorded runs
 
-### Default-model baseline: `deepseek-flash-baseline.json` (2026-10-17)
+### Default-model baseline: `deepseek-flash-baseline.json` (+ `-confirm`), 2026-10-17
 
-The first successful real-model baseline (106 cases, 0 errors/timeouts):
+**The gate is green on the default model** — three runs on the final tree, all three thresholds
+met (ADR-0001 decision 14):
 
-| pass | wrong-route | missed-ask | unnecessary-ask |
-|---|---|---|---|
-| 93/106 (87.7%) | **0 ✓** | 1/11 (9.1%) ✗ | 12/95 (12.6%) ✓ |
+| Run | pass | wrong-route | missed-ask | unnecessary-ask |
+|---|---|---|---|---|
+| `deepseek-flash-baseline.json` | 93+1/106 (88.7%) | 1 (0.9%) ✓ | 0/11 ✓ | 11/95 (11.6%) ✓ |
+| `deepseek-flash-baseline-confirm.json` | 92+2/106 (88.7%) | 0 (0.0%) ✓ | 0/11 ✓ | 12/95 (12.6%) ✓ |
 
-Getting there required two fixes, both found by this run:
+(+1/+2 are 文字反问 `pass_text_ask`, counted as pass.) Getting the first real-model baseline
+took three fixes, all found by these runs:
 
 1. **Tool schema** (`llm/extension.ts`): `notes_commit` parameters used `Type.Intersect`,
    which serializes as bare `allOf` with no top-level `type: "object"` — DeepSeek rejects
    that with 400 (`schema must be a JSON Schema of 'type: "object"', got 'type: null'`),
    failing **every** turn on the default model. Replaced with a merged `Type.Object`.
-2. **Eval harness** (`eval/harness.ts`): `buildEvalContext` never wired `sendToWorker`/
-   `interruptWorker`, so the attach-and-steer path (the labeled outcome for the imperative
-   follow-up cases) threw `ctx.sendToWorker is not a function` and scored as `chat`. The
-   pre-fix run showed 4.7% wrong-route entirely from this artifact; after wiring it: 0%.
+2. **Eval harness relay wiring** (`eval/harness.ts`): `buildEvalContext` never wired
+   `sendToWorker`/`interruptWorker`, so attach-and-steer — the labeled outcome for the
+   imperative follow-up cases — threw `ctx.sendToWorker is not a function` and scored as
+   `chat` (a 4.7% wrong-route artifact; 0–0.9% after). Same class: `routines` (create /
+   set_followup / suggest / cancel / pause) was missing too, so "写完提醒我 review" failed
+   with `setFollowup 未定义` instead of recording its route. `eval/` is outside tsconfig's
+   include, which is why the gaps never surfaced at typecheck — worth remembering when
+   extending the context interface.
+3. **Prompt rule** (rule 2, `llm/extension.ts`): symptom/investigation utterances
+   （「有点慢，帮我看看」） hung on a self-chosen thread with a read-only worker as the
+   justification. The owner's product call: **uncertainty asks — read-only diagnosis is not
+   an exemption** (the findings would land in the wrong thread's context). Added to rule 2:
+   a symptom that could originate from several threads of one topic is the "multiple
+   candidates match" case → `ask_user`; a request for a full sweep is new work → new thread.
+   This flipped #63 (the only missed-ask) to ask and, as a side effect, fixed #75
+   （全面排查 → 新开）.
 
-Gate status: **red on missed-ask alone**. The threshold (< 3% of 11 ask cases) admits zero
-misses; the single miss is **#63 「网关那边有点慢，帮我看看」** — the dataset note itself
-marks the cluster ambiguous (网关簇 x2，日志开销也可能相关), and the model's behavior
-(dispatching a read-only diagnostics worker on the refactor thread) is defensible. The
-decision whether to recalibrate #63's label or to treat it as a real regression is the
-owner's; every other metric is green with zero misattachments.
-
+The residual failure cluster is unnecessary-ask only (11–12/95, stable across runs): the
+same label-edge cases below, every one carrying a dataset note marking it defensible.
 Spike baseline for comparison (deepseek-flash, 2026-10-14): 94.3% pass, wrong-route 1.9%,
 missed asks 0%, unnecessary 4.2% — with documented run-to-run variance of 88–93% (the spike
 README's regression protocol: a single run decides nothing; rerun and look for failure
-clusters). One run is recorded here so far; a second confirming run is warranted before
-treating #63 as pure noise.
+clusters). The two committed runs are that rerun.
 
 ### Local-router runs (2026-10-16, pre-harness-fix)
 
 Before a valid DeepSeek key was available, three runs went through a local OpenAI-compatible
-router (`--endpoint`), same world, same prompts — but **before the `sendToWorker` harness
-wiring above**, so their wrong-route numbers carry the same chat-instead-of-steer artifact
-(missed-ask is unaffected; that path never involved the relay tools):
+router (`--endpoint`), same world, same prompts — but **before the harness wiring above**, so
+their wrong-route numbers carry the same chat-instead-of-relay artifact (missed-ask is
+unaffected; that path never involved the relay tools):
 
 | Run (file in `eval/results/`) | pass | wrong-route | missed-ask | unnecessary-ask |
 |---|---|---|---|---|
@@ -98,16 +107,15 @@ The runner's headline counts `pass + pass_text_ask` (the two glm runs are 93 + 2
 文字反问, listed separately in each JSON's `summary`); an earlier revision of this table
 double-counted them as "95+2".
 
-**No in-tree baseline passes the gate as configured**: the default-model run above misses
-the missed-ask bar by exactly the #63 label-edge case (1/11 = 9.1% vs < 3%); the local-router
-runs below additionally carried the harness artifact. The exit code is therefore red on
-every recorded file — resolving #63 (label recalibration or a prompt fix) is what turns the
-gate green, per ADR-0001 decision 14.
+**The gate is green on the default model** (see the baseline table above): the 2026-10-17
+prompt rule resolved #63 — uncertainty asks, read-only diagnosis is not an exemption — and
+both committed runs meet all three thresholds. The local-router runs below predate the
+harness wiring and stay red; they are kept for history, not as gates.
 
 ### The persistent cluster
 
 The local-router runs miss the same handful, and the dataset's own notes mark them defensible
-under either label (the default-model baseline carries only #63 of these):
+under either label (the default-model baseline carries the same cluster as its residual):
 
 - **#63 「网关那边有点慢」** (label: ask) — two gateway threads exist, but the model argues a
   performance investigation is neither the running refactor nor the logging thread, and

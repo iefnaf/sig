@@ -163,6 +163,31 @@ export function buildEvalContext(ledger: Ledger, caseId: number, observation: Ob
     },
     answerWorker: async () => ({ kind: "refused", reason: "eval world has no workers to answer" }),
     isOwnerMessage: async (msgId) => msgId.startsWith("eval_"),
+    messageReceivedAt: async () => Date.now(), // consistent with checkProvenanceRef=true
+    recordProactiveOutcome: () => {},
+    // The proactive-behavior service (issue #20): a minimal in-memory stand-in. The real
+    // RoutineService needs the Agents SDK scheduler + outbound queue; the eval only needs
+    // the tools to answer honestly and the routing outcome to land in the observation
+    // (set_followup on a thread routes the request to that thread; create_routine is new
+    // standing work). Before this wiring these tools threw `ctx.routines is not a function`-
+    // style errors and correct routes scored as chat (run 3, #39).
+    routines: {
+      create: async (input: { routineId: string; instruction: string; scheduleKind: string; cron?: string; onceAt?: number }) => {
+        observation.dispatches.push({ threadId: `routine:${input.routineId}`, isNew: true });
+        return {
+          ok: true as const,
+          routine: { routineId: input.routineId, instruction: input.instruction, scheduleKind: input.scheduleKind, cron: input.cron, onceAt: input.onceAt, paused: false },
+        };
+      },
+      suggest: async () => ({ ok: true as const }), // the button card is not a routing outcome
+      setFollowup: async (input: { followupId: string; threadId: string; afterMinutes: number }) => {
+        if (!ledger.threads.get(input.threadId)) return { ok: false as const, reason: `Thread ${input.threadId} 不存在` };
+        observation.dispatches.push({ threadId: input.threadId, isNew: false });
+        return { ok: true as const, followup: { followupId: input.followupId, dueAt: Date.now() + input.afterMinutes * 60_000 } };
+      },
+      cancel: async (scheduleId: string) => ({ ok: true as const, what: `已取消 ${scheduleId}` }),
+      pause: async (routineId: string, paused: boolean) => ({ ok: true as const, what: `${routineId} 已${paused ? "暂停" : "恢复"}` }),
+    },
     audit: () => {},
   };
 }
