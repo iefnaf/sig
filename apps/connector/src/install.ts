@@ -22,6 +22,11 @@ export interface InstalledAssets {
   promptPath: string;
 }
 
+export interface ClaudeAssets {
+  /** The installed MCP report server (spawned by Claude Code per its mcp-config). */
+  serverPath: string;
+}
+
 function writeIfChanged(path: string, content: string): void {
   if (existsSync(path) && readFileSync(path, "utf8") === content) return;
   writeFileSync(path, content, { mode: 0o600 });
@@ -39,4 +44,15 @@ export function installAssets(stateDir: string, version = SHEPHERD_VERSION): Ins
   writeIfChanged(extensionPath, readFileSync(new URL("./ext/shepherd-pi.ts", import.meta.url), "utf8"));
   writeIfChanged(promptPath, WORKER_SYSTEM_PROMPT);
   return { extensionPath, promptPath };
+}
+
+/** Writes the MCP report server under `<stateDir>/mcp` (issue #17). Claude Code loads it
+ *  through the per-worker mcp-config the ClaudeAdapter writes next to it — never from the
+ *  repo, so project content cannot swap the reporting channel out (§4.2 rationale). */
+export function installClaudeAssets(stateDir: string, version = SHEPHERD_VERSION): ClaudeAssets {
+  const mcpDir = join(stateDir, "mcp");
+  mkdirSync(mcpDir, { recursive: true });
+  const serverPath = join(mcpDir, `shepherd-report-${version}.mjs`);
+  writeIfChanged(serverPath, readFileSync(new URL("./mcp/report-server.mjs", import.meta.url), "utf8"));
+  return { serverPath };
 }

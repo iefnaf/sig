@@ -14,7 +14,9 @@ import { VERSION } from "./version.ts";
 export interface DaemonOptions {
   stateDir: string;
   machineName?: string;
-  /** Test seams: fake-pi adapter and injected WebSocket. */
+  /** Test seams: fake agent adapters and injected WebSocket. */
+  adapters?: AgentAdapter[];
+  /** Single-adapter test seam. */
   adapter?: AgentAdapter;
   WebSocketImpl?: import("./client.ts").ClientOptions["WebSocketImpl"];
   logger?: Logger;
@@ -61,6 +63,7 @@ export async function runDaemon(options: DaemonOptions): Promise<DaemonHandle> {
     store,
     stateDir: options.stateDir,
     machineName: options.machineName,
+    adapters: options.adapters ?? (options.adapter ? [options.adapter] : undefined),
     adapter: options.adapter,
     WebSocketImpl: options.WebSocketImpl,
     log: (event, fields) => logger.info(event, fields),

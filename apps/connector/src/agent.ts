@@ -45,6 +45,11 @@ export interface StartSpec {
   approveProject?: boolean;
   images?: { data: string; mimeType: string }[];
   model?: string;
+  /** Continuation launches (send-relaunch, resume, stall respawn) set this when the worker
+   *  already has a session: agents whose session id is not the workerId (Claude Code's UUID)
+   *  resume with it instead of deriving a fresh one. Pi ignores it — its session id IS the
+   *  workerId, so first start and resume share one flag. */
+  resumeSessionId?: string;
 }
 
 export interface WorkerHandle {
@@ -73,6 +78,19 @@ export class PartialInterruptError extends Error {
   ) {
     super(`interrupt failed after clear_queue: ${causeErr.message}`);
     this.name = "PartialInterruptError";
+  }
+}
+
+/** Thrown by adapters for structured failures (code surfaces in cmd_result). The
+ *  AgentAdapter contract's shared error type — pi and Claude Code both use it. */
+export class AdapterError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+    readonly retriable = false,
+  ) {
+    super(message);
+    this.name = "AdapterError";
   }
 }
 
@@ -138,6 +156,8 @@ export type RawAdapterEvent =
 export interface AgentAdapter {
   readonly kind: AgentKind;
   readonly capabilities: AgentCapabilities;
+  /** Reported in hello.agents (protocol §6.1); defaults to the connector's own version. */
+  readonly version?: string;
 
   start(spec: StartSpec): Promise<WorkerHandle>; // must
   send(

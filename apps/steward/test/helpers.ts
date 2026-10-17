@@ -439,6 +439,8 @@ export class FakeConnector {
   readonly repos: FakeRepo[];
   /** Carried in hello (protocol §6.1): set per simulated connector boot. */
   bootId = "boot-1";
+  /** hello.agents kinds (issue #17): what this machine claims to have installed. */
+  agents: string[] = ["pi"];
   /** Full workers snapshot for hello.workers (reconciliation input, issue #12). */
   workers: Array<Record<string, unknown>> = [];
   /** Scripted L3 history (issue #23): entries replayed as windowed chunks on history_req. */
@@ -487,17 +489,15 @@ export class FakeConnector {
   }
 
   helloOverrides(): Record<string, unknown> {
+    const caps = (kind: string) =>
+      kind === "claude-code"
+        ? { steer: false, followUp: false, interrupt: true, resume: true, history: false, images: false, structuredReport: true, readonly: false }
+        : { steer: true, followUp: true, interrupt: true, resume: true, history: true, images: true, structuredReport: true, readonly: true };
     return {
       bootId: this.bootId,
       workers: this.workers,
       machine: { name: this.machineName, memTotalMB: 65536, memFreeMB: 31000 },
-      agents: [
-        {
-          kind: "pi",
-          version: "1.2.0",
-          capabilities: { steer: true, followUp: true, interrupt: true, resume: true, history: true, images: true, structuredReport: true, readonly: true },
-        },
-      ],
+      agents: this.agents.map((kind) => ({ kind, version: "1.0.0-test", capabilities: caps(kind) })),
       repos: this.repos.map((r) => ({
         repoId: r.repoId,
         name: r.name,
@@ -687,10 +687,10 @@ export class FakeConnector {
 /** Pairs a device for the fake connector and returns it, ready to connect. */
 export async function pairFakeConnector(
   name = "mac-studio",
-  options: { run?: FakeWorkerRun | null; repos?: FakeRepo[]; autorun?: boolean; machineName?: string } = {},
+  options: { run?: FakeWorkerRun | null; repos?: FakeRepo[]; autorun?: boolean; machineName?: string; agents?: string[] } = {},
 ): Promise<FakeConnector> {
   const { deviceId, token } = await pairDevice(name);
-  return new FakeConnector({
+  const connector = new FakeConnector({
     deviceId,
     token,
     machineName: options.machineName ?? name,
@@ -698,6 +698,8 @@ export async function pairFakeConnector(
     run: options.run,
     ...(options.autorun === undefined ? {} : { autorun: options.autorun }),
   });
+  if (options.agents) connector.agents = options.agents;
+  return connector;
 }
 
 // ---- The owner's web session (issue #22 login, reused by the L3 stream tests) -------------------

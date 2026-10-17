@@ -328,3 +328,121 @@ describe("the dispatch service: interventions on a broken worker are refused up 
     fake.close();
   });
 });
+
+// Issue #17: the steward can TARGET an agent (hello.agents is the menu) — the command
+// carries it, the worker row records it, and machines without it are refused honestly
+// instead of receiving a start_worker the connector would bounce (unknown_agent).
+describe("the dispatch service: agent targeting (issue #17)", () => {
+  beforeEach(async () => {
+    await resetLedgerState();
+    await mockReset();
+    await configureAndBind("ou_owner");
+  });
+
+  it("dispatches to claude-code when the machine advertises it; the command and worker row say so", async () => {
+    const fake = await pairFakeConnector("mac-studio", { run: null, autorun: false, agents: ["pi", "claude-code"] });
+    await fake.connect();
+    const outcome = await ownerStub().dispatchForTest({
+      prompt: "用另一套思路修个东西",
+      repoRef: "repo-a",
+      newTitle: "修东西",
+      agent: "claude-code",
+    });
+    expect(outcome).toMatchObject({ kind: "dispatched" });
+    const [cmd] = await fake.waitForCmds(1);
+    expect(cmd!.kind).toBe("start_worker");
+    expect(cmd!.args).toMatchObject({ agent: "claude-code" });
+    const snap = await ownerStub().debugSnapshot();
+    expect(snap.threads[0]!.workers[0]!.agent).toBe("claude-code");
+    fake.close();
+  });
+
+  it("defaults to pi and omits the agent field (legacy connectors never see it)", async () => {
+    const fake = await pairFakeConnector("mac-studio", { run: null, autorun: false });
+    await fake.connect();
+    const outcome = await ownerStub().dispatchForTest({ prompt: "修个东西", repoRef: "repo-a", newTitle: "修东西" });
+    expect(outcome).toMatchObject({ kind: "dispatched" });
+    const [cmd] = await fake.waitForCmds(1);
+    expect(cmd!.args).not.toHaveProperty("agent");
+    const snap = await ownerStub().debugSnapshot();
+    expect(snap.threads[0]!.workers[0]!.agent).toBe("pi");
+    fake.close();
+  });
+
+  it("refuses honestly when no machine with the repo has the agent installed", async () => {
+    const fake = await pairFakeConnector("mac-studio", { run: null, autorun: false }); // pi only
+    await fake.connect();
+    const outcome = await ownerStub().dispatchForTest({
+      prompt: "用 Claude Code 修个东西",
+      repoRef: "repo-a",
+      newTitle: "修东西",
+      agent: "claude-code",
+    });
+    expect(outcome).toMatchObject({ kind: "refused" });
+    expect((outcome as { reason: string }).reason).toContain("claude-code");
+    expect((outcome as { reason: string }).reason).toContain("pi");
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(fake.cmds).toHaveLength(0); // never sent — the connector would bounce it
+    fake.close();
+  });
+
+  it("an agent switch on a Thread is a new session from the previous leg's branch (spec §5.3)", async () => {
+    const fake = await pairFakeConnector("mac-studio", {
+      run: { status: "done", summary: "pi leg done", branch: "shepherd/leg-1" },
+      autorun: false,
+      agents: ["pi", "claude-code"],
+    });
+    await fake.connect();
+    const first = await ownerStub().dispatchForTest({ prompt: "第一段：pi 先跑", repoRef: "repo-a", newTitle: "接力" });
+    expect(first).toMatchObject({ kind: "dispatched" });
+    const leg1Id = (first as { workerId: string }).workerId;
+    const [cmd1] = await fake.waitForCmds(1);
+    fake.send({ t: "cmd_ack", re: cmd1!.id, status: "accepted" });
+    fake.send({ t: "cmd_result", re: cmd1!.id, ok: true, data: { sessionId: leg1Id, branch: "shepherd/leg-1" } });
+    await fake.emit("started", leg1Id, { sessionId: leg1Id, branch: "shepherd/leg-1" });
+    await fake.emit("report", leg1Id, {
+      type: "report",
+      status: "done",
+      summary: "pi leg done",
+      git: {
+        branch: "shepherd/leg-1",
+        base: "b464a0f8c355115c1212b0f019b4a65d2bb44e3",
+        ahead: 1,
+        dirty: 0,
+        filesChanged: 1,
+        insertions: 10,
+        deletions: 0,
+        pushed: false,
+        head: "3e56dab13073fd2a79e042e36414851b2fba95f",
+        commits: ["3e56dab13073fd2a79e042e36414851b2fba95f"],
+        changedFiles: ["PLAN.md"],
+        pointersTruncated: false,
+      },
+    });
+    await fake.emit("settled", leg1Id, { type: "settled", outcome: "reported", usage: { contextUsage: { percent: 2 } } });
+    for (;;) {
+      const snap = await ownerStub().debugSnapshot();
+      if (snap.threads[0]!.workers[0]?.state === "idle") break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    const threadId = (await ownerStub().debugSnapshot()).threads[0]!.threadId;
+
+    // Same thread, DIFFERENT agent: never a resume — a new session on the pi leg's branch.
+    const second = await ownerStub().dispatchForTest({
+      prompt: "第二段：claude 接力",
+      repoRef: "repo-a",
+      threadId,
+      agent: "claude-code",
+    });
+    expect(second).toMatchObject({
+      kind: "dispatched",
+      continuation: { action: "new_session", reason: "agent_switch", base: "shepherd/leg-1" },
+    });
+    const [, cmd2] = await fake.waitForCmds(2);
+    expect(cmd2!.args).toMatchObject({ agent: "claude-code", base: "shepherd/leg-1" });
+    const snap = await ownerStub().debugSnapshot();
+    expect(snap.threads[0]!.workers).toHaveLength(2);
+    expect(snap.threads[0]!.workers[1]!.agent).toBe("claude-code");
+    fake.close();
+  });
+});

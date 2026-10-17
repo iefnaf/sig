@@ -59,10 +59,15 @@ export interface SendArgs {
 
 export interface SendResult {
   delivery: "prompt" | "steer" | "follow_up" | "queued";
-  /** §6.2: steer waits for the current tool batch — the steward relays this to the user. */
-  effect?: "after_current_tools";
+  /** §6.2: steer waits for the current tool batch — the steward relays this to the user.
+   *  `after_run_end`: the §3 degradation for agents that cannot steer at all (issue #17) —
+   *  the text is delivered as the next prompt once the current run settles. */
+  effect?: "after_current_tools" | "after_run_end";
   /** True when an idle-cold send relaunched the process with `--session-id` (§6.2). */
   relaunched?: boolean;
+  /** §3 degradation (issue #17): why the delivery differs from the §6.2 state table — the
+   *  steward relays this so nobody waits for a steer that will never come. */
+  degraded?: string;
 }
 
 /** `interrupt` args (§6.1): abort, optionally followed by one new instruction. */
@@ -89,6 +94,13 @@ interface PendingSend {
   reject: (err: CommandError) => void;
 }
 
+/** A mid-run send parked on a no-steer agent until its run settles (§3, issue #17). */
+interface DeferredSend {
+  commandId: string;
+  text: string;
+  images?: { data: string; mimeType: string }[];
+}
+
 const DEFAULT_IDLE_RECLAIM_MS = 10 * 60_000;
 const DEFAULT_ABORT_SETTLE_TIMEOUT_MS = 5_000;
 
@@ -98,8 +110,10 @@ export interface StartWorkerArgs {
   threadId: string;
   repoId: string;
   mode: WorkerMode;
-  base?: string;
   prompt: string;
+  /** Which agent runs the task (issue #17); default 'pi'. Must be one of hello.agents. */
+  agent?: string;
+  base?: string;
   images?: { data: string; mimeType: string }[];
   model?: string;
 }
@@ -145,6 +159,10 @@ export interface RecoveryOptions {
 export interface WorkerManagerOptions {
   store: LocalStore;
   stateDir: string;
+  /** Every agent this connector drives (issue #17: pi + Claude Code). The first entry is
+   *  the default for start_worker commands that carry no `agent`. */
+  adapters?: AgentAdapter[];
+  /** Single-adapter shorthand (tests); ignored when `adapters` is given. Defaults to PiAdapter. */
   adapter?: AgentAdapter;
   /**
    * Persist-and-send for worker events (§11.3): the transport supplies this (ConnectorClient
@@ -180,7 +198,10 @@ const LOCAL_ONLY_ARGS = ["approveProject", "approve", "workspace", "workspaceMod
 export class WorkerManager {
   private readonly store: LocalStore;
   private readonly stateDir: string;
-  private readonly adapter: AgentAdapter;
+  /** Every agent behind the contract (issue #17), keyed by kind; the default handles
+   *  commands that name no agent (legacy rows included — their worker.agent is 'pi'). */
+  private readonly adapters: Map<string, AgentAdapter>;
+  private readonly defaultAdapter: AgentAdapter;
   private readonly worktrees: WorktreeManager;
   private readonly emit?: (workerId: string, fields: Record<string, unknown>) => void;
   private readonly now: () => number;
@@ -216,6 +237,13 @@ export class WorkerManager {
   /** Sends held while the worker is starting/recovering/lost (§6.2 queue rows); drained
    *  when the transition completes, superseded by an interrupt (protocol §7.4). */
   private readonly pendingSends = new Map<string, PendingSend[]>();
+  /** §3 degradation (issue #17): sends that landed mid-run on an agent that cannot steer
+   *  (Claude Code headless). Delivered as the next prompt when the run settles; flushed
+   *  back as `queue_returned` when the run ends any other way — never dropped. In memory
+   *  on purpose: a connector crash loses them exactly like it loses a steer pi already
+   *  queued (the command result went out in both cases), and the steward's re-ask path —
+   *  not silent replay — is the recovery for both. */
+  private readonly deferredSends = new Map<string, DeferredSend[]>();
   /** The in-flight start/resume transition per worker: what `interrupt` waits out and what
    *  drains the send queue when it settles. */
   private readonly transitions = new Map<string, Promise<unknown>>();
@@ -239,7 +267,10 @@ export class WorkerManager {
   constructor(options: WorkerManagerOptions) {
     this.store = options.store;
     this.stateDir = options.stateDir;
-    this.adapter = options.adapter ?? new PiAdapter({ stateDir: options.stateDir });
+    const list = options.adapters ?? (options.adapter ? [options.adapter] : [new PiAdapter({ stateDir: options.stateDir })]);
+    if (list.length === 0) throw new Error("WorkerManager needs at least one AgentAdapter");
+    this.adapters = new Map(list.map((adapter) => [adapter.kind, adapter]));
+    this.defaultAdapter = this.adapters.get("pi") ?? list[0]!;
     this.worktrees = new WorktreeManager({ worktreesRoot: join(options.stateDir, "worktrees") });
     this.emit = options.emit;
     this.now = options.now ?? Date.now;
@@ -260,16 +291,40 @@ export class WorkerManager {
       candidates: () => this.watchdogCandidates(),
       onStrike: (workerId, strike, why) => this.handleStallStrike(workerId, strike, why),
     });
-    this.adapter.on("worker-event", (event) => {
-      void this.onAdapterEvent(event).catch((err) => {
-        // Event handling must never take the connector down (e.g. store closed at shutdown).
-        console.error(`[shepherd] worker-event handling failed for ${event.workerId}:`, err);
+    for (const adapter of this.adapters.values()) {
+      adapter.on("worker-event", (event) => {
+        void this.onAdapterEvent(event).catch((err) => {
+          // Event handling must never take the connector down (e.g. store closed at shutdown).
+          console.error(`[shepherd] worker-event handling failed for ${event.workerId}:`, err);
+        });
       });
-    });
+    }
   }
 
   get agents() {
-    return [{ kind: this.adapter.kind, capabilities: this.adapter.capabilities }];
+    return [...this.adapters.values()].map((a) => ({ kind: a.kind, version: a.version, capabilities: a.capabilities }));
+  }
+
+  /** The adapter for an agent kind; unknown kinds fail loudly (never silently fall back —
+   *  the steward's hello.agents list is the contract). */
+  private adapterFor(kind: string | null | undefined): AgentAdapter {
+    if (!kind) return this.defaultAdapter;
+    const adapter = this.adapters.get(kind);
+    if (!adapter) {
+      throw new CommandError("unknown_agent", `agent '${kind}' is not available on this machine`, false);
+    }
+    return adapter;
+  }
+
+  /** The adapter owning a worker row (legacy rows predate the agent column → pi). */
+  private adapterOfWorker(worker: WorkerRow): AgentAdapter {
+    return this.adapterFor(worker.agent ?? "pi");
+  }
+
+  /** stopProcess/interrupt can arrive for a worker the store no longer knows: fan the
+   *  no-op-tolerant calls out to every adapter so whichever owns it is covered. */
+  private stopProcessEverywhere(workerId: string): Promise<void> {
+    return Promise.all([...this.adapters.values()].map((a) => a.stopProcess(workerId))).then(() => undefined);
   }
 
   /** Handles a steward command envelope; returns data for cmd_result or throws CommandError. */
@@ -334,6 +389,23 @@ export class WorkerManager {
       }
     }
 
+    // --- §3 capability gate (issue #17): the command's agent must exist here, and its
+    // honest declarations are enforced — never quietly run a task the agent cannot honor.
+    const agentKind = args.agent ?? "pi";
+    const adapter = this.adapterFor(agentKind);
+    if (args.images && args.images.length > 0 && !adapter.capabilities.images) {
+      throw new CommandError(
+        "unsupported_capability",
+        `agent '${agentKind}' cannot take images (capability images=false); dispatch without them or to another agent`,
+      );
+    }
+    if (args.mode === "readonly" && !adapter.capabilities.readonly) {
+      throw new CommandError(
+        "unsupported_capability",
+        `agent '${agentKind}' cannot truly be restricted to read-only (capability readonly=false); dispatch it write tasks only`,
+      );
+    }
+
     // --- Repository whitelist (§8.1): a start_worker for an unregistered repo is rejected.
     const repo = this.store.getRepo(args.repoId);
     if (!repo) {
@@ -351,6 +423,7 @@ export class WorkerManager {
           workerId: args.workerId,
           threadId: args.threadId,
           repoId: args.repoId,
+          agent: agentKind,
           mode: "write",
           state: "queued",
           branch: null,
@@ -379,6 +452,7 @@ export class WorkerManager {
    * client, only the single JS turn serializes them). The same claim closes the stop-vs-pump
    * window (finding 3): a stop landing after the claim sees `starting`, not `queued`. */
   private async launchWorker(commandId: string, args: StartWorkerArgs, repo: RegisteredRepo): Promise<StartWorkerResult> {
+    const adapter = this.adapterFor(args.agent); // unknown agents never reach a lock or a row
     // --- One process per session (§4.3): lock file, `lock_held` when alive, stale removed.
     const lock = acquireLock(this.stateDir, args.workerId);
     if (!lock.ok) {
@@ -392,6 +466,7 @@ export class WorkerManager {
       workerId: args.workerId,
       threadId: args.threadId,
       repoId: args.repoId,
+      agent: args.agent ?? "pi",
       mode: args.mode,
       state: "starting",
     });
@@ -470,7 +545,7 @@ export class WorkerManager {
       };
 
       try {
-        handle = await this.adapter.start(spec);
+        handle = await adapter.start(spec);
       } catch (err) {
         if (this.stopRequested.has(args.workerId)) {
           // The stop could not kill what had not spawned; the start raced it and lost.
@@ -480,7 +555,7 @@ export class WorkerManager {
       }
       if (this.stopRequested.has(args.workerId)) {
         // The process did spawn after all — reclaim it, leave the stop's bookkeeping alone.
-        await this.adapter.stopProcess(args.workerId).catch(() => undefined);
+        await adapter.stopProcess(args.workerId).catch(() => undefined);
         throw new CommandError("aborted", "worker was stopped during startup");
       }
 
@@ -496,6 +571,7 @@ export class WorkerManager {
         workerId: args.workerId,
         threadId: args.threadId,
         repoId: args.repoId,
+        agent: args.agent ?? "pi",
         mode: args.mode,
         state: "running",
         sessionId: handle.sessionId,
@@ -595,7 +671,13 @@ export class WorkerManager {
       clearTimeout(timer);
       this.resumeTimers.delete(workerId);
     }
-    await this.adapter.stopProcess(workerId); // process_exit handler releases the lock
+    // §3 degradation: a stop is the one intervention every agent must honor — fan out to
+    // every adapter when the row is gone; adapters that do not own the worker no-op.
+    if (worker) await this.adapterOfWorker(worker).stopProcess(workerId);
+    else await this.stopProcessEverywhere(workerId);
+    // process_exit handler releases the lock; a §3 no-steer agent's deferred texts come
+    // back to the steward instead of silently relaunching a worker the user just stopped.
+    await this.flushDeferredSends(workerId, "stopped");
     // §9.3: a stop that had to escalate to SIGKILL may have orphaned tool children.
     await this.cleanupOrphans(workerId);
     if (inFlight) {
@@ -747,7 +829,7 @@ export class WorkerManager {
     }
     // Settled but still idle-hot: the process is alive inside that directory — never delete
     // under it (review finding 5's other half; also keeps resume-after-cleanup cold).
-    if (this.adapter.isRunning?.(workerId) === true) {
+    if (this.adapterOfWorker(worker).isRunning?.(workerId) === true) {
       throw new CommandError(
         "worker_running",
         `worker ${workerId} still has a live (idle) process in its worktree; stop_process first`,
@@ -855,7 +937,8 @@ export class WorkerManager {
         });
       });
     }
-    const hot = this.adapter.isRunning?.(workerId) ?? false;
+    const adapter = this.adapterOfWorker(worker);
+    const hot = adapter.isRunning?.(workerId) ?? false;
     if (worker.state === "running" || worker.state === "recovering") {
       if (!hot) {
         throw new CommandError(
@@ -869,8 +952,17 @@ export class WorkerManager {
       // handler first collects git facts) — a steer that lands after the run ended simply
       // waits in pi's queue for the next one. Never lost, never racing.
       const how: Delivery = input.intent === "after" ? "follow_up" : "steer";
+      const capable = input.intent === "after" ? adapter.capabilities.followUp : adapter.capabilities.steer;
+      if (!capable) {
+        // §3 degradation (issue #17): headless agents have no mid-run channel. The send
+        // parks until the run settles and is then delivered as the next prompt; the command
+        // result says so (effect: after_run_end) so the steward never promises a steer.
+        // (No marker check here: nothing is written to the agent yet — the deferred
+        // delivery runs its own expectCommandMarker when it relaunches.)
+        return this.deferSendUntilRunEnd(worker, commandId, input, how);
+      }
       this.expectCommandMarker(commandId, workerId);
-      await this.adapter.send(workerId, { text: input.text, images: input.images, commandId }, how);
+      await adapter.send(workerId, { text: input.text, images: input.images, commandId }, how);
       return how === "steer" ? { delivery: "steer", effect: "after_current_tools" } : { delivery: "follow_up" };
     }
     // idle: prompt starts the next run in the same session. State flips first so a
@@ -897,7 +989,7 @@ export class WorkerManager {
     this.store.setWorkerState(workerId, "running");
     this.expectCommandMarker(commandId, workerId);
     try {
-      await this.adapter.send(workerId, { text: input.text, images: input.images, commandId }, "prompt");
+      await this.adapterOfWorker(worker).send(workerId, { text: input.text, images: input.images, commandId }, "prompt");
     } catch (err) {
       this.store.setWorkerState(workerId, "idle");
       this.armIdleReclaim(workerId);
@@ -950,9 +1042,12 @@ export class WorkerManager {
       // send-relaunch path included (issue #16 merge stitch).
       approveProject: repo?.approved === true ? true : undefined,
       images: input.images,
+      // The worker already has a session: agents whose session id is not the workerId
+      // (Claude Code) resume it instead of deriving a fresh one (issue #17).
+      resumeSessionId: worker.sessionId ?? undefined,
     };
     try {
-      const handle = await this.adapter.start(spec);
+      const handle = await this.adapterOfWorker(worker).start(spec);
       this.store.upsertWorker({
         workerId,
         threadId: worker.threadId,
@@ -989,9 +1084,19 @@ export class WorkerManager {
    * true}`, and — when `then` is present — deliver it as the next prompt.
    */
   private async interruptWorker(commandId: string, args: InterruptArgs): Promise<InterruptOutcome> {
-    this.requireWorker(args.workerId);
+    const worker = this.requireWorker(args.workerId);
+    const adapter = this.adapterOfWorker(worker);
     this.cancelIdleReclaim(args.workerId);
     this.supersedePendingSends(args.workerId);
+    // §3 degradation (issue #17): an agent that cannot interrupt at all fails loudly — the
+    // command error is what tells the steward (and the user) that this run cannot be
+    // stopped here, only waited out (or stop_process-ed out from under the session).
+    if (!adapter.capabilities.interrupt) {
+      throw new CommandError(
+        "unsupported_capability",
+        `agent '${worker.agent ?? "pi"}' cannot interrupt a running task (capability interrupt=false); wait for it to settle or stop the process`,
+      );
+    }
     // A start/resume still in flight owns the process; let it land (bounded by its own
     // timeouts) so the abort hits a known state — "stop that one" right after dispatch.
     const transition = this.transitions.get(args.workerId);
@@ -1000,10 +1105,17 @@ export class WorkerManager {
     let aborted = false;
     let then: SendResult | undefined;
     try {
-      if (this.adapter.isRunning?.(args.workerId)) {
+      // §3 (issue #17): texts parked on a no-steer agent were never delivered — the
+      // interrupt supersedes them, so they come back with the queue instead of vanishing.
+      const deferred = this.takeDeferredSends(args.workerId);
+      if (deferred.length > 0) {
+        returned = deferred.map((send) => send.text);
+        await this.emitEvent(args.workerId, "queue_returned", { texts: returned, reason: "interrupted" });
+      }
+      if (adapter.isRunning?.(args.workerId)) {
         let interruptResult: Awaited<ReturnType<AgentAdapter["interrupt"]>>;
         try {
-          interruptResult = await this.adapter.interrupt(args.workerId);
+          interruptResult = await adapter.interrupt(args.workerId);
         } catch (err) {
           // R2-3: clear_queue may already have emptied the agent's queue — the retrieved
           // texts ride a PartialInterruptError; surface them as queue_returned before
@@ -1013,21 +1125,21 @@ export class WorkerManager {
           }
           throw err;
         }
-        returned = interruptResult.returned;
-        if (returned.length > 0) {
-          await this.emitEvent(args.workerId, "queue_returned", { texts: returned });
+        returned = [...returned, ...interruptResult.returned];
+        if (interruptResult.returned.length > 0) {
+          await this.emitEvent(args.workerId, "queue_returned", { texts: interruptResult.returned });
         }
         aborted = true;
         // Wait out the abort only when a run window is open — an interrupt on an idle-hot
         // worker has nothing settling, and the wait must not stall the command (§6.2).
-        if (this.adapter.isStreaming?.(args.workerId)) await this.waitForAbortSettle(args.workerId);
+        if (adapter.isStreaming?.(args.workerId)) await this.waitForAbortSettle(args.workerId);
       }
       if (args.then !== undefined) {
         const worker = await this.awaitSettleBeforeThen(args.workerId);
         if (worker.state === "broken") {
           throw new CommandError("broken_worker", `worker ${args.workerId} is broken and needs a human decision`);
         }
-        const runWindowOpen = this.adapter.isStreaming?.(args.workerId) ?? false;
+        const runWindowOpen = this.adapterOfWorker(worker).isStreaming?.(args.workerId) ?? false;
         const storeSettled = worker.state !== "running" && worker.state !== "recovering";
         if (!runWindowOpen && !storeSettled) {
           // PR #45 review #2: the settle pipeline stalled past the bound while pi's run window
@@ -1073,7 +1185,7 @@ export class WorkerManager {
    */
   private async awaitSettleBeforeThen(workerId: string): Promise<WorkerRow> {
     const worker = this.requireWorker(workerId);
-    if (this.adapter.isStreaming?.(workerId)) return worker; // a run window is open: §6.2's table applies
+    if (this.adapterOfWorker(worker).isStreaming?.(workerId)) return worker; // a run window is open: §6.2's table applies
     if (worker.state !== "running" && worker.state !== "recovering") return worker; // store already caught up
     await this.waitForAbortSettle(workerId); // the settle is in flight; bounded by abortSettleTimeoutMs
     return this.requireWorker(workerId);
@@ -1133,6 +1245,67 @@ export class WorkerManager {
     }
   }
 
+  // --- §3 degradation: sends deferred past run end (issue #17) ------------------------------
+
+  /** Parks a mid-run send on a no-steer agent; the command settles immediately with the
+   *  degradation note so the steward can tell the user when the text will land. */
+  private async deferSendUntilRunEnd(
+    worker: WorkerRow,
+    commandId: string,
+    input: { text: string; images?: SendArgs["images"] },
+    how: Delivery,
+  ): Promise<SendResult> {
+    const queue = this.deferredSends.get(worker.workerId) ?? [];
+    this.deferredSends.set(worker.workerId, queue);
+    queue.push({ commandId, text: input.text, images: input.images });
+    return {
+      delivery: "queued",
+      effect: "after_run_end",
+      degraded: `${worker.agent ?? "pi"} cannot ${how} mid-run; the text is delivered as the next prompt when the current run ends`,
+    };
+  }
+
+  /** Delivers a no-steer agent's deferred sends once its run settled (the settled handler
+   *  calls this). Serial by nature: a delivery that lands while the NEXT run is already
+   *  going simply defers again — never lost, never racing. */
+  private async drainDeferredSends(workerId: string): Promise<void> {
+    const queue = this.deferredSends.get(workerId);
+    if (!queue || queue.length === 0) return;
+    this.deferredSends.delete(workerId);
+    for (const [index, send] of queue.entries()) {
+      if (this.crashed) {
+        // A shutdown mid-drain: the remaining texts keep their slot for the next life —
+        // they were promised delivery, so they are never silently dropped.
+        this.deferredSends.set(workerId, queue.slice(index));
+        return;
+      }
+      try {
+        const worker = this.requireWorker(workerId);
+        if (worker.state === "broken") throw new CommandError("broken_worker", `worker ${workerId} is broken`);
+        await this.deliverSend(worker, send.commandId, { text: send.text, intent: "auto", images: send.images });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(`[shepherd] deferred send failed for ${workerId}: ${message}`);
+        await this.emitEvent(workerId, "queue_returned", { texts: [send.text], reason: "undeliverable" });
+      }
+    }
+  }
+
+  /** Takes the deferred texts out (interrupt path: they ride `queue_returned`). */
+  private takeDeferredSends(workerId: string): DeferredSend[] {
+    const queue = this.deferredSends.get(workerId) ?? [];
+    this.deferredSends.delete(workerId);
+    return queue;
+  }
+
+  /** Returns the deferred texts to the steward as `queue_returned` — the run (or the
+   *  worker) ended in a way that will not deliver them (stop, broken, shutdown). */
+  private async flushDeferredSends(workerId: string, why: string): Promise<void> {
+    const queue = this.takeDeferredSends(workerId);
+    if (queue.length === 0) return;
+    await this.emitEvent(workerId, "queue_returned", { texts: queue.map((s) => s.text), reason: why });
+  }
+
   // --- §4.1 idle reclamation -------------------------------------------------------------------
 
   private armIdleReclaim(workerId: string): void {
@@ -1166,7 +1339,7 @@ export class WorkerManager {
     if (this.crashed) return;
     const worker = this.store.getWorker(workerId);
     if (!worker || worker.state !== "idle") return;
-    if (!(this.adapter.isRunning?.(workerId) ?? false)) return;
+    if (!(this.adapterOfWorker(worker).isRunning?.(workerId) ?? false)) return;
     await this.stopProcess(workerId).catch((err) => {
       console.error(`[shepherd] idle reclaim failed for ${workerId}:`, err);
     });
@@ -1180,9 +1353,10 @@ export class WorkerManager {
   async history(workerId: string, since: string | undefined, maxBytes: number): Promise<HistoryPage> {
     const worker = this.store.getWorker(workerId);
     if (!worker) throw new CommandError("not_found", `worker ${workerId} is unknown on this machine`);
-    if (typeof this.adapter.history === "function" && this.adapter.isRunning?.(workerId)) {
+    const adapter = this.adapterOfWorker(worker);
+    if (typeof adapter.history === "function" && adapter.isRunning?.(workerId)) {
       try {
-        return await this.adapter.history(workerId, since, maxBytes);
+        return await adapter.history(workerId, since, maxBytes);
       } catch (err) {
         // The process died between the isRunning check and the RPC: the run is over, so the
         // session file is now the truth — fall through instead of surfacing the race.
@@ -1231,6 +1405,25 @@ export class WorkerManager {
   }
 
   private async reconcileWorkerTail(worker: WorkerRow): Promise<void> {
+    // Issue #17: agents that keep their own session store (Claude Code: ~/.claude) have no
+    // sessionFile to tail. With a sessionId the run had started — the crash killed it, so
+    // the §9.2 resume path applies (--resume). Without one the start never completed, the
+    // same verdict the empty-tail check gives pi.
+    if (!worker.sessionFile) {
+      if (worker.sessionId) {
+        this.store.setWorkerState(worker.workerId, "lost", "restart");
+        await this.emitEvent(worker.workerId, "lost", { reason: "connector_restart" });
+        this.scheduleAutoResume(worker.workerId, "connector_restart");
+        return;
+      }
+      await this.breakWorker(
+        worker.workerId,
+        "unknown",
+        "Connector restarted during startup; the task never began. Re-dispatch it.",
+        "startup_interrupted",
+      );
+      return;
+    }
     const tail = this.inspectTailFn(worker.sessionFile);
     this.recordSessionTail(worker.workerId); // §10: adopt the crashed run's own entries before any resume
     if (tail.kind === "settled") {
@@ -1337,6 +1530,7 @@ export class WorkerManager {
   ): Promise<void> {
     const worker = this.store.getWorker(workerId);
     if (!worker) throw new CommandError("not_found", `worker ${workerId} is unknown on this machine`);
+    const adapter = this.adapterOfWorker(worker);
     if (worker.state === "queued") {
       // §8.2: a queued write worker has no session yet — there is nothing to resume. It
       // starts on its own when the repo's serial slot frees.
@@ -1353,10 +1547,10 @@ export class WorkerManager {
         true,
       );
     }
-    if (this.adapter.isRunning?.(workerId)) {
+    if (adapter.isRunning?.(workerId)) {
       const commandId = options.commandId;
       if (commandId) this.expectCommandMarker(commandId, workerId);
-      await this.adapter.resume(workerId, reason, commandId ? { commandId } : undefined);
+      await adapter.resume(workerId, reason, commandId ? { commandId } : undefined);
       this.recordSessionTail(workerId);
       this.store.setWorkerState(workerId, "running");
       await this.emitEvent(workerId, "resumed", { reason, count });
@@ -1411,6 +1605,9 @@ export class WorkerManager {
       },
       // §13: the repo's local trust applies to resumes exactly like first starts.
       approveProject: repo?.approved === true ? true : undefined,
+      // The session exists (this is a resume): Claude Code resumes its UUID session
+      // instead of deriving a fresh one (issue #17).
+      resumeSessionId: worker.sessionId ?? undefined,
     };
     this.active.set(workerId, {
       repoId: worker.repoId,
@@ -1421,13 +1618,13 @@ export class WorkerManager {
     try {
       let handle: WorkerHandle;
       try {
-        handle = await this.adapter.start(spec);
+        handle = await adapter.start(spec);
       } catch (err) {
         if (this.stopRequested.has(workerId)) throw new CommandError("aborted", "worker was stopped during resume");
         throw err;
       }
       if (this.stopRequested.has(workerId)) {
-        await this.adapter.stopProcess(workerId).catch(() => undefined);
+        await adapter.stopProcess(workerId).catch(() => undefined);
         throw new CommandError("aborted", "worker was stopped during resume");
       }
       this.stopRequested.delete(workerId);
@@ -1478,6 +1675,9 @@ export class WorkerManager {
         send.reject(new CommandError("broken_worker", `worker ${workerId} is broken: ${detail}`));
       }
     }
+    // §3 (issue #17): texts deferred past run end can never deliver on a broken worker —
+    // hand them back instead of dropping them.
+    await this.flushDeferredSends(workerId, "broken");
     await this.emitEvent(workerId, "settled", { outcome: "error", errorClass, lastText: detail });
     // §8.2: a broken write worker frees the repo's serial slot for the next queued one.
     this.pumpQueuedWorkers();
@@ -1488,7 +1688,9 @@ export class WorkerManager {
   /** Live processes in lifecycle states the watchdog may declare stalled. */
   private watchdogCandidates(): WatchdogCandidate[] {
     if (this.crashed) return [];
-    return (this.adapter.workerActivity?.() ?? []).filter(({ workerId }) => {
+    // Every agent's live processes (issue #17): the watchdog is agent-agnostic.
+    const activity = [...this.adapters.values()].flatMap((a) => a.workerActivity?.() ?? []);
+    return activity.filter(({ workerId }) => {
       const worker = this.store.getWorker(workerId);
       return worker !== null && (worker.state === "running" || worker.state === "recovering");
     });
@@ -1554,7 +1756,9 @@ export class WorkerManager {
       clearTimeout(timer);
       this.resumeTimers.delete(workerId);
     }
-    await this.adapter.stopProcess(workerId); // process_exit handler releases the lock
+    const worker = this.store.getWorker(workerId);
+    if (worker) await this.adapterOfWorker(worker).stopProcess(workerId);
+    else await this.stopProcessEverywhere(workerId);
     await this.cleanupOrphans(workerId);
     // The process_exit handler's releaseLock rides a microtask; release again rather than
     // race it — releaseLock on an already-removed file is a no-op.
@@ -1580,6 +1784,8 @@ export class WorkerManager {
       commandId: `stall-respawn-${this.now()}`,
       // §13: reproduce the original launch's trust mode — the respawn is the same run.
       approveProject: repo?.approved === true ? true : undefined,
+      // Same session as the stalled run (issue #17: Claude Code resumes its UUID).
+      resumeSessionId: worker.sessionId ?? undefined,
     };
     this.active.set(workerId, {
       repoId: worker.repoId,
@@ -1588,7 +1794,7 @@ export class WorkerManager {
       base: worker.base ?? undefined,
     });
     try {
-      const handle = await this.adapter.start(spec);
+      const handle = await this.adapterOfWorker(worker).start(spec);
       // A stop is not a transition and can land while adapter.start is in flight: it settles
       // the worker (idle + settled:aborted) and its verdict must survive (the resume path
       // applies the same check). If this strike's `recovering` is gone the stop won the race
@@ -1596,7 +1802,7 @@ export class WorkerManager {
       // (PR #46 review round 3, finding 2b).
       const current = this.store.getWorker(workerId);
       if (!current || current.state !== "recovering") {
-        await this.adapter.stopProcess(workerId).catch(() => undefined); // expected exit: no settle
+        await this.adapterOfWorker(worker).stopProcess(workerId).catch(() => undefined); // expected exit: no settle
         throw new CommandError("aborted", `worker ${workerId} was stopped during the stall respawn`);
       }
       this.store.upsertWorker({
@@ -1649,7 +1855,8 @@ export class WorkerManager {
 
   private async snapshotOnce(): Promise<void> {
     if (this.crashed) return;
-    const pids = this.adapter.workerPids?.() ?? [];
+    // Every agent's live processes (issue #17): orphan snapshots are agent-agnostic.
+    const pids = [...this.adapters.values()].flatMap((a) => a.workerPids?.() ?? []);
     if (pids.length === 0) {
       this.stopSnapshotLoop();
       return;
@@ -1691,7 +1898,7 @@ export class WorkerManager {
     this.resumeTimers.clear();
     for (const timer of this.idleTimers.values()) clearTimeout(timer);
     this.idleTimers.clear();
-    this.adapter.simulateCrash?.();
+    for (const adapter of this.adapters.values()) adapter.simulateCrash?.();
     markLocksHeldByDeadProcess(this.stateDir);
   }
 
@@ -1753,6 +1960,9 @@ export class WorkerManager {
           // resume keeps the slot — the run is still in flight from the queue's viewpoint.)
           this.pumpQueuedWorkers();
         }
+        // §3 (issue #17): a no-steer agent's deferred sends now have an idle worker to
+        // deliver into — the promised after-run-end prompt.
+        await this.drainDeferredSends(event.workerId);
         return;
       }
       case "process_exit": {
@@ -1937,6 +2147,7 @@ function parseStartWorkerArgs(args: Record<string, unknown>): StartWorkerArgs {
     prompt: String(args.prompt ?? ""),
     images,
   };
+  if (typeof args.agent === "string" && args.agent.length > 0) parsed.agent = args.agent;
   if (typeof args.base === "string" && args.base.length > 0) parsed.base = args.base;
   if (typeof args.model === "string" && args.model.length > 0) parsed.model = args.model;
   return parsed;
