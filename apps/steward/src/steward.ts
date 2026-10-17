@@ -25,8 +25,6 @@ import { Agent, type Connection, type ConnectionContext, type WSMessage } from "
 import { PiHarness } from "agents/harness/pi";
 import { Harness, createRegistry, type Extension, type Registry } from "@earendil-works/pi-durable";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import { UsageDoc, type ConversationId, type ConversationRecord, type Tx } from "@earendil-works/pi-durable";
-import { BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
 import {
   CloseCode,
   CmdAckMessageSchema,
@@ -220,6 +218,15 @@ export interface ShOutboundRow {
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+/** pi-durable's invocation Context is structural (an abort signal, keyed values, a name), and
+ *  chord's own BACKGROUND_CONTEXT lives in a dev-only dependency of this package — so, like
+ *  agents/harness/pi, we carry the same never-cancelled value rather than import it. */
+const BACKGROUND_CONTEXT: Parameters<Harness["usage"]>[0] = Object.freeze({
+  abortSignal: undefined,
+  value: () => undefined,
+  toString: () => "[Context steward background]",
+});
+
 /** UTF-8 size of a serialized relay message — the byte meter is numbers only, never content. */
 function jsonByteLength(value: unknown): number {
   return new TextEncoder().encode(JSON.stringify(value)).length;
@@ -251,34 +258,16 @@ export class Steward extends Agent<Env> {
     // fresh deployment; the handler re-arms itself with the review-#1 cancel-then-schedule
     // pattern so the chain never dies with an evicted isolate.
     void this.schedule(NOTES_MAINTENANCE_DAY_S, "notesMaintenance", undefined, { idempotent: true });
+    // Issue #28: the usage cursor is seeded FIRST — queued ahead of everything below that can
+    // start a model call — so the first reading is the boot baseline (pi's history ≠ today's
+    // spend, budget.ts observe()). Void: onStart must not gate startup on pi.
+    void this.syncUsageQuietly("budget_baseline_failed");
     // Wakes queued by past reducers (crash between queue and submit, §11) drain now.
     void this.drainWakes();
     void this.pollRuns();
     // Routine/follow-up rows and their SDK schedules live in different stores — a crash
     // between INSERT and schedule() must not silently kill a routine (issue #20, §11).
     void this.reconcileRoutineSchedules();
-    // Issue #28: seed the usage cursors as baselines (history ≠ today's spend — budget.ts
-    // observe()) and sweep any commit an interrupted listener missed. Void: onStart must
-    // not gate startup on pi, and later work re-syncs anyway.
-    void this.armUsageMetering();
-  }
-
-  /** Seeds every existing conversation's usage cursor without charging it, then syncs. */
-  private async armUsageMetering(): Promise<void> {
-    try {
-      // The per-conversation cursors are seeded by conversationCreated (fresh conversations
-      // only — the hook runs solely in creating commits). What this pass adds is the
-      // session-wide sweep: the baseline for everything that already existed (an upgrade to
-      // #28 carries history that is not today's spend), and a catch-up for any commit an
-      // interrupted listener missed (§11's durable-queue reasoning).
-      await this.piHarness.pi();
-      await this.syncUsage();
-      // The session sweep above baselined the cursor: from here on, syncUsage charges real
-      // deltas (and the commit listener has been metering live all along).
-      this.usageBaselined = true;
-    } catch (err) {
-      this.logChannel("budget_baseline_failed", errorText(err));
-    }
   }
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -324,21 +313,33 @@ export class Steward extends Agent<Env> {
   // notifyChain/deliveryChain.
   private usageSyncChain: Promise<void> = Promise.resolve();
 
-  /** Folds pi's cumulative usage into today's counter; resolves when the write landed.
-   *  pi.usage() is session-wide, so the delta is charged to the root conversation's cursor —
-   *  every conversation feeds that one cursor, which is exactly what the daily row needs
-   *  (the per-conversation split below matters only for the baseline rule). */
+  /**
+   * Folds pi's cumulative session usage into today's counter; resolves once the write landed.
+   *
+   * Nothing feeds the counter in the background, on purpose. A pi commit listener has to be
+   * attached from `conversationCreated`, which pi runs only when it CREATES the root — an
+   * isolate that restarts onto an existing root (every Durable Object eviction) never gets
+   * one, and a second writer next to this sweep double-charges the same spend. So the
+   * counter is brought current exactly where a decision reads it: the wake drain (before the
+   * gate), run settlement (before the over-budget note), and the spend readout.
+   */
   private syncUsage(): Promise<void> {
     const run = this.usageSyncChain.then(async () => {
       const pi = await this.piHarness.pi();
-      this.ledger.budget.observe(
-        "session",
-        sumUsage(await pi.usage(BACKGROUND_CONTEXT)),
-        !this.usageBaselined,
-      );
+      this.ledger.budget.observe(sumUsage(await pi.usage(BACKGROUND_CONTEXT)));
     });
     this.usageSyncChain = run.catch(() => {});
     return run;
+  }
+
+  /** syncUsage for decision points: a failed read must not take the decision down with it —
+   *  the persisted counter is stale-but-honest and the failure is on the channel log. */
+  private async syncUsageQuietly(reason = "budget_sync_failed"): Promise<void> {
+    try {
+      await this.syncUsage();
+    } catch (err) {
+      this.logChannel(reason, errorText(err));
+    }
   }
 
   /**
@@ -376,78 +377,11 @@ export class Steward extends Agent<Env> {
           // pi's report channel (listener failures, section-render errors): into the channel
           // log, where a sick extension is diagnosable from the outside.
           onReport: (error) => this.logChannel("pi_report", errorText(error)),
-          // Issue #28 (steward.md §12): the commit listener meters pi.usage as it lands, in
-          // the same commit the spend does — the budget state a later alarm reads is then
-          // current to the last model call, and a crash between them cannot lose the delta.
-          // The read runs off the mutation line (the commit is durable when a host listener
-          // runs); a throw reaches onReport, never the commit.
-          conversationCreated: (tx, conversation) => {
-            void this.attachUsageListener(tx, conversation, context);
-          },
         },
         context,
       ),
     defaults: { model: { provider: this.modelVarsConfig.provider, id: this.modelVarsConfig.modelId } },
   });
-
-  // Seeded (armUsageMetering) once the boot baselines pass; see budget.ts observe().
-  private usageBaselined = false;
-  // One listener registration per conversation, for this isolate's pi session only.
-  private readonly usageListened = new Set<string>();
-
-  /** Subscribes the usage meter to one conversation's commits (HarnessOptions.conversationCreated). */
-  private async attachUsageListener(tx: Tx, conversation: ConversationRecord, context: Context): Promise<void> {
-    const id = String(conversation.id);
-    if (this.usageListened.has(id)) return;
-    this.usageListened.add(id);
-    // A fresh conversation's pi.usage starts at the definition's zero — the baseline seed
-    // keeps cursor and ledger in step for replays of this hook. The read inside the creating
-    // commit cannot touch sh_* tables (the ledger runs migrations in onStart, which has not
-    // run yet on a cold DO — the DO storage SQL and pi's adapter share the database, but
-    // sh_usage_* may not exist); the seed is therefore deferred to readUsage's snapshot.
-    this.ledgerSeedPending.add(id);
-    try {
-      const state = await tx.doc(UsageDoc, conversation.id);
-      if (state !== undefined) this.seedUsageCursor(id, sumUsage(state));
-    } catch {
-      // Cold-start ordering: the cursor seeds at the first live observation instead.
-    }
-    (await this.piHarness.pi()).subscribeCommits((publication) => {
-      for (const change of publication.changes) {
-        if (change.type !== "document" || change.record.kind !== "pi.usage" || change.value === null) continue;
-        if (change.conversationId === undefined || String(change.conversationId) !== id) continue;
-        // The commit is durable; this synchronous listener queues the read, never blocking it.
-        void this.readUsage(id, change.conversationId, context);
-      }
-    });
-  }
-
-  /** Conversations whose baseline seed has not landed yet (cold-start ordering). */
-  private readonly ledgerSeedPending = new Set<string>();
-
-  private seedUsageCursor(id: string, totals: ReturnType<typeof sumUsage>): void {
-    try {
-      this.ledger.budget.observe(id, totals, true);
-      this.ledgerSeedPending.delete(id);
-    } catch {
-      // Still before migrations: retried by the first live observation.
-    }
-  }
-
-  private async readUsage(id: string, conversationId: ConversationId, context: Context): Promise<void> {
-    try {
-      const pi = await this.piHarness.pi();
-      const state = await pi.snapshot(UsageDoc, conversationId, context);
-      if (state !== undefined) {
-        // The first observation after a failed seed baselines instead of charging, so the
-        // hook's cold-start path cannot bill a conversation's pre-existing history.
-        const baseline = this.ledgerSeedPending.delete(id);
-        this.ledger.budget.observe(id, sumUsage(state), baseline);
-      }
-    } catch (err) {
-      this.logChannel("budget_observe_failed", `${id} ${errorText(err)}`);
-    }
-  }
 
   /**
    * Applies the merged model selection to the live collection and the root session, before
@@ -533,7 +467,7 @@ export class Steward extends Agent<Env> {
       onOfferTap: (offerId, action) => this.routineService.handleOfferTap(offerId, action),
       // Issue #28: the deterministic spend readout ("how much today?") — counter, no LLM.
       spendStatusText: async () => {
-        await this.syncUsage();
+        await this.syncUsageQuietly();
         const state = this.budgetState();
         // Asking is hearing: the explicit readout carries the same information the daily
         // note would, so it satisfies "noted once" for today too (no double notice).
@@ -2332,6 +2266,9 @@ export class Steward extends Agent<Env> {
           }
           continue;
         }
+        // Issue #28: bring the counter current before the over-budget note reads it — the
+        // run that just settled is the spend that may tip today over the cap.
+        await this.syncUsageQuietly();
         this.settleRun(run, result);
       }
     } catch (err) {
@@ -2493,11 +2430,14 @@ export class Steward extends Agent<Env> {
       // The budget gate (issue #28, steward.md §12): today's spend has reached the cap →
       // event/routine/follow-up wakes are skipped, not submitted — while their deterministic
       // halves (done cards, fallback pushes, digest routines) already ran and never depended
-      // on the model. A single check before the loop is the boundary: wakes submitted in one
-      // drain may overshoot the cap by the batch's spend, and the next drain stops — the
-      // soft cap bounds a runaway, it is not a prepaid meter.
+      // on the model. The counter syncs first (a failed read degrades to the last honest
+      // number rather than skipping the drain) and a single check before the loop is the
+      // boundary: wakes submitted in one drain may overshoot the cap by the batch's spend,
+      // and the next drain stops — the soft cap bounds a runaway, it is not a prepaid meter.
+      const due = this.ledger.wakes.due(Date.now());
+      if (due.length > 0) await this.syncUsageQuietly();
       const budget = this.budgetState();
-      for (const wake of this.ledger.wakes.due(Date.now())) {
+      for (const wake of due) {
         if (budget.over) {
           this.skipWake(wake, budget);
           continue;
@@ -2746,6 +2686,11 @@ export class Steward extends Agent<Env> {
     return { ...state, text: renderSpendStatus(state) };
   }
 
+  /** Test-only: pi's own session-wide usage total — the number the counter must agree with. */
+  async piUsageForTest(): Promise<{ costUsd: number; tokens: number }> {
+    return sumUsage(await (await this.piHarness.pi()).usage(BACKGROUND_CONTEXT));
+  }
+
   /** Test-only: swaps the cap (setBudgetForTest(0.5)); undefined restores the deploy config. */
   async setBudgetForTest(usd?: number): Promise<void> {
     this.budgetConfig_ = usd === undefined ? undefined : resolveBudgetConfig(usd);
@@ -2766,8 +2711,25 @@ export class Steward extends Agent<Env> {
   /** Test-only: wipes the cursors only — pi history stays, so the next sync must re-baseline. */
   async resetCursorsForTest(): Promise<void> {
     this.ctx.storage.sql.exec("DELETE FROM sh_usage_cursor");
-    this.usageBaselined = false;
     await this.syncUsage();
+  }
+
+  /** Test-only: every budget test starts virgin — no day rows, cursor parked at zero. One
+   *  transaction on purpose: a cursor deleted-but-not-yet-reseeded reads as never-seen to a
+   *  racing background sync, which then baseline-seeds it at pi's CURRENT total and swallows
+   *  the run the test is about to measure. */
+  async resetBudgetForTest(): Promise<void> {
+    const now = Date.now();
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec("DELETE FROM sh_usage_day");
+      this.ctx.storage.sql.exec("DELETE FROM sh_usage_cursor");
+      this.ctx.storage.sql.exec(`INSERT INTO sh_usage_cursor (id, costUsd, tokens, updatedAt) VALUES (1, 0, 0, ${now})`);
+    });
+  }
+
+  /** Test-only: the never-seen state — the next observation baselines instead of charging. */
+  async resetCursorForTest(): Promise<void> {
+    this.ctx.storage.sql.exec("DELETE FROM sh_usage_cursor");
   }
 
   /** Test-only: marks a past day's over-budget note as sent. */
@@ -2857,11 +2819,13 @@ export class Steward extends Agent<Env> {
     this.ctx.storage.sql.exec("DELETE FROM sh_run");
     this.ctx.storage.sql.exec("DELETE FROM sh_wake");
     // Issue #28: pi's usage tables are gone, so the next conversation starts from zero — the
-    // counters and cursors must follow, or the next observation looks like a rebuild and
-    // the day's row charges again. This reset runs before armUsageMetering re-baselines.
+    // counters must follow, and the cursor row must EXIST at zero: an absent row would make
+    // the next sync treat the first run's spend as a never-seen baseline and swallow it.
     this.ctx.storage.sql.exec("DELETE FROM sh_usage_day");
     this.ctx.storage.sql.exec("DELETE FROM sh_usage_cursor");
-    this.usageListened.clear();
+    this.ctx.storage.sql.exec(
+      "INSERT INTO sh_usage_cursor (id, costUsd, tokens, updatedAt) VALUES (1, 0, 0, " + Date.now() + ")",
+    );
     if (this.llmModels.faux) this.llmModels.faux.reset();
   }
 

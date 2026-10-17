@@ -662,9 +662,9 @@ export const MIGRATIONS: readonly Migration[] = [
   },
   {
     // Daily budget soft cap (issue #28, steward.md §12, ADR-0001 decision 15): today's
-    // counter and the per-conversation cursors into pi's cumulative usage ledger. spend is
-    // an estimate derived from token counts and catalog pricing — never a bill — and the
-    // day is the UTC calendar date (the same clock as routine cron expressions).
+    // counter and the cursor into pi's cumulative usage ledger. spend is an estimate derived
+    // from token counts and catalog pricing — never a bill — and the day is the UTC calendar
+    // date (the same clock as routine cron expressions).
     id: "013_budget",
     up: (sql) => {
       // One row per UTC day that saw spend or a skip. costUsd accumulates pi.usage's
@@ -678,10 +678,27 @@ export const MIGRATIONS: readonly Migration[] = [
         overNotedAt INTEGER,
         updatedAt INTEGER NOT NULL
       )`;
-      // Last cumulative pi.usage total observed per conversation (budget.ts observe()):
-      // the delta against this cursor is what lands in today's row.
+      // The last cumulative pi.usage total observed (budget.ts observe()): one row, and the
+      // growth against it is what lands in today's row.
       sql`CREATE TABLE IF NOT EXISTS sh_usage_cursor (
-        conversation TEXT PRIMARY KEY,
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        costUsd REAL NOT NULL DEFAULT 0,
+        tokens INTEGER NOT NULL DEFAULT 0,
+        updatedAt INTEGER NOT NULL
+      )`;
+    },
+  },
+  {
+    // #28 follow-up, never shipped: the first cut of 013 keyed the cursor per conversation
+    // (a pi commit-listener design that double-charged and went blind across isolate
+    // restarts — see steward.ts syncUsage). The shipped shape is the single session cursor
+    // above. DOs that already ran the first cut (local test state only) migrate over; fresh
+    // databases skip straight past both.
+    id: "014_budget_session_cursor",
+    up: (sql) => {
+      sql`DROP TABLE IF EXISTS sh_usage_cursor`;
+      sql`CREATE TABLE IF NOT EXISTS sh_usage_cursor (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
         costUsd REAL NOT NULL DEFAULT 0,
         tokens INTEGER NOT NULL DEFAULT 0,
         updatedAt INTEGER NOT NULL
