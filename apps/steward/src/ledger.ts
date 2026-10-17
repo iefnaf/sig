@@ -10,7 +10,9 @@ import type { GitFacts, HelloMessage } from "@shepherd/protocol";
 import { createBudget } from "./budget.ts";
 import { createNotes, type NoteRow } from "./notes.ts";
 import { assembleBrief, type BriefDecision, type HandoffBrief } from "./handoff.ts";
-import { eventWakeText, queueReturnedWakeText } from "./wake-text.ts";
+import { eventWakeText, externalActivityWakeText, queueReturnedWakeText } from "./wake-text.ts";
+import { createMachineStatus, type MachineReliability } from "./machine-status.ts";
+import type { StartWorkerInput } from "./dispatch.ts";
 import type { QuietSection } from "./report-template.ts";
 
 /** Tagged-template SQL over the DO's SQLite (same shape schema.ts migrations use). */
@@ -30,6 +32,8 @@ export const WAKE_MERGE_MS = 3_000;
 /** The quiet merge window (issue #11, spec §7.6 / steward.md §6.4): `urgency: quiet` outbound
  *  holds this long per channel+receiver, so notifications landing together leave as one. */
 export const QUIET_MERGE_MS = 60_000;
+/** steward.md §5.3: external_activity wakes merge over a 10-minute window (low priority). */
+export const EXTERNAL_ACTIVITY_MERGE_MS = 10 * 60_000;
 /** Blocked reports give the steward this long before the core forwards the question. */
 export const QUESTION_WINDOW_MS = 90_000;
 
@@ -76,6 +80,8 @@ export interface WorkerRow {
   agent: string;
   mode: string;
   state: string;
+  /** A disconnected machine does not imply the session failed. */
+  unreachable?: boolean;
   sessionId: string | null;
   branch: string | null;
   cmdId: string | null;
@@ -147,13 +153,30 @@ export interface MachineRow {
   maxWorkers: number;
   /** The connector process generation (protocol §6.1): changes on every connector restart. */
   bootId: string | null;
+  reliability?: MachineReliability | null;
+}
+
+export interface OfflineDispatchRow {
+  cmdId: string;
+  threadId: string;
+  deviceId: string;
+  input: StartWorkerInput;
+  status: "offered" | "waiting" | "switching" | "switched" | "cancelled";
+  choices: string[];
 }
 
 /** A notification intent persisted by the reducer (steward.md §5.1 step 4). */
 export interface NotifyRow {
   id: number;
   dedupeKey: string;
-  kind: "done_report" | "attention_report" | "failure_push" | "stall_notice";
+  kind:
+    | "done_report"
+    | "attention_report"
+    | "failure_push"
+    | "stall_notice"
+    | "machine_offline"
+    | "machine_online"
+    | "waited_started";
   threadId: string;
   workerId: string | null;
   questionId: string | null;
@@ -173,7 +196,7 @@ export interface WakeRow {
   kind: "event" | "routine" | "followup";
   dedupeKey: string;
   text: string;
-  priority: "normal" | "high";
+  priority: "low" | "normal" | "high";
   /** 'skipped' = the daily budget cap kept this wake from the model (issue #28, steward.md §12). */
   status: "pending" | "merged" | "submitted" | "skipped";
   dueAt: number;
@@ -426,6 +449,7 @@ const viewMachine = (r: Record<string, unknown>): MachineRow => ({
   agents: jsonOrNull<string[]>(r.agents as string | null) ?? [],
   maxWorkers: (r.maxWorkers as number | null) ?? 1,
   bootId: (r.bootId as string | null) ?? null,
+  reliability: jsonOrNull<MachineReliability>(r.reliability as string | null),
 });
 
 const viewWorker = (r: Record<string, unknown>): WorkerRow => ({
@@ -436,6 +460,7 @@ const viewWorker = (r: Record<string, unknown>): WorkerRow => ({
   agent: r.agent as string,
   mode: r.mode as string,
   state: r.state as string,
+  unreachable: !!r.unreachable,
   sessionId: (r.sessionId as string | null) ?? null,
   branch: (r.branch as string | null) ?? null,
   cmdId: (r.cmdId as string | null) ?? null,
@@ -526,6 +551,12 @@ export function createLedger(deps: LedgerDeps) {
   // The notes half of the memory module (issue #18, steward.md §2.3-§2.5): layered
   // knowledge with a two-phase write. Same SQL handle, same transaction wrapper.
   const notes = createNotes({ sql, tx, now });
+  const machineStatus = createMachineStatus({
+    sql,
+    tx,
+    now,
+    timelineAdd: (threadId, kind, text, refs) => timeline.add(threadId, kind, text, refs),
+  });
 
   // The daily budget counter (issue #28, steward.md §12): sh_usage_day / sh_usage_cursor.
   // Same SQL handle, same transaction wrapper.
@@ -577,6 +608,7 @@ export function createLedger(deps: LedgerDeps) {
     /** Upserts machine facts + the full repo snapshot from a hello, and marks it online. */
     upsertFromHello(hello: HelloMessage): void {
       const ts = now();
+      machineStatus.setOnline(hello.deviceId, true, hello.machine.name);
       sql`
         INSERT INTO sh_machine (deviceId, name, online, lastSeen, agents, maxWorkers, bootId)
         VALUES (${hello.deviceId}, ${hello.machine.name}, 1, ${ts}, ${JSON.stringify(hello.agents.map((a) => a.kind))}, ${hello.limits.maxWorkers}, ${hello.bootId})
@@ -584,6 +616,11 @@ export function createLedger(deps: LedgerDeps) {
           name = excluded.name, online = 1, lastSeen = excluded.lastSeen,
           agents = excluded.agents, maxWorkers = excluded.maxWorkers, bootId = excluded.bootId
       `;
+      // Slots occupied by sessions outside this ledger also count; tracked sessions are
+      // counted live so a subsequent dispatch/settle immediately changes the free slots.
+      const trackedRunning = hello.workers.filter((w) =>
+        (ACTIVE_WORKER_STATES as readonly string[]).includes(w.state) && workers.get(w.workerId) !== null).length;
+      sql`UPDATE sh_machine SET otherRunning = ${Math.max(0, hello.limits.running - trackedRunning)} WHERE deviceId = ${hello.deviceId}`;
       // hello.repos is a full snapshot: replace this machine's rows so removals stick.
       sql`DELETE FROM sh_repo WHERE deviceId = ${hello.deviceId}`;
       for (const repo of hello.repos) {
@@ -595,11 +632,7 @@ export function createLedger(deps: LedgerDeps) {
     },
     /** Online derives from live connections only (issue #5): onConnect marks, onClose clears. */
     setOnline(deviceId: string, online: boolean, fallbackName?: string): void {
-      sql`
-        INSERT INTO sh_machine (deviceId, name, online, lastSeen)
-        VALUES (${deviceId}, ${fallbackName ?? deviceId}, ${online ? 1 : 0}, ${now()})
-        ON CONFLICT (deviceId) DO UPDATE SET online = ${online ? 1 : 0}, lastSeen = ${now()}
-      `;
+      machineStatus.setOnline(deviceId, online, fallbackName);
     },
     get(deviceId: string): MachineRow | null {
       const row = sql<Record<string, unknown>>`SELECT * FROM sh_machine WHERE deviceId = ${deviceId}`[0];
@@ -613,7 +646,7 @@ export function createLedger(deps: LedgerDeps) {
       return sql<{ n: number }>`
         SELECT COUNT(*) AS n FROM sh_worker
         WHERE deviceId = ${deviceId} AND state IN ('starting', 'running', 'recovering')
-      `[0]!.n;
+      `[0]!.n + (sql<{ n: number }>`SELECT otherRunning AS n FROM sh_machine WHERE deviceId = ${deviceId}`[0]?.n ?? 0);
     },
   };
 
@@ -662,6 +695,9 @@ export function createLedger(deps: LedgerDeps) {
     },
     repoIds(threadId: string): string[] {
       return sql<{ repoId: string }>`SELECT repoId FROM sh_thread_repo WHERE threadId = ${threadId}`.map((r) => r.repoId);
+    },
+    addRepo(threadId: string, repoId: string): void {
+      sql`INSERT OR IGNORE INTO sh_thread_repo (threadId, repoId) VALUES (${threadId}, ${repoId})`;
     },
     /** Bug 4: dispatch affinity — the machine the Thread last ran on. */
     setLastMachine(threadId: string, deviceId: string): void {
@@ -907,6 +943,10 @@ export function createLedger(deps: LedgerDeps) {
         SELECT * FROM sh_report WHERE workerId = ${workerId} ORDER BY seq
       `.map(viewReport);
     },
+    byCommand(cmdId: string): WorkerRow | null {
+      const row = sql<Record<string, unknown>>`SELECT * FROM sh_worker WHERE cmdId = ${cmdId}`[0];
+      return row ? viewWorker(row) : null;
+    },
     /** Backfills the start_worker cmdId once the command exists (registration precedes it). */
     setCmdId(workerId: string, cmdId: string): void {
       sql`UPDATE sh_worker SET cmdId = ${cmdId}, updatedAt = ${now()} WHERE workerId = ${workerId}`;
@@ -949,6 +989,9 @@ export function createLedger(deps: LedgerDeps) {
         if (snap.state === 'broken' && worker.state !== 'broken') {
           recordBrokenQuestion(worker, `q_broken_${worker.workerId}_${processed}`, '自动恢复未成功（连接器对账），需要你决定下一步。');
         }
+        // Back online (issue #14): the connector's snapshot re-states this worker's truth —
+        // the DO-side unreachable mark from the drop must not outlive the reconnection.
+        sql`UPDATE sh_worker SET unreachable = 0 WHERE workerId = ${worker.workerId}`;
         const ledgerActive = (ACTIVE_WORKER_STATES as readonly string[]).includes(worker.state);
         const snapActive = (ACTIVE_WORKER_STATES as readonly string[]).includes(snap.state);
         if (ledgerActive && !snapActive) {
@@ -1070,6 +1113,16 @@ export function createLedger(deps: LedgerDeps) {
     markStartFailed(workerId: string, cmdId: string | null, reason: string): boolean {
       const worker = workers.get(workerId);
       if (!worker || worker.state === "broken") return false;
+      // Issue #14: a start that dies while an offline ask was open settles the ask too —
+      // the offer row must not sit `offered`/`waiting` on top of a broken worker, and the
+      // `offline:` question would otherwise pin the Thread in waiting_you forever.
+      const askCmdId = cmdId ?? worker.cmdId;
+      if (askCmdId !== null && offlineDispatches.transition(askCmdId, "offered", "cancelled")) {
+        questions.close(`offline:${askCmdId}`, "派发未能开始");
+      }
+      if (askCmdId !== null && offlineDispatches.transition(askCmdId, "waiting", "cancelled")) {
+        questions.close(`offline:${askCmdId}`, "派发未能开始");
+      }
       sql`
         UPDATE sh_worker SET state = 'broken', lastOutcome = ${`start_failed:${reason}`}, updatedAt = ${now()}
         WHERE workerId = ${workerId}
@@ -1377,25 +1430,70 @@ export function createLedger(deps: LedgerDeps) {
     },
   };
 
+  const offlineDispatches = {
+    get(cmdId: string): OfflineDispatchRow | null {
+      const row = sql<{ cmdId: string; threadId: string; deviceId: string; input: string; status: OfflineDispatchRow["status"]; choices: string | null }>`
+        SELECT * FROM sh_offline_dispatch WHERE cmdId = ${cmdId}`[0];
+      return row ? { ...row, input: JSON.parse(row.input), choices: JSON.parse(row.choices ?? "[]") } : null;
+    },
+    create(input: StartWorkerInput, threadId: string, deviceId: string): void {
+      sql`INSERT OR IGNORE INTO sh_offline_dispatch (cmdId, threadId, deviceId, input)
+        VALUES (${input.cmdId}, ${threadId}, ${deviceId}, ${JSON.stringify(input)})`;
+    },
+    transition(cmdId: string, from: OfflineDispatchRow["status"], to: OfflineDispatchRow["status"], choices: string[] = []): boolean {
+      sql`UPDATE sh_offline_dispatch SET status = ${to}, choices = ${JSON.stringify(choices)} WHERE cmdId = ${cmdId} AND status = ${from}`;
+      return sql<{ n: number }>`SELECT changes() AS n`[0]!.n > 0;
+    },
+    /** Flips switching → switched WITHOUT touching the stored choices, and `reopen` flips
+     *  it back the same way (PR #51 review finding 8): the picker's buttons index into the
+     *  choices, so any transition that rewrote them — including the forward one — would
+     *  strand a refused switch exactly as before the fix. */
+    markSwitched(cmdId: string, to: "switched" | "switching" = "switched"): boolean {
+      const from = to === "switched" ? "switching" : "switched";
+      sql`UPDATE sh_offline_dispatch SET status = ${to} WHERE cmdId = ${cmdId} AND status = ${from}`;
+      return sql<{ n: number }>`SELECT changes() AS n`[0]!.n > 0;
+    },
+  };
+
   // ---- notification intents (§5.1 step 4) --------------------------------------------------------
 
   const notifications = {
-    /** INSERT OR IGNORE on dedupeKey: the reducer transaction may be re-entered after a crash. */
-    queue(dedupeKey: string, kind: NotifyRow["kind"], threadId: string, workerId: string | null, questionId: string | null = null): void {
-      sql`
-        INSERT OR IGNORE INTO sh_notify (dedupeKey, kind, threadId, workerId, createdAt, questionId)
-        VALUES (${dedupeKey}, ${kind}, ${threadId}, ${workerId}, ${now()}, ${questionId})
-      `;
+    /** INSERT OR IGNORE on dedupeKey: the reducer transaction may be re-entered after a crash.
+     *  `questionId` links #10's resolution window to its question row; `dueAt` is the
+     *  machine-status debounce (§5.3) — such intents are data until the state has held for
+     *  the window, and the drain re-checks them, not a timer promise. */
+    queue(
+      dedupeKey: string,
+      kind: NotifyRow["kind"],
+      threadId: string,
+      workerId: string | null,
+      questionId: string | null = null,
+      dueAt?: number,
+    ): void {
+      // The debounced variants add the dueAt column; interpolation would bind a parameter,
+      // not SQL text, so the statement is chosen before the template runs.
+      const stmt =
+        dueAt === undefined
+          ? sql`INSERT OR IGNORE INTO sh_notify (dedupeKey, kind, threadId, workerId, createdAt, questionId)
+                VALUES (${dedupeKey}, ${kind}, ${threadId}, ${workerId}, ${now()}, ${questionId})`
+          : sql`INSERT OR IGNORE INTO sh_notify (dedupeKey, kind, threadId, workerId, questionId, dueAt, createdAt)
+                VALUES (${dedupeKey}, ${kind}, ${threadId}, ${workerId}, ${questionId}, ${dueAt}, ${now()})`;
+      void stmt;
     },
     /** Whether a row with this dedupeKey exists (sent or pending) — "already notified". */
     seen(dedupeKey: string): boolean {
       return sql`SELECT 1 AS one FROM sh_notify WHERE dedupeKey = ${dedupeKey}`.length > 0;
     },
     pending(): NotifyRow[] {
-      return sql<NotifyRow>`SELECT id, dedupeKey, kind, threadId, workerId, questionId FROM sh_notify WHERE sentAt IS NULL ORDER BY id`;
+      return sql<NotifyRow>`SELECT id, dedupeKey, kind, threadId, workerId, questionId FROM sh_notify WHERE sentAt IS NULL AND (dueAt IS NULL OR dueAt <= ${now()}) ORDER BY id`;
     },
     markSent(id: number): void {
       sql`UPDATE sh_notify SET sentAt = ${now()} WHERE id = ${id} AND sentAt IS NULL`;
+    },
+    /** A dropped intent (its news evaporated — a healed blip) is REMOVED, not marked sent:
+     *  sentAt means "the owner was told", and later notices key off exactly that. */
+    drop(id: number): void {
+      sql`DELETE FROM sh_notify WHERE id = ${id} AND sentAt IS NULL`;
     },
   };
 
@@ -1569,8 +1667,14 @@ export function createLedger(deps: LedgerDeps) {
         return;
       }
       const mergeMs = opts.mergeMs ?? WAKE_MERGE_MS;
+      // Merge only within the same window class: a 10-minute external_activity wake must not
+      // swallow a 3-second report wake (and vice versa) — their latencies answer different
+      // needs (steward.md §5.3/§5.4). dueAt - createdAt is the row's own merge window.
       const open = sql<{ id: number; text: string }>`
-        SELECT id, text FROM sh_wake WHERE kind = ${kind} AND status = 'pending' AND dueAt > ${ts} ORDER BY id LIMIT 1
+        SELECT id, text FROM sh_wake
+        WHERE kind = ${kind} AND status = 'pending' AND dueAt > ${ts}
+          AND dueAt - createdAt >= ${Math.max(mergeMs - 1, 1)} AND dueAt - createdAt <= ${mergeMs + 1}
+        ORDER BY id LIMIT 1
       `[0];
       if (open) {
         // §5.4: events within the window become ONE wake-up — append this block to the
@@ -1851,6 +1955,9 @@ export function createLedger(deps: LedgerDeps) {
       worker.lastOutcome === "reaped" &&
       sql`SELECT 1 AS one FROM sh_reap_pending WHERE workerId = ${workerId}`.length === 0;
 
+    // Issue #14: an event from the machine is contact, whatever the DO believed during the
+    // drop — the unreachable mark dies with the first real news.
+    sql`UPDATE sh_worker SET unreachable = 0 WHERE workerId = ${workerId}`;
     switch (type) {
       case "queued": {
         // §8.2 serial repos (issue #16): the connector parked this write worker behind the
@@ -2076,7 +2183,35 @@ export function createLedger(deps: LedgerDeps) {
         break;
       }
       case "external_activity": {
-        timeline.add(worker.threadId, "note", "检测到会话在机器上被直接使用过", { workerId, seq });
+        // §10: the connector compared the session tail against lastKnownEntryId before a
+        // relaunch and found entries it did not write — the owner used the session at the
+        // keyboard. Deterministic timeline note (counts, window, coarse summary); the steward
+        // is woken at low priority to fold the summary into the Thread (steward.md §5.3),
+        // merging over the §5.4 10-minute window.
+        const count = Number(event.entries ?? 0);
+        const changedFiles = (Array.isArray(event.changedFiles) ? event.changedFiles : []).map((f) => String(f));
+        const summary = str(event.summary) ?? "";
+        const window = [str(event.firstAt), str(event.lastAt)].filter((v) => v !== null).join(" ~ ");
+        timeline.add(
+          worker.threadId,
+          "note",
+          `会话在机器上被直接使用过：新增 ${count} 条记录${window ? `（${window}）` : ""}${changedFiles.length ? `，改动文件：${changedFiles.join("、")}` : ""}${summary ? `。${summary}` : ""}`,
+          { workerId, seq, entries: count, firstAt: event.firstAt ?? null, lastAt: event.lastAt ?? null, changedFiles },
+        );
+        wakes.queue(
+          "event",
+          `external_activity:${workerId}:${seq}`,
+          externalActivityWakeText({
+            thread: threads.get(worker.threadId),
+            worker: workers.get(workerId)!,
+            machine: machines.get(worker.deviceId),
+            count,
+            window: window || null,
+            changedFiles,
+            summary,
+          }),
+          { priority: "low", mergeMs: EXTERNAL_ACTIVITY_MERGE_MS },
+        );
         break;
       }
       default:
@@ -2167,7 +2302,10 @@ export function createLedger(deps: LedgerDeps) {
       followups: FollowupRow[];
       offers: RoutineOfferRow[];
       /** The newest timeline entries across ALL threads — routine fires may be Thread-less. */
-      timelineRecent: Array<{ id: number; threadId: string | null; ts: number; kind: string; text: string }>;    } {
+      timelineRecent: Array<{ id: number; threadId: string | null; ts: number; kind: string; text: string }>;
+      /** The open/answered offline asks (issue #14): cmdId → status + machine choices. */
+      offlineDispatches: Array<{ cmdId: string; threadId: string; deviceId: string; status: string; choices: string[] }>;
+    } {
       return {
         machines: machines.list(),
         threads: threads.list().map((t) => ({
@@ -2199,12 +2337,15 @@ export function createLedger(deps: LedgerDeps) {
         timelineRecent: sql<{ id: number; threadId: string | null; ts: number; kind: string; text: string }>`
           SELECT id, threadId, ts, kind, text FROM sh_timeline ORDER BY id DESC LIMIT 20
         `.reverse(),
+        offlineDispatches: sql<{ cmdId: string; threadId: string; deviceId: string; status: string; choices: string | null }>`
+          SELECT cmdId, threadId, deviceId, status, choices FROM sh_offline_dispatch ORDER BY cmdId
+        `.map((r) => ({ ...r, choices: JSON.parse(r.choices ?? "[]") })),
       };
     },
   };
 
   return {
-    machines, repos, threads, workers, reports, questions, timeline, notifications, outbound,
+    machines, machineStatus, offlineDispatches, repos, threads, workers, reports, questions, timeline, notifications, outbound,
     runs, wakes, notes, budget, routines, followups, offers, handoff, views, applyPendingEvents, recomputeThreadState, debug,
   };
 }

@@ -29,9 +29,12 @@ const WorkerSnapshotSchema = z.object({
   lastOutcome: z.string(),
 });
 
+// `state` may be any command state; `code` rides a recovered `failed` (e.g.
+// not_delivered from the §6.3 session-tail adjudication) so the DO can surface it.
 const PendingAckSchema = z.object({
   cmdId: z.string(),
   state: z.string(),
+  code: z.string().optional(),
 });
 
 export const HelloMessageSchema = z.object({

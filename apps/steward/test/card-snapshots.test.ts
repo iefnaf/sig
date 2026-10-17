@@ -5,11 +5,13 @@ import { describe, expect, it } from "vitest";
 import type { ReportRow, WorkerRow } from "../src/ledger.ts";
 import {
   MERGED_CARD_BUDGET_BYTES,
+  MERGED_TEXT_BUDGET_BYTES,
   MAX_RAW_NEEDS_YOU_BYTES,
   byteLength,
   clipBytes,
   didBullets,
   mergeQuietOutbound,
+  mergedSendUuid,
   needsYouOf,
   renderMergedCard,
   renderReportCard,
@@ -123,6 +125,39 @@ describe("card size budget (issue #11: cards stay under 30 KB)", () => {
     const json = JSON.stringify(card);
     expect(json).toContain("另有"); // overflow is COUNTED in the footer, never silently dropped
     expect(json).toContain("合并汇报：40 件事"); // the header still tells the whole truth
+  });
+
+  it("text sections count against the SAME budget as report sections (PR #58 review)", () => {
+    // A full notes-maintenance bookkeeping text (~4 KB) plus budget-filling report sections
+    // used to ride OUTSIDE the budget and push the card past the transport cap.
+    const fatText = { kind: "text" as const, text: `记忆整理：${"一条已归档的记忆。".repeat(160)}` };
+    const card = renderMergedCard([fatText, ...Array.from({ length: 40 }, (_, i) => fatSection(i + 1))]);
+    const bytes = byteLength(JSON.stringify(card));
+    expect(bytes).toBeLessThanOrEqual(MERGED_CARD_BUDGET_BYTES);
+    expect(bytes).toBeLessThan(MAX_SERIALIZED_BYTES);
+    const json = JSON.stringify(card);
+    expect(json).toContain("另有"); // the text div that did not fit is counted too
+  });
+
+  it("a merged pure-text group is budgeted — merging never aggregates past the cap (PR #58 review)", () => {
+    const texts = Array.from({ length: 30 }, (_, i) => ({
+      kind: "text" as const,
+      text: `第 ${i} 条整理记录：${"细节".repeat(300)}`, // ~1.8 KB each — 30 × 1.8 KB ≫ 28 KB
+    }));
+    const merged = mergeQuietOutbound(texts);
+    expect(merged.kind).toBe("text");
+    if (merged.kind !== "text") return;
+    expect(byteLength(JSON.stringify({ text: merged.text }))).toBeLessThanOrEqual(MERGED_TEXT_BUDGET_BYTES);
+    expect(merged.text).toContain("另有"); // the unlisted texts are counted, never silently dropped
+    expect(merged.text).toContain("第 0 条"); // arrival order kept
+  });
+
+  it("mergedSendUuid is membership-scoped: stable across retries and reorderings, fresh for a joiner", () => {
+    const a = ["01AAA", "01BBB", "01CCC"];
+    expect(mergedSendUuid(a)).toBe(mergedSendUuid([...a].reverse())); // membership, not order
+    expect(mergedSendUuid(a)).toBe(mergedSendUuid([...a])); // same members → same uuid on retry
+    expect(mergedSendUuid(a)).not.toBe(mergedSendUuid([...a, "01DDD"])); // a late joiner → fresh uuid
+    expect(mergedSendUuid(a).length).toBeLessThanOrEqual(64); // Feishu uuid limit
   });
 
   it("a single card with a pathological verbatim question is clipped inside the cap", () => {

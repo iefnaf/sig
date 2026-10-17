@@ -315,15 +315,20 @@ describe("per-repo workspace modes (spec §11, connector-pi.md §8.2)", () => {
     expect(store.getWorker(queuedId)?.state).toBe("queued");
     manager.simulateCrash(); // runner in flight, queued start persisted
 
-    // Second boot over the same state: the runner's session never reached disk → it breaks
-    // (startup_interrupted), which frees the serial slot; the pump then launches the queued
-    // worker from the persisted queue row — its command result was already sent with
-    // queued:true, so losing it would have stranded the Thread at `starting` forever.
-    const scenario = writeScenario(dir, "scenario-boot2", [reportRun({ status: "done", summary: "queued after restart" })]);
+    // Second boot over the same state. Issue #15 made the crash-window observable: the
+    // runner's prompt is now ON DISK (fake-pi persists the §6.3 marker at prompt time), so
+    // its tail adjudicates interrupted → lost (not "never began" → broken), and a lost
+    // runner keeps the serial slot while its auto-resume is pending. The queued worker
+    // therefore starts only after the runner's story resolves: with a fast backoff and a
+    // resume that settles, the slot frees and the pump launches the persisted start — its
+    // command result already went out with queued:true, so losing it would have stranded
+    // the Thread at `starting` forever.
+    const scenario = writeScenario(dir, "scenario-boot2", [reportRun({ status: "done", summary: "resumed runner" })]);
     const manager2 = new WorkerManager({
       store,
       stateDir,
       adapter: fakePiAdapter(stateDir, scenario),
+      recovery: { autoResumeBackoffMs: 200 },
       emit: (workerId, fields) => {
         const stored = eventLog.append(workerId, fields);
         events.push(JSON.parse(stored.payload) as EmittedEvent);
@@ -617,6 +622,8 @@ describe("CommandError surface for the new paths", () => {
   it("a stop interrupting an in-flight automatic resume is the stop, not a resume failure (review N2)", async () => {
     // The run crashes mid-flight → lost → fast auto-resume; stop it while the resume is
     // relaunching. The stop's settle must be the final word — no broken row, no error event.
+    // fake-pi replays run[0] in every fresh process, so the relaunched process crashes
+    // again (exit 7) — the resume must never get that far: the stop settles it first.
     const scenario = writeScenario(dir, "scenario-n2", [
       [
         { emit: { type: "agent_start" } },
@@ -624,7 +631,6 @@ describe("CommandError surface for the new paths", () => {
         { delayMs: 50 },
         { exit: 7 },
       ],
-      reportRun({ status: "done", summary: "resumed" }),
     ]);
     const id = "w-n2";
     workerIds.add(id);

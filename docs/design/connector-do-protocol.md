@@ -119,7 +119,7 @@ outbox(cmdId PK, deviceId, workerId?, cseq, kind, payload, notAfter?,
 - **Re-send**: after a reconnect (once `welcome` is done), the DO re-sends every command that is `sent` but not `accepted`; when the `ackDeadline` expires while the connection is still up, it re-sends once more — after two failures it marks the machine suspect and notifies the steward.
 - **The alarm handler must re-schedule itself.** `schedule()` has whole-second granularity, so an alarm may fire a few hundred milliseconds before the millisecond-precision `ackDeadline`; if the handler wakes, finds no due rows, and returns, there will be no further alarm and the command stays in `sent` forever. Rule: before the handler finishes, as long as any row is still `sent`, schedule one more alarm (about 1 second out). This is a defect found during spike testing.
 - **Expiry**: a command may carry `notAfter`. If it is already expired when the connector receives it, it replies `rejected{code:"expired"}`. The default is `notAfter = 下发时刻 + 10 分钟` (issuance time + 10 minutes), so a machine that was offline for a day does not suddenly execute stale instructions; commands where the user explicitly chose "wait for it to come online" are set to `null` (no expiry).
-- **Ambiguous state**: a command during whose `sending` phase the connector crashed is reported by the connector as `ambiguous` during reconciliation (connector-pi.md §6.3); the DO marks the `outbox` row `ambiguous` and hands it to the steward — **no automatic re-send**.
+- **Ambiguous state**: a command during whose `sending` phase the connector crashed is reported by the connector as `ambiguous` during reconciliation (connector-pi.md §6.3); the DO marks the `outbox` row `ambiguous` and hands it to the steward — **no automatic re-send**. *(Implemented by #15: "hands it to the steward" is a high-priority ⟦event⟧ wake instructing the LLM to `ask_user` — the row is never redelivered, the connector answers later re-deliveries `ambiguous`, and the wake lands once per `cmdId`. `hello.pendingAcks` may equally carry `done`/`failed` for commands the connector *resolved* from session-tail evidence before its first hello — the DO settles those rows from the snapshot the same way, and a `failed` entry carries the recovered error `code` (e.g. `not_delivered`) so the steward can surface it without a `cmd_result`.)*
 
 ### 4.3 Event flow (connector → DO): at-least-once, DO dedups
 
@@ -359,6 +359,21 @@ connection drops ─▶ connector reconnects with backoff ─▶ wss + token ─
 ```
 
 ### 7.3 Dispatching commands while a machine is offline
+
+> **As implemented (issue #14, PR #51).** The offline ask parks the whole dispatch: the
+> worker row (a plain `starting` — #13's sweepWorkers owns its closure), the outbox command
+> (`held` — deliver refuses it, and its enqueue arms the lapse alarm), and the card
+> (`offline:<cmdId>` outbound id, so a tap resolves to exactly that command, never the
+> Thread's latest worker). [wait] clears the hold (`notAfter = null`, delivered at the next
+> hello with a deterministic "started" notice); [switch] expires the held command and
+> re-dispatches over the same deterministic rule — to the unique alternative, or a machine
+> picker when several; with no alternative the original stays held. An unanswered ask lapses
+> with its `notAfter` (default 10 minutes): sweepIdle marks the command `failed/not_after`
+> (the user-withdrawal state `expired` stays reserved for cancel/switch, per #13) and
+> sweepWorkers closes the worker with a failure push — nothing wedges. A waited command
+> keeps the queue's 30-minute idle bound, closed the same way with a「排队超时」push. A
+> continuation to the Thread's remembered machine now asks the same way instead of silently
+> queueing (spec §9 "never decide silently" supersedes the spike's bug-4 behavior).
 
 - The DO finds the machine has no active connection: the command is written to `outbox` (`queued`) and "machine offline" is returned to the steward immediately; the steward asks the user "wait for it to come online, or switch to another machine" (spec §9).
 - User picks "wait": the command's `notAfter` is set to `null`; it is delivered automatically after `welcome` once the machine comes online.

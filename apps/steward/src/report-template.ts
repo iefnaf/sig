@@ -15,19 +15,26 @@ export const MAX_NEEDS_YOU = 120;
 /** Feishu's serialized message cap is 30 KB (feishu-channel.md §4). Merged cards budget
  *  under it with margin so the adapter's transport guard never rejects a merge (issue #11). */
 export const MERGED_CARD_BUDGET_BYTES = 26_000;
+/** The same cap for a merged pure-text message (the adapter measures JSON.stringify({text})). */
+export const MERGED_TEXT_BUDGET_BYTES = 28_000;
 /** The verbatim question forward (§5.3) is the only uncapped text entering a card; this hard
  *  byte cap keeps even that card inside the 30 KB transport limit. */
 export const MAX_RAW_NEEDS_YOU_BYTES = 24_000;
 
 export const byteLength = (text: string): number => new TextEncoder().encode(text).length;
 
-/** Clips at a UTF-8 BYTE boundary (CJK is 3 bytes/char), not a character count. */
+/** Clips at a UTF-8 BYTE boundary (CJK is 3 bytes/char), not a character count. Never
+ *  splits a surrogate pair: the char-descent backs off a dangling high surrogate so the
+ *  clip cannot mint a U+FFFD. */
 export function clipBytes(text: string, maxBytes: number): string {
   if (byteLength(text) <= maxBytes) return text;
   const room = maxBytes - 3; // leave room for the ellipsis
   let chars = Math.ceil(room / 3); // worst case: every char is 3 bytes
   while (chars > 0 && byteLength(text.slice(0, chars)) > room) chars -= 1;
-  return `${text.slice(0, Math.max(0, chars))}…`;
+  let slice = text.slice(0, Math.max(0, chars));
+  const last = slice.charCodeAt(slice.length - 1);
+  if (last >= 0xd800 && last <= 0xdbff) slice = slice.slice(0, -1); // drop a dangling high surrogate
+  return `${slice}…`;
 }
 
 export type Tone = "success" | "attention" | "failure";
@@ -174,36 +181,80 @@ export function stallCard(
 }
 
 /** The offline-ask card (spec §9): dispatch found only an offline machine — never decide silently. */
-export function offlineAskCard(repoName: string, machineName: string, threadTitle: string) {
+export function offlineAskCard(repoName: string, machineName: string, threadTitle: string, alternatives: string[] = []) {
+  // [换台机器] appears only when another machine actually has the repo (protocol §7.3
+  // "switch to another machine that has the repo"); otherwise the choice is wait or cancel.
+  // The title/body follow the button set (PR #51 review finding 11):「只在 X 上」is a lie
+  // when alternatives exist, and the body must state the actual three-way choice.
+  const actions = [
+    { tag: "button", text: { tag: "plain_text", content: "等它上线" }, type: "primary", value: { action: "wait_online" } },
+    ...(alternatives.length > 0
+      ? [{ tag: "button", text: { tag: "plain_text", content: `换台机器（${alternatives.slice(0, 2).join("／")}${alternatives.length > 2 ? "等" : ""}）` }, type: "default", value: { action: "switch_machine" } }] 
+      : []),
+    { tag: "button", text: { tag: "plain_text", content: "算了" }, type: "default", value: { action: "cancel" } },
+  ];
   return {
     config: { wide_screen_mode: true },
     header: {
       template: "orange",
-      title: { tag: "plain_text", content: `⚠️ ${repoName} 只在 ${machineName} 上，它现在不在线` },
+      title: {
+        tag: "plain_text",
+        content: alternatives.length > 0 ? `⚠️ ${machineName} 不在线（${repoName}）` : `⚠️ ${repoName} 只在 ${machineName} 上，它现在不在线`,
+      },
     },
     elements: [
       {
         tag: "div",
         text: {
           tag: "lark_md",
-          content: `已建好 Thread「${threadTitle}」。要排队等它上线后自动开始，还是取消？`,
+          content:
+            alternatives.length > 0
+              ? `已建好 Thread「${threadTitle}」。等 ${machineName} 上线后自动开始，还是换台机器（${alternatives.slice(0, 2).join("、")}${alternatives.length > 2 ? " 等" : ""}）？`
+              : `已建好 Thread「${threadTitle}」。要排队等它上线后自动开始，还是取消？`,
         },
       },
       {
         tag: "action",
         // The values carry only the action — the Thread is resolved from the card's
         // providerMsgId on callback, never from data stuffed in here (spike bug, §3.1).
-        actions: [
-          { tag: "button", text: { tag: "plain_text", content: "排队等上线" }, type: "primary", value: { action: "wait_online" } },
-          { tag: "button", text: { tag: "plain_text", content: "算了" }, type: "default", value: { action: "cancel" } },
-        ],
+        actions,
       },
       { tag: "note", elements: [{ tag: "plain_text", content: `Thread「${threadTitle}」 · ${machineName}` }] },
     ],
   };
 }
 
-/** The three-part card the steward's `notify_user` renders (steward.md §6.4 source 2). */
+export function machineOfflineCard(machineName: string, threadTitle: string, footer: string) {
+  return renderReportCard({
+    tone: "attention",
+    conclusion: `${machineName} 暂时联系不上`,
+    did: [`「${threadTitle}」正在它上面运行：已标记为暂时失联，未按失败处理`],
+    needsYou: "无需操作；机器重新上线后会自动对账并告诉你结果。",
+    threadTitle,
+    footer,
+  });
+}
+
+export function machineOnlineCard(machineName: string, threadTitle: string, outcome: string, footer: string) {
+  return renderReportCard({
+    tone: "success",
+    conclusion: `${machineName} 回来了`,
+    did: [`「${threadTitle}」${outcome}`],
+    threadTitle,
+    footer,
+  });
+}
+
+export function waitedStartCard(machineName: string, threadTitle: string, footer: string, detailsUrl?: string) {
+  return renderReportCard({
+    tone: "success",
+    conclusion: `${machineName} 上线了，等它的任务开始跑`,
+    did: [`「${threadTitle}」已送达 ${machineName}，开始后照常汇报`],
+    threadTitle,
+    footer,
+    detailsUrl,
+  });
+}
 export function notifyCard(input: {
   tone: Tone;
   conclusion: string;
@@ -480,8 +531,9 @@ function mergedSectionElements(section: ReportSection, separator: boolean): unkn
 
 /** Renders merged quiet sections as ONE interactive card. Tone is the WORST of the sections
  *  (one glance at the color still tells whether anything went wrong, §6.4); report sections
- *  keep their three parts each; anything past the byte budget is counted in the footer —
- *  never silently dropped (the digest-card rule). */
+ *  keep their three parts each; EVERY section — text divs included — is counted against the
+ *  byte budget, and anything past it is counted in the footer, never silently dropped (the
+ *  digest-card rule; review finding on PR #58: texts rode outside the budget). */
 export function renderMergedCard(sections: QuietSection[]): { config: unknown; header: unknown; elements: unknown[] } {
   const reports = sections.filter((s): s is ReportSection => s.kind === "report");
   const texts = sections.filter((s): s is Extract<QuietSection, { kind: "text" }> => s.kind === "text");
@@ -491,10 +543,21 @@ export function renderMergedCard(sections: QuietSection[]): { config: unknown; h
       ? "attention"
       : "success";
 
-  const elements: unknown[] = texts.map((t) => ({ tag: "div", text: { tag: "lark_md", content: clip(t.text, 600) } }));
+  const elements: unknown[] = [];
   let used = 768; // header + footer allowance
   let overflow = 0;
-  let first = elements.length === 0;
+  let first = true;
+  for (const text of texts) {
+    const element = { tag: "div", text: { tag: "lark_md", content: clip(text.text, 600) } };
+    const add = byteLength(JSON.stringify(element));
+    if (used + add > MERGED_CARD_BUDGET_BYTES) {
+      overflow += 1; // counted in the footer, never silently dropped
+      continue;
+    }
+    elements.push(element);
+    used += add;
+    first = false;
+  }
   for (const report of reports) {
     const sectionElements = mergedSectionElements(report, !first);
     const add = byteLength(JSON.stringify(sectionElements));
@@ -508,7 +571,7 @@ export function renderMergedCard(sections: QuietSection[]): { config: unknown; h
   }
   const note =
     overflow > 0
-      ? `合并汇报（${reports.length} 件事） · 另有 ${overflow} 件放不进这张卡，问我要详情`
+      ? `合并汇报（${reports.length} 件事） · 另有 ${overflow} 条放不进这张卡，问我要详情`
       : `合并汇报（${reports.length} 件事） · 点「查看详情」看对应时间线 · 引用回复可继续对应事项`;
   elements.push({ tag: "note", elements: [{ tag: "plain_text", content: note }] });
   return {
@@ -519,14 +582,43 @@ export function renderMergedCard(sections: QuietSection[]): { config: unknown; h
 }
 
 /** Folds the merge window's quiet sections into the ONE message that goes out: plain texts
- *  join into one text; anything carrying a report section becomes one merged card (texts ride
- *  along as leading divs). */
+ *  join into one text (budgeted — merging must never aggregate past the transport cap, PR
+ *  #58 review); anything carrying a report section becomes one merged card (texts ride along
+ *  as leading divs). */
 export function mergeQuietOutbound(sections: QuietSection[]): { kind: "text"; text: string } | { kind: "card"; card: unknown } {
   const reports = sections.filter((s) => s.kind === "report");
   if (reports.length === 0) {
-    return { kind: "text", text: sections.map((s) => (s.kind === "text" ? s.text.trim() : "")).filter(Boolean).join("\n\n") };
+    const bodies = sections.map((s) => (s.kind === "text" ? s.text.trim() : "")).filter(Boolean);
+    const kept: string[] = [];
+    let used = 96; // JSON wrapper + the overflow note's own room
+    for (const body of bodies) {
+      const add = byteLength(body) + 2; // "\n\n" separator
+      if (used + add > MERGED_TEXT_BUDGET_BYTES) break;
+      kept.push(body);
+      used += add;
+    }
+    const overflow = bodies.length - kept.length;
+    const tail = overflow > 0 ? `\n\n（另有 ${overflow} 条未列入这条消息，问我要详情）` : "";
+    return { kind: "text", text: `${kept.join("\n\n")}${tail}` };
   }
   return { kind: "card", card: renderMergedCard(sections) };
+}
+
+/** The merged group's provider dedupe uuid (PR #58 review): scoped to the group's EXACT
+ *  membership, so a retry with unchanged members reuses the uuid (Feishu dedupes the
+ *  ambiguous-timeout case, spike bug 3) while a late arrival joining between attempts gets
+ *  a fresh uuid — its section can never be swallowed by the first attempt's message. */
+export function mergedSendUuid(ids: string[]): string {
+  const sorted = [...ids].sort();
+  const digest = sorted.join("\n");
+  let h1 = 0x811c9dc5;
+  let h2 = 0x01000193;
+  for (let i = 0; i < digest.length; i++) {
+    h1 ^= digest.charCodeAt(i);
+    h1 = Math.imul(h1, 0x01000193) >>> 0;
+    h2 = Math.imul(h2 ^ (h1 & 0xff), 0x85ebca6b) >>> 0;
+  }
+  return `${sorted[0] ?? "merge"}.${h1.toString(16).padStart(8, "0")}${h2.toString(16).padStart(8, "0")}`;
 }
 
 /** Normalizes a queued row's stored payload into a mergeable section: the `part` written at

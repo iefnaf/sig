@@ -16,6 +16,7 @@ import type {
 import { PartialInterruptError } from "./agent.ts";
 import { adjudicate, type RunWindow } from "./adjudication.ts";
 import { normalizeSessionEntries } from "./session-history.ts";
+import { observeSession } from "./session-observation.ts";
 import { installAssets, type InstalledAssets } from "./install.ts";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
@@ -198,10 +199,21 @@ export class PiAdapter implements AgentAdapter {
           `sessionId mismatch: expected ${spec.workerId}, got ${String(state.sessionId)}`,
         );
       }
+      const sessionFile = typeof state.sessionFile === "string" ? state.sessionFile : null;
+      // §6.3/§10: the session file and its current tail are on record BEFORE the prompt is
+      // sent, so a crash anywhere past this point leaves decidable evidence (the marker
+      // entry for this command, and the external-activity baseline it is diffed against).
+      // Fires even with no session file: the write-ahead must precede the prompt regardless.
+      const observation = sessionFile ? observeSession(sessionFile) : null;
+      try {
+        spec.onSession?.(sessionFile, observation?.lastEntryId ?? null);
+      } catch {
+        // observation bookkeeping must never fail a launch
+      }
       const handle: WorkerHandle = {
         workerId: spec.workerId,
         sessionId: String(state.sessionId),
-        sessionFile: typeof state.sessionFile === "string" ? state.sessionFile : undefined,
+        sessionFile: sessionFile ?? undefined,
         cwd: spec.cwd,
       };
 
@@ -250,8 +262,13 @@ export class PiAdapter implements AgentAdapter {
       await runtime.process.rpc({ type: "prompt", message, images });
       return {};
     }
+    // §6.3: a queued steer/follow_up cannot carry the `/shepherd` wrapper (pi forbids
+    // extension commands there), so the commandId travels as an input preamble. pi's input
+    // handler runs before queueing: it strips the preamble and appends the custom entry, so
+    // the marker is on disk from the moment pi ACCEPTS the message into its queue.
     const type = how === "steer" ? "steer" : "follow_up";
-    await runtime.process.rpc({ type, message: input.text, images });
+    const message = input.commandId ? markerPreamble(input.commandId, input.text) : input.text;
+    await runtime.process.rpc({ type, message, images });
     // §6.2: steer takes effect after the current tool batch finishes.
     return { effect: how === "steer" ? "after_current_tools" : undefined };
   }
@@ -275,16 +292,19 @@ export class PiAdapter implements AgentAdapter {
     return { returned };
   }
 
-  async resume(id: string, reason: string): Promise<void> {
+  async resume(id: string, reason: string, options: { commandId?: string } = {}): Promise<void> {
     const runtime = this.runtimes.get(id);
     if (runtime && !runtime.process.hasExited) {
-      await runtime.process.rpc({ type: "prompt", message: `${RESUME_PROMPT}\n\nReason: ${reason}` });
+      // §6.3: the resume prompt on a live process carries the marker like any other prompt,
+      // so a crash mid-`sending` is decidable from the session tail.
+      const commandId = options.commandId ?? `resume-${Date.now()}`;
+      await runtime.process.rpc({ type: "prompt", message: wrapPrompt(commandId, `${RESUME_PROMPT}\n\nReason: ${reason}`) });
       return;
     }
     // Relaunch with the same session id and send the fixed resume prompt (§9.2).
     const existing = this.pendingResumeSpecs.get(id);
     if (!existing) throw new AdapterError("not_found", `no known spec to resume worker ${id}`);
-    await this.start({ ...existing, prompt: RESUME_PROMPT, commandId: `resume-${Date.now()}` });
+    await this.start({ ...existing, prompt: RESUME_PROMPT, commandId: options.commandId ?? `resume-${Date.now()}` });
   }
 
   /** Remembered so `resume` can relaunch a dead worker (§9.2). */
@@ -480,6 +500,13 @@ export class PiAdapter implements AgentAdapter {
 /** `/shepherd <commandId>\n<text>` — the extension unwraps it and writes the marker (ADR-0001). */
 export function wrapPrompt(commandId: string, text: string): string {
   return `/${SHEPHERD_COMMAND} ${commandId}\n${text}`;
+}
+
+/** The §6.3 marker for deliveries pi will not accept extension commands on (steer/
+ *  follow_up): a one-line preamble that is part of the message itself, so pi persists it
+ *  together with the user message exactly when the message is delivered. */
+export function markerPreamble(commandId: string, text: string): string {
+  return `[shepherd:command ${commandId}]\n${text}`;
 }
 
 /** Validates and normalizes `report` tool args into the §7.2 payload; null when invalid. */

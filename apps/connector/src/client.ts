@@ -36,10 +36,8 @@ export interface ClientOptions {
   workersSnapshot?: () => Array<Record<string, unknown>>;
   /** Honest hello snapshot for the non-worker sections (protocol §6.1): agents, repos, limits. */
   snapshot?: () => { agents: unknown[]; repos: unknown[]; limits: { maxWorkers: number; running: number } };
-  /**
-   * L3 raw-history loader (connector-pi.md §11.4): when set, `history_req` messages are
-   * answered with windowed `history_chunk` streams; without it they get `error{unsupported}`.
-   */
+  /** L3 raw-history loader (connector-pi.md §11.4): when set, `history_req` messages are
+   *  answered with windowed `history_chunk` streams; without it they get `error{unsupported}`. */
   loadHistory?: (workerId: string, since: string | undefined, maxBytes: number) => Promise<HistoryPage>;
   pingIntervalMs?: number;
   pongTimeoutMs?: number;
@@ -111,8 +109,9 @@ export class ConnectorClient {
           load: options.loadHistory,
         })
       : undefined;
-    // A crash mid-`sending` left undecidable commands; they become `ambiguous` and ride the
-    // next hello's pendingAcks so the DO can settle its outbox rows (protocol §6.1).
+    // A crash mid-`sending` is adjudicated from the persisted evidence at the next boot
+    // (§6.3): marker commands become delivered/not_delivered from the session tail; the rest
+    // stay honestly ambiguous. All outcomes ride hello.pendingAcks (protocol §6.1).
     this.commands.reconcileCrashed();
   }
 
@@ -283,7 +282,7 @@ export class ConnectorClient {
       }
       return;
     }
-    this.commands.begin(cmd.id);
+    this.commands.begin(cmd.id, commandMeta(cmd));
     const handler = this.options.handleCommand;
     if (!handler) {
       this.commands.settle(cmd.id, { ok: false, error: { code: "unsupported" } });
@@ -302,7 +301,16 @@ export class ConnectorClient {
     } catch (err) {
       result = { ok: false, error: { code: "internal", message: err instanceof Error ? err.message : String(err) } };
     }
-    this.commands.settle(cmd.id, result);
+    // A zombie continuation (the handler outliving a shutdown/crash in tests; a stopping
+    // daemon racing its last command in production) must not crash the process on the way
+    // out: the restarted connector's recovery already owns the row, and the socket is gone.
+    try {
+      this.commands.settle(cmd.id, result);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ERR_INVALID_STATE") throw err;
+      console.error("[shepherd] late command settle skipped (store closed):", cmd.id);
+      return;
+    }
     this.send(ws, { t: "cmd_result", re: cmd.id, ok: result.ok, data: result.data, error: result.error });
   }
 
@@ -399,4 +407,9 @@ function toWsOrigin(serverUrl: string): string {
   const url = new URL(serverUrl);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   return url.origin;
+}
+
+function commandMeta(cmd: CmdMessage): import("./commands.ts").CommandMeta {
+  const workerId = typeof cmd.args?.workerId === "string" && cmd.args.workerId.length > 0 ? cmd.args.workerId : cmd.workerId;
+  return { workerId: workerId ?? null, kind: cmd.kind };
 }

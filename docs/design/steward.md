@@ -91,6 +91,10 @@ interface Memory {
 
 A `ChangeReport` is a change the memory module **proactively reports** (noted, evicted, demoted, superseded, pinned by the user). The steward must relay these to the user (§9) — this is where "forgetting is visible to the user" gets implemented.
 
+> **Reliability, as implemented (issue #14).** `sh_machine.reliability` is a record-only JSON
+> tally (`observedSince / since / onlineMs / offlineMs / transitions`) written in the same
+> transaction as every real connection-status change; nothing selects on it yet.
+
 ### 2.2 The ledger's data model
 
 Table names all carry the `sh_` prefix. Only semantics are listed below, not every column.
@@ -417,8 +421,19 @@ Workers in the `lost` / `broken` states do not count as running; `broken` produc
 | `lost` / `resumed` | timeline | none | no |
 | `broken` | Create a question | push | yes |
 | `external_activity` | timeline | none | yes (low priority; update the summary; 10-minute merge window) |
+| Command `ambiguous` (§4.2/#15) | timeline note | none | yes (high priority; `ask_user` whether to re-issue; never re-send) |
+| `cmd_result` failed `session_in_use` / `not_delivered` (#15) | timeline note | none | yes (high priority; tell the user; re-issue only on their confirmation) |
 | Machine offline / online | Mark that machine's workers `unreachable` | Only when in-flight tasks are affected; 2-minute debounce | no |
 | Stall (§8.4) | timeline | Reports once: "X has shown no activity for N minutes" | no |
+
+> **Machine status, as implemented (issue #14).** A real disconnect marks the machine's
+> in-flight workers `unreachable` — a flag alongside the execution state, so nothing
+> invents a `failed`/`lost` task or discards a `running` state the connector may still honor;
+> the next `hello.workers` snapshot (plus any replayed events) re-states the truth. The
+> notice is a `sh_notify` intent whose `dueAt` carries the 2-minute debounce: it renders
+> only if the worker is *still* unreachable when the window closes (a healed blip produces
+> no notice at all, recovery included), and "X is back" follows later only when an offline
+> notice was actually delivered. No wake: these are core templates, never the LLM.
 
 **The 90-second window**: `needs_decision` / `blocked` reports go to the steward first, letting it try to answer factual questions itself per the first autonomy tier (`answer_worker`, evidence required). If the steward calls `ask_user`, `answer_worker`, or `notify_user` within the window, the report counts as handled; if the window expires with no action (LLM unavailable, budget spent, model error), the core **falls back to a deterministic push** and forwards the worker's question to the user verbatim. A pending user decision can therefore never get lost because of the LLM.
 
