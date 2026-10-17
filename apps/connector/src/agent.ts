@@ -65,6 +65,10 @@ export type Delivery = "prompt" | "steer" | "follow_up";
  *  undelivered steer/follow_up messages, surfaced to the steward as `queue_returned`. */
 export interface InterruptResult {
   returned: string[];
+  /** PR #59 review finding 4: the run had ALREADY settled when the interrupt landed (the
+   *  agent's post-result window). The manager reports aborted:false — "aborted" must never
+   *  sit next to a completed run's report card. Absent = something was in flight. */
+  alreadySettled?: boolean;
 }
 
 /** Thrown by an adapter whose `clear_queue` succeeded but the subsequent `abort` failed

@@ -387,6 +387,7 @@ The `history` command backs "view raw history" in the web UI:
 - Command authentication, pairing codes, and transport encryption are covered by the transport protocol design; this document assumes commands come from an authenticated steward.
 - The connector passes none of its own credentials to pi and never logs session transcripts.
 - The MVP is fully automatic by default (yolo): pi itself does not request approval before each tool call. Later approval lands via the extension's `tool_call` hook and `extension_ui_request`, without changing the structure described here.
+- **Claude Code (issue #17) runs unconditionally under `--dangerously-skip-permissions` — `approveProject` does not apply to it.** The per-repo trust flag is a pi mechanism (it gates pi's own project extensions and `--approve`); headless Claude Code has no equivalent trust tier, so a claude-code worker gets the full bypass in every repo, approved or not. Known trust-model inconsistency, accepted for the MVP; a repo the owner has not approved should simply not have claude-code tasks dispatched to it.
 
 ## 14. Test strategy
 

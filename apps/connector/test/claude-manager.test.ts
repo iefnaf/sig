@@ -341,3 +341,93 @@ describe("restart reconciliation for claude workers (§9.1 via issue #17)", () =
     90_000,
   );
 });
+
+// PR #59 review findings: the honest-degradation gates must cover EVERY delivery path, a
+// workerId is pinned to its agent for life, and an interrupt landing in claude's
+// post-result window must not claim it aborted a completed run.
+describe("PR #59 review fixes", () => {
+  it("refuses send.images for a no-images agent — every delivery path, not just start_worker (finding 2)", async () => {
+    setup([], [[...claudeReportRun({ status: "done", summary: "ok" })]]);
+    await manager.handleCommand("f1", "start_worker", cmdArgs(args()), undefined);
+    await waitFor(() => eventsOf("w-claude-m1", "settled").length > 0, 15_000, "settle");
+    // idle → the prompt path; running would hit the steer path; both must refuse alike.
+    await expect(
+      manager.handleCommand(
+        "f2",
+        "send",
+        { workerId: "w-claude-m1", text: "look at this", intent: "auto", images: [{ data: "aGk=", mimeType: "image/png" }] },
+        undefined,
+      ),
+    ).rejects.toMatchObject({ code: "unsupported_capability" });
+  });
+
+  it("refuses mid-run image sends on the deferral path too (finding 2)", async () => {
+    setup([], [[{ delayMs: 60_000 }]]);
+    await manager.handleCommand("f3", "start_worker", cmdArgs(args()), undefined);
+    await waitFor(() => eventsOf("w-claude-m1", "started").length > 0, 15_000, "started");
+    await expect(
+      manager.handleCommand(
+        "f4",
+        "send",
+        { workerId: "w-claude-m1", text: "and this", intent: "now", images: [{ data: "aGk=", mimeType: "image/png" }] },
+        undefined,
+      ),
+    ).rejects.toMatchObject({ code: "unsupported_capability" });
+    expect(store.getWorker("w-claude-m1")!.state).toBe("running"); // nothing deferred
+  });
+
+  it("a workerId is pinned to its agent: a re-start under another agent is refused (finding 3)", async () => {
+    setup([], [[...claudeReportRun({ status: "done", summary: "ok" })]]);
+    await manager.handleCommand("f5", "start_worker", cmdArgs(args()), undefined);
+    await waitFor(() => eventsOf("w-claude-m1", "settled").length > 0, 15_000, "settle");
+    await expect(
+      manager.handleCommand("f6", "start_worker", cmdArgs({ ...args(), agent: undefined }), undefined),
+    ).rejects.toMatchObject({ code: "agent_mismatch" });
+    // The same agent re-starts fine (a fresh task on a reused id keeps its agent).
+    const again = (await manager.handleCommand("f7", "start_worker", cmdArgs(args()), undefined)) as unknown;
+    expect(again).toBeTruthy();
+  });
+
+  it("an interrupt in claude's post-result window reports aborted:false (finding 4)", async () => {
+    // Run 1 settles, but the process lingers in its exiting window (delayMs on a second
+    // hold-back step is not possible post-result — model it with a long-running run that
+    // we let FINISH, then interrupt before the idle reclaim).
+    setup([], [
+      [...claudeReportRun({ status: "done", summary: "finished" })],
+    ]);
+    await manager.handleCommand("f8", "start_worker", cmdArgs(args()), undefined);
+    await waitFor(() => eventsOf("w-claude-m1", "settled").length > 0, 15_000, "settle");
+    // The process may already be gone (fast exit) — the finding only bites while it is
+    // alive; either way the command must never claim aborted for a settled run.
+    const outcome = (await manager.handleCommand("f9", "interrupt", { workerId: "w-claude-m1" }, undefined)) as {
+      aborted: boolean;
+    };
+    expect(outcome.aborted).toBe(false);
+    expect(eventsOf("w-claude-m1", "settled").filter((e) => e.outcome === "aborted")).toHaveLength(0);
+  });
+
+  it("stop_process settles a stranded row whose agent is no longer wired (finding 6)", async () => {
+    setup([], [[...claudeReportRun({ status: "done", summary: "ok" })]]);
+    await manager.handleCommand("g1", "start_worker", cmdArgs(args()), undefined);
+    await waitFor(() => eventsOf("w-claude-m1", "settled").length > 0, 15_000, "settle");
+    // A manager with ONLY pi wired — the shape after "claude uninstalled" + reboot.
+    const managerB = new WorkerManager({
+      store,
+      stateDir,
+      adapters: [fakePiAdapter(stateDir, writeScenario(dir, "pi-only", []))],
+      emit: (workerId, fields) => {
+        events.push(JSON.parse(eventLog.append(workerId, fields).payload) as EmittedEvent);
+      },
+    });
+    // Send (idle-cold relaunch) fails honestly — the text cannot be delivered.
+    await expect(
+      managerB.handleCommand("g2", "send", { workerId: "w-claude-m1", text: "hi", intent: "auto" }, undefined),
+    ).rejects.toMatchObject({ code: "unknown_agent" });
+    // But the operator can still settle the row (a `lost` strand, the post-reboot shape)
+    // instead of being locked out until claude is reinstalled.
+    store.setWorkerState("w-claude-m1", "lost", "crash");
+    await managerB.handleCommand("g3", "stop_process", { workerId: "w-claude-m1" }, undefined);
+    expect(store.getWorker("w-claude-m1")!.state).toBe("idle");
+    managerB.stop();
+  });
+});

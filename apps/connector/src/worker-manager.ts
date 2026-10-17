@@ -321,6 +321,13 @@ export class WorkerManager {
     return this.adapterFor(worker.agent ?? "pi");
   }
 
+  /** PR #59 review finding 6: a worker whose agent is no longer wired (claude uninstalled
+   *  between boots) must still be stoppable and cleanable — those paths degrade to "no live
+   *  process" / fan-out instead of throwing unknown_agent at the operator. */
+  private adapterOfWorkerOrNull(worker: WorkerRow): AgentAdapter | null {
+    return this.adapters.get(worker.agent ?? "pi") ?? null;
+  }
+
   /** stopProcess/interrupt can arrive for a worker the store no longer knows: fan the
    *  no-op-tolerant calls out to every adapter so whichever owns it is covered. */
   private stopProcessEverywhere(workerId: string): Promise<void> {
@@ -403,6 +410,16 @@ export class WorkerManager {
       throw new CommandError(
         "unsupported_capability",
         `agent '${agentKind}' cannot truly be restricted to read-only (capability readonly=false); dispatch it write tasks only`,
+      );
+    }
+    // PR #59 review finding 3: a workerId is pinned to its agent for life (the row's agent
+    // column is write-once). A start under a different agent would launch under the new
+    // adapter while every later command still routes to the old one — reject instead.
+    const existingRow = this.store.getWorker(args.workerId);
+    if (existingRow && (existingRow.agent ?? "pi") !== agentKind) {
+      throw new CommandError(
+        "agent_mismatch",
+        `worker ${args.workerId} already ran as ${existingRow.agent ?? "pi"}; workerIds are never reused across agents`,
       );
     }
 
@@ -672,8 +689,11 @@ export class WorkerManager {
       this.resumeTimers.delete(workerId);
     }
     // §3 degradation: a stop is the one intervention every agent must honor — fan out to
-    // every adapter when the row is gone; adapters that do not own the worker no-op.
-    if (worker) await this.adapterOfWorker(worker).stopProcess(workerId);
+    // every adapter when the row is gone OR its agent is no longer wired (PR #59 review
+    // finding 6: claude uninstalled between boots must not strand the row's stop_process);
+    // adapters that do not own the worker no-op.
+    const owner = worker ? this.adapterOfWorkerOrNull(worker) : null;
+    if (owner) await owner.stopProcess(workerId);
     else await this.stopProcessEverywhere(workerId);
     // process_exit handler releases the lock; a §3 no-steer agent's deferred texts come
     // back to the steward instead of silently relaunching a worker the user just stopped.
@@ -828,8 +848,10 @@ export class WorkerManager {
       );
     }
     // Settled but still idle-hot: the process is alive inside that directory — never delete
-    // under it (review finding 5's other half; also keeps resume-after-cleanup cold).
-    if (this.adapterOfWorker(worker).isRunning?.(workerId) === true) {
+    // under it (review finding 5's other half; also keeps resume-after-cleanup cold). An
+    // unwired agent (PR #59 finding 6) cannot have a live process here by construction.
+    const owner = this.adapterOfWorkerOrNull(worker);
+    if (owner?.isRunning?.(workerId) === true) {
       throw new CommandError(
         "worker_running",
         `worker ${workerId} still has a live (idle) process in its worktree; stop_process first`,
@@ -890,6 +912,18 @@ export class WorkerManager {
     }
     if (worker.state === "broken") {
       throw new CommandError("broken_worker", `worker ${args.workerId} is broken and needs a human decision`);
+    }
+    // §3 gate (PR #59 review finding 2): the images check is NOT start_worker-only — every
+    // delivery path (steer, follow-up, deferral, hot prompt, cold relaunch) would otherwise
+    // carry images an images=false agent silently drops. Refuse at the entrance instead.
+    if (args.images && args.images.length > 0) {
+      const owner = this.adapterOfWorkerOrNull(worker);
+      if (owner && !owner.capabilities.images) {
+        throw new CommandError(
+          "unsupported_capability",
+          `agent '${worker.agent ?? "pi"}' cannot take images (capability images=false); send text only or dispatch to another agent`,
+        );
+      }
     }
     this.cancelIdleReclaim(args.workerId); // the send revives the worker
     if (worker.state === "starting" || worker.state === "recovering" || worker.state === "lost") {
@@ -1129,7 +1163,10 @@ export class WorkerManager {
         if (interruptResult.returned.length > 0) {
           await this.emitEvent(args.workerId, "queue_returned", { texts: interruptResult.returned });
         }
-        aborted = true;
+        // PR #59 review finding 4: an interrupt that landed in the agent's post-result
+        // window did not abort anything — the run settled and its report is on the wire.
+        // Report aborted:false so the steward never says「已停止」next to the report card.
+        aborted = interruptResult.alreadySettled !== true;
         // Wait out the abort only when a run window is open — an interrupt on an idle-hot
         // worker has nothing settling, and the wait must not stall the command (§6.2).
         if (adapter.isStreaming?.(args.workerId)) await this.waitForAbortSettle(args.workerId);
@@ -1184,11 +1221,25 @@ export class WorkerManager {
    * the state table applies as-is: a steer pi queues and never loses.
    */
   private async awaitSettleBeforeThen(workerId: string): Promise<WorkerRow> {
-    const worker = this.requireWorker(workerId);
-    if (this.adapterOfWorker(worker).isStreaming?.(workerId)) return worker; // a run window is open: §6.2's table applies
+    const streaming = () => {
+      const worker = this.requireWorker(workerId);
+      return { worker, open: this.adapterOfWorker(worker).isStreaming?.(workerId) ?? false };
+    };
+    let { worker, open } = streaming();
+    if (open) return worker; // a run window is open: §6.2's table applies
     if (worker.state !== "running" && worker.state !== "recovering") return worker; // store already caught up
-    await this.waitForAbortSettle(workerId); // the settle is in flight; bounded by abortSettleTimeoutMs
-    return this.requireWorker(workerId);
+    // The settle is in flight — poll for it instead of betting on one event (PR #59 review
+    // finding 5): a kill-based interrupt emits its settled DURING adapter.interrupt(), so
+    // an event-registered waiter can miss it and stall the full abortSettleTimeoutMs. The
+    // store flip and any re-opened window both resolve within one 25 ms tick.
+    const deadline = Date.now() + this.abortSettleTimeoutMs;
+    while (Date.now() < deadline && !this.crashed) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      ({ worker, open } = streaming());
+      if (open) return worker;
+      if (worker.state !== "running" && worker.state !== "recovering") return worker;
+    }
+    return this.requireWorker(workerId); // timed out: the caller's §6.2 branches handle it
   }
 
   /** Resolved by the worker's next `settled` adapter event, or the timeout — whichever first. */
@@ -1339,7 +1390,7 @@ export class WorkerManager {
     if (this.crashed) return;
     const worker = this.store.getWorker(workerId);
     if (!worker || worker.state !== "idle") return;
-    if (!(this.adapterOfWorker(worker).isRunning?.(workerId) ?? false)) return;
+    if (!(this.adapterOfWorkerOrNull(worker)?.isRunning?.(workerId) ?? false)) return;
     await this.stopProcess(workerId).catch((err) => {
       console.error(`[shepherd] idle reclaim failed for ${workerId}:`, err);
     });
@@ -1757,7 +1808,8 @@ export class WorkerManager {
       this.resumeTimers.delete(workerId);
     }
     const worker = this.store.getWorker(workerId);
-    if (worker) await this.adapterOfWorker(worker).stopProcess(workerId);
+    const owner = worker ? this.adapterOfWorkerOrNull(worker) : null;
+    if (owner) await owner.stopProcess(workerId);
     else await this.stopProcessEverywhere(workerId);
     await this.cleanupOrphans(workerId);
     // The process_exit handler's releaseLock rides a microtask; release again rather than
@@ -2035,7 +2087,8 @@ export class WorkerManager {
    *  only when the session is free. */
   private async checkSessionBeforeRelaunch(worker: WorkerRow): Promise<void> {
     if (!worker.sessionFile) return;
-    const live = this.adapter.workerPids?.().map((p) => p.pid) ?? [];
+    // Every agent's live pids (issue #17): the holders check is agent-agnostic.
+    const live = [...this.adapters.values()].flatMap((a) => a.workerPids?.() ?? []).map((p) => p.pid);
     const holders = await this.findSessionHoldersFn(worker.workerId, worker.sessionFile, live);
     if (holders.length > 0) {
       throw new CommandError(

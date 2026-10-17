@@ -320,18 +320,23 @@ export class ClaudeAdapter implements AgentAdapter {
    *  transcript), so `--resume` + the fixed prompt recovers, exactly like a crash. */
   async interrupt(id: string): Promise<InterruptResult> {
     const runtime = this.require(id);
-    if (runtime.resultSeen) return { returned: [] }; // the run already settled; nothing to abort
+    if (runtime.resultSeen) {
+      // PR #59 review finding 4: the run already settled and reported — nothing to abort.
+      // Reclaim the lingering (exiting) process so the interrupt still does something, and
+      // say so: aborted:false, or the steward tells the user "停了" next to a report card.
+      runtime.stopping = true;
+      this.runtimes.delete(id);
+      await runtime.process.close(2000);
+      return { returned: [], alreadySettled: true };
+    }
     runtime.interrupting = true;
     runtime.process.kill();
     await runtime.process.waitExit();
-    // Let the manager's async settled handling (state flips ride sqlite + the event emit)
-    // run before the command continues into a possible `then` delivery.
-    await new Promise((resolve) => setImmediate(resolve));
-    await new Promise((resolve) => setImmediate(resolve));
     return { returned: [] };
   }
 
-  async resume(id: string, reason: string): Promise<void> {
+  async resume(id: string, reason: string, _options: { commandId?: string } = {}): Promise<void> {
+    // (_options carries the pi commandId marker; claude has no session-file marker to write.)
     const runtime = this.runtimes.get(id);
     if (runtime && !runtime.process.hasExited) {
       throw new AdapterError(
