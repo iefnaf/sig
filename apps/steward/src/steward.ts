@@ -89,14 +89,37 @@ import {
   type FauxRequestRecord,
   type StewardModels,
 } from "./llm/models.ts";
-import { createLedger, type Ledger, type LedgerSql, type NotifyRow, type QuestionRow, type RunRow, type WakeRow } from "./ledger.ts";
+import { createLedger, QUIET_MERGE_MS, type Ledger, type LedgerSql, type NotifyRow, type OutboundDeliveryRow, type QuestionRow, type RunRow, type WakeRow } from "./ledger.ts";
 import { renderChangeReports } from "./notes.ts";
 import { RoutineService } from "./routines.ts";
-import { failureCard, notifyCard, askUserCard, reportCardFor, noteDecisionCard, stallCard, workerQuestionCard, didBullets, prCreatedCard, prFailureNeedsYou, prCommandArgs, type AskCardButton } from "./report-template.ts";
+import {
+  failureCard,
+  notifyCard,
+  askUserCard,
+  reportCardFor,
+  noteDecisionCard,
+  stallCard,
+  workerQuestionCard,
+  didBullets,
+  needsYouOf,
+  toneOfReport,
+  mergeQuietOutbound,
+  mergedSendUuid,
+  sectionFromPayload,
+  machineOfflineCard,
+  machineOnlineCard,
+  waitedStartCard,
+  prConsentFor,
+  prCreatedCard,
+  prFailureNeedsYou,
+  prCommandArgs,
+  type AskCardButton,
+  type QuietSection,
+} from "./report-template.ts";
 import { MIGRATIONS, runMigrations } from "./schema.ts";
 import { openSecret, sealSecret } from "./secretbox.ts";
 import { renderSetupPage, type SetupView } from "./setup-page.ts";
-import { escapeMarkers, verifyWakeText } from "./wake-text.ts";
+import { ambiguousWakeText, commandAttentionWakeText, escapeMarkers, verifyWakeText } from "./wake-text.ts";
 import { WebApp, linkTargetForThread, parseSessionCookie } from "./web.ts";
 
 interface ConnState {
@@ -276,6 +299,25 @@ function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/** A short, human-readable phrase for what a command asked the worker to do — used in the
+ *  ambiguous/not-delivered/in-use notices (issue #15). Reads the stored args defensively. */
+function commandInstruction(kind: string, payload: string): string {
+  let args: Record<string, unknown> = {};
+  try {
+    args = JSON.parse(payload) as Record<string, unknown>;
+  } catch {
+    // unparsable payload: fall through to the generic label
+  }
+  if (kind === "send" || kind === "interrupt") {
+    const thenText = (args.then as { text?: unknown } | undefined)?.text;
+    const text = typeof args.text === "string" ? args.text : typeof thenText === "string" ? thenText : "";
+    if (text) return text.slice(0, 60);
+  }
+  if (kind === "start_worker" && typeof args.prompt === "string") return args.prompt.slice(0, 60);
+  if (kind === "resume") return "恢复运行";
+  return kind;
+}
+
 function versionRangesOverlap(a: { min: number; max: number }, b: { min: number; max: number }): boolean {
   return a.min <= b.max && b.min <= a.max;
 }
@@ -310,9 +352,14 @@ export class Steward extends Agent<Env> {
     // unhandled question left). Draining pending intents at boot closes that window; the
     // rows are idempotent, so an extra pass on a clean boot is free.
     void this.drainNotifications();
+    // Issue #11: a quiet row waiting out its merge window (or a backoff between retries)
+    // must not depend on the enqueue-time pass having survived — re-arm from storage.
+    void this.deliverOutbound();
     // A DO restart clears the in-memory arm-dedupe while storage alarms keep their own
     // clock: re-arm maintenance so a restart never strands active workers unwatched.
     this.armWorkerSweeps();
+    // Crash-window machine-status intents (created, never drained) get their due-date wake.
+    this.rearmNoticeDrain();
     // Wakes queued by past reducers (crash between queue and submit, §11) drain now.
     void this.drainWakes();
     void this.pollRuns();
@@ -479,6 +526,10 @@ export class Steward extends Agent<Env> {
   // Tests shrink the history relay TTL to exercise the alarm-driven sweep quickly.
   protected historyRelayTtlMs = HISTORY_RELAY_TTL_DEFAULT_MS;
 
+  // Tests shrink the quiet merge window (issue #11) — 0 makes quiet rows due immediately,
+  // keeping the content-path tests deterministic while the window itself has its own suite.
+  protected quietMergeMs = QUIET_MERGE_MS;
+
   // The memory module (steward.md §2): all sh_* ledger SQL lives behind this handle. Bound
   // lazily because `sql`/`ctx` only mean something once the DO is live.
   private ledger_?: Ledger;
@@ -486,6 +537,7 @@ export class Steward extends Agent<Env> {
     return (this.ledger_ ??= createLedger({
       sql: this.sql.bind(this) as unknown as LedgerSql,
       tx: (fn) => this.ctx.storage.transactionSync(fn),
+      quietWindowMs: () => this.quietMergeMs,
     }));
   }
 
@@ -497,28 +549,35 @@ export class Steward extends Agent<Env> {
       // Withdraw only what never left the DO (still `queued`); a sent command may already be
       // persisted connector-side, and at-most-once beats a maybe-duplicate cancel (§4.2).
       cancelQueuedCommand: (cmdId) => {
-        this.sql`UPDATE outbox SET state = 'expired' WHERE cmdId = ${cmdId} AND state = 'queued'`;
+        this.sql`UPDATE outbox SET state = 'expired', held = 0 WHERE cmdId = ${cmdId} AND state = 'queued'`;
         return this.sql<{ changes: number }>`SELECT changes() AS changes`[0]!.changes > 0;
       },
-      // A start_worker that has not left the outbox pipeline yet (issue #13 review finding 3):
-      // the run is alive even when its worker row was reaped away.
-      hasDeliverableStart: (threadId) =>
-        this.sql<{ one: number }>`
-          SELECT 1 AS one FROM outbox o JOIN sh_worker w ON w.workerId = o.workerId
-          WHERE w.threadId = ${threadId} AND o.kind = 'start_worker'
-            AND o.state IN ('queued', 'sent') AND o.workerId IS NOT NULL
-          LIMIT 1
-        `.length > 0,
+      // "wait" (protocol §7.3): the command loses its deadline entirely — held AND notAfter —
+      // and tries to deliver right away (a machine that reconnected while the card sat
+      // unread starts immediately).
+      waitForCommand: (cmdId) => {
+        try {
+          this.ctx.storage.transactionSync(() => {
+            this.sql`UPDATE outbox SET held = 0, notAfter = NULL WHERE cmdId = ${cmdId} AND state = 'queued' AND held = 1`;
+          });
+          const changed = this.sql<{ changes: number }>`SELECT changes() AS changes`[0]!.changes > 0;
+          if (changed) void this.deliver(cmdId);
+          return changed;
+        } catch (err) {
+          this.logChannel("wait_command_failed", `${cmdId} ${errorText(err)}`);
+          return false;
+        }
+      },
       commandExists: (cmdId) => this.sql`SELECT 1 AS one FROM outbox WHERE cmdId = ${cmdId}`.length > 0,
       sendText: async (text, threadId) => {
         const owner = this.ownerOpenIdSync();
         if (!owner) return;
         await this.enqueueOutbound({ kind: "text", to: owner, text, threadId: threadId ?? null, urgency: "push" });
       },
-      sendCard: async (card, threadId) => {
+      sendCard: async (card, threadId, id) => {
         const owner = this.ownerOpenIdSync();
         if (!owner) return;
-        await this.enqueueOutbound({ kind: "card", to: owner, card, threadId, urgency: "push" });
+        await this.enqueueOutbound({ kind: "card", to: owner, card, threadId, urgency: "push", ...(id !== undefined ? { id } : {}) });
       },
       createPairing: () => this.createPairing(),
       deployOrigin: () => this.web.origin(),
@@ -689,6 +748,11 @@ export class Steward extends Agent<Env> {
         // §6.4: the timeline link is appended by the system, never by the model — the same
         // fresh one-time link the core-template cards carry (issue #22).
         const detailsUrl = thread ? await this.web.linkUrl(linkTargetForThread(thread.threadId)) : null;
+        // Issue #11 (spec §7.6): push only what the model marks important — everything else
+        // is quiet and merges over the 60-second window. Anything tied to `waiting_you` is
+        // ALWAYS push: an open question binding, or a Thread sitting in waiting_you.
+        const urgency: "push" | "quiet" =
+          input.urgency === "push" || question !== null || thread?.state === "waiting_you" ? "push" : "quiet";
         await this.enqueueOutbound({
           id: input.dedupeId,
           kind: "card",
@@ -702,7 +766,20 @@ export class Steward extends Agent<Env> {
           }),
           threadId: input.threadId ?? null,
           questionId: question !== null && question.status === "open" && question.workerId !== null ? question.qid : null,
-          urgency: input.urgency,
+          urgency,
+          ...(urgency === "quiet"
+            ? {
+                part: {
+                  kind: "report",
+                  tone: input.tone,
+                  conclusion: input.conclusion,
+                  did: input.did,
+                  ...(input.needsYou !== undefined ? { needsYou: input.needsYou } : {}),
+                  threadTitle: thread?.title ?? "",
+                  ...(detailsUrl ? { detailsUrl } : {}),
+                } satisfies QuietSection,
+              }
+            : {}),
         });
         if (question !== null && question.status === "open" && question.workerId !== null) {
           // §5.3 (issue #10, review finding 5): reaching the user always cancels the fallback
@@ -920,6 +997,8 @@ export class Steward extends Agent<Env> {
           to: owner,
           threadId: thread.threadId,
           text: `✅ 已把你的回答转给 ${worker.workerId}（${outcome.delivery === "steer" ? "不打断手头工具，当前批次结束后生效" : "按其状态尽快送达"}）。`,
+          // A direct ack of the owner's own action (issue #11): push, never merged away.
+          urgency: "push",
         });
       }
       return { workerId: worker.workerId, delivery: outcome.delivery };
@@ -1020,6 +1099,7 @@ export class Steward extends Agent<Env> {
     // Machine online state derives from live connections (issue #5): this and onClose are the
     // only writers. hello fills in the machine's real name and facts moments later.
     this.ledger.machines.setOnline(parsed.deviceId, true, row.name ?? undefined);
+    this.rearmNoticeDrain(); // a recovery intent may now be counting down its debounce
   }
 
   onClose(connection: Connection): void {
@@ -1046,6 +1126,7 @@ export class Steward extends Agent<Env> {
       this.getConnection(relay.webConnId)?.send(JSON.stringify({ t: "machine_offline", re: relay.reqId } satisfies MachineOfflineMessage));
     }
     this.ledger.machines.setOnline(state.deviceId, false);
+    this.rearmNoticeDrain(); // the offline intents' 2-minute window starts here
   }
 
   async onMessage(connection: Connection, raw: WSMessage): Promise<void> {
@@ -1279,6 +1360,7 @@ export class Steward extends Agent<Env> {
     // hello is the machine/repo snapshot's source of truth (protocol §6.1, steward.md §2.2):
     // name, agents, limits, and the full repo list — removals included — land in the ledger.
     this.ledger.machines.upsertFromHello(hello);
+    this.rearmNoticeDrain();
     const acks = Object.fromEntries(
       this.sql<{ workerId: string; upTo: number }>`SELECT workerId, upTo FROM worker_ack`.map((row) => [row.workerId, row.upTo]),
     );
@@ -1301,19 +1383,42 @@ export class Steward extends Agent<Env> {
     connection.send(JSON.stringify(welcome));
     // Reconciliation (protocol §6.1): the connector reports the states of commands that never
     // settled (e.g. `ambiguous` after a crash mid-sending). Settle the matching outbox rows;
-    // ambiguous rows are never re-delivered (§4.2).
+    // ambiguous rows are never re-delivered (§4.2) — the steward is woken to ask (issue #15).
     for (const pending of hello.pendingAcks) {
       if (pending.state === "ambiguous") {
-        this.sql`UPDATE outbox SET state = 'ambiguous' WHERE cmdId = ${pending.cmdId} AND state NOT IN ('done', 'failed', 'expired', 'ambiguous')`;
-        this.markPrWorkerAmbiguous(pending.cmdId, true);
+        // pr_worker rows route to the consent gate's own deterministic answer inside
+        // (issue #21); every other kind gets #15's wake-to-ask.
+        this.markCommandAmbiguous(pending.cmdId, "hello.pendingAcks");
       } else if (pending.state === "done" || pending.state === "failed") {
+        // The connector resolved the command from session-tail evidence before connecting:
+        // settle the row from the snapshot (its stored result rode hello as a duplicate-ack
+        // payload; here the state is what matters). A recovered not_delivered surfaces like
+        // any delivery failure — except start_worker, whose worker-break event (emitted by
+        // the connector's own §9.1 reconciliation) already tells the user.
         this.sql`
-          UPDATE outbox SET state = ${pending.state}, result = ${JSON.stringify({ source: "pendingAck" })}
+          UPDATE outbox SET state = ${pending.state}
           WHERE cmdId = ${pending.cmdId} AND state NOT IN ('done', 'failed', 'expired', 'ambiguous')
         `;
+        const changed = this.sql<{ changes: number }>`SELECT changes() AS changes`[0]!.changes > 0;
+        if (changed && pending.state === "failed" && pending.code === "not_delivered") {
+          const row = this.sql<{ workerId: string | null; kind: string }>`
+            SELECT workerId, kind FROM outbox WHERE cmdId = ${pending.cmdId}
+          `[0];
+          if (row?.workerId && row.kind !== "start_worker") {
+            this.noteCommandAttention(pending.cmdId, "not_delivered", "connector restarted before the command reached the agent");
+          }
+        }
       }
     }
+    // protocol §6.1: hello re-delivers every queued/sent command; "waited" start_workers
+    // (their notAfter cleared by the owner's wait) are queued for exactly this moment.
+    const before = new Set(
+      this.sql<{ cmdId: string }>`
+        SELECT cmdId FROM outbox WHERE deviceId = ${auth.deviceId} AND state = 'queued' AND kind = 'start_worker' AND held = 0 AND notAfter IS NULL
+      `.map((r) => r.cmdId),
+    );
     this.redeliverOutbox(auth.deviceId);
+    this.queueWaitedStartNotices(auth.deviceId, before);
     // A reconnect is also the natural catch-up point for events persisted but not yet reduced
     // (crash between the events_ack and the reducer, protocol §4.3): drain, then notify.
     this.applyLedgerEvents();
@@ -1345,6 +1450,22 @@ export class Steward extends Agent<Env> {
     for (const row of pending) this.deliver(row.cmdId);
   }
 
+  /** The "runs on reconnect with a notice" half of protocol §7.3: a start_worker whose
+   *  notAfter the owner's wait cleared was queued only for the machine's return — its
+   *  delivery at this hello is exactly the promised moment, so the notice follows it out. */
+  private queueWaitedStartNotices(deviceId: string, before: Set<string>): void {
+    const delivered = this.sql<{ cmdId: string; workerId: string }>`
+      SELECT cmdId, workerId FROM outbox WHERE deviceId = ${deviceId} AND state = 'sent' AND kind = 'start_worker' AND held = 0
+    `;
+    for (const row of delivered) {
+      if (!before.has(row.cmdId)) continue;
+      const worker = this.ledger.workers.get(row.workerId);
+      if (!worker || worker.state !== "starting") continue;
+      this.ledger.notifications.queue(`waited:${row.cmdId}`, "waited_started", worker.threadId, worker.workerId);
+    }
+    void this.drainNotifications();
+  }
+
   private handleCmdAck(raw: unknown): void {
     const parsed = CmdAckMessageSchema.safeParse(raw);
     if (!parsed.success) return;
@@ -1367,9 +1488,10 @@ export class Steward extends Agent<Env> {
       `;
       this.noteCommandFailure(ack.re, `连接器拒绝（${ack.code ?? "未知原因"}）`);
     } else if (ack.status === "ambiguous") {
-      // protocol §4.2: a crash during `sending`, undecidable — no automatic re-send.
-      this.sql`UPDATE outbox SET state = 'ambiguous' WHERE cmdId = ${ack.re}`;
-      this.markPrWorkerAmbiguous(ack.re, true);
+      // protocol §4.2: a crash during `sending`, undecidable — no automatic re-send. The row
+      // is marked ambiguous; #15 wakes the steward to ask, except pr_worker rows, which the
+      // consent gate answers deterministically (issue #21).
+      this.markCommandAmbiguous(ack.re, "cmd_ack");
     }
   }
 
@@ -1377,15 +1499,16 @@ export class Steward extends Agent<Env> {
     const parsed = CmdResultMessageSchema.safeParse(raw);
     if (!parsed.success) return;
     const result = parsed.data;
+    const wasFailed = this.sql<{ state: string }>`SELECT state FROM outbox WHERE cmdId = ${result.re}`[0]?.state === "failed";
     this.sql`
       UPDATE outbox SET state = ${result.ok ? "done" : "failed"}, result = ${JSON.stringify(result.ok ? result.data ?? null : result.error ?? null)}
       WHERE cmdId = ${result.re}
     `;
     if (result.ok) {
-      // Review finding 4: a pr_worker settles with the URL even when its pr_created event
-      // was lost (the connector's emit raced a shutdown). This backstop delivers the card
-      // from the command result; idempotent against the event path — whichever lands first
-      // wins, the other no-ops on the already-set url.
+      // Review finding 4 (#57): a pr_worker settles with the URL even when its pr_created
+      // event was lost (the connector's emit raced a shutdown). This backstop delivers the
+      // card from the command result; idempotent against the event path — whichever lands
+      // first wins, the other no-ops on the already-set url (so redeliveries are free).
       const row = this.sql<{ workerId: string | null; kind: string }>`
         SELECT workerId, kind FROM outbox WHERE cmdId = ${result.re}
       `[0];
@@ -1397,17 +1520,64 @@ export class Steward extends Agent<Env> {
       }
       return;
     }
-    const error = (result.error ?? {}) as { code?: unknown; message?: unknown };
-    const reason = [typeof error.code === "string" ? error.code : null, typeof error.message === "string" ? error.message : null]
-      .filter((part): part is string => part !== null)
-      .join("：") || "未知原因";
-    this.noteCommandFailure(result.re, reason);
+    if (!wasFailed) {
+      const error = (result.error ?? {}) as { code?: unknown; message?: unknown };
+      const reason = [typeof error.code === "string" ? error.code : null, typeof error.message === "string" ? error.message : null]
+        .filter((part): part is string => part !== null)
+        .join("：") || "未知原因";
+      this.noteCommandFailure(result.re, reason);
+      // Issue #15: two failure classes carry their own user-facing story — a session the
+      // owner is using at the keyboard (§10), and an instruction the connector provably
+      // never delivered (§6.3 recovery). Both land on the timeline and wake the steward;
+      // the ordinary tool says the delivery happened, so silence would mislead.
+      const code = typeof error.code === "string" ? error.code : null;
+      if (code === "session_in_use" || code === "not_delivered") {
+        this.noteCommandAttention(result.re, code, typeof error.message === "string" ? error.message : "");
+      }
+    }
+  }
+
+  /** A delivery-class failure the user should hear about even without the LLM's help: a
+   *  deterministic timeline note plus a wake (the steward relays/asks). Idempotent on the
+   *  cmdId through the wake's dedupeKey. */
+  private noteCommandAttention(cmdId: string, code: string, message: string): void {
+    const row = this.sql<{ workerId: string | null; kind: string; payload: string }>`
+      SELECT workerId, kind, payload FROM outbox WHERE cmdId = ${cmdId}
+    `[0];
+    if (!row || !row.workerId) return;
+    const worker = this.ledger.workers.get(row.workerId);
+    if (!worker) return;
+    const instruction = commandInstruction(row.kind, row.payload);
+    // The instruction is model- or user-authored text: marker-escape it everywhere it is
+    // embedded (the ⟦…⟧ policy every wake builder follows — review #48 finding 5).
+    const safe = escapeMarkers(instruction);
+    const text =
+      code === "session_in_use"
+        ? `「${safe}」没有送达：这个会话此刻正被机器上的另一个 pi 进程使用（可能是本人在键盘上继续）。`
+        : `「${safe}」没有送达：连接器在投递前重启了，worker 从未收到这条指令。`;
+    this.ledger.timeline.add(worker.threadId, "note", text, { cmdId, workerId: row.workerId, code });
+    this.ledger.wakes.queue(
+      "event",
+      `attention:${cmdId}`,
+      commandAttentionWakeText({
+        threadId: worker.threadId,
+        workerId: worker.workerId,
+        kind: row.kind,
+        instruction: safe,
+        code,
+        detail: text,
+      }),
+      { priority: "high" },
+    );
+    void this.drainWakes();
   }
 
   // A start_worker the connector could not run: the worker lands `broken`, the failure reaches
   // the timeline + the user deterministically (there is no LLM to relay it in M1). Idempotent
-  // on the cmdId — cmd_result redeliveries re-run this handler.
-  private noteCommandFailure(cmdId: string, reason: string): void {
+  // on the cmdId — cmd_result redeliveries re-run this handler. `stageHint` (issue #21) lets
+  // callers without a settled result pick the pr_failed card's stage (the idle sweep's
+  // timeout is a *delivery* failure, not an execution one).
+  private noteCommandFailure(cmdId: string, reason: string, stageHint?: string): void {
     const row = this.sql<{ workerId: string | null; kind: string }>`
       SELECT workerId, kind FROM outbox WHERE cmdId = ${cmdId}
     `[0];
@@ -1435,7 +1605,7 @@ export class Steward extends Agent<Env> {
       } catch {
         // result unreadable — the generic reason stands
       }
-      const stage = PR_ERROR_CODE_TO_STAGE[code ?? ""] ?? "command";
+      const stage = stageHint ?? PR_ERROR_CODE_TO_STAGE[code ?? ""] ?? "command";
       if (this.ledger.prConsent.fail({ workerId: row.workerId, cmdId, stage, message: message ?? reason })) {
         void this.drainNotifications();
       }
@@ -1447,24 +1617,57 @@ export class Steward extends Agent<Env> {
     }
   }
 
-  /**
-   * Review finding 2: an ambiguous pr_worker (the connector crashed mid-send; protocol §4.2
-   * never re-delivers it) must not wedge the consent row in "in flight" forever. The
-   * outcome is undecidable — the PR may or may not exist — which is itself an answer the
-   * owner needs; a later replayed pr_created (persist-first §11.3) heals the row with the
-   * URL. Called from both ambiguous paths: the live cmd_ack and hello.pendingAcks.
-   * `alreadySettled` = the caller already wrote the outbox's ambiguous state.
-   */
-  private markPrWorkerAmbiguous(cmdId: string, alreadySettled: boolean): void {
-    const row = this.sql<{ workerId: string | null; kind: string; state: string }>`
-      SELECT workerId, kind, state FROM outbox WHERE cmdId = ${cmdId}
+  /** Issue #15 / protocol §4.2: the connector reported a command `ambiguous` (a crash during
+   *  `sending` — delivery unknowable). Mark the outbox row ambiguous (never re-sent) and wake
+   *  the steward to ask the user; idempotent on the cmdId via the wake's dedupeKey.
+   *  Exception: a pr_worker routes to the consent gate's own deterministic answer (issue #21,
+   *  review finding 2) — an "ask the user" wake would only second-guess the card that already
+   *  tells them exactly what to do (check the repo, re-tap to retry). */
+  private markCommandAmbiguous(cmdId: string, via: string): void {
+    // Idempotency gate: the wake/note fire only when this call actually transitioned the
+    // row (duplicate cmd_acks and repeated hellos find it already ambiguous).
+    this.sql`
+      UPDATE outbox SET state = 'ambiguous' WHERE cmdId = ${cmdId} AND state NOT IN ('done', 'failed', 'expired', 'ambiguous')
+    `;
+    const changed = this.sql<{ changes: number }>`SELECT changes() AS changes`[0]!.changes > 0;
+    if (!changed) return;
+    const row = this.sql<{ workerId: string | null; kind: string; payload: string }>`
+      SELECT workerId, kind, payload FROM outbox WHERE cmdId = ${cmdId}
     `[0];
-    if (!row || row.kind !== "pr_worker" || !row.workerId) return;
-    if (!alreadySettled && (row.state === "done" || row.state === "failed" || row.state === "expired" || row.state === "ambiguous")) return;
-    if (!alreadySettled) this.sql`UPDATE outbox SET state = 'ambiguous' WHERE cmdId = ${cmdId}`;
+    if (!row || !row.workerId) return;
+    if (row.kind === "pr_worker") {
+      this.markPrWorkerAmbiguous(row.workerId, cmdId);
+      return;
+    }
+    const worker = this.ledger.workers.get(row.workerId);
+    if (!worker) return;
+    const instruction = escapeMarkers(commandInstruction(row.kind, row.payload));
+    this.ledger.timeline.add(
+      worker.threadId,
+      "note",
+      `命令结果不确定（${via}）：连接器在投递「${instruction}」时崩溃，无法判断 worker 是否已收到。不会自动重发。`,
+      { cmdId, workerId: row.workerId, ambiguous: true },
+    );
+    this.ledger.wakes.queue(
+      "event",
+      `ambiguous:${cmdId}`,
+      ambiguousWakeText({ thread: this.ledger.threads.get(worker.threadId), worker, cmdId, kind: row.kind, instruction }),
+      { priority: "high" },
+    );
+    void this.drainWakes();
+  }
+
+  /**
+   * The consent gate's ambiguous answer (issue #21, review finding 2 of #57): an ambiguous
+   * pr_worker must not wedge the consent row in "in flight" forever. The outcome is
+   * undecidable — the PR may or may not exist — which is itself an answer the owner needs;
+   * a later replayed pr_created (persist-first §11.3) heals the row with the URL. fail() is
+   * idempotent, so the duplicate hello/pendingAck redeliveries are free.
+   */
+  private markPrWorkerAmbiguous(workerId: string, cmdId: string): void {
     if (
       this.ledger.prConsent.fail({
-        workerId: row.workerId,
+        workerId,
         cmdId,
         stage: "ambiguous",
         message: "连接器在执行中途失联，PR 是否已创建无法确定",
@@ -1549,6 +1752,17 @@ export class Steward extends Agent<Env> {
   // The pending drainWakes schedule's id, so a fresh earlier wake can cancel and pull it in.
   private drainWakeScheduleId: string | undefined;
 
+  /** F4 (PR #51 review): the debounce is a due date, not a timer promise — something must
+   *  wake the DO at it, or an offline notice sits pending through the very outage it exists
+   *  to report (and the reconnect then deletes it as healed). */
+  private rearmNoticeDrain(): void {
+    const at = this.sql<{ at: number | null }>`
+      SELECT MIN(dueAt) AS at FROM sh_notify WHERE sentAt IS NULL AND dueAt IS NOT NULL
+    `[0]?.at ?? null;
+    if (at === null) return;
+    void this.schedule(Math.max(1, Math.ceil((at - Date.now()) / 1000)), "drainNotifications");
+  }
+
   drainNotifications(): Promise<void> {
     const run = this.notifyChain.then(() => this.drainNotifyPass());
     this.notifyChain = run.catch(() => {});
@@ -1560,14 +1774,30 @@ export class Steward extends Agent<Env> {
     for (const intent of this.ledger.notifications.pending()) {
       try {
         if (!cfg?.ownerOpenId) continue; // no owner yet: the intent stays pending, not lost
-        const card = await this.renderNotification(intent);
-        if (card === null) {
-          // Its data is gone (thread archived / worker pruned); drop the intent rather than
-          // retry forever.
-          this.ledger.notifications.markSent(intent.id);
+        const rendered = await this.renderNotification(intent);
+        if (rendered === null) {
+          // Its data is gone (thread archived / worker pruned), or the news evaporated (a
+          // drop that healed inside the debounce window): remove the intent rather than
+          // retry forever — and never count it as "the owner was told".
+          this.ledger.notifications.drop(intent.id);
           continue;
         }
         const question = intent.questionId !== null ? this.ledger.questions.get(intent.questionId) : null;
+        const questionTied = question !== null && question.status === "open";
+        const thread = this.ledger.threads.get(intent.threadId);
+        // Issue #11 (spec §7.6): an ordinary done report is QUIET — it merges over the
+        // 60-second window instead of buzzing the phone. Everything the reducer queues for
+        // the user's attention (question-bound reports, stalls, failures) pushes at once,
+        // and a done report on a Thread already waiting on the user pushes too. Issue #21:
+        // a done report carrying the consent ask is waiting_you in card form — [同意]/[先不
+        // 要] cannot ride a merged card (sections carry no buttons, and one merged message
+        // settles N member rows' providerMsgIds, which would break the tap's §3.1 routing) —
+        // so it pushes on its own, buttons intact.
+        const quiet =
+          intent.kind === "done_report" &&
+          !questionTied &&
+          thread?.state !== "waiting_you" &&
+          rendered.holdsConsentAsk !== true;
         await this.enqueueOutbound({
           kind: "card",
           to: cfg.ownerOpenId,
@@ -1575,19 +1805,25 @@ export class Steward extends Agent<Env> {
           // (`notify:report:<workerId>:<seq>`) on callback — the §3.1 rule applied to consent.
           id: `notify:${intent.dedupeKey}`,
           threadId: intent.threadId,
-          questionId: question?.status === "open" && question.threadId !== null ? question.qid : null,
-          card,
-          urgency: "push",
+          questionId: questionTied && question!.threadId !== null ? question!.qid : null,
+          card: rendered.card,
+          urgency: quiet ? "quiet" : "push",
+          ...(quiet && rendered.section !== undefined ? { part: rendered.section } : {}),
         });
         this.ledger.notifications.markSent(intent.id);
       } catch (err) {
         this.logChannel("notify_drain_failed", `${intent.id} ${errorText(err)}`);
       }
     }
+    this.rearmNoticeDrain(); // a still-debounced intent needs its own wake
   }
 
-  /** Deterministic core templates (steward.md §6.2 source 1): data in, card out, no LLM. */
-  private async renderNotification(intent: NotifyRow): Promise<unknown | null> {
+  /** Deterministic core templates (steward.md §6.2 source 1): data in, card out, no LLM.
+   *  Done reports also carry their merge section (issue #11) so a quiet window folds several
+   *  threads into one card that keeps each one's three parts. */
+  private async renderNotification(intent: NotifyRow): Promise<
+    { card: unknown; section?: QuietSection; holdsConsentAsk?: boolean } | null
+  > {
     const worker = intent.workerId ? this.ledger.workers.get(intent.workerId) : null;
     const thread = this.ledger.threads.get(intent.threadId);
     if (!worker || !thread) return null;
@@ -1605,6 +1841,42 @@ export class Steward extends Agent<Env> {
     // per card, never by the (M2) LLM.
     const detailsUrl = await this.web.linkUrl(linkTargetForThread(thread.threadId));
 
+    // Machine status (issue #14, steward.md §5.3): only when in-flight work is affected,
+    // debounced two minutes — and the drop only counts if the worker is still unreachable
+    // when the window closes (a blip that healed produces no notice at all).
+    if (intent.kind === "machine_offline") {
+      if (!worker.unreachable) return null;
+      return { card: machineOfflineCard(machineName, thread.title, footer) };
+    }
+    if (intent.kind === "machine_online") {
+      // "X is back" only when the owner heard about THIS outage: the offline intent paired
+      // to this transition (dedupeKey machine:<dev>:<T>:on:<worker> ← machine:<dev>:<T-1>:off:<worker>)
+      // must have actually been sent. A sub-debounce blip's offline intent was dropped as
+      // healed, so its recovery stays quiet too — and a later blip cannot ride an earlier
+      // outage's notice (PR #51 review finding 7).
+      const paired = /^machine:([^:]+):(\d+):on:(.+)$/.exec(intent.dedupeKey);
+      const offlineKey = paired ? `machine:${paired[1]}:${Number(paired[2]) - 1}:off:${paired[3]}` : null;
+      const announced =
+        offlineKey === null
+          ? 0
+          : this.sql<{ n: number }>`
+              SELECT COUNT(*) AS n FROM sh_notify WHERE dedupeKey = ${offlineKey} AND sentAt IS NOT NULL
+            `[0]!.n;
+      if (announced === 0) return null;
+      const outcome =
+        worker.state === "running" || worker.state === "recovering"
+          ? "已恢复运行"
+          : worker.state === "starting" || worker.state === "queued"
+            ? "仍在排队/启动中"
+            : worker.state === "lost" || worker.state === "broken"
+              ? "未恢复（见时间线）"
+              : "已结束，结果已对账";
+      return { card: machineOnlineCard(machineName, thread.title, outcome, footer) };
+    }
+    if (intent.kind === "waited_started") {
+      return { card: waitedStartCard(machineName, thread.title, footer, detailsUrl ?? undefined) };
+    }
+
     if (intent.kind === "done_report") {
       // The intent's own seq (its dedupeKey is `report:<workerId>:<seq>`), so the consent
       // gate binds to the report this card rendered — not to a newer one that arrived in
@@ -1615,30 +1887,57 @@ export class Steward extends Agent<Env> {
           this.ledger.workers.reportsForWorker(worker.workerId).at(-1))
         : this.ledger.workers.reportsForWorker(worker.workerId).at(-1);
       if (!report) return null;
-      return reportCardFor(report, worker, machineName, thread.title, detailsUrl ?? undefined);
+      const needsYou = needsYouOf(report);
+      // Issue #21 × #11: a consent-carrying done report asks the user ([同意]/[先不要]) — it
+      // pushes as its own card (see drainNotifyPass) and never contributes a merge section
+      // (sections carry no buttons). Ordinary completions keep #11's quiet merge.
+      const consent = prConsentFor(report, worker);
+      return {
+        card: reportCardFor(report, worker, machineName, thread.title, detailsUrl ?? undefined),
+        ...(consent
+          ? { holdsConsentAsk: true }
+          : {
+              // The merge section (issue #11): the same three parts the single card renders,
+              // kept per Thread when several done reports share one quiet window.
+              section: {
+                kind: "report",
+                tone: toneOfReport(report.status),
+                conclusion: report.summary,
+                did: didBullets(report),
+                ...(needsYou !== undefined ? { needsYou } : {}),
+                threadTitle: thread.title,
+                ...(detailsUrl ? { detailsUrl } : {}),
+              } satisfies QuietSection,
+            }),
+      };
     }
 
     // The consent gate's async answers (issue #21): the PR URL, or the classified failure —
-    // both deterministic, both from the payload the reducer attached to the intent.
+    // both deterministic, both from the payload the reducer attached to the intent. Both are
+    // the user's awaited answer to their own tap: push, never a merge section.
     if (intent.kind === "pr_created") {
       const payload = parseNotifyPayload(intent.payload);
-      return prCreatedCard({
-        url: payload.url ?? "",
-        branch: payload.branch ?? "",
-        threadTitle: thread.title,
-        footer,
-        detailsUrl: detailsUrl ?? undefined,
-      });
+      return {
+        card: prCreatedCard({
+          url: payload.url ?? "",
+          branch: payload.branch ?? "",
+          threadTitle: thread.title,
+          footer,
+          detailsUrl: detailsUrl ?? undefined,
+        }),
+      };
     }
     if (intent.kind === "pr_failed") {
       const payload = parseNotifyPayload(intent.payload);
-      return failureCard(
-        "推送 / 创建 PR 失败",
-        prFailureNeedsYou(String(payload.stage ?? ""), String(payload.message ?? "")),
-        thread.title,
-        footer,
-        detailsUrl ?? undefined,
-      );
+      return {
+        card: failureCard(
+          "推送 / 创建 PR 失败",
+          prFailureNeedsYou(String(payload.stage ?? ""), String(payload.message ?? "")),
+          thread.title,
+          footer,
+          detailsUrl ?? undefined,
+        ),
+      };
     }
 
     // §5.3 (issue #10): a blocked/needs_decision question that nothing handled within the
@@ -1649,14 +1948,16 @@ export class Steward extends Agent<Env> {
       const question = this.ledger.questions.get(intent.questionId);
       if (!question) return null;
       const report = this.ledger.workers.reportsForWorker(worker.workerId).at(-1);
-      return workerQuestionCard({
-        question: question.text,
-        ...(report?.summary ? { summary: report.summary } : {}),
-        ...(report?.changes?.length ? { did: didBullets(report) } : {}),
-        threadTitle: thread.title,
-        footer,
-        detailsUrl: detailsUrl ?? undefined,
-      });
+      return {
+        card: workerQuestionCard({
+          question: question.text,
+          ...(report?.summary ? { summary: report.summary } : {}),
+          ...(report?.changes?.length ? { did: didBullets(report) } : {}),
+          threadTitle: thread.title,
+          footer,
+          detailsUrl: detailsUrl ?? undefined,
+        }),
+      };
     }
 
     // stall_notice (§8.4): attention, not failure — the run may still be a very long tool
@@ -1664,28 +1965,46 @@ export class Steward extends Agent<Env> {
     // or the intent would have been for a different, newer stall).
     if (intent.kind === "stall_notice") {
       const minutes = Math.max(1, Math.round((Date.now() - (worker.lastEventAt ?? worker.createdAt)) / 60_000));
-      return stallCard(minutes, worker, machineName, thread.title, footer, detailsUrl ?? undefined);
+      return { card: stallCard(minutes, worker, machineName, thread.title, footer, detailsUrl ?? undefined) };
     }
 
     // failure_push: either the start never happened or the run ended in a failure class that
     // needs a human (steward.md §5.3); the matching open question carries the specifics.
     if (worker.lastOutcome?.startsWith("resume_failed:")) {
-      return failureCard(
-        `接续原会话失败`,
-        `${worker.lastOutcome.slice("resume_failed:".length)}。原会话未受影响，重新说一次要做什么即可。`,
-        thread.title,
-        footer,
-        detailsUrl ?? undefined,
-      );
+      return {
+        card: failureCard(
+          `接续原会话失败`,
+          `${worker.lastOutcome.slice("resume_failed:".length)}。原会话未受影响，重新说一次要做什么即可。`,
+          thread.title,
+          footer,
+          detailsUrl ?? undefined,
+        ),
+      };
     }
     const needsYou =
       boundQuestion?.status === "open" && boundQuestion.text.trim().length > 0
         ? boundQuestion.text
         : "查看 Thread 时间线了解详情。";
     if (worker.lastOutcome?.startsWith("start_failed:")) {
-      return failureCard(`派发失败：任务没有开始`, `${worker.lastOutcome.slice("start_failed:".length)}。重新说一次要做什么即可。`, thread.title, footer, detailsUrl ?? undefined);
+      return {
+        card: failureCard(
+          `派发失败：任务没有开始`,
+          `${worker.lastOutcome.slice("start_failed:".length)}。重新说一次要做什么即可。`,
+          thread.title,
+          footer,
+          detailsUrl ?? undefined,
+        ),
+      };
     }
-    return failureCard(worker.lastOutcome === "unreported" ? "运行结束但没有汇报" : "运行出错，需要你决定下一步", needsYou, thread.title, footer, detailsUrl ?? undefined);
+    return {
+      card: failureCard(
+        worker.lastOutcome === "unreported" ? "运行结束但没有汇报" : "运行出错，需要你决定下一步",
+        needsYou,
+        thread.title,
+        footer,
+        detailsUrl ?? undefined,
+      ),
+    };
   }
 
   // `/加机器` in chat is the trigger (issue #22); `/pair` is the only HTTP consumer of the
@@ -1771,7 +2090,7 @@ export class Steward extends Agent<Env> {
     deviceId: string,
     kind: string,
     args: unknown,
-    opts: { workerId?: string; notAfter?: number | null; ackTimeoutMs?: number; cmdId?: string } = {},
+    opts: { workerId?: string; notAfter?: number | null; ackTimeoutMs?: number; cmdId?: string; held?: boolean } = {},
   ): Promise<{ cmdId: string; cseq: number; state: string }> {
     const cseq = (this.sql<{ m: number | null }>`SELECT MAX(cseq) AS m FROM outbox WHERE deviceId = ${deviceId}`[0]?.m ?? 0) + 1;
     // `cmdId` is the idempotency key for steward tool replays (protocol §7.1): the start_worker
@@ -1784,12 +2103,19 @@ export class Steward extends Agent<Env> {
     if (existing) return { cmdId: existing.cmdId, cseq: existing.cseq, state: existing.state };
     const notAfter = opts.notAfter === undefined ? Date.now() + DEFAULT_NOTAFTER_MS : opts.notAfter;
     this.sql`
-      INSERT INTO outbox (cmdId, deviceId, workerId, cseq, kind, payload, notAfter, state, createdAt)
-      VALUES (${cmdId}, ${deviceId}, ${opts.workerId ?? null}, ${cseq}, ${kind}, ${JSON.stringify(args ?? {})}, ${notAfter}, 'queued', ${Date.now()})
+      INSERT INTO outbox (cmdId, deviceId, workerId, cseq, kind, payload, notAfter, held, state, createdAt)
+      VALUES (${cmdId}, ${deviceId}, ${opts.workerId ?? null}, ${cseq}, ${kind}, ${JSON.stringify(args ?? {})}, ${notAfter}, ${opts.held ? 1 : 0}, 'queued', ${Date.now()})
     `;
     // A dispatch registers the worker before enqueueing: the moment the row exists, the
     // maintenance alarm (stall notice + reap) must be armed (issue #13).
     this.armWorkerSweeps();
+    if (opts.held && notAfter !== null) {
+      // Nothing will ever try to deliver a held row while the machine is away, so its own
+      // notAfter lapse needs the alarm armed here (PR #51 review finding 2): sweepIdle
+      // marks the row failed/not_after at the deadline, and sweepWorkers (armed by the
+      // enqueue above, the worker is `starting`) closes the worker with a push.
+      void this.schedule(Math.max(1, Math.ceil((notAfter - Date.now()) / 1000)) + 1, "sweepIdle");
+    }
     this.deliver(cmdId, opts.ackTimeoutMs);
     const state = this.sql<{ state: string }>`SELECT state FROM outbox WHERE cmdId = ${cmdId}`[0]!.state;
     return { cmdId, cseq, state };
@@ -1818,9 +2144,10 @@ export class Steward extends Agent<Env> {
       kind: string;
       payload: string;
       notAfter: number | null;
+      held: number;
       state: string;
     }>`
-      SELECT deviceId, workerId, cseq, kind, payload, notAfter, state FROM outbox WHERE cmdId = ${cmdId}
+      SELECT deviceId, workerId, cseq, kind, payload, notAfter, held, state FROM outbox WHERE cmdId = ${cmdId}
     `[0];
     if (!row || (row.state !== "queued" && row.state !== "sent")) return false;
     const now = Date.now();
@@ -1833,6 +2160,10 @@ export class Steward extends Agent<Env> {
       this.sql`UPDATE outbox SET state = 'failed', failReason = 'not_after' WHERE cmdId = ${cmdId}`;
       return false;
     }
+    // An offline ask is still open (protocol §7.3): the command must not slip out at a
+    // reconnect before the owner answers. Lapsed rows were already marked above — the hold
+    // never outlives its own delivery window.
+    if (row.held) return false;
     const connection = this.connFor(row.deviceId);
     if (!connection) {
       void this.schedule(IDLE_SWEEP_INTERVAL_S, "sweepIdle");
@@ -1882,14 +2213,28 @@ export class Steward extends Agent<Env> {
   // Periodic backstop (spike-conclusions bug 5): a command queued for a device that never
   // comes back must not wait forever even when `notAfter` is null ("wait until online").
   async sweepIdle(): Promise<void> {
-    const cutoff = Date.now() - IDLE_FAIL_MS;
-    const stale = this.sql<{ cmdId: string; kind: string }>`SELECT cmdId, kind FROM outbox WHERE state = 'queued' AND createdAt <= ${cutoff}`;
+    const nowMs = Date.now();
+    // notAfter enforcement while offline (protocol §4.2, PR #51 review finding 2): deliver()
+    // marks lapsed rows when something attempts them, but a HELD row is never attempted
+    // while the machine is away — this pass is the only writer it will see. It writes the
+    // same terminal `failed/not_after` deliver() would (never `expired`: that is the
+    // user's withdrawal state); sweepWorkers then closes the `starting` worker with a push.
+    const lapsed = this.sql<{ cmdId: string; kind: string }>`
+      SELECT cmdId, kind FROM outbox
+      WHERE state = 'queued' AND notAfter IS NOT NULL AND notAfter <= ${nowMs}
+    `;
+    for (const row of lapsed) {
+      this.sql`UPDATE outbox SET state = 'failed', failReason = 'not_after' WHERE cmdId = ${row.cmdId} AND state = 'queued'`;
+    }
+    const cutoff = nowMs - IDLE_FAIL_MS;
+    const stale = this.sql<{ cmdId: string; kind: string }>`SELECT cmdId, kind FROM outbox WHERE state = 'queued' AND createdAt <= ${cutoff} AND held = 0`;
     for (const row of stale) {
       this.sql`UPDATE outbox SET state = 'failed', failReason = 'idle' WHERE cmdId = ${row.cmdId}`;
       // Issue #21: a pr_worker the machine never came back for must not vanish silently —
-      // the consent click promised an answer, so the failure reaches the owner as a card.
+      // the consent click promised an answer, so the failure reaches the owner as a card
+      // (the `delivery` stage fits: the instruction never reached the machine).
       // (start_worker rows keep their existing quiet path: the worker sweep owns those.)
-      if (row.kind === "pr_worker") this.noteCommandFailure(row.cmdId, "机器长时间未上线，指令超时未送达");
+      if (row.kind === "pr_worker") this.noteCommandFailure(row.cmdId, "机器长时间未上线，指令超时未送达", "delivery");
     }
     const waiting = this.sql<{ n: number }>`SELECT COUNT(*) AS n FROM outbox WHERE state = 'queued'`[0]!.n;
     if (waiting > 0) void this.schedule(IDLE_SWEEP_INTERVAL_S, "sweepIdle");
@@ -2834,8 +3179,14 @@ export class Steward extends Agent<Env> {
   ): Promise<void> {
     const operationId = `user:${input.msgId}`;
     // Signal 1 (§3.1): a quote of one of our messages routes to that Thread directly.
+    // A MERGED card (issue #11) spans several Threads — no single owner — so the reply
+    // routes to the conversation (the steward decides which matter it belongs to) while
+    // clearing unread on every Thread the card reported (§6.5: the reply means they were
+    // all seen).
+    const quotedThreadIds = input.parentId ? this.ledger.outbound.threadIdsForProviderMsg(input.parentId) : [];
+    for (const quotedThreadId of quotedThreadIds) this.ledger.threads.markRead(quotedThreadId);
+    const routed = quotedThreadIds.length === 1 ? quotedThreadIds[0]! : null;
     const routedRow = input.parentId ? this.ledger.outbound.rowForProviderMsg(input.parentId) : null;
-    const routed = routedRow?.threadId ?? null;
     const routedThread = routed ? this.ledger.threads.get(routed) : null;
     if (routedThread) {
       this.ledger.threads.markRead(routedThread.threadId); // a reply means the report was seen (§6.5)
@@ -2874,7 +3225,9 @@ export class Steward extends Agent<Env> {
         ? input.prefilledNote
         : routedThread
           ? `（系统注：这条消息是对 Thread「${escapeMarkers(routedThread.title)}」（${routedThread.threadId}）消息的回复，已确定归属该 Thread。）\n`
-          : "";
+          : quotedThreadIds.length > 1
+            ? `（系统注：这条消息是对一张合并汇报卡片的回复，覆盖 ${quotedThreadIds.length} 个 Thread；由你判断它属于哪件事。）\n`
+            : "";
     const text = `${note}${escaped}`;
     const routedId = input.routedThreadId ?? routedThread?.threadId ?? null;
     if (!this.ledger.runs.open(operationId, "user", text, { replyTo: input.msgId, channel: "feishu", routedThreadId: routedId })) {
@@ -3287,7 +3640,8 @@ export class Steward extends Agent<Env> {
           : "这条记忆已经不在常驻层了（可能已被归档或腾挪），无需保留。";
       }
     }
-    await this.enqueueOutbound({ kind: "text", to: ownerOpenId, text: reply });
+    // The tap's ack is a direct response to the owner's action (issue #11): push.
+    await this.enqueueOutbound({ kind: "text", to: ownerOpenId, text: reply, urgency: "push" });
   }
 
   /**
@@ -3518,6 +3872,8 @@ export class Steward extends Agent<Env> {
     threadId?: string | null;
     questionId?: string | null;
     urgency?: "push" | "quiet";
+    /** Structured merge section (issue #11) — carried in the payload for quiet rows. */
+    part?: QuietSection;
     /** Stable dedupe key (review #6): retries/replays of the same logical message converge on
      *  one row (INSERT OR IGNORE) — the id doubles as the provider-side uuid, so a repeated
      *  enqueue can never double-send. Omitted: a fresh one-of message. */
@@ -3683,6 +4039,13 @@ export class Steward extends Agent<Env> {
     return this.sweepQuestionFallback();
   }
 
+  /** Test-only: swaps the quiet merge window (issue #11) — 0 makes quiet rows due
+   *  immediately, so content-path suites stay deterministic; the window itself has its
+   *  own suite that keeps the production 60 s. */
+  async setQuietMergeForTest(ms: number): Promise<void> {
+    this.quietMergeMs = ms;
+  }
+
   /** Test entry into the intervention half of the dispatch service (send/interrupt). */
   async interruptForTest(
     input: Omit<import("./dispatch.ts").InterruptWorkerInput, "provenance" | "cmdId"> & { cmdId?: string },
@@ -3700,6 +4063,13 @@ export class Steward extends Agent<Env> {
       createdFromMsg: input.createdFromMsg ?? "om_test_source",
     });
     return outcome.ok ? { ok: true, routineId: outcome.routine.routineId } : { ok: false, reason: outcome.reason };
+  }
+
+  /** Test read: the alarm-driven maintenance callbacks currently scheduled (findings 2/4). */
+  async maintenanceSchedulesForTest(): Promise<Array<{ id: string; callback: string; type: string; time: number }>> {
+    return (await this.listSchedules())
+      .filter((s) => ["sweepIdle", "sweepWorkers", "drainNotifications"].includes(s.callback))
+      .map((s) => ({ id: s.id, callback: s.callback, type: s.type, time: s.time ?? 0 }));
   }
 
   /** Test read: the fireRoutine/fireFollowup schedule rows the Agents SDK currently holds. */
@@ -3814,10 +4184,103 @@ export class Steward extends Agent<Env> {
   private async deliverOutboundPass(): Promise<void> {
     // Reclaim rows whose delivery pass died mid-send (claim expired): back to queued.
     this.ledger.outbound.reclaimExpiredClaims(Date.now());
-    for (const id of this.ledger.outbound.dueIds(Date.now(), OUTBOUND_BATCH)) {
-      await this.deliverOneOutbound(id);
+    // Issue #11: due QUIET rows for one channel+receiver fold into a single merged message —
+    // everything else (push) goes out on its own, in arrival order.
+    const due = this.ledger.outbound.dueRows(Date.now(), OUTBOUND_BATCH);
+    const grouped = new Set<string>();
+    for (const row of due) {
+      if (grouped.has(row.id)) continue;
+      if (row.urgency !== "quiet") {
+        await this.deliverOneOutbound(row.id);
+        continue;
+      }
+      const group = due.filter(
+        (r) => r.urgency === "quiet" && r.channel === row.channel && r.receiveId === row.receiveId && !grouped.has(r.id),
+      );
+      for (const member of group) grouped.add(member.id);
+      if (group.length === 1) await this.deliverOneOutbound(row.id);
+      else await this.deliverMergedGroup(group.map((r) => r.id));
     }
     this.rearmDeliveryAlarm();
+  }
+
+  /** The merged send (issue #11): claim every sibling row, render ONE message from their
+   *  sections, send it once, and settle all rows against the same providerMsgId — so a
+   *  quote-reply marks every bound thread read while routing to the conversation (the
+   *  steward decides which matter the reply belongs to). */
+  private async deliverMergedGroup(ids: string[]): Promise<void> {
+    const claimed: Array<{ row: OutboundDeliveryRow }> = [];
+    for (const id of ids) {
+      const row = this.ledger.outbound.claimForDelivery(id, Date.now(), OUTBOUND_CLAIM_MS);
+      if (row) claimed.push({ row });
+    }
+    if (claimed.length === 0) return;
+    if (claimed.length === 1) return this.deliverClaimed(claimed[0]!.row); // siblings got stolen mid-claim
+
+    const cfg = await this.loadFeishuConfig();
+    if (!cfg) {
+      for (const { row } of claimed) {
+        this.ledger.outbound.settleFailure(row.id, row.claim, row.attempts + 1, "channel_not_configured", null, Date.now());
+      }
+      return;
+    }
+    // 5 QPS per receiver (feishu-channel.md §4): the merged group is ONE wire send.
+    await this.paceSend(claimed[0]!.row.channel, claimed[0]!.row.receiveId);
+    const sections = claimed
+      .map(({ row }) => sectionFromPayload(JSON.parse(row.payload) as { text?: string; card?: unknown; part?: QuietSection }))
+      .filter((section): section is QuietSection => section !== null);
+    if (sections.length === 0) {
+      // Nothing mergeable (unreachable with today's producers, but merging must never send
+      // an empty message on their behalf): fail the rows loudly and permanently.
+      for (const { row } of claimed) {
+        this.ledger.outbound.settleFailure(row.id, row.claim, row.attempts + 1, "no_mergeable_sections", null, Date.now());
+      }
+      return;
+    }
+    const message = mergeQuietOutbound(sections);
+    try {
+      const { providerMsgId } = await this.newFeishuAdapter(cfg).send({
+        // Membership-scoped uuid (PR #58 review): a retried group keeps its dedupe key only
+        // while its members are unchanged — a late joiner between attempts gets a fresh one,
+        // so Feishu's dedupe can never swallow its section.
+        id: mergedSendUuid(claimed.map(({ row }) => row.id)),
+        to: claimed[0]!.row.receiveId,
+        kind: message.kind,
+        text: message.kind === "text" ? message.text : undefined,
+        card: message.kind === "card" ? message.card : undefined,
+        threadId: null,
+      });
+      this.touchPace(claimed[0]!.row.channel, claimed[0]!.row.receiveId);
+      for (const { row } of claimed) this.ledger.outbound.settleSent(row.id, row.claim, providerMsgId, Date.now());
+    } catch (err) {
+      this.touchPace(claimed[0]!.row.channel, claimed[0]!.row.receiveId);
+      for (const { row } of claimed) {
+        if (!this.ledger.outbound.stillOwns(row.id, row.claim)) continue; // a reclaim took over mid-send; its send settles
+        const attempts = row.attempts + 1;
+        const retriable = err instanceof RetriableChannelError;
+        const permanent = !retriable || attempts >= OUTBOUND_MAX_ATTEMPTS;
+        const delay = permanent
+          ? null
+          : Math.min(OUTBOUND_BACKOFF_BASE_MS * 2 ** Math.max(0, attempts - 1), OUTBOUND_BACKOFF_CAP_MS);
+        this.ledger.outbound.settleFailure(
+          row.id,
+          row.claim,
+          attempts,
+          errorText(err),
+          permanent ? null : Date.now() + (delay ?? 0),
+          Date.now(),
+        );
+      }
+    }
+  }
+
+  /** The pacing wait shared by the single and merged send paths. */
+  private async paceSend(channel: string, receiveId: string): Promise<void> {
+    const pace = this.sql<{ lastSendAt: number }>`
+      SELECT lastSendAt FROM sh_channel_pace WHERE channel = ${channel} AND receiveId = ${receiveId}
+    `[0];
+    const wait = pace ? pace.lastSendAt + OUTBOUND_SEND_SPACING_MS - Date.now() : 0;
+    if (wait > 0) await sleep(wait);
   }
 
   private async deliverOneOutbound(id: string): Promise<void> {
@@ -3825,24 +4288,23 @@ export class Steward extends Agent<Env> {
     // taken, so two concurrent passes never both send it.
     const row = this.ledger.outbound.claimForDelivery(id, Date.now(), OUTBOUND_CLAIM_MS);
     if (!row) return; // another pass owns this row
+    await this.deliverClaimed(row);
+  }
 
+  private async deliverClaimed(row: OutboundDeliveryRow): Promise<void> {
     const cfg = await this.loadFeishuConfig();
     if (!cfg) {
-      this.ledger.outbound.settleFailure(id, row.claim, row.attempts + 1, "channel_not_configured", null, Date.now());
+      this.ledger.outbound.settleFailure(row.id, row.claim, row.attempts + 1, "channel_not_configured", null, Date.now());
       return;
     }
 
     // 5 QPS per receiver (feishu-channel.md §4): space this send from the previous one.
-    const pace = this.sql<{ lastSendAt: number }>`
-      SELECT lastSendAt FROM sh_channel_pace WHERE channel = ${row.channel} AND receiveId = ${row.receiveId}
-    `[0];
-    const wait = pace ? pace.lastSendAt + OUTBOUND_SEND_SPACING_MS - Date.now() : 0;
-    if (wait > 0) await sleep(wait);
+    await this.paceSend(row.channel, row.receiveId);
 
     const payload = JSON.parse(row.payload) as { text?: string; card?: unknown };
     try {
       const { providerMsgId } = await this.newFeishuAdapter(cfg).send({
-        id,
+        id: row.id,
         to: row.receiveId,
         kind: row.kind === "card" ? "card" : "text",
         text: payload.text,
@@ -3850,12 +4312,12 @@ export class Steward extends Agent<Env> {
         threadId: row.threadId,
       });
       this.touchPace(row.channel, row.receiveId);
-      this.ledger.outbound.settleSent(id, row.claim, providerMsgId, Date.now());
+      this.ledger.outbound.settleSent(row.id, row.claim, providerMsgId, Date.now());
     } catch (err) {
       // The attempt hit the wire (or timed out at 10s — spike bug 3), so it counts against
       // the receiver's rate budget either way.
       this.touchPace(row.channel, row.receiveId);
-      if (!this.ledger.outbound.stillOwns(id, row.claim)) return; // a reclaim took over mid-send; its send settles
+      if (!this.ledger.outbound.stillOwns(row.id, row.claim)) return; // a reclaim took over mid-send; its send settles
       const attempts = row.attempts + 1;
       const retriable = err instanceof RetriableChannelError;
       const permanent = !retriable || attempts >= OUTBOUND_MAX_ATTEMPTS;
@@ -3863,7 +4325,7 @@ export class Steward extends Agent<Env> {
         ? null
         : Math.min(OUTBOUND_BACKOFF_BASE_MS * 2 ** Math.max(0, attempts - 1), OUTBOUND_BACKOFF_CAP_MS);
       this.ledger.outbound.settleFailure(
-        id,
+        row.id,
         row.claim,
         attempts,
         errorText(err),

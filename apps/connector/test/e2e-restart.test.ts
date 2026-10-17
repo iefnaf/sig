@@ -135,15 +135,15 @@ describe("connector restart fault injection (issue #12, connector-pi.md §9/§14
   it("killed mid-`sending`: the stuck command is reported ambiguous at hello, never re-run (§6.3)", async () => {
     // A command whose handler was in flight when the connector died is undecidable.
     const stuck = new CommandLog(store.database);
-    stuck.begin("cmd-sending-crash");
+    stuck.begin("cmd-sending-crash", { kind: "diag" });
     stuck.markSending("cmd-sending-crash");
 
     await bootApp(null);
     await mock.waitConnected();
     await mock.waitHello(); // the frame can trail the OPEN on slow runners (CI flake)
 
-    const hello = mock.hellos().at(-1) as { pendingAcks: Array<{ cmdId: string; state: string }> };
-    expect(hello.pendingAcks).toContainEqual({ cmdId: "cmd-sending-crash", state: "ambiguous" });
+    const hello = mock.hellos().at(-1) as { pendingAcks: Array<{ cmdId: string; state: string; recovered?: boolean }> };
+    expect(hello.pendingAcks).toContainEqual(expect.objectContaining({ cmdId: "cmd-sending-crash", state: "ambiguous" }));
 
     mock.sendCmd("start_worker", {}, "cmd-sending-crash"); // DO redelivery
     await waitFor(

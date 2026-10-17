@@ -208,10 +208,9 @@ describe("the happy loop: natural language → tool dispatch → done card → e
   }, 45_000);
 });
 
-describe("offline machines (spike bug 4): a Thread remembers its machine and queues", () => {
-  it("a quote-reply dispatch while offline queues (notAfter null) and runs at the next hello", async () => {
+describe("offline machines (spike bug 4 → protocol §7.3): the Thread remembers its machine; the command waits for the owner", () => {
+  it("a quote-reply continuation while offline parks a held resume; wait delivers it at the next hello", async () => {
     const fake = await pairFakeConnector("mac-studio", { run: { status: "done", summary: "第一段完成", branch: "shepherd/leg-1" } });
-    fake.queueRun({ status: "done", summary: "第二段接力完成", branch: "shepherd/leg-2" });
     await fake.connect();
 
     await scriptModel(
@@ -230,32 +229,53 @@ describe("offline machines (spike bug 4): a Thread remembers its machine and que
     fake.close();
     await snapshotWhere((s) => s.machines.every((m) => !m.online), "machine offline");
 
-    // --- quote-reply continuation: the Thread keeps its machine and the command queues ------
+    // --- quote-reply continuation: affinity keeps the machine, and the owner is asked -------
+    // (#8) same agent + machine + repo ⇒ the continuation is a RESUME, and (issue #14) its
+    // send parks HELD behind the offline ask instead of silently queueing.
     await scriptModel(
       fauxAssistantMessage([fauxToolCall("start_worker", { prompt: "接着做第二段", repoRef: "repo-a", threadId, basis: "user_reply_to" })], { stopReason: "toolUse" }),
-      fauxAssistantMessage([fauxText("已续派第二段；机器不在线，已排队，上线后自动开始。")]),
+      fauxAssistantMessage([fauxText("mac-studio 不在线，我发卡片问你是等它还是换台机器。")]),
     );
     const res = await ownerDm("接着做第二段", card1!.providerMsgId!);
     expect(res.status).toBe(200);
-    const queuedSnap = await snapshotWhere(
+    const heldSnap = await snapshotWhere(
       (s) => s.threads[0]?.workers[0]?.state === "starting" && s.threads[0]?.workers.length === 1,
-      "resume pending while offline",
+      "resume pending behind the ask",
     );
-    expect(queuedSnap.threads[0]!.state).toBe("running"); // resume-pending while queued (issue #8)
+    expect(heldSnap.threads[0]!.state).toBe("running"); // resume-pending while held (issue #8)
+    const parkedCmdId = heldSnap.threads[0]!.workers[0]!.cmdId!;
+    expect((await ownerStub().outboxRow(parkedCmdId))?.state).toBe("queued");
     await waitRunsSettled();
     await waitWhileOutboundPending();
-    const texts = await sentTexts();
-    expect(texts.some((t) => t.includes("不在线"))).toBe(true);
+    const [askCard] = (await ownerStub().outboundRows(20)).filter((r) => r.kind === "card" && r.status === "sent" && r.id === `offline:${parkedCmdId}`);
+    expect(askCard).toBeDefined();
     await new Promise((resolve) => setTimeout(resolve, 300));
     expect(fake.cmds).toHaveLength(1); // nothing was delivered to a dead socket
 
-    // --- the machine comes back: hello redelivers the queued resume, the run completes ------
+    // --- the owner waits: the deadline is cleared and the resume delivers at hello ---------
+    const click = await postEvent({
+      schema: "2.0",
+      header: {
+        event_id: `evt_wait_${crypto.randomUUID().slice(0, 8)}`,
+        event_type: "card.action.trigger",
+        create_time: String(Date.now()),
+        token: "verify-token",
+        app_id: "cli_test_app",
+      },
+      event: { operator: { open_id: "ou_owner" }, action: { value: { action: "wait_online" } }, context: { open_message_id: askCard!.providerMsgId! } },
+    });
+    expect(click.status).toBe(200);
+    await waitWhileOutboundPending();
+    expect((await sentTexts()).some((t) => t.includes("已排队"))).toBe(true);
+    expect((await ownerStub().outboxRow(parkedCmdId))?.notAfter).toBeNull();
+
+    // --- the machine comes back: hello redelivers the waited resume, the run completes -----
     await fake.connect();
     const [, cmd2] = await fake.waitForCmds(2);
     expect(cmd2).toBeDefined();
-    expect(cmd2!.kind).toBe("send"); // the queued continuation was the resume send
+    expect(cmd2!.kind).toBe("send"); // the parked continuation was the resume send
     expect(cmd2!.notAfter).toBeNull(); // "wait until online" (protocol §4.2)
-    const workerId = queuedSnap.threads[0]!.workers[0]!.workerId;
+    const workerId = heldSnap.threads[0]!.workers[0]!.workerId;
     fake.send({ t: "cmd_ack", re: cmd2!.id, status: "accepted" });
     fake.send({ t: "cmd_result", re: cmd2!.id, ok: true, data: { delivery: "prompt", relaunched: true } });
     await fake.emit("started", workerId, { sessionId: workerId, branch: "shepherd/leg-1" });
@@ -264,37 +284,43 @@ describe("offline machines (spike bug 4): a Thread remembers its machine and que
     await snapshotWhere((s) => s.threads[0]?.workers[0]?.state === "idle", "second leg done after reconnect");
     await waitRunsSettled();
     await waitWhileOutboundPending();
-    expect((await sentCards()).length).toBe(2);
+    expect((await sentCards()).length).toBe(3); // leg-1 done + the ask card + leg-2 done
     fake.close();
     void (await mockCalls());
   }, 30_000);
 });
 
 describe("the offline-ask card: buttons resolve the Thread via providerMsgId (§3.1)", () => {
-  it("start_worker on an offline-only machine asks with buttons; wait_online queues and runs on return", async () => {
+  it("start_worker on an offline-only machine asks with buttons; wait_online clears the hold and it runs on return", async () => {
     const fake = await pairFakeConnector("mac-studio", { run: { status: "done", summary: "排队后完成", branch: "shepherd/queued-1" } });
     await fake.connect();
     await snapshotWhere((s) => s.machines.some((m) => m.online), "machine checked in");
     fake.close();
     await snapshotWhere((s) => s.machines.every((m) => !m.online), "machine gone offline");
 
-    // The model dispatches; the deterministic rule turns it into the wait/cancel card.
+    // The model dispatches; the deterministic rule parks the command and asks.
     await scriptModel(
       fauxAssistantMessage([fauxToolCall("start_worker", { prompt: "修个东西", repoRef: "repo-a", newTitle: "修个东西", basis: "user_explicit" })], { stopReason: "toolUse" }),
-      fauxAssistantMessage([fauxText("mac-studio 现在不在线，我发了一张卡片问你是排队还是取消。")]),
+      fauxAssistantMessage([fauxText("mac-studio 现在不在线，我发了一张卡片问你是等它还是取消。")]),
     );
     const res = await ownerDm("修个东西");
     expect(res.status).toBe(200);
     const snap = await snapshotWhere((s) => s.threads.length === 1, "thread created for the ask");
-    expect(snap.threads[0]!.workers).toHaveLength(0); // nothing dispatched yet: ask, don't decide (spec §9)
+    // Held, not dispatched: the worker waits on the machine until the owner answers.
+    expect(snap.threads[0]!.workers).toHaveLength(1);
+    expect(snap.threads[0]!.workers[0]!.state).toBe("starting");
     expect(snap.threads[0]!.lastMachine).toBe(fake.deviceId); // affinity set at ask time
+    const parkedCmdId = snap.threads[0]!.workers[0]!.cmdId!;
+    const parkedRow = await ownerStub().outboxRow(parkedCmdId);
+    expect(parkedRow?.state).toBe("queued");
+    expect(parkedRow?.notAfter).not.toBeNull();
     await waitRunsSettled();
     await waitWhileOutboundPending();
     const [askCard] = await sentCards();
     expect(askCard?.providerMsgId).toMatch(/^om_mock_/);
     const ask = JSON.stringify(JSON.parse(askCard!.payload as string));
     expect(ask).toContain("不在线");
-    expect(ask).toContain("排队等上线");
+    expect(ask).toContain("等它上线");
 
     // --- the click: the callback carries only open_message_id + action, no thread data ------
     const click = await postEvent({
@@ -309,11 +335,11 @@ describe("the offline-ask card: buttons resolve the Thread via providerMsgId (§
       event: { operator: { open_id: "ou_owner" }, action: { value: { action: "wait_online" } }, context: { open_message_id: askCard!.providerMsgId! } },
     });
     expect(click.status).toBe(200);
-    const queued = await snapshotWhere((s) => s.threads[0]?.workers.length === 1, "worker registered on click");
-    expect(queued.threads[0]!.state).toBe("running");
+    expect((await ownerStub().outboxRow(parkedCmdId))?.notAfter).toBeNull(); // wait cleared the hold
+    const queued = await snapshotWhere((s) => s.threads[0]?.workers.length === 1, "worker still parked");
     expect(queued.threads[0]!.unread).toBe(false); // the click counts as read (§6.5)
 
-    await fake.connect(); // machine returns: hello redelivers the queued start_worker
+    await fake.connect(); // machine returns: hello redelivers the waited start_worker
     const [cmd] = await fake.waitForCmds(1);
     expect(cmd).toBeDefined();
     expect(cmd!.notAfter).toBeNull();
@@ -321,7 +347,7 @@ describe("the offline-ask card: buttons resolve the Thread via providerMsgId (§
     await snapshotWhere((s) => s.threads[0]?.workers[0]?.state === "idle", "queued run finished");
     await waitRunsSettled();
     await waitWhileOutboundPending();
-    expect((await sentCards()).length).toBe(2); // ask card + done card
+    expect((await sentCards()).length).toBeGreaterThanOrEqual(2); // ask card + done card (+ waited-start notice)
     fake.close();
     void (await mockCalls());
   }, 30_000);

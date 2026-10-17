@@ -6,7 +6,7 @@
 // the DO reconciles against already reflects the crash (issue #12).
 import os from "node:os";
 import { ConnectorClient, type ClientOptions } from "./client.ts";
-import type { CommandResult } from "./commands.ts";
+import { CommandLog, type CommandResult } from "./commands.ts";
 import type { CmdMessage } from "@shepherd/protocol";
 import { EventLog } from "./events.ts";
 import type { LocalStore } from "./store.ts";
@@ -44,11 +44,13 @@ export class ConnectorApp {
   private readonly log?: (event: string, fields?: Record<string, unknown>) => void;
   readonly manager: WorkerManager;
   readonly client: ConnectorClient;
+  private commandLog: CommandLog;
 
   constructor(options: ConnectorAppOptions) {
     this.store = options.store;
     this.log = options.log;
     const events = new EventLog(options.store.database);
+    this.commandLog = new CommandLog(options.store.database);
     this.manager = new WorkerManager({
       store: options.store,
       stateDir: options.stateDir,
@@ -70,6 +72,7 @@ export class ConnectorApp {
         this.log?.("worker_event", { workerId, type: fields.type });
         this.client.emit(workerId, fields);
       },
+      onExpectMarker: (cmdId, meta) => this.commandLog.expectMarker(cmdId, meta),
     });
 
     this.client = new ConnectorClient({

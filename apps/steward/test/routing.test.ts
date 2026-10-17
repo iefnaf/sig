@@ -72,6 +72,8 @@ async function oneIdleThread(title: string): Promise<{ fake: FakeConnector; thre
   await fake.emit("report", workerId, { type: "report", status: "done", summary: `${title}完成` });
   await fake.emit("settled", workerId, { type: "settled", outcome: "reported" });
   await waitRunsSettled();
+  // The done card is quiet now (issue #11) — settle the queue so tests can quote it.
+  await waitWhileOutboundPending();
   return { fake, threadId };
 }
 

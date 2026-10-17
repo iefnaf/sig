@@ -147,13 +147,21 @@ describe("failure and offline-ask cards", () => {
   it("the offline-ask card carries only the action in button values — no thread data stuffed in (§3.1)", () => {
     const card = offlineAskCard("repo-a", "mac-studio", "修复登录 bug") as { elements: Array<Record<string, unknown>> };
     const action = card.elements.find((el) => el.tag === "action") as { actions: Array<{ value: Record<string, unknown> }> };
-    expect(action.actions).toHaveLength(2);
+    expect(action.actions).toHaveLength(2); // no alternative machine: wait or cancel
     for (const button of action.actions) {
       expect(Object.keys(button.value)).toEqual(["action"]);
-      expect(button.value.action).toMatch(/^(wait_online|cancel)$/);
+      expect(button.value.action).toMatch(/^(wait_online|switch_machine|cancel)$/);
     }
     // And nothing anywhere in the card mentions a thread id.
     expect(JSON.stringify(card)).not.toMatch(/t_[0-9A-Z]+/);
+  });
+
+  it("a [switch] button appears only when another machine has the repo (protocol §7.3)", () => {
+    const withAlt = offlineAskCard("repo-a", "mac-studio", "修复登录 bug", ["mac-mini"]) as { elements: Array<Record<string, unknown>> };
+    const actions = (withAlt.elements.find((el) => el.tag === "action") as { actions: Array<{ value: Record<string, unknown>; text: { content: string } }> }).actions;
+    expect(actions).toHaveLength(3);
+    expect(actions.map((a) => a.value.action)).toEqual(["wait_online", "switch_machine", "cancel"]);
+    expect(JSON.stringify(actions[1])).toContain("mac-mini");
   });
 });
 

@@ -43,6 +43,48 @@ describe("runMigrations", () => {
     });
   });
 
+  it("017 adds sh_notify.dueAt to deployments that ran the pre-#14 004 (PR #51 review finding 1)", async () => {
+    const id = env.Steward.idFromName(`test-migrations-${crypto.randomUUID()}`);
+    // Warm the DO through a plain RPC first: runInDurableObject on a cold instance does not
+    // await onStart, and the migration probe below must not race the boot migrations.
+    await (env.Steward.get(id) as unknown as { setupState: () => Promise<unknown> }).setupState();
+
+    await runInDurableObject(env.Steward.get(id), async (instance: Steward) => {
+      const sql = (instance as unknown as { sql: SqlExecutor }).sql.bind(instance);
+
+      // A deployment provisioned BEFORE this PR: every migration except 017 applied, and
+      // its 004-era sh_notify has no dueAt column (a fresh database gets it from 017's
+      // ALTER — which is exactly why the suite stays green while such upgrades need it too).
+      // (also rewind the ledger row: a pre-#14 deployment never recorded 017)
+      sql`DELETE FROM _migrations WHERE id = '017_offline_dispatch'`;
+      sql`ALTER TABLE sh_notify DROP COLUMN dueAt`;
+      const before = sql<{ n: number }>`SELECT COUNT(*) AS n FROM pragma_table_info('sh_notify') WHERE name = 'dueAt'`;
+      expect(before[0]!.n).toBe(0);
+
+      // The upgrade path: 017's ALTER adds the column the debounced intents write to, and
+      // pending()'s dueAt filter can read it.
+      runMigrations(sql, MIGRATIONS);
+      const after = sql<{ n: number }>`SELECT COUNT(*) AS n FROM pragma_table_info('sh_notify') WHERE name = 'dueAt'`;
+      expect(after[0]!.n).toBe(1);
+      expect(() => sql`SELECT id FROM sh_notify WHERE sentAt IS NULL AND (dueAt IS NULL OR dueAt <= 0)`).not.toThrow();
+
+      // ignoringDuplicateColumn is what makes 017's ALTER safe on databases where the
+      // column already exists — the exact 010_history_relay_cursor pattern; assert the
+      // guard itself tolerates the duplicate.
+      const dup: Migration = {
+        id: "t017_dup_dueAt",
+        up: (s) => {
+          try {
+            s`ALTER TABLE sh_notify ADD COLUMN dueAt INTEGER`;
+          } catch (err) {
+            if (!(err instanceof Error) || !/duplicate column/i.test(err.message)) throw err;
+          }
+        },
+      };
+      expect(() => runMigrations(sql, [dup])).not.toThrow();
+    });
+  });
+
   it("a migration that dies mid-flight rolls back completely when wrapped in a transaction (review #48 finding 3)", async () => {
     const id = env.Steward.idFromName(`test-migrations-${crypto.randomUUID()}`);
     const stub = env.Steward.get(id);

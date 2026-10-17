@@ -8,6 +8,9 @@ export function ownerStub() {
   return env.Steward.get(id) as unknown as DurableObjectStub<Steward> & Steward;
 }
 
+/** Raw SQL inside the DO (the tagged template must be invoked through the instance). */
+type Sql = (strings: TemplateStringsArray, ...values: unknown[]) => unknown;
+
 // DO SQLite is NOT rolled back between tests in this setup (state visibly carries over), so
 // every channel test starts by clearing the sh_* tables the same way the outbox tests reach
 // in with raw SQL.
@@ -48,7 +51,7 @@ export async function resetLedgerState(): Promise<void> {
     const storage = (instance as unknown as { ctx: { storage: { sql: { exec: (query: string) => unknown } } } }).ctx.storage;
     for (const table of [
       "sh_machine", "sh_repo", "sh_thread", "sh_thread_repo", "sh_thread_summary", "sh_worker", "sh_report",
-      "sh_timeline", "sh_question", "sh_notify", "sh_note", "sh_note_log", "event_inbox", "worker_ack", "outbox",
+      "sh_timeline", "sh_question", "sh_notify", "sh_offline_dispatch", "sh_note", "sh_note_log", "event_inbox", "worker_ack", "outbox",
       "sh_web_link", "sh_web_session", "sh_deploy", "device", "pairing", "sh_reap_pending", "sh_pr_consent",
       // sh_usage_day / sh_usage_cursor are NOT here: resetLlmStateForTests (called just
       // above) owns them, because pi's tables and the cursor must reset TOGETHER — dropping
@@ -300,11 +303,19 @@ export function urlVerification(token = TEST_VERIFY_TOKEN): Promise<Response> {
   return postEvent({ type: "url_verification", challenge: "ch-123", token });
 }
 
-/** Polls until no sh_outbound row is queued/sending (the void-fired delivery settled). */
+/** Polls until no sh_outbound row is queued/sending (the void-fired delivery settled).
+ *  Quiet rows legitimately wait out the 60 s merge window (issue #11) — waiting that out
+ *  would time every content test out, so the helper TIME-TRAVELS them due instead (the
+ *  window's own timing behavior has its dedicated suite in report-merge.test.ts). */
 export async function waitWhileOutboundPending(timeoutMs = 5000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const pending = await ownerStub().outboundRows(20);
+    await runInDurableObject(ownerStub(), (instance: Steward) => {
+      const sql = (instance as unknown as { sql: Sql }).sql.bind(instance);
+      sql`UPDATE sh_outbound SET nextAttemptAt = 1 WHERE status = 'queued' AND urgency = 'quiet' AND nextAttemptAt > ${Date.now()}`;
+    });
+    await ownerStub().deliverOutbound();
+    const pending = await ownerStub().outboundRows(50);
     if (pending.every((row) => row.status === "sent" || row.status === "failed")) return;
     if (Date.now() > deadline) throw new Error(`outbound rows still pending: ${JSON.stringify(pending.map((r) => [r.id, r.status]))}`);
     await new Promise((resolve) => setTimeout(resolve, 25));
@@ -428,6 +439,10 @@ export interface FakeWorkerRun {
   tests?: { ran: boolean; passed?: boolean; note?: string };
   /** Emitted as the `started` event's branch and the report's git facts. */
   branch?: string;
+  /** Whether the run's commits are already on the remote (git.pushed). Default false — an
+   *  unpushed write completion carries the #21 consent ask, which pushes instead of merging
+   *  quietly; tests that model an ORDINARY completion (e.g. #11's merge windows) set this. */
+  pushed?: boolean;
   /** Extra delay (ms) between the report and settled events. */
   settleDelayMs?: number;
 }
@@ -646,7 +661,7 @@ export class FakeConnector {
       ...(run.next ? { next: run.next } : {}),
       ...(run.leftovers ? { leftovers: run.leftovers } : {}),
       ...(run.tests ? { tests: run.tests } : {}),
-      git: { branch, base: "main", ahead: 1, dirty: 0, filesChanged: 2, insertions: 10, deletions: 2, pushed: false },
+      git: { branch, base: "main", ahead: 1, dirty: 0, filesChanged: 2, insertions: 10, deletions: 2, pushed: run.pushed === true },
     });
     if (run.settleDelayMs) await new Promise((resolve) => setTimeout(resolve, run.settleDelayMs));
     await this.emit("settled", workerId, {
@@ -698,12 +713,13 @@ export class FakeConnector {
 /** Pairs a device for the fake connector and returns it, ready to connect. */
 export async function pairFakeConnector(
   name = "mac-studio",
-  options: { run?: FakeWorkerRun | null; repos?: FakeRepo[]; autorun?: boolean } = {},
+  options: { run?: FakeWorkerRun | null; repos?: FakeRepo[]; autorun?: boolean; machineName?: string } = {},
 ): Promise<FakeConnector> {
   const { deviceId, token } = await pairDevice(name);
   return new FakeConnector({
     deviceId,
     token,
+    machineName: options.machineName ?? name,
     repos: options.repos ?? [{ repoId: "/srv/repo-a", name: "repo-a" }],
     run: options.run,
     ...(options.autorun === undefined ? {} : { autorun: options.autorun }),

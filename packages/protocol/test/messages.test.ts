@@ -36,6 +36,14 @@ describe("HelloMessageSchema", () => {
   it("rejects the wrong message type", () => {
     expect(HelloMessageSchema.safeParse({ ...validHello, t: "welcome" }).success).toBe(false);
   });
+
+  it("accepts a recovered failure's error code on a pendingAck (issue #15)", () => {
+    const parsed = HelloMessageSchema.safeParse({
+      ...validHello,
+      pendingAcks: [{ cmdId: "cmd_1", state: "failed", code: "not_delivered" }],
+    });
+    expect(parsed.success).toBe(true);
+  });
 });
 
 describe("WelcomeMessageSchema", () => {

@@ -23,6 +23,7 @@ import {
   resetLedgerState,
   scriptModel,
   waitRunsSettled,
+  waitWhileOutboundPending,
   TEST_APP_ID,
   TEST_VERIFY_TOKEN,
 } from "./helpers.ts";
@@ -1297,6 +1298,9 @@ describe("notes daily maintenance: the alarm, the ask, the reports (issue #19)",
     await ownerStub().notesMaintenance();
     const deadline = Date.now() + 8000;
     for (;;) {
+      // The bookkeeping notice is quiet (issue #11) and waits out its merge window —
+      // time-travel it due like waitWhileOutboundPending does, or it never turns "sent".
+      await waitWhileOutboundPending();
       const rows = await ownerStub().outboundRows(50);
       if (pred(rows)) return;
       if (Date.now() > deadline) {
