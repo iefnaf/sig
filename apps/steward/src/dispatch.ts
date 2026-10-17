@@ -569,7 +569,13 @@ export class Dispatcher {
   }
 
   /** The resume half: deliver the task into the existing session. `intent: "after"` when the
-   *  previous run is still going — the task queues as a follow-up instead of steering it. */
+   *  previous run is still going — the task queues as a follow-up instead of steering it.
+   *  For every other state the intent is `auto` and the CONNECTOR's state table decides: an
+   *  idle worker prompts (hot or cold relaunch), a `lost` one queues behind its §9.2 resume,
+   *  and a worker still `starting` (its first start in flight) has the task delivered as a
+   *  steer of that first run once it comes up — the same session either way, but the task
+   *  reads as a mid-run redirect rather than a queued follow-up (documented per PR #54
+   *  review finding 8). */
   private async resumeSession(
     thread: ThreadRow,
     workerId: string,
@@ -619,11 +625,18 @@ export class Dispatcher {
   ): Promise<StartWorkerContinuation> {
     const workerId = `w_${ulid()}`;
     // Relay (spec §5.3): base = the Thread's latest worker branch — skipping legs that never
-    // got one (readonly runs, never-started starts). relaySource also nulls a same-machine
-    // repo switch: that branch belongs to another repo and must not be relayed.
+    // got one (readonly runs, never-started starts). relaySource nulls a same-machine repo
+    // switch, and the base lookup carries the same repo filter (PR #54 review finding 3):
+    // a repo-A branch name sent to repo-B's clone would only fail the start; a repo switch
+    // is a fresh start, exactly what the comment always promised.
     const previous = this.ledger.workers.relaySource(thread.threadId, { deviceId, repoId });
-    const baseWorker = previous?.branch ? previous : this.ledger.workers.latestBranchOnThread(thread.threadId);
-    const brief = previous ? this.ledger.handoff.build(thread.threadId, previous.workerId) : null;
+    const baseWorker = previous?.branch ? previous : this.ledger.workers.latestBranchOnThread(thread.threadId, { deviceId, repoId });
+    // A brief only when the previous leg produced anything (a branch or at least one event):
+    // retrying after a cancelled/never-started leg must not prefix an empty 【交接简报】.
+    const brief =
+      previous && (previous.branch !== null || previous.lastEventAt !== null)
+        ? this.ledger.handoff.build(thread.threadId, previous.workerId)
+        : null;
     const fullPrompt = brief ? `${renderHandoffBrief(brief)}${prompt}` : prompt;
     this.ledger.questions.closeOpen(thread.threadId, "用户重新派发");
     this.ledger.workers.register({
@@ -657,7 +670,7 @@ export class Dispatcher {
     const reasonText =
       decision.from === null
         ? ""
-        : `（接续 ${decision.from.workerId} 的分支${decision.reason ? `，原因 ${decision.reason}` : ""}，已附交接简报）`;
+        : `（接续 ${decision.from.workerId}${decision.reason ? `，原因 ${decision.reason}` : ""}${brief ? "，已附交接简报" : ""}${baseWorker ? `，新会话从分支 ${baseWorker.branch} 起跑` : "，首棒无前序分支"}）`;
     this.ledger.timeline.add(
       thread.threadId,
       "dispatch",

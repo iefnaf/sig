@@ -469,6 +469,28 @@ describe("readonly relay legs continue from the previous branch (issue #8, spec 
     await waitFor(() => settledOf(workerId), 15_000, "settled event");
   }, 30_000);
 
+  it("a second readonly leg on the same thread+repo gets its own worktree (finding 2)", async () => {
+    setup([reportRun({ status: "done", summary: "r1" }), reportRun({ status: "done", summary: "r2" })]);
+    registerRepo();
+    await git(repo, ["checkout", "-b", "shepherd/write-1"]);
+    writeFileSync(join(repo, "PLAN.md"), "# plan\n");
+    await git(repo, ["add", "PLAN.md"]);
+    await git(repo, ["commit", "-m", "plan"]);
+    await git(repo, ["checkout", "main"]);
+
+    const first = await manager.startWorker("cmd-ro-a", args({ workerId: "w-ro-1", threadId: "relay-thread", mode: "readonly", base: "shepherd/write-1" }));
+    await waitFor(() => settledOf("w-ro-1"), 15_000, "first readonly leg settled");
+    // The leg went idle-hot (process alive, directory in use) — the second leg must not
+    // reuse or delete that directory; it gets its own, and git's "missing but already
+    // registered" never fires (PR #54 review finding 2).
+    const second = await manager.startWorker("cmd-ro-b", args({ workerId: "w-ro-2", threadId: "relay-thread", mode: "readonly", base: "shepherd/write-1" }));
+    expect(second.worktree).toBeTruthy();
+    expect(second.worktree).not.toBe(first.worktree);
+    expect(existsSync(join(second.worktree!, "PLAN.md"))).toBe(true);
+    expect(existsSync(join(first.worktree!, "PLAN.md"))).toBe(true); // the live leg kept its checkout
+    await waitFor(() => settledOf("w-ro-2"), 15_000, "second readonly leg settled");
+  }, 30_000);
+
   it("an unknown base fails loudly instead of silently starting from the default branch", async () => {
     setup([]);
     registerRepo();

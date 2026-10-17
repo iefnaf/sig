@@ -1586,7 +1586,8 @@ export class Steward extends Agent<Env> {
           continue;
         }
         if (worker.state === "starting") {
-          const cmd = worker.cmdId ? this.commandState(worker.cmdId) : null;
+          const cmdId = worker.cmdId;
+          const cmd = cmdId ? this.commandState(cmdId) : null;
           // A resume-pending worker (issue #8): its cmdId points at the resume SEND, not a
           // start_worker — markResumePending overwrote it. The session underneath is intact,
           // so a failed/expired send must revert the worker to idle (never `broken`, never a
@@ -1595,12 +1596,12 @@ export class Steward extends Agent<Env> {
           // review, blocker 3) and break a healthy session.
           if (cmd?.kind === "send") {
             if (cmd.state === "failed") {
-              if (this.ledger.workers.markResumeFailed(worker.workerId, worker.cmdId, this.startFailureText(cmd))) reaped += 1;
+              if (this.ledger.workers.markResumeFailed(worker.workerId, cmdId!, this.startFailureText(cmd))) reaped += 1;
               continue;
             }
             if (cmd.state === "expired") {
               // The dispatcher's cancel normally settled it already; the sweep is the backstop.
-              if (this.ledger.workers.markResumeCancelled(worker.workerId, worker.cmdId)) reaped += 1;
+              if (this.ledger.workers.markResumeCancelled(worker.workerId, cmdId!)) reaped += 1;
               continue;
             }
             if (cmd.state === "queued" || cmd.state === "sent") {
@@ -2768,6 +2769,17 @@ export class Steward extends Agent<Env> {
    *  in settled.usage.contextUsage; issue #8's high-context rule reads it at dispatch). */
   async setWorkerContextForTest(workerId: string, percent: number | null): Promise<void> {
     this.sql`UPDATE sh_worker SET contextPercent = ${percent} WHERE workerId = ${workerId}`;
+  }
+
+  /** Test-only: force a still-queued command into a terminal failure — the idle sweep's
+   *  queue-timeout shape (`failed/idle`), without waiting out the real ~30 min. */
+  async failQueuedForTest(cmdId: string, failReason: string): Promise<void> {
+    this.sql`UPDATE outbox SET state = 'failed', failReason = ${failReason} WHERE cmdId = ${cmdId}`;
+  }
+
+  /** Test-only: backdates a worker's lastEventAt (the sweep's silence clock). */
+  async backdateWorkerForTest(workerId: string, minutes: number): Promise<void> {
+    this.sql`UPDATE sh_worker SET lastEventAt = ${Date.now() - minutes * 60_000} WHERE workerId = ${workerId}`;
   }
 
   /** Test read of the memory module's handoff brief (issue #8, steward.md §2.6). */

@@ -6,7 +6,7 @@
 // - one worktree per write task; no automatic deletion (§8.2).
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
 
@@ -160,17 +160,34 @@ export interface ReadonlyWorktreeResult {
  * Creates a worktree for a readonly continuation (issue #8, connector-pi.md §8.3): detached
  * HEAD at `base` — typically the previous write leg's branch — so a review/read task sees
  * that state without checking anything out in the owner's working directory. The detached
- * HEAD also makes the session provably read-only-ish in git terms (no branch to move).
+ * HEAD also means no branch is ever moved by a task that must not write.
+ *
+ * The directory is unique per invocation (`<slug>-ro-<n>`, smallest free n): a second
+ * readonly leg on the same thread never collides with a live one's directory, and nothing
+ * is ever removed here — stale registrations whose directories disappeared are pruned the
+ * same way WorktreeManager.create does (PR #54 review finding 2: reusing a fixed path hit
+ * git's "missing but already registered", and an unconditional rm could delete a running
+ * leg's checkout). Explicit cleanup stays with cleanup_worktree.
  */
 export async function createReadonlyWorktree(
   repoPath: string,
-  opts: { worktreesRoot: string; base: string; threadId: string },
+  opts: { worktreesRoot: string; base: string; threadId: string; maxTries?: number },
 ): Promise<ReadonlyWorktreeResult> {
-  const slug = `${slugify(opts.threadId)}-ro`;
+  await git(repoPath, ["worktree", "prune"]).catch(() => {});
+  const slugBase = `${slugify(opts.threadId)}-ro`;
   const pathHash = createHash("sha256").update(repoPath).digest("hex").slice(0, 8);
   const repoName = slugify(basename(repoPath), "repo");
-  const dir = join(opts.worktreesRoot, `${repoName}-${pathHash}`, slug);
-  await rm(dir, { recursive: true, force: true });
+  const root = join(opts.worktreesRoot, `${repoName}-${pathHash}`);
+  const maxTries = opts.maxTries ?? 999;
+  let dir = "";
+  for (let n = 1; n <= maxTries; n++) {
+    const candidate = join(root, `${slugBase}-${n}`);
+    if (!existsSync(candidate)) {
+      dir = candidate;
+      break;
+    }
+  }
+  if (!dir) throw new GitError(`no free ${slugBase}-<n> worktree within ${maxTries} tries`);
   await git(repoPath, ["worktree", "add", "--detach", dir, opts.base]);
   const head = (await git(dir, ["rev-parse", "HEAD"])).trim();
   return { path: dir, head, base: head };

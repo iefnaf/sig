@@ -63,7 +63,12 @@ async function oneIdleThread(title: string): Promise<{ fake: FakeConnector; thre
   if (outcome.kind !== "dispatched") throw new Error(`dispatch failed: ${JSON.stringify(outcome)}`);
   const threadId = outcome.threadId;
   const workerId = outcome.workerId;
-  fake.send({ t: "cmd_ack", re: (await fake.waitForCmds(1))[0]!.id, status: "accepted" });
+  const [cmd] = await fake.waitForCmds(1);
+  fake.send({ t: "cmd_ack", re: cmd!.id, status: "accepted" });
+  // A realistic leg: started (the session exists on the connector) → report → settled.
+  // Without the started event the worker has no sessionId and a follow-up correctly
+  // opens a NEW session instead of resuming (issue #8 / PR #54 review finding 1).
+  await fake.emit("started", workerId, { sessionId: workerId, branch: `shepherd/${title}-1` });
   await fake.emit("report", workerId, { type: "report", status: "done", summary: `${title}完成` });
   await fake.emit("settled", workerId, { type: "settled", outcome: "reported" });
   await waitRunsSettled();

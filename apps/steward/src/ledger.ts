@@ -851,12 +851,21 @@ export function createLedger(deps: LedgerDeps) {
       return row ? viewWorker(row) : null;
     },
     /** The Thread's most recent worker that actually has a branch — the relay base when the
-     *  latest leg ran readonly or never started (issue #8, spec §5.3). */
-    latestBranchOnThread(threadId: string): WorkerRow | null {
-      const row = sql<Record<string, unknown>>`
-        SELECT * FROM sh_worker WHERE threadId = ${threadId} AND branch IS NOT NULL
-        ORDER BY createdAt DESC, workerId DESC LIMIT 1
-      `[0];
+     *  latest leg ran readonly or never started (issue #8, spec §5.3). `target` filters out
+     *  same-machine/different-repo rows: relaying repo-A's branch name into repo-B's clone
+     *  would just fail the start (PR #54 review finding 3); cross-machine rows stay — the
+     *  branch may exist there after a push+fetch, and the dispatch flags `crossMachine`. */
+    latestBranchOnThread(threadId: string, target?: { deviceId: string; repoId: string | null }): WorkerRow | null {
+      const row = target
+        ? sql<Record<string, unknown>>`
+            SELECT * FROM sh_worker WHERE threadId = ${threadId} AND branch IS NOT NULL
+              AND NOT (deviceId = ${target.deviceId} AND repoId IS NOT NULL AND ${target.repoId} IS NOT NULL AND repoId != ${target.repoId})
+            ORDER BY createdAt DESC, workerId DESC LIMIT 1
+          `[0]
+        : sql<Record<string, unknown>>`
+            SELECT * FROM sh_worker WHERE threadId = ${threadId} AND branch IS NOT NULL
+            ORDER BY createdAt DESC, workerId DESC LIMIT 1
+          `[0];
       return row ? viewWorker(row) : null;
     },
     /** The worker a new relay session continues FROM (issue #8): the previous leg. Same
@@ -984,26 +993,46 @@ export function createLedger(deps: LedgerDeps) {
     },
 
     /**
-     * The resume send failed at the connector (rejected / failed cmd_result, issue #8):
-     * revert the resume-pending `starting` back to `idle` — the session itself is intact —
-     * and surface it as a failure push. Idempotent on the cmdId; only the command that the
-     * worker row still points at may revert it (a newer dispatch superseded otherwise).
+     * The resume send failed at the connector (rejected / failed cmd_result / sweep, issue
+     * 8): a resume-pending `starting` worker reverts to `idle` — the session itself is intact
+     * — and the failure is surfaced. A resume sent into a still-`running` worker (intent
+     * "after") cannot revert the state (the run goes on); the undelivered task is still
+     * recorded on the timeline and pushed to the user — the promise "会汇报" must not
+     * silently evaporate (PR #54 review finding 8). Idempotent on the cmdId; only the
+     * command that the worker row still points at may settle it.
      */
     markResumeFailed(workerId: string, cmdId: string, reason: string): boolean {
       const worker = workers.get(workerId);
-      if (!worker || worker.cmdId !== cmdId || worker.state !== "starting") return false;
-      sql`
-        UPDATE sh_worker SET state = 'idle', lastOutcome = ${`resume_failed:${reason}`}, updatedAt = ${now()}
-        WHERE workerId = ${workerId}
-      `;
-      timeline.add(worker.threadId, "note", `接续原会话失败（${reason}）；原会话未受影响，重新派发即可`, {
-        workerId,
-        cmdId,
-      });
-      sql`UPDATE sh_thread SET unread = 1 WHERE threadId = ${worker.threadId}`;
-      notifications.queue(`resume_failed:${cmdId}`, "failure_push", worker.threadId, workerId);
-      recomputeThreadState(worker.threadId);
-      return true;
+      if (!worker || worker.cmdId !== cmdId) return false;
+      if (worker.state === "starting") {
+        sql`
+          UPDATE sh_worker SET state = 'idle', lastOutcome = ${`resume_failed:${reason}`}, updatedAt = ${now()}
+          WHERE workerId = ${workerId}
+        `;
+        timeline.add(worker.threadId, "note", `接续原会话失败（${reason}）；原会话未受影响，重新派发即可`, {
+          workerId,
+          cmdId,
+        });
+        sql`UPDATE sh_thread SET unread = 1 WHERE threadId = ${worker.threadId}`;
+        notifications.queue(`resume_failed:${cmdId}`, "failure_push", worker.threadId, workerId);
+        recomputeThreadState(worker.threadId);
+        return true;
+      }
+      if (worker.state === "running" || worker.state === "recovering") {
+        // The current run is unaffected; only the queued-in task was lost. State stays; the
+        // outcome marker routes the deterministic failure card (and the next report/settled
+        // overwrites it).
+        sql`UPDATE sh_worker SET lastOutcome = ${`resume_failed:${reason}`}, updatedAt = ${now()} WHERE workerId = ${workerId}`;
+        timeline.add(worker.threadId, "note", `接续指令未送达（${reason}）；当前运行不受影响，但新任务没有交给它`, {
+          workerId,
+          cmdId,
+        });
+        sql`UPDATE sh_thread SET unread = 1 WHERE threadId = ${worker.threadId}`;
+        notifications.queue(`resume_failed:${cmdId}`, "failure_push", worker.threadId, workerId);
+        recomputeThreadState(worker.threadId);
+        return true;
+      }
+      return false;
     },
 
     /**
@@ -1191,11 +1220,15 @@ export function createLedger(deps: LedgerDeps) {
       const fromWorkerRow = named ?? all.at(-1)!;
       const threadReports = reports.listByThread(threadId);
       const latestGit = threadReports.filter((r): r is ReportRow & { git: GitFacts } => r.git !== null).at(-1) ?? null;
+      // A readonly from-leg has no branch of its own: its predecessor's pointers carry the
+      // relay (finding 4) — same resolution the dispatcher uses for the base.
+      const pointerWorker = fromWorkerRow.branch ? fromWorkerRow : workers.latestBranchOnThread(threadId);
       return assembleBrief({
         threadId,
         goal: thread.goal ?? thread.title,
         state: thread.summary,
         fromWorker: fromWorkerRow,
+        ...(pointerWorker ? { pointerWorker } : {}),
         reports: threadReports,
         latestGit,
       });

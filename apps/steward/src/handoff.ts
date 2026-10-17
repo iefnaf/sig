@@ -46,7 +46,10 @@ export interface ContinuationInput {
  * session that can still run the task. Everything else — a switch of agent, machine, or
  * task shape; a bloated context; an explicit fresh-review request — starts a new session
  * on the previous worker's branch. Check order: the user's explicit wish first, then
- * session health, then the switches (most to least fundamental).
+ * session health (a worker with no session — never started, withdrawn start, or one whose
+ * start failed — can never be resumed: the connector would answer not_found and the retry
+ * loop would never end, PR #54 review finding 1), then the switches (most to least
+ * fundamental).
  */
 export function decideContinuation(input: ContinuationInput): ContinuationDecision {
   const { previous } = input;
@@ -54,7 +57,7 @@ export function decideContinuation(input: ContinuationInput): ContinuationDecisi
   if (input.freshReview) return { action: "new_session", from: previous, reason: "fresh_review" };
   if (previous.agent !== input.next.agent) return { action: "new_session", from: previous, reason: "agent_switch" };
   if (previous.deviceId !== input.next.deviceId) return { action: "new_session", from: previous, reason: "machine_switch" };
-  if (previous.state === "broken") return { action: "new_session", from: previous, reason: "session_unusable" };
+  if (!resumableSession(previous)) return { action: "new_session", from: previous, reason: "session_unusable" };
   if (previous.repoId !== null && input.next.repoId !== null && previous.repoId !== input.next.repoId) {
     return { action: "new_session", from: previous, reason: "repo_switch" };
   }
@@ -63,6 +66,18 @@ export function decideContinuation(input: ContinuationInput): ContinuationDecisi
     return { action: "new_session", from: previous, reason: "context_high" };
   }
   return { action: "resume", worker: previous };
+}
+
+/** A session the connector can actually deliver into: the worker is not terminally broken,
+ *  it ran at least once (a sessionId — the connector knows the worker), was not withdrawn
+ *  before starting (`cancelled`), and its start did not fail (`start_failed:*`; those also
+ *  land `broken`, but the check is cheap insurance). A `starting` worker without a sessionId
+ *  is a start still in flight — equally unresumable (PR #54 review finding 1). */
+function resumableSession(previous: WorkerRow): boolean {
+  if (previous.state === "broken") return false;
+  if (previous.sessionId === null || previous.sessionId.length === 0) return false;
+  const outcome = previous.lastOutcome ?? "";
+  return !outcome.startsWith("cancelled") && !outcome.startsWith("start_failed");
 }
 
 /** One deduped decision, attributed to the worker that first reported it. */
@@ -108,11 +123,19 @@ export interface BriefSource {
   state: string | null;
   fromWorker: WorkerRow;
   reports: ReportRow[];
-  /** Fallback git pointers when the from-worker reported none. */
+  /** The worker whose branch the relay continues from — the from-worker when it has one,
+   *  else the Thread's latest branch-carrying worker (a readonly leg points at its
+   *  predecessor, PR #54 review finding 4). Defaults to `fromWorker`. */
+  pointerWorker?: WorkerRow;
+  /** Fallback git pointers when neither worker reported any. */
   latestGit: (ReportRow & { git: GitFacts }) | null;
 }
 
-/** Collapses a reported item to one bounded line — a bullet, never a forged section. */
+/** Collapses a reported item to one bounded line — a bullet, never a forged section.
+ *  Everything worker- or connector-reported passes through here before it is rendered:
+ *  decision texts, leftovers, file paths, commit names, goal, state (PR #54 review
+ *  finding 6 — `git diff --name-only -z` preserves newlines in filenames, and an unsanitized
+ *  newline could forge a line — even a 本次任务： header — inside the brief). */
 const oneLine = (text: string): string =>
   text.replace(/[\r\n\t]+/g, " ").replace(/\s{2,}/g, " ").trim().slice(0, ITEM_MAX_CHARS);
 
@@ -128,10 +151,11 @@ const decisionKey = (text: string): string =>
 /** Assembles the brief from ledger rows — pure, so tests run without a database. */
 export function assembleBrief(source: BriefSource): HandoffBrief {
   // Decisions: across all reports, oldest first; a repeat only re-confirms the earlier
-  // wording, so the first reporter keeps the attribution.
-  const decisions: BriefDecision[] = [];
+  // wording, so the first reporter keeps the attribution. The cap keeps the LATEST decisions
+  // (a stale one is exactly what a relay must not re-anchor on) and counts the older ones it
+  // dropped (PR #54 review finding 5).
+  const all: BriefDecision[] = [];
   const seen = new Set<string>();
-  let droppedDecisions = 0;
   for (const report of source.reports) {
     for (const raw of report.decisions ?? []) {
       const text = oneLine(raw);
@@ -139,46 +163,49 @@ export function assembleBrief(source: BriefSource): HandoffBrief {
       const key = decisionKey(text);
       if (seen.has(key)) continue;
       seen.add(key);
-      if (decisions.length >= MAX_DECISIONS) {
-        droppedDecisions += 1;
-        continue;
-      }
-      decisions.push({ text, workerId: report.workerId });
+      all.push({ text, workerId: report.workerId });
     }
   }
+  const droppedDecisions = Math.max(0, all.length - MAX_DECISIONS);
+  const decisions = droppedDecisions > 0 ? all.slice(all.length - MAX_DECISIONS) : all;
 
-  // Leftovers: the latest report that named any (§2.6 "the latest sh_report.leftovers").
+  // Leftovers: the LATEST report that carried the field at all (§2.6 "the latest
+  // sh_report.leftovers") — an explicit empty list clears them; only reports that omit the
+  // field fall through to the previous one (PR #54 review finding 7).
   let leftovers: string[] = [];
   for (let i = source.reports.length - 1; i >= 0; i--) {
-    const list = (source.reports[i]!.leftovers ?? []).map(oneLine).filter((t) => t.length > 0);
-    if (list.length > 0) {
-      leftovers = list;
-      break;
-    }
+    const field = source.reports[i]!.leftovers;
+    if (field === null || field === undefined) continue;
+    leftovers = field.map(oneLine).filter((t) => t.length > 0);
+    break;
   }
   const droppedLeftovers = Math.max(0, leftovers.length - MAX_LEFTOVERS);
   if (leftovers.length > MAX_LEFTOVERS) leftovers = leftovers.slice(0, MAX_LEFTOVERS);
 
-  // Pointers: the from-worker's branch with its own report's git facts; when it reported
-  // none (or ran without a branch), the Thread's latest reported facts stand in — every
-  // number stays connector-collected (§7.2), never the model's own account.
+  // Pointers: the pointer-worker's branch with its own report's git facts; when it reported
+  // none, the Thread's latest reported facts stand in — every number stays
+  // connector-collected (§7.2), never the model's own account. A readonly from-leg has no
+  // branch of its own: its predecessor's pointers carry the relay (finding 4).
   let pointers: BriefPointers | null = null;
-  if (source.fromWorker.branch) {
-    const own = [...source.reports].reverse().find((r) => r.workerId === source.fromWorker.workerId && r.git !== null);
+  const pointerWorker = source.pointerWorker ?? source.fromWorker;
+  if (pointerWorker.branch) {
+    const own = [...source.reports].reverse().find((r) => r.workerId === pointerWorker.workerId && r.git !== null);
     const latestReported =
       source.latestGit?.git ?? [...source.reports].reverse().find((r) => r.git !== null)?.git ?? null;
     const git = own?.git ?? latestReported;
-    // The branch is always the from-worker's own (the relay base); borrowed facts may name
-    // another branch (an older leg's report) — numbers stand in, identity does not.
-    pointers = { workerId: source.fromWorker.workerId, ...(git ?? emptyGit(source.fromWorker.branch)), branch: source.fromWorker.branch };
+    pointers = {
+      workerId: pointerWorker.workerId,
+      ...(git ? sanitizeGit(git) : emptyGit(pointerWorker.branch)),
+      branch: pointerWorker.branch,
+    };
   }
 
   return {
     threadId: source.threadId,
     fromWorkerId: source.fromWorker.workerId,
     fromAgent: source.fromWorker.agent,
-    goal: source.goal.length > GOAL_MAX_CHARS ? `${source.goal.slice(0, GOAL_MAX_CHARS - 1)}…` : source.goal,
-    state: source.state,
+    goal: oneLineWide(source.goal, GOAL_MAX_CHARS),
+    state: source.state === null ? null : oneLineWide(source.state, MAX_THREAD_SUMMARY_RENDER),
     decisions,
     leftovers,
     pointers,
@@ -196,6 +223,26 @@ function emptyGit(branch: string): GitFacts {
     insertions: 0,
     deletions: 0,
     pushed: false,
+  };
+}
+
+/** The summary is capped at 600 chars (§2.6); the brief renders at most this much of it. */
+const MAX_THREAD_SUMMARY_RENDER = 400;
+
+/** oneLine with a caller-chosen width (goal, summary). */
+const oneLineWide = (text: string, max: number): string => {
+  const line = text.replace(/[\r\n\t]+/g, " ").replace(/\s{2,}/g, " ").trim();
+  return line.length > max ? `${line.slice(0, max - 1)}…` : line;
+};
+
+/** Sanitizes connector-collected git pointers: every name one line, lists bounded. */
+function sanitizeGit(git: GitFacts): GitFacts {
+  return {
+    ...git,
+    branch: oneLine(git.branch),
+    base: oneLine(git.base),
+    ...(git.commits ? { commits: git.commits.map(oneLine).filter((c) => c.length > 0).slice(0, 20) } : {}),
+    ...(git.changedFiles ? { changedFiles: git.changedFiles.map(oneLine).filter((f) => f.length > 0).slice(0, 100) } : {}),
   };
 }
 

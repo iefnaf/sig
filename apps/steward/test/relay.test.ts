@@ -7,12 +7,15 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   configureAndBind,
+  messageEvent,
   mockReset,
   ownerStub,
   pairFakeConnector,
+  postEvent,
   resetLedgerState,
   waitWhileOutboundPending,
   type FakeConnector,
+  type FakeRepo,
 } from "./helpers.ts";
 
 beforeEach(async () => {
@@ -317,6 +320,186 @@ describe("the resume send failing reverts the worker and tells the user", () => 
     expect(JSON.stringify(cards.at(-1)?.payload)).toContain("接续原会话失败");
     fake.close();
   });
+});
+
+/** A card-action event on one of our sent cards (the webhook shape the adapter parses). */
+function cardActionEvent(cardMsgId: string, action: string, eventId = `evt_card_${crypto.randomUUID().slice(0, 8)}`) {
+  return {
+    schema: "2.0",
+    header: {
+      event_id: eventId,
+      event_type: "card.action.trigger",
+      create_time: String(Date.now()),
+      token: "verify-token",
+      app_id: "cli_test_app",
+    },
+    event: { operator: { open_id: "ou_owner" }, action: { value: { action } }, context: { open_message_id: cardMsgId } },
+  };
+}
+
+describe("PR #54 review findings", () => {
+  it("finding 1: retry after a cancelled queued start opens a NEW session, never a resume loop", async () => {
+    const fake = await pairFakeConnector("mac-studio", { run: null, autorun: false });
+    await fake.connect();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    fake.close(); // offline: the only machine with the repo → ask card
+    for (;;) {
+      const snap = await ownerStub().debugSnapshot();
+      if (snap.machines.every((m) => !m.online)) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    const asked = await ownerStub().dispatchForTest({ prompt: "任务 X", repoRef: "repo-a", newTitle: "任务 X" });
+    expect(asked.kind).toBe("asked_offline");
+    await waitWhileOutboundPending();
+    const askCard = (await ownerStub().outboundRows(10)).find((r) => r.kind === "card" && r.status === "sent");
+    expect(askCard?.providerMsgId).toBeTruthy();
+
+    // wait_online: a queued start_worker registers a starting worker the connector never saw.
+    expect((await postEvent(cardActionEvent(askCard!.providerMsgId!, "wait_online"))).status).toBe(200);
+    const queued = await snapshotWhere((s) => s.threads[0]?.workers[0]?.state === "starting", "queued start pending");
+    const neverRan = queued.threads[0]!.workers[0]!;
+    expect(neverRan.sessionId).toBeNull();
+
+    // cancel: the withdrawal settles the never-started worker (sessionId null → start path).
+    expect((await postEvent(cardActionEvent(askCard!.providerMsgId!, "cancel"))).status).toBe(200);
+    const cancelled = await snapshotWhere(
+      (s) => s.threads[0]?.workers[0]?.state === "idle" && s.threads[0]?.workers[0]?.lastOutcome === "cancelled",
+      "withdrawn start settled",
+    );
+    expect(cancelled.threads[0]!.workers[0]!.sessionId).toBeNull();
+
+    // The machine returns; the re-dispatch must START a new worker (a send into the
+    // never-started session would not_found at the connector and loop forever).
+    await fake.connect();
+    const retry = await ownerStub().dispatchForTest({ prompt: "任务 X（重试）", repoRef: "repo-a", threadId: cancelled.threads[0]!.threadId });
+    expect(retry).toMatchObject({
+      kind: "dispatched",
+      continuation: { action: "new_session", reason: "session_unusable", brief: false },
+    });
+    const [cmd] = await fake.waitForCmds(1);
+    expect(cmd!.kind).toBe("start_worker"); // NOT a send
+    expect(String((cmd!.args as Record<string, unknown>).prompt)).not.toContain("【交接简报】"); // the never-ran leg briefs nothing
+    fake.close();
+  }, 30_000);
+
+  it("finding 3: a same-machine repo switch is a fresh start — no foreign branch as base, no brief claim", async () => {
+    const repos: FakeRepo[] = [
+      { repoId: "/srv/repo-a", name: "repo-a" },
+      { repoId: "/srv/repo-b", name: "repo-b" },
+    ];
+    const fake = await pairFakeConnector("mac-studio", { run: null, autorun: false, repos });
+    await fake.connect();
+    const { threadId } = await runLeg1(fake);
+
+    const switched = await ownerStub().dispatchForTest({ prompt: "在 repo-b 里做收尾", repoRef: "repo-b", threadId });
+    expect(switched.kind).toBe("dispatched");
+    expect((switched as { continuation?: { base?: string } }).continuation).toMatchObject({
+      action: "new_session",
+      reason: "repo_switch",
+      brief: false,
+      crossMachine: false,
+    });
+    expect((switched as { continuation?: { base?: string } }).continuation).not.toHaveProperty("base");
+    const cmd2 = await waitForCmd(fake, (switched as { workerId: string }).workerId);
+    expect(cmd2.args).not.toHaveProperty("base"); // repo-A's branch must not become repo-B's base
+    expect(String((cmd2.args as Record<string, unknown>).prompt)).not.toContain("【交接简报】");
+    // And the timeline does not claim a brief it did not attach.
+    const snap = await ownerStub().debugSnapshot();
+    const dispatchEntry = snap.threads[0]!.timeline.filter((e) => e.kind === "dispatch").at(-1)!;
+    expect(dispatchEntry.text).not.toContain("交接简报");
+    fake.close();
+  });
+
+  it("finding 4: after a readonly leg, the brief carries the predecessor's pointers", async () => {
+    const fake = await pairFakeConnector("mac-studio", { run: null, autorun: false });
+    await fake.connect();
+    const { threadId } = await runLeg1(fake);
+
+    // A readonly review leg on the same machine: mode switch → new session, base relayed.
+    const review = await ownerStub().dispatchForTest({ prompt: "只读评审", repoRef: "repo-a", threadId, mode: "readonly" });
+    expect(review).toMatchObject({ continuation: { action: "new_session", reason: "mode_switch", base: "shepherd/leg-1-1" } });
+    const cmd2 = await waitForCmd(fake, (review as { workerId: string }).workerId);
+    fake.send({ t: "cmd_ack", re: cmd2.id, status: "accepted" });
+    const roWorker = (review as { workerId: string }).workerId;
+    await fake.emit("started", roWorker, { sessionId: roWorker, cwd: "/srv/repo-a" }); // no branch: readonly
+    await fake.emit("report", roWorker, { type: "report", status: "done", summary: "评审通过" });
+    await fake.emit("settled", roWorker, { type: "settled", outcome: "reported" });
+    await snapshotWhere((s) => s.threads.some((t) => t.workers.some((w) => w.workerId === roWorker && w.state === "idle")), "review leg idle");
+
+    // The next leg's brief: the readonly leg is the predecessor (no branch of its own), but
+    // the pointers still name the write leg's branch and its facts — not null (finding 4).
+    const brief = await ownerStub().handoffForTest(threadId);
+    expect(brief).toMatchObject({ fromWorkerId: roWorker });
+    expect(brief!.pointers).toMatchObject({ workerId: expect.any(String), branch: "shepherd/leg-1-1", ahead: 2 });
+    expect(brief!.pointers!.changedFiles).toContain("PLAN.md");
+    fake.close();
+  });
+
+  it("finding 8: a failed resume into a RUNNING worker records the lost task and pushes — it never evaporates", async () => {
+    const fake = await pairFakeConnector("mac-studio", { run: null, autorun: false });
+    await fake.connect();
+    const outcome1 = await ownerStub().dispatchForTest({ prompt: "第一棒", repoRef: "repo-a", newTitle: "第一棒" });
+    if (outcome1.kind !== "dispatched") throw new Error("dispatch failed");
+    const cmd1 = await waitForCmd(fake, outcome1.workerId);
+    fake.send({ t: "cmd_ack", re: cmd1.id, status: "accepted" });
+    await fake.emit("started", outcome1.workerId, { sessionId: outcome1.workerId, branch: "shepherd/leg-1-1" });
+    await snapshotWhere((s) => s.threads.some((t) => t.workers.some((w) => w.workerId === outcome1.workerId && w.state === "running")), "leg 1 running");
+
+    // A continuation while running → resume with intent after; the send FAILS at the connector.
+    const resume = await ownerStub().dispatchForTest({ prompt: "做完后接着写文档", repoRef: "repo-a", threadId: outcome1.threadId });
+    expect(resume).toMatchObject({ continuation: { action: "resume" } });
+    const sendCmd = fake.cmds.find((c) => c.kind === "send");
+    expect(sendCmd).toBeTruthy();
+    fake.send({ t: "cmd_ack", re: sendCmd!.id, status: "rejected", code: "not_running" });
+    const noted = await snapshotWhere(
+      (s) => s.threads.some((t) => t.timeline.some((e) => e.text.includes("接续指令未送达"))),
+      "lost-task note on the timeline",
+    );
+    // The worker keeps running — only the queued-in task was lost, and the user hears it.
+    const w = noted.threads[0]!.workers.find((x) => x.workerId === outcome1.workerId)!;
+    expect(w.state).toBe("running");
+    await waitWhileOutboundPending();
+    const cards = (await ownerStub().outboundRows(10)).filter((r) => r.kind === "card" && r.status === "sent");
+    expect(JSON.stringify(cards.at(-1)?.payload)).toContain("接续原会话失败");
+    fake.close();
+  }, 30_000);
+
+  it("blocker 3: the reap sweep reverts a resume-pending worker whose send failed — it never breaks the session", async () => {
+    const fake = await pairFakeConnector("mac-studio", { run: null, autorun: false });
+    await fake.connect();
+    const { threadId, workerId } = await runLeg1(fake);
+
+    // Resume while the machine is offline: the send queues (notAfter null), worker pending.
+    fake.close();
+    for (;;) {
+      const snap = await ownerStub().debugSnapshot();
+      if (snap.machines.every((m) => !m.online)) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    const resume = await ownerStub().dispatchForTest({ prompt: "第二棒", repoRef: "repo-a", threadId });
+    expect(resume).toMatchObject({ continuation: { action: "resume" } });
+    const pending = await snapshotWhere(
+      (s) => s.threads.some((t) => t.workers.some((w) => w.workerId === workerId && w.state === "starting")),
+      "resume pending",
+    );
+    const sendCmdId = pending.threads[0]!.workers.find((w) => w.workerId === workerId)!.cmdId!;
+
+    // The queued send times out into a terminal failure (the idle sweep's queue timeout),
+    // and the worker goes silent long enough to enter the sweep's candidate set.
+    await ownerStub().failQueuedForTest(sendCmdId, "idle");
+    await ownerStub().backdateWorkerForTest(workerId, 11);
+    // The reap sweep must route by the command KIND: a failed send on a resume-pending
+    // worker reverts it to idle — markStartFailed would have broken a healthy session.
+    await ownerStub().sweepWorkers();
+    const reverted = await snapshotWhere(
+      (s) => s.threads.some((t) => t.workers.some((w) => w.workerId === workerId && w.state === "idle")),
+      "sweep reverted the resume-pending worker",
+    );
+    const w = reverted.threads[0]!.workers.find((x) => x.workerId === workerId)!;
+    expect(w.state).toBe("idle");
+    expect(w.lastOutcome).toContain("resume_failed");
+    expect(w.lastOutcome).not.toContain("start_failed");
+  }, 30_000);
 });
 
 describe("thread summaries: capped, versioned, rewritten from scratch (§2.6, issue #8)", () => {
