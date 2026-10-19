@@ -22,7 +22,7 @@
     "url": "git+https://github.com/iefnaf/sig.git",
     "directory": "apps/connector"
   },
-  "license": "UNLICENSED",
+  "license": "MIT",
   "scripts": {
     "build": "node build.mjs",
     "prepack": "node build.mjs",

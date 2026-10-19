@@ -93,3 +93,7 @@ Connector 会主动连接 Sig，你无需给电脑开放入站端口。本地 ag
 - [架构设计](docs/design/steward.md) · [产品规格](docs/spec.md) · [路由评测](docs/routing-eval.md)：面向贡献者。
 
 Sig 的前身是 Shepherd。部分内部标识和本地 `~/.shepherd/` 目录仍保留旧名称，以兼容已有部署和会话。
+
+## 许可证
+
+Sig 采用 [MIT License](LICENSE)。

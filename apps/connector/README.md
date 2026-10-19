@@ -68,6 +68,10 @@ sig uninstall              # remove the service, preserve local state
 
 State remains in `~/.shepherd/` for compatibility with earlier Shepherd releases. You can revoke a machine from the Sig workspace at any time.
 
+## License
+
+Released under the [MIT License](LICENSE).
+
 ## Documentation
 
 The deployment and connector runbooks live in the [Sig repository](https://github.com/iefnaf/sig):
@@ -141,3 +145,7 @@ sig uninstall              # 移除服务，保留本地状态
 ```
 
 为了兼容早期 Shepherd 版本，状态仍保存在 `~/.shepherd/`。你可以随时在 Sig 工作台撤销一台电脑。
+
+## 许可证
+
+采用 [MIT License](LICENSE)。
