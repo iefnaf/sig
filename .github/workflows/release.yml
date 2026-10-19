@@ -1,8 +1,8 @@
 name: Release
 
-# Publishes @iefnaf/sig (the connector CLI) to npm. Triggered by pushing a `v*` tag
+# Publishes @nightboats/sig (the connector CLI) to npm. Triggered by pushing a `v*` tag
 # (e.g. `v0.1.0`) after bumping apps/connector/package.json; requires an NPM_TOKEN secret
-# with publish rights for the @iefnaf scope. ADR-0001 decision 10, issue #26.
+# with publish rights for the @nightboats scope. ADR-0001 decision 10, issue #26.
 on:
   push:
     tags: ["v*"]
@@ -22,9 +22,9 @@ jobs:
           cache: pnpm
           registry-url: https://registry.npmjs.org
       - run: pnpm install --frozen-lockfile
-      - run: pnpm --filter @iefnaf/sig build
-      - run: pnpm --filter @iefnaf/sig typecheck
-      - run: pnpm --filter @iefnaf/sig test
+      - run: pnpm --filter @nightboats/sig build
+      - run: pnpm --filter @nightboats/sig typecheck
+      - run: pnpm --filter @nightboats/sig test
       # prepack rebuilds dist into the tarball; the manifest carries no runtime deps.
       - run: npm publish --access public
         working-directory: apps/connector

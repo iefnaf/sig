@@ -17,7 +17,7 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
 });
 
-/** Creates the layout `npm install -g` would produce: <npmRoot>/@iefnaf/sig/bin+package.json. */
+/** Creates the layout `npm install -g` would produce: <npmRoot>/@nightboats/sig/bin+package.json. */
 function fakeGlobalInstall(npmRoot: string, version: string): void {
   const pkgRoot = join(npmRoot, PACKAGE_NAME);
   mkdirSync(join(pkgRoot, "bin"), { recursive: true });

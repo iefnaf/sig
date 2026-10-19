@@ -170,7 +170,7 @@ User (Feishu/web)                                  DO                           
    │ "添加机器" ("add machine")                    │                                           │
    │──────────────────────────────────────────────▶│ create pairing{code, 10min}               │
    │◀── command hint ──────────────────────────────│                                           │
-   │  npx @iefnaf/sig connect <url> <code>                                                             │
+   │  npx @nightboats/sig connect <url> <code>                                                          │
    │ ………… 在目标机器终端粘贴运行 ("paste & run on the target machine") ……………………………………………………………▶│
    │                                               │◀── POST /pair {code, machine}─────────────│
    │                                               │ validate code: exists, unexpired, unused  │

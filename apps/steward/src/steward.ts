@@ -2779,7 +2779,7 @@ export class Steward extends Agent<Env> {
     if (!origin) return Response.json({ error: "origin_unknown" }, { status: 409 });
     const { code } = await this.createPairing();
     this.logChannel("pairing_minted", "api");
-    return Response.json({ code, command: `npx @iefnaf/sig connect ${origin} ${code}` });
+    return Response.json({ code, command: `npx @nightboats/sig connect ${origin} ${code}` });
   }
 
   /** POST /api/login-link — a fresh one-time web login link (was the chat /网页 command). */
