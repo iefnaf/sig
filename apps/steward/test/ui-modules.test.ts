@@ -63,7 +63,7 @@ describe("shipped files", () => {
   it("refer only to files that ship", async () => {
     const html = await asset("workspace.html");
     const referenced = [...html.matchAll(/\/app\/assets\/([\w.-]+)/g)].map((match) => match[1]!);
-    expect(referenced.length).toBeGreaterThan(3);
+    expect(referenced.length).toBeGreaterThanOrEqual(2); // workspace.css + workspace.js
     for (const name of new Set(referenced)) await fetchAsset(name);
     const script = await asset("workspace.js");
     for (const name of new Set([...script.matchAll(/\/app\/assets\/([\w.-]+)/g)].map((match) => match[1]!))) await fetchAsset(name);
@@ -299,35 +299,34 @@ describe("what the page derives from a snapshot", () => {
 });
 
 describe("cards as the workspace reads them", () => {
-  it("turns a question card into a title and answers, without the Feishu-only hint or the emoji", () => {
+  it("turns a flat question message into a title, answers and the Thread note (ADR-0003 shape)", () => {
     const view = cardView(askUserCard({ question: "Which approach?", threadTitle: "Fix login", buttons: [{ label: "A", action: "ask:q1:0" }, { label: "B", action: "ask:q1:1", primary: true }] }));
-    expect(view).toMatchObject({ tone: "attention", title: "需要你拍板", body: ["Which approach?"], note: "Fix login" });
+    expect(view).toMatchObject({ tone: "attention", title: "Which approach?", note: "Fix login" });
+    expect(view.body).toEqual(["点按钮即可回答；也可以直接回复这条消息。"]); // the hint stays: it is the message's own copy
     expect(view.buttons).toEqual([{ label: "A", action: "ask:q1:0" }, { label: "B", action: "ask:q1:1", primary: true }]);
-    expect(cardView(askUserCard({ question: "Open question", buttons: [] })).note).toBeNull(); // nothing left once the hint is gone
+    expect(cardView(askUserCard({ question: "Open question", buttons: [] })).note).toBeNull();
   });
 
   it("keeps real links and drops one-time login links and anything that is not http(s)", () => {
-    const withButtons = (buttons: unknown[]) => ({ header: { template: "green", title: { content: "✅ Done" } }, elements: [{ tag: "action", actions: buttons }] });
-    const button = (label: string, extra: Record<string, unknown>) => ({ tag: "button", text: { content: label }, type: "default", ...extra });
-    const view = cardView(withButtons([
-      button("Open PR", { url: "https://github.com/acme/repo/pull/7" }),
-      button("查看详情", { url: "https://example.com/link/wl1.t/t_1.1792246301233.a01d.14ca" }),
-      button("Evil", { url: "javascript:alert(1)" }),
-      button("Data", { url: "data:text/html,x" }),
-      button("Approve", { value: { action: "pr_approve" } }),
-      button("", { value: { action: "ghost" } }),
-      button("Nothing", {}),
-    ]));
+    const view = cardView({ text: "✅ Done", buttons: [
+      { label: "Open PR", url: "https://github.com/acme/repo/pull/7" },
+      { label: "查看详情", url: "https://example.com/link/wl1.t/t_1.1792246301233.a01d.14ca" },
+      { label: "Evil", url: "javascript:alert(1)" },
+      { label: "Data", url: "data:text/html,x" },
+      { label: "Approve", action: "pr_approve" },
+      { label: "", action: "ghost" },
+      {},
+    ] });
     expect(view).toMatchObject({ tone: "success", title: "Done" });
     expect(view.buttons).toEqual([{ label: "Open PR", url: "https://github.com/acme/repo/pull/7" }, { label: "Approve", action: "pr_approve" }]);
   });
 
-  it("reads the system's own cards: offline, routine offer, memory, worker question", () => {
+  it("reads the system's own messages: offline, routine offer, memory, worker question", () => {
     expect(cardView(offlineAskCard("repo-a", "mac-studio", "Fix it", ["mac-mini"])).buttons.map((button) => button.action)).toEqual(["wait_online", "switch_machine", "cancel"]);
     expect(cardView(routineOfferCard({ schedule: "cron 0 17 * * 5", instruction: "Check dependencies" })).buttons.map((button) => button.action)).toEqual(["routine_accept", "routine_decline"]);
     expect(cardView(noteDecisionCard({ noteId: "n_1", text: "Keep reports short" })).buttons.map((button) => button.action)).toEqual(["note_archive", "note_keep"]);
     const question = cardView(workerQuestionCard({ question: "Drop the old index?", threadTitle: "Migrate", footer: "Thread「Migrate」", detailsUrl: "https://example.com/link/wl1.t/t_1.1.a.b" }));
-    expect(question.buttons).toEqual([]); // answered by replying; the detail link is dropped
+    expect(question.buttons).toEqual([]); // answered by replying; the detail link rides the text, not a button
     expect(question.body.join("\n")).toContain("Drop the old index?");
     expect(cardView(null)).toMatchObject({ tone: "info", title: "", body: [], buttons: [], note: null }); // junk in, nothing out
   });

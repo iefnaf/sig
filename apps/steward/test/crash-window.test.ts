@@ -8,7 +8,6 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   configureAndBind,
   connectAndHello,
-  mockReset,
   ownerStub,
   pairDevice,
   resetLedgerState,
@@ -16,7 +15,6 @@ import {
 
 beforeEach(async () => {
   await resetLedgerState();
-  await mockReset();
   await configureAndBind("ou_owner");
 });
 

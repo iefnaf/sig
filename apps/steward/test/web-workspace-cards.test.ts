@@ -1,5 +1,5 @@
 // Every kind of decision Pip can hand the owner, pressed from the workspace instead of Feishu
-// (ADR-0002): PR consent, an offline machine, a routine suggestion, a memory suggestion, and a
+// (ADR-0004): PR consent, an offline machine, a routine suggestion, a memory suggestion, and a
 // question a worker asked. The tap goes through the same handlers as a Feishu callback, the
 // acknowledgement comes back on the web, and Feishu hears nothing about it.
 import { SELF, runInDurableObject } from "cloudflare:test";
@@ -11,14 +11,11 @@ import {
   configureAndBind,
   llmState,
   messageEvent,
-  mockCalls,
-  mockReset,
   ownerStub,
   pairFakeConnector,
   postEvent,
   resetLedgerState,
   scriptModel,
-  sendCalls,
   waitRunsSettled,
   waitWhileOutboundPending,
   webLogin,
@@ -29,7 +26,6 @@ const BASE = "https://example.com";
 
 beforeEach(async () => {
   await resetLedgerState();
-  await mockReset();
   await configureAndBind("ou_owner");
 });
 
@@ -51,14 +47,8 @@ async function browser() {
 
 async function webTexts(): Promise<string[]> {
   return (await ownerStub().outboundRows(100))
-    .filter((row) => row.channel === "web" && row.kind === "text")
+    .filter((row) => row.channel === "local" && row.kind === "text")
     .map((row) => (JSON.parse(row.payload as string) as { text?: string }).text ?? "");
-}
-
-/** Feishu must not hear about an acknowledgement that belongs to the web. */
-async function feishuSends(): Promise<number> {
-  await waitWhileOutboundPending();
-  return sendCalls(await mockCalls()).length;
 }
 
 async function waitFor<T>(get: () => T | Promise<T>, pred: (value: T) => boolean, what: string, timeoutMs = 8000): Promise<T> {
@@ -109,14 +99,12 @@ describe("pull request consent", () => {
     expect(item).toMatchObject({ kind: "consent" });
     expect(item!.buttons.map((button) => button.action)).toEqual(["pr_approve", "pr_decline"]);
 
-    await mockCalls();
     const before = fake.cmds.length;
     expect((await post("actions", { id: "approve-001", cardId, action: "pr_approve" })).status).toBe(202);
     const command = (await waitFor(() => fake.cmds.find((cmd) => cmd.kind === "pr_worker"), (cmd) => cmd !== undefined, "pr_worker command"))!;
     expect(command).toMatchObject({ workerId });
     expect(fake.cmds.length - before).toBe(1);
     expect((await webTexts()).some((text) => text.includes("正在推送") && text.includes("shepherd/login-1"))).toBe(true);
-    expect(await feishuSends()).toBe(0);
 
     const after = await get();
     expect(after.attention.find((entry) => entry.id === cardId)).toBeUndefined();
@@ -129,13 +117,11 @@ describe("pull request consent", () => {
   it("declining records the decision and sends nothing to the machine", async () => {
     const { fake, cardId } = await doneReport();
     const { get, post } = await browser();
-    await mockCalls();
     expect((await post("actions", { id: "decline-001", cardId, action: "pr_decline" })).status).toBe(202);
     await waitFor(() => webTexts(), (texts) => texts.some((text) => text.includes("先不推送")), "decline acknowledged on the web");
     expect(fake.cmds.filter((cmd) => cmd.kind === "pr_worker")).toHaveLength(0);
     expect((await ownerStub().debugSnapshot()).prConsent).toEqual([expect.objectContaining({ decision: "declined" })]);
     expect((await get()).attention.find((entry) => entry.id === cardId)).toBeUndefined();
-    expect(await feishuSends()).toBe(0);
     fake.close();
   }, 45_000);
 });
@@ -156,11 +142,9 @@ describe("an offline machine", () => {
     expect(item).toBeDefined();
     expect(item!.buttons.map((button) => button.action)).toEqual(["wait_online", "cancel"]);
 
-    await mockCalls();
     expect((await post("actions", { id: "cancel-0001", cardId: item!.id, action: "cancel" })).status).toBe(202);
     await waitFor(() => webTexts(), (texts) => texts.some((text) => text.includes("已取消")), "cancel acknowledged on the web");
     expect((await get()).attention.find((entry) => entry.id === item!.id)).toBeUndefined();
-    expect(await feishuSends()).toBe(0);
     expect((await post("actions", { id: "cancel-0002", cardId: item!.id, action: "cancel" })).status).toBe(409);
   }, 45_000);
 });
@@ -176,7 +160,7 @@ describe("a routine suggestion", () => {
     await waitRunsSettled();
     const offer = (await get()).attention.find((entry) => entry.kind === "offer");
     expect(offer).toBeDefined();
-    expect((await ownerStub().outboundRows(100)).find((row) => row.id === offer!.id)).toMatchObject({ channel: "web" });
+    expect((await ownerStub().outboundRows(100)).find((row) => row.id === offer!.id)).toMatchObject({ channel: "local" });
 
     expect((await post("actions", { id: "accept-0001", cardId: offer!.id, action: "routine_accept" })).status).toBe(202);
     expect((await ownerStub().debugSnapshot()).routines).toEqual([expect.objectContaining({ instruction: "Check dependencies every Friday", status: "active" })]);
@@ -233,14 +217,12 @@ describe("a question a worker asked", () => {
     expect(item!.buttons).toEqual([]); // a free-text question: answered by replying
 
     const runsBefore = (await llmState()).runs.length;
-    await mockCalls();
     expect((await post("messages", { id: "answer-0001", text: "Yes, drop it and rebuild", replyTo: item!.id })).status).toBe(202);
     const send = (await waitFor(() => fake.cmds.find((cmd) => cmd.kind === "send"), (cmd) => cmd !== undefined, "answer relayed"))!;
     expect(String((send.args as Record<string, unknown>).text)).toContain("Yes, drop it and rebuild");
     expect((await ownerStub().debugSnapshot()).questions.find((q) => q.qid === question.qid)).toMatchObject({ status: "answered" });
     expect((await webTexts()).some((text) => text.includes("已把你的回答转给"))).toBe(true);
     expect((await llmState()).runs.length).toBe(runsBefore); // no model run for the relay
-    expect(await feishuSends()).toBe(0);
     expect((await get()).attention).toEqual([]);
     fake.close();
   }, 45_000);

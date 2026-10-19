@@ -118,7 +118,8 @@ h1 { font-size: 18px; font-weight: 600; line-height: 1.5; margin: 0; letter-spac
 .message { margin-bottom: 26px; }
 .message:last-child { margin-bottom: 0; }
 .message-header { display: flex; align-items: center; gap: 7px; margin-bottom: 9px; font-size: 12px; font-weight: 550; }
-.pip-avatar { display: block; width: 26px; height: 26px; padding: 1px; border-radius: 7px; background: #edf0e5; }
+.agent-avatar { display: block; width: 26px; height: 26px; padding: 1px; border-radius: 7px; background: #edf0e5; }
+.brand-word { font-weight: 700; letter-spacing: -.03em; font-size: 17px; }
 .message-time { font-size: 10px; color: #8a937d; font-weight: 400; margin-left: 2px; }
 .message-body { padding-left: 30px; line-height: 1.9; font-size: 14px; color: #424d3b; }
 .message-body > p { margin: 0 0 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -357,7 +358,7 @@ dialog::backdrop { background: #29382438; backdrop-filter: blur(2px); }
 .user-meta .failed { color: #a2573f; }
 .user-meta button { padding: 0 0 0 6px; font-size: inherit; color: var(--green); text-decoration: underline; }
 
-/* Pip's cards: questions, decisions, reports */
+/* The agent's cards: questions, decisions, reports */
 .card { border: 1px solid #e3e8dc; background: #fcfdfa; border-radius: 8px; padding: 14px 15px; margin: 4px 0 8px; }
 .card + .card { margin-top: 10px; }
 .card[data-tone="success"] { border-color: #dbe6d3; background: #fbfdf8; }
@@ -389,7 +390,7 @@ a.button { text-decoration: none; }
 .reply-chip button:hover { background: #e3ebd9; }
 .reply-chip svg { width: 12px; height: 12px; }
 
-/* Pip is working */
+/* The agent is working */
 .working { display: flex; align-items: center; gap: 9px; margin: 0 0 20px 30px; color: #859379; font-size: 12px; }
 .working-dots { display: inline-flex; gap: 3px; }
 .message.live .message-body > .working-dots { margin: 2px 0 0; }

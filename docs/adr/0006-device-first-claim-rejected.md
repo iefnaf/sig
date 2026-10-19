@@ -1,4 +1,6 @@
-# ADR-0004: Device-first claiming and sign-in, no deploy-time secrets
+# ADR-0006: Device-first claiming and sign-in, no deploy-time secrets (rejected)
+
+Status: **rejected** at the PR #60/#61 merge. ADR-0003 (the SERVER_KEY owner API) is the merged design: SERVER_KEY stays the deploy-time secret and the owner credential, `POST /api/login-link` mints browser sign-in links, and machines pair with one-time codes from `POST /api/pairing`. What survives from this ADR is the browser sign-in shape — a one-time link opening a session — and the demand that the fresh-deployment walk be executable by the owner's agent (ADR-0007). The text below is kept as the record of the rejected alternative.
 
 A Deploy-to-Cloudflare deployment could not ask its owner to generate and keep three secrets (SERVER_KEY, OWNER_KEY/Access values) — the worst step was copying a pairing code out of a build log. We decided the deployment itself owns its trust: the Durable Object generates its signing secret on first boot, and the owner's authority is the Cloudflare account, proved once at claim time through Cloudflare's own API. The web workspace has no password and no input on its public pages; every browser session starts from a one-time link minted on an already-paired machine.
 

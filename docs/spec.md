@@ -1,11 +1,19 @@
-# Shepherd Product Requirements Document (Spec)
+# Sig Product Requirements Document (Spec)
 
-> Status: draft v0.2, reflecting the Web entry and local-session scope accepted in [ADR-0003](adr/0003-web-entry-local-sessions.md). It is implemented; [deploy.md](deploy.md) describes the flow.
+> Status: draft v0.2.
+>
+> **Update (ADR-0003):** the chat-channel requirement (Feishu) is deferred. The owner
+> interacts through a SERVER_KEY-gated HTTP API and the web workspace; everything else in
+> this document stands. The channel sections remain as the future-integration design.
+>
+> **Update (ADR-0004/0005):** the web workspace is the owner's everyday entry — one
+> continuous conversation over the API's local channel, with Threads, "Needs you" decisions,
+> and worker session records read on demand from their machines ([web entry](design/web-entry.md)).
 > This document defines only **product requirements and boundaries** and does not cover specific technical implementation approaches. Technology-related assumptions and items to verify are collected in the "Items to Verify" section.
 
 ## 1. Overview
 
-Shepherd is a personal agent "steward" deployed on a Cloudflare Durable Object, online 24/7.
+Sig is a personal agent "steward" deployed on a Cloudflare Durable Object, online 24/7.
 
 It does not write code itself. Its job is:
 
@@ -18,7 +26,7 @@ The product is built on [pi-durable](https://github.com/earendil-works/pi) (`@ea
 
 ## 2. Target Users and Use Cases
 
-**Target users**: developers already using coding agents such as Claude Code, Codex, and pi, who use Shepherd mainly on their phones.
+**Target users**: developers already using coding agents such as Claude Code, Codex, and pi, who use Sig mainly on their phones.
 
 Core insight: at the computer, the user can operate a specific agent directly; away from the computer, the user wants to say one sentence to the steward, have the matter handled and get a report back when it is done, without going back and forth with an agent over every detail.
 
@@ -41,7 +49,7 @@ Typical scenarios:
 5. **Proactive behavior must have a source.** Every proactive action by the steward can be traced back to something the user said.
 6. **Memory is visible and controllable by the user.** What gets remembered and what gets forgotten — the user can see and intervene in both.
 
-Differentiation: products like Grok Bot and Dots put their capabilities in the cloud; Shepherd's capabilities live **on the user's own machines**, with access to real code, files, logged-in state, and the local environment.
+Differentiation: products like Grok Bot and Dots put their capabilities in the cloud; Sig's capabilities live **on the user's own machines**, with access to real code, files, logged-in state, and the local environment.
 
 ## 4. Core Concepts
 
@@ -105,29 +113,28 @@ Sub-agent permission policy: fully automatic (yolo) by default in the MVP, with 
 
 ## 7. Interaction and Interface
 
-### 7.1 Main Entry: One Continuous Conversation with Pip
+### 7.1 Main Entry: One Continuous Conversation with the Steward
 
-The personal agent is named **Pip** in the interface (the steward role in this document). The user always faces the same steward and the same conversation. Giving instructions, hearing reports, and making corrections all happen there. Threads flow behind the conversation, and the user never switches between chat windows. Reports appear directly in this conversation — there is no separate inbox; items that need the user are surfaced through Needs you and unread flags.
+The user always faces the same steward and the same conversation. Giving instructions, hearing reports, and making corrections all happen there. Threads flow behind the conversation, and the user never switches between chat windows. Reports appear directly in this conversation — there is no separate inbox; items that need the user are surfaced through push and flags.
 
 ### 7.2 Channels
 
-- **Web workspace.** The web is the sole owner entry for this phase: login, initial configuration, machine pairing, conversation, reports and decisions all work there. Owner identity is independent of messaging accounts.
-- Feishu and other IM channels are deferred. Adding a messaging channel later must not make it a prerequisite for the workspace.
+- **The first channel: Feishu.** After deployment completes, a QR code is generated and the user scans it to create a bot. The scanner is bound as the owner; only their direct messages are answered.
+- Channels are abstracted as adapters; WeCom, Telegram, Slack, etc. can be added later.
 - Reports can take the form of **cards with buttons**; "waiting on you" decisions become a single tap.
-- Reports and decisions remain available when the owner returns to the workspace. There is no native app or PWA in this phase, and no promise of notifications while the page is closed.
+- No native app of our own, and no PWA first either. Important notifications are likewise carried by the IM; push reliability depends on the IM platform.
 
-### 7.3 Pip Web Workspace
+### 7.3 Companion Web Pages (Detail Pages)
 
-The approved workspace (see [ADR-0002](adr/0002-pip-web-workspace.md), amended by [ADR-0003](adr/0003-web-entry-local-sessions.md)) has a Thread sidebar, the continuous conversation, and a collapsible context panel. The default view shows all conversation activity and an overview. Selecting a Thread focuses related messages, explicitly routes new input to it, and shows its summary, timeline, workers, git facts, and PR state. Existing Thread URLs remain deep links into this workspace.
+Content that does not fit in chat is viewed on the web via a link. The web is not the main entry:
 
-- Conversation replies stream live; input can queue while Pip is busy. Reconnecting or retrying a submission must not duplicate it.
-- Decisions stay actionable in their conversation cards. A persistent “Needs you” view aggregates questions, PR consent, offline dispatch, routine offers, and memory suggestions, including decisions without a Thread.
-- Only what Pip actually says to the owner appears in the conversation: the bookkeeping of event and routine runs is never shown. Sensitive setup information, including pairing commands, appears in authenticated setup and machine views rather than the ordinary conversation feed.
-- The header shows online machines, running work, pending decisions, and today’s spend. Machine details show capabilities, repositories, and capacity. Worker raw process remains read-only.
-- English is the default UI language. An English/Chinese switch remembers the user’s choice without resetting their work; user input and agent output are never translated by the UI.
-- On mobile, conversation, Threads, and machines use a single-column layout; details open as a drawer.
+- Thread timelines.
+- A worker's raw process (read-only).
+- Memory page (view, edit, delete, pin).
+- Routine and patrol list (view, pause, delete).
+- Machine management (pair, revoke).
 
-The owner logs in directly to the workspace, with logout available there. Initial configuration, generating a pairing command and revoking a machine are web workflows. Memory management and routine/patrol management pages remain a later phase.
+Login is handled by the IM: links the steward issues carry a one-time signature; opening one logs you in.
 
 ### 7.4 Visibility Layers
 
@@ -135,13 +142,9 @@ The owner logs in directly to the workspace, with logout available there. Initia
 |---|---|---|
 | L1 Overview | Thread list: title, status, machine and agent, recent progress, unread flag | Queried on demand in the conversation, or the web |
 | L2 Timeline | Summary-level events of one Thread | Web |
-| L3 Raw process | A Pip-started worker session's recorded messages, tool arguments and results, and available attachments | Inside the workspace, read-only, responsive on mobile |
+| L3 Raw process | One worker's full conversation and tool calls | Web, read-only, degraded on mobile |
 
-A Thread exposes its current and previous worker sessions. Long entries can be loaded in parts without permanently losing content. The first viewer covers only sessions started by Pip; discovering or importing independent terminal sessions is out of scope.
-
-Original session records remain on the machine and are read on demand while its connector is online. The agent process may have finished: its retained session file is still readable. A disconnected machine makes further full-session reads unavailable, while cloud-held Thread summaries, reports and owner/Pip conversation remain available. The cloud relay does not persist or log original session content or attachments. Offline full-session browsing and a cloud transcript archive are not required.
-
-Missing session records and unsupported agent history must be distinguished from empty history. The separate raw-process page is replaced by an integrated workspace view. Instructions and interventions continue **through Pip**; direct worker chat remains a future escape hatch.
+There are two ways to step in: **through the steward** (the default; memory stays unbroken) and **talking directly to a specific worker** (the escape hatch). Conversations during direct intervention are also recorded in the Thread timeline; the steward keeps updating the summary as a bystander but does not interfere. Direct intervention has the lowest priority on mobile.
 
 ### 7.5 Report Format
 
@@ -162,9 +165,9 @@ Example:
 >
 > Your decision: push it and open a PR?
 
-### 7.6 Notification Policy
+### 7.6 Push Policy
 
-Surface "waiting on you" and important completions through the workspace's pending-decision and unread indicators. Ordinary progress appears silently in the conversation. Keep reports and decisions when no page is open so the owner sees them on return; closed-page push delivery is a separate future capability.
+Push only "waiting on you" and important completions. Ordinary progress appears silently in the conversation and does not buzz the phone.
 
 ## 8. Proactive Behavior
 
@@ -275,9 +278,9 @@ When several matters run at the same time on the same repo, **each change-making
 
 ### 12.1 Onboarding Flow
 
-1. Deploy to the user's own Cloudflare account and configure owner access before exposing the setup workflow. Choose a domain reachable by both the owner and their machines; the existing deployment research found `workers.dev` blocked from mainland China.
-2. Sign in as the configured owner and complete setup in the workspace, including model configuration. No messaging account or bot is required.
-3. Generate a pairing command in the machine view and run it in a terminal on the computer to connect; the machine appears in the workspace.
+1. Click Deploy to deploy to Cloudflare and fill in the model API key. **Users in mainland China must additionally bind a custom domain to the Worker**: `*.workers.dev` is blocked in mainland China (verified on this machine), which breaks both the user's access to the web pages and the connector's connection to the steward.
+2. When deployment completes, a QR code appears; scan it with Feishu to create a bot, and the scanner becomes the owner (based on Feishu's official app-registration device flow; see [research/feishu-channel.md](research/feishu-channel.md)).
+3. In the conversation, the steward gives a command; paste and run it in a terminal on the computer to connect, and the machine shows up with the steward.
 4. (Nice to have) The steward probes that machine's agents and repos and walks the user through dispatching the first task.
 
 The MVP goes up to step 3.
@@ -286,9 +289,9 @@ The MVP goes up to step 3.
 
 The connector is effectively a remote-code-execution entry point and is fully automatic by default, so it must be designed as a security problem from the start:
 
-- **Identity**: each deployment serves a configured owner whose identity is independent of any IM account. Only that authenticated owner can use the workspace and direct Pip; public first-visitor ownership is forbidden.
-- **Machine pairing**: the web-generated command embeds a short-lived, one-time pairing code; each machine has its own credentials, revocable individually on the web. Machine credentials do not grant owner access.
-- **Web access**: all owner pages, APIs and live connections require owner authorization, including setup and session browsing. Changing the public URL must not bypass this requirement.
+- **Identity**: carried by the Feishu account system; only the owner's direct messages are answered.
+- **Machine pairing**: the command embeds a one-time pairing code that expires once used; each machine has its own credentials, revocable individually on the web.
+- **Web access**: login via one-time signed links issued through the IM.
 - **Model keys**: stored encrypted in the user's own Cloudflare account, never passing through a third party.
 - Content from external sources (agent reports, future external events) is never treated as a trusted instruction.
 
@@ -308,9 +311,9 @@ The steward should be dormant, costing nothing, most of the time. The documentat
 **Included**
 
 - Single-tenant deployment (each deployment serves one user).
-- Web as the sole owner entry: login, setup, machine pairing, conversation, decision cards and reports.
+- Feishu channel (QR-code bot creation, cards, push).
 - Machine pairing and the connector, supporting at least one agent. The onboarding order is **pi → Claude Code → Codex** (Codex to be confirmed on this machine before it is finalized). For the pi integration see the [research](research/pi-integration.md) and the [design](design/connector-pi.md).
-- The driven agent must already be installed and logged in on that machine; Shepherd never touches the agent's account credentials.
+- The driven agent must already be installed and logged in on that machine; Sig never touches the agent's account credentials.
 - The steward manages only the sessions it started itself; sessions the user starts manually are not monitored, but external changes are detected before one is spun up again.
 - Thread / session memory and routing, relay-style handoff briefs.
 - Three-part reports, the "waiting on you" state, and unread flags.
@@ -318,13 +321,11 @@ The steward should be dormant, costing nothing, most of the time. The documentat
 - Memory module (layers, forgetting, visible and controllable).
 - Worktree isolation for change-making tasks.
 - Scheduled routines, stall reminders, machine-status notifications.
-- Integrated workspace views for timeline, Pip-started worker sessions (read-only, requiring an online connector) and machine management; the remaining pages come later.
+- Companion web pages: timeline, raw process (read-only), machine management; the remaining pages come later.
 
 **Not included for now**
 
 - Multi-user / multi-tenant.
-- Feishu and other IM channels; closed-page push notifications.
-- Cloud archival of original worker sessions or offline full-session browsing.
 - Parallel splitting, comparison-style collaboration, agents reviewing each other.
 - Event triggers and integration with external systems.
 - Machine-side observation of sessions the user starts manually.
@@ -338,7 +339,7 @@ The steward should be dormant, costing nothing, most of the time. The documentat
 1. **Integration capability of the other agents.** pi has been researched (see [research/pi-integration.md](research/pi-integration.md)); the Claude Code CLI has options such as `--resume` and `stream-json` input/output, but whether interjecting mid-run takes effect and whether a structured report can be obtained are unverified; Codex is not installed on this machine and has not been researched. Agents express their differences through capability declarations, and product promises are written against the smallest common capability (see Section 3 of [design/connector-pi.md](design/connector-pi.md)).
 2. **Input forms.** Voice, images, files (e.g. dispatch a bug straight from a screenshot).
 3. **Cost and usage visibility, budget caps.**
-4. **Privacy of report content.** Original worker sessions remain local and pass through the cloud only for on-demand viewing (§7.4); whether persisted reports should carry code snippets remains an open question.
+4. **Privacy and data boundaries.** Whether code content passes through the cloud; whether reports may carry code snippets.
 5. **The long-term shape of multi-user support.**
 6. **Persona and speaking style.**
 
@@ -351,9 +352,10 @@ The following are assumptions formed during discussion, not yet verified. They a
 - Most pi-side assumptions have been verified on this machine; see [research/pi-integration.md](research/pi-integration.md) and [spikes/pi-rpc](../spikes/pi-rpc): interjecting mid-run, aborting, resuming a session after the process is killed, injecting a reporting tool, forcing a catch-up report, and read-only restrictions all hold.
 - Whether the long connection between the connector and the DO supports hibernation, and whether a task can be woken by an alarm after hibernating.
 - The dispatch tool has external side effects; crash replay must avoid duplicate dispatches, so an idempotency key is needed.
+- The actual capability and permission scope of Feishu's "scan QR code to create a bot", and whether a personal account can create one.
 - Whether each coding agent can run independently of the connector, to reduce the chance of "lost contact" turning into an "interrupt".
 - The resume and external-drive capabilities of Claude Code, Codex, and pi.
-- Name collisions for the project name Shepherd on npm, GitHub, and domains have not been checked yet.
+- Name collisions for the project name Sig on npm, GitHub, and domains have not been checked yet.
 
 ## 17. References
 

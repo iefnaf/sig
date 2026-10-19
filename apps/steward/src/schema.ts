@@ -838,7 +838,7 @@ export const MIGRATIONS: readonly Migration[] = [
     },
   },
   {
-    // The Pip web workspace (ADR-0002): the conversation the browser draws is the owner's
+    // The web workspace (ADR-0004): the conversation the browser draws is the owner's
     // inputs (sh_inbound keeps their text from now on) plus the outbound rows; web requests
     // are made idempotent by the client's request id (sh_web_request). Existing messages
     // reappear in the transcript from the runs they started — less the routing note the
@@ -857,33 +857,16 @@ export const MIGRATIONS: readonly Migration[] = [
     },
   },
   {
-    // The web owner (ADR-0003): who the deployment serves, independent of any messaging
-    // account; and the pairing codes the workspace minted (a retried request gets the same
-    // code back). Authorization is the claim (ADR-0004), not an Access subject.
+    // The workspace's idempotent pairing mints (ADR-0004): a retried "add machine" request
+    // gets the same one-time code back instead of a second one. The owner needs no row —
+    // ADR-0003: whoever holds SERVER_KEY is the owner.
     id: "020_web_owner",
     up: (sql) => {
-      sql`CREATE TABLE IF NOT EXISTS sh_owner (id INTEGER PRIMARY KEY CHECK (id = 1), ownerId TEXT NOT NULL, email TEXT NOT NULL)`;
       sql`CREATE TABLE IF NOT EXISTS sh_web_session (
         sid TEXT PRIMARY KEY, csrf TEXT NOT NULL,
         createdAt INTEGER NOT NULL, expiresAt INTEGER NOT NULL, lastSeenAt INTEGER NOT NULL
       )`; // 009_web's table, restated so this migration never depends on running after it
-      ignoringDuplicateColumn(() => { sql`ALTER TABLE sh_web_session ADD COLUMN subject TEXT`; });
       sql`CREATE TABLE IF NOT EXISTS sh_web_pairing (id TEXT PRIMARY KEY, code TEXT NOT NULL, expiresAt INTEGER NOT NULL)`;
-    },
-  },
-  {
-    // ADR-0004: the first connection claims the deployment. A claim grant (packages/protocol
-    // claimGrant.ts) is redeemed exactly once — its nonce is recorded here — and the row marks
-    // the deployment as claimed from then on.
-    id: "021_claim",
-    up: (sql) => {
-      sql`CREATE TABLE IF NOT EXISTS sh_claim (
-        id INTEGER PRIMARY KEY CHECK (id = 1), claimedAt INTEGER NOT NULL,
-        accountId TEXT NOT NULL, scriptName TEXT NOT NULL
-      )`;
-      sql`CREATE TABLE IF NOT EXISTS sh_claim_grant (
-        nonce TEXT PRIMARY KEY, redeemedAt INTEGER NOT NULL
-      )`;
     },
   },
 ];

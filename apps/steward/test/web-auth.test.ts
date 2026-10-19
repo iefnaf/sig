@@ -88,7 +88,7 @@ describe("the worker-layer gate: invalid links never reach the DO", () => {
     for (const token of ["garbage", "wl1.home.1.2.3", `${(await mintLinkToken("wrong-key", "home")).token}`]) {
       const res = await SELF.fetch(`https://example.com/link/${token}`, { redirect: "manual" });
       expect(res.status).toBe(410);
-      expect(await res.text()).toContain("/网页");
+      expect(await res.text()).toContain("/api/login-link");
     }
     // Valid shape but long-expired: still rejected statelessly.
     const expired = await mintLinkToken("test-server-key-not-a-secret", "home", Date.now() - LINK_TTL_MS - 1);
@@ -107,7 +107,7 @@ describe("/网页 → one-time link → session cookie → /app", () => {
     expect(res.headers.get("content-type")).toContain("text/html");
     const html = await res.text();
     expect(html).toContain('name="viewport"'); // mobile
-    expect(html).toContain('id="workspace"'); // the Pip workspace shell (ADR-0002)
+    expect(html).toContain('id="workspace"'); // the workspace shell (ADR-0004)
     expect(html).toContain("/app/assets/workspace.js");
   });
 
@@ -146,19 +146,13 @@ describe("/网页 → one-time link → session cookie → /app", () => {
     expect(res.status).toBe(401);
   });
 
-  it("credentials minted under the primary verify across the key set, and die outside it (issue #27 shape)", async () => {
-    // ADR-0004: the Durable Object's auth root is the primary; a legacy env key (when one
-    // exists) rides along in the set. A credential minted by the primary verifies under the
-    // whole set but not under a key that is not in it — the rotation-window property.
-    const keys = await ownerStub().authKeys();
-    const primary = keys[0]!.secret;
-    const other = keys[1]?.secret ?? "a-key-that-was-never-configured";
+  it("the SERVER_KEY_PREVIOUS window keeps old-key links and cookies alive; dropping it kills them (issue #27)", async () => {
+    const previous = "test-previous-server-key-not-a-secret";
     const { cookie, linkUrl } = await loginViaChat();
     const token = linkUrl.slice("https://example.com/link/".length);
-    expect(await verifyLinkToken(keys.map((k) => k.secret), token)).not.toBeNull();
-    expect(await parseSessionCookie(keys.map((k) => k.secret), cookie.split("=")[1]!)).not.toBeNull();
-    expect(await verifyLinkToken([primary], token)).not.toBeNull();
-    expect(await verifyLinkToken([other], token)).toBeNull();
-    expect(await parseSessionCookie([other], cookie.split("=")[1]!)).toBeNull();
+    expect(await verifyLinkToken(["test-server-key-not-a-secret", previous], token)).not.toBeNull();
+    expect(await parseSessionCookie(["test-server-key-not-a-secret", previous], cookie.split("=")[1]!)).not.toBeNull();
+    expect(await verifyLinkToken([previous], token)).toBeNull();
+    expect(await parseSessionCookie([previous], cookie.split("=")[1]!)).toBeNull();
   });
 });

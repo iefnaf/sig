@@ -1,5 +1,11 @@
 # Design: the steward (Durable Object internals)
 
+> **Status note (ADR-0003):** the Feishu channel this design describes — QR onboarding,
+> the webhook inbound, cards — is removed for now. The owner talks to the deployment through
+> the SERVER_KEY-gated `/api/*` routes; outbound rows render locally as text + buttons. The
+> rest of this document (ledger, routing, routines, questions) still describes the system.
+
+
 Status: draft v0.1. Based on: the [product spec](../spec.md), the [connector–DO protocol](connector-do-protocol.md), and [protocol spike field tests](../research/do-protocol-spike.md).
 
 This document designs the half that lives inside the Durable Object: **the memory module, routing, Thread management, event processing, notification policy, proactive behavior, and how the steward (the LLM) uses them**. The connector side is in [connector-pi.md](connector-pi.md); the transport protocol is in [connector-do-protocol.md](connector-do-protocol.md).
@@ -18,7 +24,7 @@ This document designs the half that lives inside the Durable Object: **the memor
  Feishu / web / connectors              (remaining layers: see the protocol and connector designs)
         │
  ┌──────▼───────────────────────────────────────────────────────────────────────────────┐
- │ Shepherd DO (singleton "owner", an Agents SDK Agent)                                   │
+ │ Sig DO (singleton "owner", an Agents SDK Agent)                                        │
  │                                                                                        │
  │  Channel adapters        Protocol gateway             Web read model                   │
  │  (dedup in, send out)    (connector/browser, outbox)  (timeline, memory page)          │
@@ -35,7 +41,7 @@ This document designs the half that lives inside the Durable Object: **the memor
  │  │   Notes                              │       └────────────────────────────────────┘ │
  │  │   retrieval / forgetting / summaries │                                              │
  │  └──────────────────────────────────────┘                                              │
- │          one shared SQLite (Shepherd's tables + pi-durable's own tables)               │
+ │          one shared SQLite (Sig's tables + pi-durable's own tables)                    │
  └──────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -364,7 +370,7 @@ For `unsafe` tools the command ID is taken from the tool task ID: `cmdId = "tool
 
 (The actual text is written at implementation time; these are the rules it must contain.)
 
-1. You are Shepherd's steward: you never write code yourself; you only dispatch and remember.
+1. You are Sig's steward: you never write code yourself; you only dispatch and remember.
 2. Input starting with `⟦` is not something the user said — it is a system event. In event-triggered runs, **do not emit user-facing text**: call `notify_user` when the user must be notified, `no_action` when there is nothing to do.
 3. Read the situation brief before every action; when routing is uncertain you must `ask_user` — never guess.
 4. Reports have exactly three parts, in a fixed format, kept short.
@@ -639,21 +645,21 @@ Feishu is the first implementation. "QR-code creation", "long connection vs webh
 
 ## 10. The web read model
 
-The web app is the Pip workspace (spec §7.3, [ADR-0002](../adr/0002-pip-web-workspace.md)): the owner's conversation, the Threads and the decisions waiting for them, drawn from one snapshot (`workspace.ts`, assembled over the memory module's `views.workspace`) and kept current by a nudge — every ledger write tells connected workspaces to refetch, and the words of a reply being written follow over pi's event stream (`workspace-stream.ts`, the one place that touches that experimental API):
+The web app is the workspace (spec §7.3, [ADR-0004](../adr/0004-web-workspace.md)): the owner's conversation, the Threads and the decisions waiting for them, drawn from one snapshot (`workspace.ts`, assembled over the memory module's `views.workspace`) and kept current by a nudge — every ledger write tells connected workspaces to refetch, and the words of a reply being written follow over pi's event stream (`workspace-stream.ts`, the one place that touches that experimental API):
 
 | Surface | Source |
 |---|---|
-| Conversation | `sh_inbound` (the owner's words, either channel) + `sh_outbound` (Pip's, either channel); credentials and setup chatter are `private` and never listed |
+| Conversation | `sh_inbound` (the owner's words) + `sh_outbound` (the steward's) on the one local channel; credentials are `private` and never listed |
 | Needs you | Open cards: `questions` / `offers` / `offlineDispatches` / `notes.askOpen` / `prConsent`, decided per card kind by `cardOpen` |
 | Thread details | `views.workspace`: workers (git facts, PR consent), latest 40 timeline entries |
 | Machines | Protocol-layer devices + `sh_machine` (slots, agents, repos) |
 | Raw transcripts | Relayed from the protocol's `history`; not stored in the DO |
-| Machine revoke | `/app/machines` (server-rendered) |
+| Machines dialog | `/app/api/machines/revoke` (the workspace API) |
 | Memory page, routine list | Later phase |
 
-Owner actions come in over `/app/api` (session cookie + CSRF token + same origin + JSON): a message, a card button, "read", logout. Each carries a client request id (`sh_web_request`; the run is `user:web:<id>`), so a retry is one effect. A button is validated against the card's own buttons and its decision must still be open; it then enters the same handlers a Feishu callback does, answering on the web. Which channel an outbound row belongs to follows the run or tap it answers: a run the owner started on the web keeps its questions and cards on the web (`sh_run.channel`), events and routines push to Feishu as before.
+Owner actions come in over `/app/api` (session cookie + CSRF token + same origin + JSON): a message, a card button, "read", logout. Each carries a client request id (`sh_web_request`; the run is `user:web:<id>`), so a retry is one effect. A button is validated against the card's own buttons and its decision must still be open; it then enters the same handlers an owner API action does — the workspace and `GET /api/messages` are two views of the one local channel (ADR-0003).
 
-Login exchanges an IM-delivered one-time signed link for a session; it is designed in a separate document. Write operations issued from the web are likewise logged to `sh_note_log` / audit, keeping "forgetting and changes visible to the user".
+Login exchanges a one-time signed link (minted via `POST /api/login-link`) for a session; it is designed in a separate document ([web-entry.md](web-entry.md)). Write operations issued from the web are likewise logged to `sh_note_log` / audit, keeping "forgetting and changes visible to the user".
 
 ## 11. Consistency and idempotency
 

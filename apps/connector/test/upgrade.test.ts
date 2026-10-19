@@ -1,4 +1,4 @@
-// `shepherd upgrade` (issue #26): npm-installs the package globally, repoints the service
+// `sig upgrade` (issue #26): npm-installs the package globally, repoints the service
 // unit at the new install, and restarts — while preserving a deliberately stopped service.
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -17,13 +17,13 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
 });
 
-/** Creates the layout `npm install -g` would produce: <npmRoot>/@iefnaf/shepherd/bin+package.json. */
+/** Creates the layout `npm install -g` would produce: <npmRoot>/@iefnaf/sig/bin+package.json. */
 function fakeGlobalInstall(npmRoot: string, version: string): void {
   const pkgRoot = join(npmRoot, PACKAGE_NAME);
   mkdirSync(join(pkgRoot, "bin"), { recursive: true });
   mkdirSync(join(pkgRoot, "dist"), { recursive: true });
   writeFileSync(join(pkgRoot, "package.json"), JSON.stringify({ name: PACKAGE_NAME, version }));
-  writeFileSync(join(pkgRoot, "bin", "shepherd.js"), "#!/usr/bin/env node\n");
+  writeFileSync(join(pkgRoot, "bin", "sig.js"), "#!/usr/bin/env node\n");
 }
 
 function fakeInstaller(state: { installed: boolean; running: boolean; actions: string[] }): ServiceInstaller {
@@ -73,7 +73,7 @@ describe("runUpgrade", () => {
 
     const result = await runUpgrade((line) => lines.push(line), {
       currentVersion: "0.1.0",
-      currentEntry: "/somewhere/else/bin/shepherd.js",
+      currentEntry: "/somewhere/else/bin/sig.js",
       exec,
       getService: () => fakeInstaller(state),
     });
@@ -81,7 +81,7 @@ describe("runUpgrade", () => {
     expect(calls[0]).toEqual(["root", "-g"]);
     expect(calls[1]).toEqual(["install", "-g", `${PACKAGE_NAME}@latest`]);
     expect(result).toMatchObject({ from: "0.1.0", to: "9.9.9", serviceRestarted: true });
-    expect(result.entryPath).toBe(join(npmRoot, PACKAGE_NAME, "bin", "shepherd.js"));
+    expect(result.entryPath).toBe(join(npmRoot, PACKAGE_NAME, "bin", "sig.js"));
     expect(state.actions).toEqual(["install"]); // install() reloads + restarts
     expect(lines.some((l) => l.includes("restarted"))).toBe(true);
   });
@@ -93,7 +93,7 @@ describe("runUpgrade", () => {
     await runUpgrade(() => {}, {
       version: "1.2.3",
       currentVersion: "0.1.0",
-      currentEntry: "/x/bin/shepherd.js",
+      currentEntry: "/x/bin/sig.js",
       exec,
       getService: () => null,
     });
@@ -108,7 +108,7 @@ describe("runUpgrade", () => {
 
     const result = await runUpgrade((line) => lines.push(line), {
       currentVersion: "0.1.0",
-      currentEntry: "/x/bin/shepherd.js",
+      currentEntry: "/x/bin/sig.js",
       exec,
       getService: () => fakeInstaller(state),
     });

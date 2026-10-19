@@ -1,4 +1,4 @@
-// `shepherd upgrade` (issue #26): replace the npm package and restart the background service.
+// `sig upgrade` (issue #26): replace the npm package and restart the background service.
 //
 // The upgrade always ends with the service running the code from the global npm install, so
 // an npx-launched `connect` becomes a durable global install on first upgrade. The process
@@ -10,7 +10,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { defaultExec, type Exec, type ServiceInstaller } from "./service.ts";
 
-export const PACKAGE_NAME = "@iefnaf/shepherd";
+export const PACKAGE_NAME = "@iefnaf/sig";
 
 export interface UpgradeOptions {
   /** Explicit version; default "latest". */
@@ -59,7 +59,7 @@ export async function runUpgrade(print: (line: string) => void, options: Upgrade
   }
 
   const pkgRoot = join(npmRoot, PACKAGE_NAME);
-  const entryPath = join(pkgRoot, "bin", "shepherd.js");
+  const entryPath = join(pkgRoot, "bin", "sig.js");
   if (!existsSync(entryPath)) {
     throw new Error(`npm reported success but ${entryPath} is missing; install layout unexpected`);
   }

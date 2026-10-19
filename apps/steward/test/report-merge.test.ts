@@ -11,15 +11,12 @@ import {
   configureAndBind,
   llmState,
   messageEvent,
-  mockCalls,
-  mockReset,
   modelRequests,
   ownerStub,
   pairFakeConnector,
   postEvent,
   resetLedgerState,
   scriptModel,
-  sendCalls,
   waitRunsSettled,
   waitWhileOutboundPending,
   webLogin,
@@ -59,17 +56,50 @@ async function waitForQuietRows(count: number, timeoutMs = 8000): Promise<void> 
   }
 }
 
+import { mergeQuietOutbound, sectionFromPayload, type QuietSection } from "../src/report-template.ts";
+
+type SentRow = { id: string; providerMsgId: string | null; kind: string; payload: string };
+
+/** Groups ALL sent rows by providerMsgId (a merged quiet group shares one id across text and
+ *  card members) and renders each group as ONE message — exactly GET /api/messages in
+ *  production (ADR-0003). */
+async function sentMessages(): Promise<Array<{ id: string; kind: "text" | "card"; body: string }>> {
+  const rows = (await ownerStub().outboundRows(100)).filter((r) => r.status === "sent") as unknown as SentRow[];
+  const groups = new Map<string, SentRow[]>();
+  for (const row of rows) {
+    const key = row.providerMsgId ?? row.id;
+    const members = groups.get(key);
+    if (members) members.push(row);
+    else groups.set(key, [row]);
+  }
+  return [...groups.entries()].map(([id, members]) => {
+    if (members.length === 1) return { id, kind: members[0]!.kind as "text" | "card", body: String(members[0]!.payload) };
+    const sections = members
+      .map((row) => sectionFromPayload(JSON.parse(row.payload) as { text?: string; card?: unknown; part?: QuietSection }))
+      .filter((s): s is QuietSection => s !== null);
+    // Mixed groups render as the merged report message (the old "card" shape); pure-text
+    // groups merge into one text.
+    const hasReport = sections.some((s) => s.kind === "report");
+    return { id, kind: hasReport ? ("card" as const) : ("text" as const), body: JSON.stringify({ text: mergeQuietOutbound(sections).text }) };
+  });
+}
+
+async function sentMessagesByKind(kind: "text" | "card"): Promise<Array<{ id: string; body: string }>> {
+  return (await sentMessages()).filter((m) => m.kind === kind).map((m) => ({ id: m.id, body: m.body }));
+}
+
 async function sentCardBodies(): Promise<Array<{ body: string }>> {
-  return sendCalls(await mockCalls())
-    .filter((call) => JSON.parse(call.body ?? "{}").msg_type === "interactive")
-    .map((call) => ({ body: call.body ?? "" }));
+  return (await sentMessagesByKind("card")).map((m) => ({ body: m.body }));
+}
+
+/** Sent messages of one kind, payload strings (ADR-0003: rows ARE the messages). */
+async function sentPayloads(kind: "text" | "card"): Promise<string[]> {
+  return (await sentMessagesByKind(kind)).map((m) => m.body);
 }
 
 beforeEach(async () => {
   await resetLedgerState();
-  await mockReset();
   await configureAndBind("ou_owner");
-  await mockCalls(); // drain the binding confirmation
   // The production window: these tests are exactly about holding and merging.
   await ownerStub().setQuietMergeForTest(60_000);
 });
@@ -85,15 +115,14 @@ describe("push vs quiet: what buzzes the phone (spec §7.6)", () => {
     // Held: nothing on the wire, the row waits out its window. (mockCalls DRAINS the log,
     // so each read counts only what happened since the previous one.)
     expect((await ownerStub().outboundRow(quiet))?.status).toBe("queued");
-    expect(sendCalls(await mockCalls())).toHaveLength(1);
+    expect((await sentPayloads("text")).some((b) => b.includes("需要你拍板"))).toBe(true); // only the push landed
 
     // Once the window closes, the quiet row goes out on its own.
     await forceQuietDue();
     await settleDelivery();
-    expect((await ownerStub().outboundRow(quiet))?.status).toBe("sent");
-    const since = sendCalls(await mockCalls());
-    expect(since).toHaveLength(1);
-    expect(since[0]!.body).toContain("记账完成");
+    const row = await ownerStub().outboundRow(quiet);
+    expect(row?.status).toBe("sent");
+    expect(String(row?.payload)).toContain("记账完成");
   });
 
   it("anything tied to waiting_you is always push, whatever the model asked for", async () => {
@@ -191,8 +220,8 @@ describe("quiet merging: one window, one message (steward.md §6.4)", () => {
     await settleDelivery();
     const row = await ownerStub().outboundRow(d);
     expect(row?.status).toBe("sent");
-    const texts = sendCalls(await mockCalls()).filter((call) => JSON.parse(call.body ?? "{}").msg_type === "text");
-    expect(texts.some((call) => call.body!.includes("稍后的记账"))).toBe(true);
+    const texts = await sentPayloads("text");
+    expect(texts.some((body) => body.includes("稍后的记账"))).toBe(true);
   });
 
   it("done reports across Threads merge into one card that keeps each Thread's three parts", async () => {
@@ -239,7 +268,7 @@ describe("quiet merging: one window, one message (steward.md §6.4)", () => {
     expect(merged!.body).toContain("退款幂等补齐，回归通过");
     expect(merged!.body).toContain("payment/refund.ts 加幂等键");
     expect(merged!.body).toContain("建议下一步：跑一遍全量回归");
-    expect(merged!.body).toContain("查看详情"); // per-thread timeline links ride along
+    expect(merged!.body).toContain("详情：https://example.com/link/"); // per-thread timeline links ride along
 
     // Exactly one merged card went out for the two reports.
     expect(cards.filter((c) => c.body.includes("合并汇报"))).toHaveLength(1);
@@ -342,24 +371,10 @@ describe("viewing a Thread clears unread (steward.md §6.5)", () => {
     const rows = await ownerStub().outboundRows(30);
     const askCard = rows.find((r) => r.kind === "card" && r.status === "sent" && JSON.stringify(r.payload).includes("接着先做哪件"));
     expect(askCard).toBeDefined();
-    const card = JSON.parse(askCard!.payload as string) as { card: { elements: Array<{ tag: string; actions?: Array<{ value: { action: string } }> }> } };
-    const action = card.card.elements.flatMap((el) => el.actions ?? []).find((btn) => btn.value.action.startsWith("ask:"))!.value.action;
+    const card = JSON.parse(askCard!.payload as string) as { card: { buttons?: Array<{ action?: string }> } };
+    const action = (card.card.buttons ?? []).find((btn) => btn.action?.startsWith("ask:"))!.action!;
 
-    await postEvent({
-      schema: "2.0",
-      header: {
-        event_id: "evt_card_wait",
-        event_type: "card.action.trigger",
-        create_time: String(Date.now()),
-        token: "verify-token",
-        app_id: "cli_test_app",
-      },
-      event: {
-        operator: { open_id: "ou_owner" },
-        action: { value: { action } },
-        context: { open_message_id: askCard!.providerMsgId! },
-      },
-    });
+    await postEvent({ cardMsgId: askCard!.providerMsgId!, action });
     await waitRunsSettled();
     await expectUnread(threadId, false);
     fake.close();

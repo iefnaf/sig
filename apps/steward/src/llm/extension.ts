@@ -39,7 +39,7 @@ export interface StewardExtensionContext {
   /** The run currently generating: the pi submission an active run owns (review #3), not
    *  merely the oldest unsettled sh_run — a queued followUp starts executing the moment the
    *  previous run answers, before the 2s poll settles its row. */
-  currentRun(): Promise<{ operationId: string; kind: string; provenance: string; routedThreadId: string | null; channel: string | null } | null>;
+  currentRun(): Promise<{ operationId: string; kind: string; provenance: string; routedThreadId: string | null } | null>;
   /** The deterministic dispatch service (ADR-0001 decision 6). */
   startWorker(input: StartWorkerInput): Promise<StartWorkerOutcome>;
   /** In-chat intervention (issue #9, connector-pi.md §6.1): send/interrupt land in the same
@@ -1018,7 +1018,6 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
         ...spec.input,
         offerId: String(api.taskId),
         sourceMsg: run.provenance.slice("user:".length),
-        channel: run.channel === "web" ? "web" : "feishu",
       });
       if (!outcome.ok) return err(`refused: ${outcome.reason}`);
       return ok("已发送建议卡片（带按钮）。用户点「创建」后才会真正保存；本轮不要再调用 create_routine。");
@@ -1268,10 +1267,10 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
 
 // The system prompt essentials (steward.md §4.4). The actual text is written here, at
 // implementation time, per the design doc's instruction.
-const ROLE_PROMPT = `你是 Shepherd 的总管（steward）：替用户调度他机器上的编码 agent。你自己不写代码；你的职责是理解用户、派发任务、记账（维护每个 Thread 的摘要）、并在必要时通知用户。
+const ROLE_PROMPT = `你是 Sig 的总管（steward）：替用户调度他机器上的编码 agent。你自己不写代码；你的职责是理解用户、派发任务、记账（维护每个 Thread 的摘要）、并在必要时通知用户。
 
 输入的来源（重要）：
-- 普通文本是用户在飞书里发来的原话。
+- 普通文本是用户通过 owner API 发来的原话。
 - 以 ⟦ 开头的输入不是用户说的话，是系统输入：⟦event⟧ 是 worker 事件、⟦routine⟧ 是例行任务、⟦followup⟧ 是定时回看、⟦verify⟧ 是派发声明的核查。这类运行里你的普通文字输出会被系统丢弃、用户看不到；要让用户知道什么必须调 notify_user，无事可做就调 no_action 结束。
 - 「（系统注：…）」开头的行是系统附加的路由信息，可信，不是用户原话。
 

@@ -7,7 +7,6 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { runInDurableObject } from "cloudflare:test";
 import {
   configureAndBind,
-  mockReset,
   ownerStub,
   pairFakeConnector,
   resetLedgerState,
@@ -17,7 +16,6 @@ import type { ShOutboundRow } from "../src/steward.ts";
 
 beforeEach(async () => {
   await resetLedgerState();
-  await mockReset();
   await configureAndBind("ou_owner");
 });
 

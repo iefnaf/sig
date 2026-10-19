@@ -8,18 +8,14 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   configureAndBind,
   connectAndHello,
-  mockCalls,
-  mockReset,
   ownerStub,
   pairDevice,
   resetLedgerState,
-  sendCalls,
   waitWhileOutboundPending,
 } from "./helpers.ts";
 
 beforeEach(async () => {
   await resetLedgerState();
-  await mockReset();
   await configureAndBind("ou_owner");
 });
 
@@ -90,6 +86,11 @@ const threadOf = (snap: Awaited<ReturnType<typeof ownerStubDebug>>, workerId: st
 const workerIn = (snap: Awaited<ReturnType<typeof ownerStubDebug>>, workerId: string) =>
   threadOf(snap, workerId).workers.find((w) => w.workerId === workerId)!;
 
+/** The local channel's "pushes": sent outbound rows (ADR-0003). */
+async function sentOutbound(): Promise<string[]> {
+  return (await ownerStub().outboundRows(50)).filter((r) => r.status === "sent").map((r) => String(r.payload));
+}
+
 describe("machine bootId (protocol §6.1)", () => {
   it("hello stores the connector's bootId, so a restart is distinguishable from a blip", async () => {
     const { deviceId, token } = await pairDevice("boot-machine");
@@ -106,7 +107,7 @@ describe("hello.workers reconciliation (issue #12, connector-pi.md §9.1 step 4)
     const workerId = await dispatchAndAwaitWorker(ws, reader);
     await sendEvents(ws, [{ workerId, seq: 1, ts: Date.now(), type: "started", sessionId: workerId }]);
     await snapshotWhere((s) => workerIn(s, workerId)?.state === "running", "worker running");
-    const sendsBefore = sendCalls(await mockCalls()).length; // the dispatch ack, not a push
+    const sendsBefore = (await sentOutbound()).length;
 
     // The connector restarts: new bootId, snapshot lost with lastSeq 1 (fully processed).
     await reconnectWithSnapshot(deviceId, token, 2, [snapshotEntry(workerId, "lost", 1)]);
@@ -116,7 +117,7 @@ describe("hello.workers reconciliation (issue #12, connector-pi.md §9.1 step 4)
     // The Thread left `running` (lost is not active), and nothing was pushed (spec §9).
     expect(threadOf(snap, workerId).state).toBe("idle");
     expect(snap.pendingNotifications).toHaveLength(0);
-    expect(sendCalls(await mockCalls())).toHaveLength(0);
+    expect((await sentOutbound()).length).toBe(sendsBefore); // nothing new was pushed
   });
 
   it("a lost worker the connector reports running again is reconciled back to running", async () => {
@@ -185,7 +186,7 @@ describe("hello.workers reconciliation (issue #12, connector-pi.md §9.1 step 4)
     // already have consumed the intent by the time the broken state is observed).
     expect(snap.questions.some((q) => q.workerId === workerId && q.status === "open" && q.kind === "failure")).toBe(true);
     await waitWhileOutboundPending();
-    const pushes = sendCalls(await mockCalls()).map((c) => c.body ?? "");
+    const pushes = await sentOutbound();
     expect(pushes.some((c) => c.includes("自动恢复未成功"))).toBe(true);
   });
 });
@@ -194,7 +195,7 @@ describe("lost/resumed events and resume failures (spec §9, connector-pi.md §9
   it("lost → resumed lands on the timeline and returns the Thread to running, without pushing", async () => {
     const { ws, reader } = await connectMachine();
     const workerId = await dispatchAndAwaitWorker(ws, reader);
-    const sendsBefore = sendCalls(await mockCalls()).length; // the dispatch ack, not a push
+    const sendsBefore = (await sentOutbound()).length;
     await sendEvents(ws, [
       { workerId, seq: 1, ts: Date.now(), type: "started", sessionId: workerId },
       { workerId, seq: 2, ts: Date.now(), type: "lost", reason: "connector_restart" },
@@ -206,7 +207,7 @@ describe("lost/resumed events and resume failures (spec §9, connector-pi.md §9
     expect(kinds).toContain("lost");
     expect(kinds).toContain("resumed");
     expect(snap.pendingNotifications).toHaveLength(0);
-    expect(sendCalls(await mockCalls())).toHaveLength(0);
+    expect((await sentOutbound()).length).toBe(sendsBefore); // nothing new was pushed
   });
 
   it("a settled error with connector detail opens a question carrying that detail and pushes", async () => {
@@ -231,6 +232,6 @@ describe("lost/resumed events and resume failures (spec §9, connector-pi.md §9
     const question = threadOf(snap, workerId).questions.find((q) => q.status === "open")!;
     expect(question.text).toContain("budget exhausted");
     // Only failed resumes reach the user (§9.2 product decision): a push did go out.
-    expect(sendCalls(await mockCalls()).length).toBeGreaterThanOrEqual(1);
+    expect((await sentOutbound()).length).toBeGreaterThanOrEqual(1);
   });
 });

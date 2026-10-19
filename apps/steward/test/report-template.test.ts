@@ -1,5 +1,6 @@
 // Deterministic template tests (issue #5): three-part reports, tone by nature, truncation —
-// all without any LLM (steward.md §6.4, spec §7.5).
+// all without any LLM (steward.md §6.4, spec §7.5). ADR-0003: a "card" is a local message —
+// structured plain text plus opaque-action buttons.
 import { describe, expect, it } from "vitest";
 import type { ReportRow, WorkerRow } from "../src/ledger.ts";
 import {
@@ -57,7 +58,7 @@ const worker: WorkerRow = {
 };
 
 describe("renderReportCard: the fixed three parts (spec §7.5)", () => {
-  it("renders conclusion in the header, did as bullets, needs-you as its own section", () => {
+  it("renders conclusion up front with the tone badge, did as bullets, needs-you as its own line", () => {
     const card = renderReportCard({
       tone: "success",
       conclusion: "登录 bug 修好，测试通过",
@@ -66,26 +67,22 @@ describe("renderReportCard: the fixed three parts (spec §7.5)", () => {
       threadTitle: "修复登录 bug",
       footer: "Thread「修复登录 bug」 · pi @ mac-studio",
     });
-    expect(card.header).toMatchObject({
-      template: "green",
-      title: { content: expect.stringContaining("登录 bug 修好") },
-    });
-    const elements = card.elements as Array<Record<string, unknown>>;
-    const did = JSON.stringify(elements[0]);
-    expect(did).toContain("做了什么");
-    expect(did).toContain("修复 auth/session.ts");
-    expect(JSON.stringify(elements)).toContain("需要你");
-    expect(JSON.stringify(elements)).toContain("要推送并开 PR 吗？");
+    expect(card.text).toContain("✅ 登录 bug 修好，测试通过");
+    expect(card.text).toContain("做了什么：");
+    expect(card.text).toContain("- 修复 auth/session.ts");
+    expect(card.text).toContain("需要你：要推送并开 PR 吗？");
+    expect(card.text).toContain("Thread「修复登录 bug」 · pi @ mac-studio");
+    expect(card.buttons).toBeUndefined();
   });
 
-  it("omits the needs-you section entirely when there is nothing needed", () => {
+  it("omits the needs-you line entirely when there is nothing needed", () => {
     const card = renderReportCard({ tone: "success", conclusion: "done", did: ["x"], threadTitle: "t", footer: "f" });
-    expect(JSON.stringify(card.elements)).not.toContain("需要你");
+    expect(card.text).not.toContain("需要你");
   });
 
-  it("tone by nature, not by needs-you: a done report with caveats stays green", () => {
+  it("tone by nature, not by needs-you: a done report with caveats stays success-badged", () => {
     // The M1 live-testing correction (steward.md §6.4): a completion with minor caveats still
-    // gets the success tone so the color alone says whether anything went wrong.
+    // gets the success tone so the badge alone says whether anything went wrong.
     expect(toneOfReport("done")).toBe("success");
     expect(toneOfReport("blocked")).toBe("attention");
     expect(toneOfReport("needs_decision")).toBe("attention");
@@ -97,8 +94,8 @@ describe("renderReportCard: the fixed three parts (spec §7.5)", () => {
       threadTitle: "t",
       footer: "f",
     });
-    expect(card.header).toMatchObject({ template: "green" });
-    expect(JSON.stringify(card.elements)).toContain("需要你");
+    expect(card.text).toContain("✅");
+    expect(card.text).toContain("需要你");
   });
 
   it("clips over-length conclusions and did items to the spec limits", () => {
@@ -109,11 +106,10 @@ describe("renderReportCard: the fixed three parts (spec §7.5)", () => {
       threadTitle: "t",
       footer: "f",
     });
-    const title = (card.header as { title: { content: string } }).title.content;
+    const title = card.text.split("\n")[0]!;
     // badge + space + conclusion; conclusion itself ≤ 80 chars + ellipsis
     expect(title.length).toBeLessThanOrEqual(2 + 1 + MAX_CONCLUSION + 2);
-    const did = JSON.stringify(card.elements);
-    expect(did).toContain("…");
+    expect(card.text).toContain("…");
   });
 });
 
@@ -138,45 +134,39 @@ describe("didBullets / needsYouOf: data in, text out", () => {
   });
 });
 
-describe("failure and offline-ask cards", () => {
-  it("failure cards are red and state the outcome plainly with a next action", () => {
-    const card = failureCard("派发失败：任务没有开始", "not_registered_repo。重新 /派发 一次即可。", "t", "f");
-    expect(card.header).toMatchObject({ template: "red" });
+describe("failure and offline-ask messages", () => {
+  it("failure messages are ❌-badged and state the outcome plainly with a next action", () => {
+    const card = failureCard("派发失败：任务没有开始", "not_registered_repo。重新派发一次即可。", "t", "f");
+    expect(card.text).toContain("❌ 派发失败：任务没有开始");
+    expect(card.text).toContain("需要你：not_registered_repo");
   });
 
-  it("the offline-ask card carries only the action in button values — no thread data stuffed in (§3.1)", () => {
-    const card = offlineAskCard("repo-a", "mac-studio", "修复登录 bug") as { elements: Array<Record<string, unknown>> };
-    const action = card.elements.find((el) => el.tag === "action") as { actions: Array<{ value: Record<string, unknown> }> };
-    expect(action.actions).toHaveLength(2); // no alternative machine: wait or cancel
-    for (const button of action.actions) {
-      expect(Object.keys(button.value)).toEqual(["action"]);
-      expect(button.value.action).toMatch(/^(wait_online|switch_machine|cancel)$/);
+  it("the offline-ask message carries only the action in button values — no thread data stuffed in (§3.1)", () => {
+    const card = offlineAskCard("repo-a", "mac-studio", "修复登录 bug");
+    expect(card.buttons).toHaveLength(2); // no alternative machine: wait or cancel
+    for (const button of card.buttons!) {
+      expect(button.url).toBeUndefined();
+      expect(button.action).toMatch(/^(wait_online|switch_machine|cancel)$/);
     }
-    // And nothing anywhere in the card mentions a thread id.
+    // And nothing anywhere in the message mentions a thread id.
     expect(JSON.stringify(card)).not.toMatch(/t_[0-9A-Z]+/);
   });
 
-  it("a [switch] button appears only when another machine has the repo (protocol §7.3)", () => {
-    const withAlt = offlineAskCard("repo-a", "mac-studio", "修复登录 bug", ["mac-mini"]) as { elements: Array<Record<string, unknown>> };
-    const actions = (withAlt.elements.find((el) => el.tag === "action") as { actions: Array<{ value: Record<string, unknown>; text: { content: string } }> }).actions;
-    expect(actions).toHaveLength(3);
-    expect(actions.map((a) => a.value.action)).toEqual(["wait_online", "switch_machine", "cancel"]);
-    expect(JSON.stringify(actions[1])).toContain("mac-mini");
+  it("a [换台机器] button appears only when another machine has the repo (protocol §7.3)", () => {
+    const withAlt = offlineAskCard("repo-a", "mac-studio", "修复登录 bug", ["mac-mini"]);
+    expect(withAlt.buttons).toHaveLength(3);
+    expect(withAlt.buttons!.map((b) => b.action)).toEqual(["wait_online", "switch_machine", "cancel"]);
+    expect(withAlt.buttons![1]!.label).toContain("mac-mini");
   });
 });
 
 describe("notifyCard / askUserText (issue #6)", () => {
-  it("notifyCard renders the three-part card the steward's notify_user sends", () => {
-    const card = notifyCard({ tone: "attention", conclusion: "构建坏了，需要你拍板", did: ["定位到依赖冲突"], needsYou: "回滚还是升级？", threadTitle: "登录 bug" }) as {
-      header: Record<string, unknown>;
-      elements: unknown[];
-    };
-    expect(JSON.stringify(card.header)).toContain("orange");
-    expect(JSON.stringify(card.header)).toContain("构建坏了，需要你拍板");
-    const parts = JSON.stringify(card.elements);
-    expect(parts).toContain("定位到依赖冲突");
-    expect(parts).toContain("回滚还是升级？");
-    expect(parts).toContain("Thread「登录 bug」");
+  it("notifyCard renders the three-part message the steward's notify_user sends", () => {
+    const card = notifyCard({ tone: "attention", conclusion: "构建坏了，需要你拍板", did: ["定位到依赖冲突"], needsYou: "回滚还是升级？", threadTitle: "登录 bug" });
+    expect(card.text).toContain("⚠️ 构建坏了，需要你拍板");
+    expect(card.text).toContain("定位到依赖冲突");
+    expect(card.text).toContain("回滚还是升级？");
+    expect(card.text).toContain("Thread「登录 bug」");
   });
 
   it("askUserText lists up to 3 options and says the reply carries the Thread", () => {
@@ -189,14 +179,13 @@ describe("notifyCard / askUserText (issue #6)", () => {
 
 describe("the PR consent gate's templates (issue #21)", () => {
   it("reportCardFor adds [同意]/[先不要] exactly for done write reports with unpushed commits", () => {
-    const withConsent = reportCardFor(report(), worker, "mac-studio", "登录 bug") as { elements: Array<Record<string, unknown>> };
-    const action = withConsent.elements.find((el) => el.tag === "action") as { actions: Array<{ value: Record<string, unknown> }> };
-    expect(action.actions.map((b) => b.value.action)).toEqual(["pr_approve", "pr_decline"]);
-    expect(JSON.stringify(withConsent)).toContain("还没推送");
-    expect(JSON.stringify(withConsent)).toContain("2 个提交");
+    const withConsent = reportCardFor(report(), worker, "mac-studio", "登录 bug");
+    expect(withConsent.buttons!.map((b) => b.action)).toEqual(["pr_approve", "pr_decline"]);
+    expect(withConsent.text).toContain("还没推送");
+    expect(withConsent.text).toContain("2 个提交");
 
-    const pushed = reportCardFor(report({ git: { ...report().git!, pushed: true } }), worker, "m", "t") as { elements: unknown[] };
-    expect(pushed.elements.some((el) => (el as Record<string, unknown>).tag === "action" && (el as { actions?: unknown[] }).actions?.some((b) => (b as { value?: { action?: string } }).value?.action?.startsWith("pr_")))).toBe(false);
+    const pushed = reportCardFor(report({ git: { ...report().git!, pushed: true } }), worker, "m", "t");
+    expect((pushed.buttons ?? []).some((b) => b.action?.startsWith("pr_"))).toBe(false);
 
     const readonlyWorker = { ...worker, mode: "readonly" } as WorkerRow;
     expect(prConsentFor(report(), readonlyWorker)).toBeNull();
@@ -204,25 +193,21 @@ describe("the PR consent gate's templates (issue #21)", () => {
     expect(prConsentFor(report({ git: { ...report().git!, ahead: 0 } }), worker)).toBeNull();
   });
 
-  it("button values carry ONLY the action — identity resolves via providerMsgId (§3.1)", () => {
-    const card = reportCardFor(report(), worker, "mac-studio", "登录 bug") as { elements: Array<Record<string, unknown>> };
-    const action = card.elements.find((el) => el.tag === "action") as { actions: Array<{ value: Record<string, unknown> }> };
-    for (const button of action.actions) {
-      expect(Object.keys(button.value)).toEqual(["action"]);
+  it("button values carry ONLY the action — identity resolves via the message id (§3.1)", () => {
+    const card = reportCardFor(report(), worker, "mac-studio", "登录 bug");
+    for (const button of card.buttons!) {
+      expect(Object.keys(button)).toEqual(["label", "action", "primary"].filter((k) => button[k as keyof typeof button] !== undefined && k !== "url"));
+      expect(button.url).toBeUndefined();
     }
     expect(JSON.stringify(card)).not.toMatch(/w_[0-9A-Z]+/); // no worker id stuffed in
   });
 
-  it("prCreatedCard is green, carries the URL as text and as an open-PR button", () => {
-    const card = prCreatedCard({ url: "https://github.com/example/repo-a/pull/7", branch: "shepherd/login-1", threadTitle: "登录 bug", footer: "f" }) as {
-      header: Record<string, unknown>;
-      elements: unknown[];
-    };
-    expect(JSON.stringify(card.header)).toContain("green");
-    expect(JSON.stringify(card.header)).toContain("PR 已创建");
-    const parts = JSON.stringify(card.elements);
-    expect(parts).toContain("https://github.com/example/repo-a/pull/7");
-    expect(parts).toContain("已推送到远端");
+  it("prCreatedCard is success-badged, carries the URL as text and as an open-PR button", () => {
+    const card = prCreatedCard({ url: "https://github.com/example/repo-a/pull/7", branch: "shepherd/login-1", threadTitle: "登录 bug", footer: "f" });
+    expect(card.text).toContain("✅ PR 已创建");
+    expect(card.text).toContain("https://github.com/example/repo-a/pull/7");
+    expect(card.text).toContain("已推送到远端");
+    expect(card.buttons).toEqual([{ label: "打开 PR", url: "https://github.com/example/repo-a/pull/7", primary: true }]);
   });
 
   it("prFailureNeedsYou names the machine-side fix per stage and the retry contract", () => {

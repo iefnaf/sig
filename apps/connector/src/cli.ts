@@ -1,16 +1,14 @@
 #!/usr/bin/env node
-// `npx @iefnaf/shepherd <command>` (ADR-0001 decision 10, issue #26).
+// `npx @iefnaf/sig <command>` (ADR-0002, superseding ADR-0001 decision 10).
 //
-//   connect <url> [code]   claim a fresh deployment (no code: Cloudflare authorization)
-//                          or redeem a pairing code from the workspace; then install + start
-//                          the background service (launchd / systemd --user);
+//   connect <url> <code>   redeem a pairing code, then install + start the background
+//                          service (launchd agent on macOS, systemd --user unit on Linux);
 //                          --foreground runs the daemon in this terminal instead
-//   login                  print a one-time sign-in link for a browser
 //   status                 service state, pairing, workers, installed assets
 //   logs [-n N] [name]     tail ~/.shepherd/logs/<name> (default connector.log)
 //   start | stop | restart control the background service (stop also disables start-at-login)
 //   uninstall              stop the service and remove its unit (keeps ~/.shepherd data)
-//   upgrade [--version V]  npm-install @iefnaf/shepherd (default @latest) and restart the
+//   upgrade [--version V]  npm-install @iefnaf/sig (default @latest) and restart the
 //                          service; the fresh daemon rewrites the versioned pi assets
 //   add-repo <path>        register a repository so start_worker may run in it (§8.1)
 //   repo-config <path> [--workspace worktree|serial|main] [--approve|--no-approve]
@@ -27,9 +25,7 @@ import { promisify } from "node:util";
 import { runDaemon } from "./daemon.ts";
 import { installAssets } from "./install.ts";
 import { tailFile } from "./logger.ts";
-import { claimDeployment } from "./claim.ts";
 import { connect } from "./pairing.ts";
-import { loginLink } from "./login.ts";
 import { getServiceInstaller, SHEPHERD_LABEL, type ServiceInstaller, type ServiceSpec } from "./service.ts";
 import { isWorkspaceMode, LocalStore, WORKSPACE_MODES } from "./store.ts";
 import { defaultBranch, repoTopLevel } from "./worktree.ts";
@@ -41,33 +37,34 @@ const exec = promisify(execFile);
 const DEFAULT_PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
 function stateDir(): string {
-  return process.env.SHEPHERD_HOME ?? join(homedir(), ".shepherd");
+  // Keep the existing store by default: rebranding must not lose paired machines.
+  return process.env.SIG_HOME ?? process.env.SHEPHERD_HOME ?? join(homedir(), ".shepherd");
 }
 
 /** The bin wrapper this package ships; both src/cli.ts (dev) and dist/cli.js sit one
- * directory below the package root, so ../bin/shepherd.js is correct in either layout. */
+ * directory below the package root, so ../bin/sig.js is correct in either layout. */
 export function binEntryPath(): string {
-  return join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "shepherd.js");
+  return join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "sig.js");
 }
 
-const USAGE = `shepherd ${VERSION} — the Shepherd connector
+const USAGE = `sig ${VERSION} — the Sig connector
 
 usage:
-  shepherd connect <url> [code] [--foreground]   claim/pair and install the service
-  shepherd login                                one-time sign-in link for a browser
-  shepherd status                                 service, pairing, workers, assets
-  shepherd logs [-n <lines>] [name]               tail ~/.shepherd/logs (default connector.log)
-  shepherd start | stop | restart                 control the background service
-  shepherd uninstall                              remove the service (keeps ~/.shepherd data)
-  shepherd upgrade [--version <version>]          replace the package and restart the service
-  shepherd add-repo <path>                        register a repository for start_worker
-  shepherd repo-config <path> [options]           per-repo local settings (workspace mode,
+  sig connect <url> <code> [--foreground]   pair and install the background service
+  sig status                                 service, pairing, workers, assets
+  sig logs [-n <lines>] [name]               tail ~/.shepherd/logs (default connector.log)
+  sig start | stop | restart                 control the background service
+  sig uninstall                              remove the service (keeps ~/.shepherd data)
+  sig upgrade [--version <version>]          replace the package and restart the service
+  sig add-repo <path>                        register a repository for start_worker
+  sig repo-config <path> [options]           per-repo local settings (workspace mode,
                                                   project trust); never settable remotely
-  shepherd daemon                                 internal: run the connector daemon
+  sig daemon                                 internal: run the connector daemon
 
 environment:
-  SHEPHERD_HOME         state directory (default ~/.shepherd)
-  SHEPHERD_MACHINE_NAME machine name reported to the steward`;
+  SIG_HOME         state directory (default ~/.shepherd, preserved across the rename)
+  SIG_MACHINE_NAME machine name reported to the steward
+  SHEPHERD_HOME / SHEPHERD_MACHINE_NAME remain supported as fallback aliases`;
 
 function usage(code = 2): never {
   console.error(USAGE);
@@ -75,7 +72,7 @@ function usage(code = 2): never {
 }
 
 function fail(message: string): never {
-  console.error(`shepherd: ${message}`);
+  console.error(`sig: ${message}`);
   process.exit(1);
 }
 
@@ -101,8 +98,9 @@ function requireInstaller(): ServiceInstaller {
 
 function serviceSpec(entryPath: string): ServiceSpec {
   const dir = stateDir();
-  const env: Record<string, string> = { PATH: process.env.PATH ?? DEFAULT_PATH };
-  if (process.env.SHEPHERD_HOME) env.SHEPHERD_HOME = process.env.SHEPHERD_HOME;
+  const env: Record<string, string> = { PATH: process.env.PATH ?? DEFAULT_PATH, SIG_HOME: dir };
+  const machineName = process.env.SIG_MACHINE_NAME ?? process.env.SHEPHERD_MACHINE_NAME;
+  if (machineName) env.SIG_MACHINE_NAME = machineName;
   return {
     label: SHEPHERD_LABEL,
     nodePath: process.execPath,
@@ -125,8 +123,6 @@ async function main(argv: string[]): Promise<void> {
   switch (command) {
     case "connect":
       return connectCommand(rest);
-    case "login":
-      return loginCommand();
     case "status":
       return statusCommand();
     case "logs":
@@ -155,33 +151,23 @@ async function main(argv: string[]): Promise<void> {
 async function connectCommand(argv: string[]): Promise<void> {
   const foreground = argv.includes("--foreground");
   const [url, code] = argv.filter((a) => a !== "--foreground");
-  if (!url) usage();
+  if (!url || !code) usage();
   const dir = stateDir();
-  // A non-default SHEPHERD_HOME must stop before anything else: the launchd/systemd unit is
-  // shared machine state (fixed label), so installing from a private state directory would
-  // silently repoint the machine's own connector at it.
-  if (process.env.SHEPHERD_HOME && !foreground) {
+  // A non-default state directory must stop before anything else: the launchd/systemd unit
+  // is shared machine state (fixed label), so installing from a private state directory
+  // would silently repoint the machine's own connector at it.
+  if ((process.env.SIG_HOME ?? process.env.SHEPHERD_HOME) && !foreground) {
     fail(
-      "SHEPHERD_HOME is set to a private state directory; installing the shared background service would repoint this machine's connector. Use --foreground, or unset SHEPHERD_HOME.",
+      "SIG_HOME (or SHEPHERD_HOME) is set to a private state directory; installing the shared background service would repoint this machine's connector. Use --foreground, or unset it.",
     );
   }
-  const machineName = process.env.SHEPHERD_MACHINE_NAME ?? hostname();
+  const machineName = process.env.SIG_MACHINE_NAME ?? process.env.SHEPHERD_MACHINE_NAME ?? hostname();
 
-  // 1. Claim (no code: ADR-0004 — a Cloudflare authorization proves deployment ownership) or
-  //    pair (protocol §5.2 — a one-time code from the workspace). Either way the credentials
-  //    land in the LocalStore exactly once.
+  // 1. Pair (protocol §5.2): redeem the code once, persist credentials in the LocalStore.
   const store = new LocalStore(join(dir, "connector.sqlite"));
   let deviceId: string;
-  let loginUrl: string | undefined;
   try {
-    if (code) {
-      ({ deviceId } = await connect(url, code, machineName, { store }));
-    } else {
-      const claimed = await claimDeployment({ serverUrl: url, machineName, log: (line) => console.log(line) });
-      loginUrl = claimed.loginUrl;
-      store.saveCredentials({ serverUrl: url, deviceId: claimed.deviceId, token: claimed.token });
-      deviceId = claimed.deviceId;
-    }
+    ({ deviceId } = await connect(url, code, machineName, { store }));
   } catch (err) {
     store.close();
     fail(err instanceof Error ? err.message : String(err));
@@ -216,41 +202,20 @@ async function connectCommand(argv: string[]): Promise<void> {
   }
   const status = await installer.status();
   console.log(`paired as ${deviceId}`);
-  if (loginUrl) {
-    console.log("");
-    console.log("Open Pip in your browser (works once, for 10 minutes):");
-    console.log(`  ${loginUrl}`);
-  }
   console.log(
     `background service ${status.running ? "installed and running" : "installed"} ` +
       `(${installer.kind}: ${installer.unitPath})`,
   );
   for (const note of installer.notes) console.log(`note: ${note}`);
   console.log(`logs: ${join(dir, "logs", "connector.log")}`);
-  console.log("next: shepherd status · shepherd add-repo <path> · shepherd logs");
-}
-
-// --- login --------------------------------------------------------------------------------------
-
-async function loginCommand(): Promise<void> {
-  const dir = stateDir();
-  const store = new LocalStore(join(dir, "connector.sqlite"));
-  try {
-    const link = await loginLink(store);
-    if (!link) fail("not paired yet — run `shepherd connect <url>` first");
-    console.log("Open this link in the browser you want to sign in. Works once, for 10 minutes:");
-    console.log("");
-    console.log(`  ${link}`);
-  } finally {
-    store.close();
-  }
+  console.log("next: sig status · sig add-repo <path> · sig logs");
 }
 
 // --- status / logs ---------------------------------------------------------------------------
 
 async function statusCommand(): Promise<void> {
   const dir = stateDir();
-  console.log(`shepherd ${VERSION} (node ${process.version}, ${process.platform})`);
+  console.log(`sig ${VERSION} (node ${process.version}, ${process.platform})`);
 
   const installer = getServiceInstaller(serviceSpec(binEntryPath()));
   if (installer) {
@@ -265,7 +230,7 @@ async function statusCommand(): Promise<void> {
 
   const dbPath = join(dir, "connector.sqlite");
   if (!existsSync(dbPath)) {
-    console.log("paired:   not paired (run `shepherd connect <url> <code>`)");
+    console.log("paired:   not paired (run `sig connect <url> <code>`)");
     return;
   }
   const store = new LocalStore(dbPath);
@@ -274,7 +239,7 @@ async function statusCommand(): Promise<void> {
     if (credentials) {
       console.log(`paired:   ${credentials.deviceId} → ${credentials.serverUrl} (connEpoch ${credentials.connEpoch})`);
     } else {
-      console.log("paired:   no credentials (run `shepherd connect <url> <code>`)");
+      console.log("paired:   no credentials (run `sig connect <url> <code>`)");
     }
     const workers = store.listWorkers();
     const byState = new Map<string, number>();
@@ -287,7 +252,7 @@ async function statusCommand(): Promise<void> {
     const repos = store.listRepos();
     const repoLine =
       repos.length === 0
-        ? "none (shepherd add-repo <path>)"
+        ? "none (sig add-repo <path>)"
         : repos.map((r) => `${r.name}[${r.workspace}${r.approved ? ", approved" : ""}]`).join(", ");
     console.log(`repos:    ${repoLine}`);
   } finally {
@@ -369,7 +334,7 @@ async function daemonCommand(): Promise<void> {
   const dir = stateDir();
   let handle;
   try {
-    handle = await runDaemon({ stateDir: dir, machineName: process.env.SHEPHERD_MACHINE_NAME ?? hostname() });
+    handle = await runDaemon({ stateDir: dir, machineName: process.env.SIG_MACHINE_NAME ?? process.env.SHEPHERD_MACHINE_NAME ?? hostname() });
   } catch (err) {
     fail(err instanceof Error ? err.message : String(err));
   }
@@ -389,7 +354,7 @@ async function daemonCommand(): Promise<void> {
 
 // --- add-repo --------------------------------------------------------------------------------
 
-/** `shepherd add-repo <path>`: registers the repository (resolving subdirectories to the
+/** `sig add-repo <path>`: registers the repository (resolving subdirectories to the
  * repo root) in the local whitelist. Runs entirely on-machine (§8.1/§13): a remote
  * steward can never add entries, only see them. */
 async function addRepo(path: string | undefined): Promise<void> {
@@ -409,7 +374,7 @@ async function addRepo(path: string | undefined): Promise<void> {
   try {
     store.addRepo({ repoId: topLevel, name, path: topLevel, defaultBranch: branch, remote });
     console.log(`registered ${name} (${topLevel})${branch ? ` default branch: ${branch}` : ""}`);
-    console.log("next: shepherd repo-config <path> to pick the workspace mode or approve the project");
+    console.log("next: sig repo-config <path> to pick the workspace mode or approve the project");
   } finally {
     store.close();
   }
@@ -443,7 +408,7 @@ function parseRepoConfigArgv(argv: string[]): { path?: string; workspace?: strin
   return { path: positional[0], workspace, approve };
 }
 
-/** `shepherd repo-config <path> [--workspace worktree|serial|main] [--approve|--no-approve]`
+/** `sig repo-config <path> [--workspace worktree|serial|main] [--approve|--no-approve]`
  * (§8.2/§13, issue #16): the per-repo settings that live only in the connector's local
  * store. A command from the steward carrying them is rejected; this is the only writer.
  * With no settings flags it just prints the current configuration. */
@@ -459,7 +424,7 @@ async function repoConfig(argv: string[]): Promise<void> {
   try {
     const repo = store.getRepo(topLevel);
     if (!repo) {
-      fail(`${topLevel} is not registered; run 'shepherd add-repo ${path}' first`);
+      fail(`${topLevel} is not registered; run 'sig add-repo ${path}' first`);
     }
     if (workspace === undefined && approve === undefined) {
       // Read-only invocation: show the current settings.

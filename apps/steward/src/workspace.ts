@@ -1,12 +1,14 @@
-// The Pip workspace's read model (ADR-0002, spec §7.3): one JSON snapshot of everything the
+// The workspace's read model (ADR-0004, spec §7.3): one JSON snapshot of everything the
 // browser draws — the continuous conversation, Threads, machines, and the decisions waiting
 // for the owner. Pure assembly over the ledger's views; nothing here writes, and nothing the
 // ledger keeps private (run text, wake text, worker transcripts, command ids) is exposed.
 import type { BudgetState } from "./budget.ts";
 import type { Ledger } from "./ledger.ts";
 
-/** Where the owner's conversation is happening: replies and acknowledgements follow the channel the owner used. */
-export type OwnerChannel = "feishu" | "web";
+/** Where a message entered the conversation. New rows are all `local` (ADR-0003: the owner
+ *  API and the web workspace are two views of one local channel); `feishu`/`web` remain only
+ *  on rows written by deployments that predate the merge. */
+export type OwnerChannel = "local" | "feishu" | "web";
 
 /** A message the owner typed in the workspace. `id` is the client's request id (idempotency key). */
 export interface WorkspaceInput {
@@ -58,6 +60,53 @@ const str = (value: unknown): string => (typeof value === "string" ? value : "")
 
 const TONES: Record<string, CardView["tone"]> = { green: "success", orange: "attention", red: "failure" };
 
+/** The tone emoji report-template.ts prefixes its first line with. */
+const TONE_EMOJI: Array<[string, CardView["tone"]]> = [
+  ["✅", "success"],
+  ["❓", "attention"],
+  ["⚠️", "attention"],
+  ["❌", "failure"],
+  ["🧠", "attention"],
+  ["💡", "info"],
+];
+
+/** A flat LocalMessage ({text, buttons}) → the structured view: the optional leading
+ *  【Thread】 prefix becomes the note, the tone emoji sets the tone, the rest of the first
+ *  line is the title and the remaining lines are the body — verbatim, hints included. */
+function localMessageView(text: string, rawButtons: unknown): CardView {
+  let rest = text;
+  let note: string | null = null;
+  const prefixed = /^【([^】]{1,120})】([\s\S]*)$/.exec(rest);
+  if (prefixed) {
+    note = prefixed[1]!;
+    rest = prefixed[2]!;
+  }
+  let tone: CardView["tone"] = "info";
+  for (const [emoji, mapped] of TONE_EMOJI) {
+    if (rest.startsWith(emoji)) {
+      tone = mapped;
+      rest = rest.slice(emoji.length);
+      break;
+    }
+  }
+  const lines = rest.split("\n");
+  const title = (lines.shift() ?? "").trim();
+  const body = lines.map((line) => line.trim()).filter((line) => line !== "");
+  const buttons: CardButton[] = (Array.isArray(rawButtons) ? rawButtons : []).map(obj)
+    .filter((b) => typeof b.label === "string" && b.label !== "")
+    .map((b) => ({
+      label: str(b.label),
+      ...(typeof b.action === "string" && b.action !== "" ? { action: b.action } : {}),
+      // Detail links are one-time logins into this very workspace — pointless inside it.
+      ...(typeof b.url === "string" && /^https?:\/\//i.test(b.url) && !b.url.includes("/link/wl1.") ? { url: b.url } : {}),
+      ...(b.primary === true ? { primary: true } : {}),
+    }))
+    // A button that does neither (its only url was a one-time login link, or it carried
+    // nothing but a label) is decoration: drop it rather than render a dead control.
+    .filter((b) => b.action !== undefined || b.url !== undefined);
+  return { tone, title, body, note, buttons };
+}
+
 /** Hints that only make sense inside Feishu (quote-replying); the workspace has its own composer. */
 const CHAT_ONLY_HINTS = [
   /(?: · )?引用回复可继续这个 Thread/g,
@@ -72,7 +121,13 @@ const LEADING_EMOJI = /^(?:\p{Extended_Pictographic}\uFE0F?\s*)+/u;
  *  stay the single source of truth; no Feishu element tags reach the browser. */
 export function cardView(card: unknown): CardView {
   const root = obj(card);
-  // New records use the workspace shape; the legacy parser below preserves old decisions.
+  // The local channel's cards are flat text + opaque buttons (ADR-0003's LocalMessage);
+  // the structured view the workspace draws is derived from the templates' own markers —
+  // the leading 【Thread】 prefix and tone emoji are written by report-template.ts, so this
+  // mapping is deterministic, not a guess at natural language.
+  if (typeof root.text === "string" && !root.header) return localMessageView(root.text, root.buttons);
+  // Records from the workspace's own era keep their shape; the legacy parser below preserves
+  // old decisions.
   if (root.type === "pip-card") return {
     tone: ["success", "attention", "failure", "info"].includes(str(root.tone)) ? root.tone as CardView["tone"] : "info",
     title: str(root.title), body: Array.isArray(root.body) ? root.body.filter((s): s is string => typeof s === "string") : [],
@@ -214,7 +269,7 @@ export function workspaceSnapshot(input: { ledger: Ledger; budget: BudgetState; 
     ...view.inputs.map((row) => ({
       id: `user:${row.id}`,
       role: "user" as const,
-      channel: row.channel === "web" ? ("web" as const) : ("feishu" as const),
+      channel: (row.channel as OwnerChannel) ?? "local",
       at: row.at,
       threadId: row.threadId,
       text: row.text,
@@ -225,7 +280,7 @@ export function workspaceSnapshot(input: { ledger: Ledger; budget: BudgetState; 
       const base = {
         id,
         role: "assistant" as const,
-        channel: row.channel === "web" ? ("web" as const) : ("feishu" as const),
+        channel: (row.channel as OwnerChannel) ?? "local",
         at: Number(row.createdAt),
         threadId: (row.threadId as string | null) ?? null,
         status: String(row.status),

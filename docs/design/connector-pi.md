@@ -254,7 +254,7 @@ What the model reports about itself is only "semantics". **Branch, commits, chan
 
 ### 7.3 Appended system prompt (draft)
 
-> 你是 Shepherd 派来的 worker，代表用户在当前目录工作。(You are a worker dispatched by Shepherd, working on the user's behalf in the current directory.)
+> 你是 Sig 派来的 worker，代表用户在当前目录工作。(You are a worker dispatched by Sig, working on the user's behalf in the current directory.)
 > 1. 只在当前目录内工作。(Work only inside the current directory.)
 > 2. 完成、遇到阻碍、或需要用户做决定时，调用 `report` 工具，且这应当是你的最后一个动作。需要用户回答的问题放进 `question`，状态用 `needs_decision`，不要用普通文字向用户提问。(When you finish, are blocked, or need the user to make a decision, call the `report` tool, and this should be your last action. Put questions that need a user answer into `question` with status `needs_decision`; do not ask the user in plain text.)
 > 3. 把关键决定和原因写进 `decisions`，把遗留问题写进 `leftovers`。(Write key decisions and their reasons into `decisions`, and leftover issues into `leftovers`.)
@@ -269,7 +269,7 @@ Item 5 mitigates the prompt-injection surface: `AGENTS.md` is loaded regardless 
 
 ### 8.1 Repository whitelist
 
-The connector starts workers only in **registered repositories**. Registration happens via `shepherd add-repo <path>` after pairing, or by configuring a set of root directories under which the connector discovers git repositories. A `start_worker` pointing at an unregistered path is always rejected. That way, even a compromised steward cannot make the connector start an agent in an arbitrary directory.
+The connector starts workers only in **registered repositories**. Registration happens via `sig add-repo <path>` after pairing, or by configuring a set of root directories under which the connector discovers git repositories. A `start_worker` pointing at an unregistered path is always rejected. That way, even a compromised steward cannot make the connector start an agent in an arbitrary directory.
 
 ### 8.2 Write tasks: a dedicated worktree
 
@@ -408,6 +408,6 @@ The `history` command backs "view raw history" in the web UI:
 3. **Whether the report fields suffice for a handoff brief**: whether `decisions`, `leftovers`, and `next` are enough — revisit after the steward-side brief generation is built. *Partially resolved (issue #8): the brief assembles from decisions/leftovers/git pointers and renders them usefully; `next` is not used (the steward's task at hand supersedes it). Revisit with real relay traffic.*
 4. **External-use detection** (§10) relies on `ps` argument matching; it must be validated on both macOS and Linux. *(Partially resolved by #15: the matching itself is implemented and tested against macOS-shaped and Linux-shaped listings, but pi's own `process.title` rewrite hides a retitled pi's argv on both platforms — see the §10 implementation note. `--resume`/`--continue` sessions remain fundamentally undetectable by argv.)*
 5. **Context-usage threshold**: how high before suggesting a new session — needs real-world data. *(Issue #8 picked 80% of the reported `contextUsage` as the deterministic resume-vs-new-session threshold — `HIGH_CONTEXT_USAGE` in `handoff.ts`; revisit with data.)*
-6. *(Resolved by [ADR-0001](../adr/0001-mvp-implementation-baseline.md): `node:sqlite`; npm package `@iefnaf/shepherd` with launchd/systemd.)* **Local store selection and the connector's packaging/distribution** (one-command `npx` run, background service registration).
+6. *(Resolved by [ADR-0001](../adr/0001-mvp-implementation-baseline.md): `node:sqlite`; npm package `@iefnaf/sig` per [ADR-0002](../adr/0002-sig-brand-and-compatibility.md), with launchd/systemd.)* **Local store selection and the connector's packaging/distribution** (one-command `npx` run, background service registration).
 7. **Cross-model `report` reliability**, and how models behave when they do not follow the "last action" rule.
 8. **Claude Code adaptation**: the first real test of this contract when a second agent plugs in; the focus is how gaps in `steer` and structured reporting degrade. *(Resolved by issue #17: ClaudeAdapter ships behind the same contract — headless `claude -p` with stream-json, an MCP `report` tool matched by `__report` suffix, and the §5.2 adjudication path shared with pi. The capability gaps degrade at the WorkerManager: no mid-run steer/follow-up (a send that lands mid-run is deferred to run end and delivered as the next prompt, reported as `queued`/`after_run_end`), no read-only, no images. Claude Code declares `interrupt: true` via kill + a synthetic `aborted` settle, `resume: true` via `--resume <uuid>` — the session id is derived deterministically from the workerId.)*

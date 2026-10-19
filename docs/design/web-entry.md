@@ -1,6 +1,6 @@
 # Web entry and the session viewer
 
-Status: implemented ([ADR-0003](../adr/0003-web-entry-local-sessions.md), auth reshaped by [ADR-0004](../adr/0004-device-first-claim.md)). This is how it is built; the decisions and their reasons are in the ADRs, the operator's steps in [deploy.md](../deploy.md).
+Status: implemented ([ADR-0005](../adr/0005-web-entry-and-local-sessions.md), on the owner API of [ADR-0003](../adr/0003-owner-api-replaces-chat-channel.md) — the device-first claim variant was rejected as [ADR-0006](../adr/0006-device-first-claim-rejected.md)). This is how it is built; the decisions and their reasons are in the ADRs, the operator's steps in [deploy.md](../deploy.md).
 
 ## Doors
 
@@ -10,38 +10,28 @@ Status: implemented ([ADR-0003](../adr/0003-web-entry-local-sessions.md), auth r
 | --- | --- | --- |
 | `/app`, `/app/*` (pages, `/app/api/*`, `/app/assets/*`) | the owner's browser | the application session cookie (HMAC at the Worker, liveness in the Durable Object); without it: the sign-in page, which has no input |
 | `/app/ws` (WebSocket) | the owner's browser | a well-formed application session cookie at the Worker; session liveness in the Durable Object |
-| `/pair` (POST) | the first machine (claim) | the SHA-256 of `SHEPHERD_CLAIM_SECRET`, a secret only writable through the Cloudflare API; redeem is once-only |
-| `/pair` (POST) | further machines | the one-time pairing code from the workspace, brute-force guarded |
-| `/login` (POST) | a paired machine | the per-machine device token; mints a one-time browser sign-in link |
+| `/api/*` (POST/GET) | the owner (scripts, agents) | the `SERVER_KEY` bearer at the Worker — [ADR-0003](../adr/0003-owner-api-replaces-chat-channel.md)'s four routes only |
+| `/pair` (POST) | machines | the one-time pairing code minted via `POST /api/pairing`, brute-force guarded |
 | `/link/<token>` (GET) | a browser with the link | the token's HMAC at the Worker; single-use in the Durable Object |
-| `/agents/steward/owner` (WebSocket) | a paired machine | the per-machine device token (`role=connector` is the only role it accepts) |
-| `/`, `/setup` | anyone | redirect (`303`) to `/app` |
+| `/agents/steward/owner` (WebSocket) | a paired machine | the per-machine device token at the Worker pre-check (`onBeforeConnect`); a browser socket instead presents the session cookie with `role=web` |
 
-The Worker rewrites both sockets onto the Agents SDK route with an explicit `role` (`web` or `connector`) and never lets a client choose its own: `/agents/steward/owner?role=web` is refused, and ordinary HTTP or SDK RPC traffic cannot reach the Agent router at all.
+The Worker rewrites the workspace's socket (`/app/ws`) onto the Agents SDK route with an explicit `role=web` and re-checks the cookie there; machine sockets authenticate with device tokens. The doors are pinned by `test/routes-audit.test.ts`: nothing beyond `POST /pair` and the two brand assets answers without credentials.
 
-### Claiming and the auth root (`auth-root.ts`, ADR-0004)
+### Keys and the application session
 
-The Durable Object generates a random secret on first boot and keeps it in its own storage (`ensureAuthRoot`). It is the primary of the key set `serverKeys()` returns — everything the deploy-time `SERVER_KEY` used to sign (device tokens, session cookies, one-time links, the claim proof comparisons' sibling material) — with a still-set legacy `SERVER_KEY` (and `SERVER_KEY_PREVIOUS`) kept in the set so pre-upgrade credentials survive the upgrade. Nothing secret is typed at deploy time.
-
-`shepherd connect <url>` (no pairing code) claims: Wrangler's OAuth authorizes `account:read` + `workers_scripts:write`, the CLI resolves the exact Worker behind the URL through the Cloudflare API, writes a random `SHEPHERD_CLAIM_SECRET` as that Worker's secret (only the account's managers can), and POSTs its SHA-256 to `/pair`. The Worker hashes its own `SHEPHERD_CLAIM_SECRET` and compares (length-independent, so nothing leaks byte-by-byte); `redeemClaim` then spends the claim in one transaction (the `sh_claim` row plus the device row) — a replayed proof finds the deployment already claimed.
-
-### The application session
-
-The application session (`sh_web_session`) carries the CSRF token and the logout. It is opened only by consuming a one-time link (`openLink`): `shepherd login` on a paired machine asks the Durable Object to mint one (bound to the machine's credential, single use, minutes of validity) and the browser that opens it gets the session cookie. Every mutation needs the CSRF header, a same-origin `Origin` (required, not merely checked when present) and a JSON body. Logout deletes the session, closes the sockets it opened, and the page returns to the sign-in page.
+Everything is signed by the deploy-time `SERVER_KEY` (`SERVER_KEY_PREVIOUS` keeps a rotation window open, issue #27): device tokens, session cookies, one-time links, the sealed model key. The application session (`sh_web_session`) carries the CSRF token and the logout. It is opened only by consuming a one-time link (`openLink`) — minted by `POST /api/login-link` (the owner's SERVER_KEY) or attached to a report card's 查看详情 button; the browser that opens it gets the session cookie. Every mutation needs the CSRF header, a non-cross-origin `Origin` and a JSON body. Logout deletes the session, closes the sockets it opened, and the page returns to the sign-in page, which names the one way in.
 
 ### The owner
 
-`sh_owner` (one row) holds the owner's internal id and the allowed email. On a deployment that had a Feishu owner the old open id is kept as the id, so every old row (`receiveId`, inbound owner authorization, card actions) stays consistent. The id is what handlers compare against; the *authorization* is the claim (ADR-0004).
+The owner is whoever holds `SERVER_KEY` (ADR-0003): no owner row, no messaging identity. Legacy rows from a deployment that had a Feishu owner keep their old `receiveId` values; new outbound rows address the constant owner id.
 
 ## Owner workflow without Feishu
 
-- **Settings** (`/app/api/settings`, `/app/api/settings/model`): the owner's address and the model selection (`apiKey` is a boolean — the key is never returned). Saving re-seals the key under `SERVER_KEY`.
-- **Pairing** (`/app/api/pairing`): mints a one-time code (10 minutes) keyed by the client's request id, so a retry gets the same code, and returns the full `npx @iefnaf/shepherd connect <origin> <code>` command. It is shown only in the machines panel, never in the conversation feed.
+- **Settings** (`/app/api/settings`, `/app/api/settings/model`): the model selection (`apiKey` is a boolean — the key is never returned). Saving re-seals the key under `SERVER_KEY`.
+- **Pairing** (`/app/api/pairing`): mints a one-time code (10 minutes) keyed by the client's request id, so a retry gets the same code, and returns the full `npx @iefnaf/sig connect <origin> <code>` command. It is shown only in the machines panel, never in the conversation feed (`private: true` on the outbound row).
 - **Revoke** (`/app/api/machines/revoke`): bumps the device epoch and closes the connection with `4403`.
 - **First run**: the page asks for settings (a model key) and then a machine, one notice at a time.
-- **Reports, questions and decisions** are written straight to the workspace (`enqueueOutbound` stores `channel: web` rows, no delivery pass, no Feishu adapter), in the workspace's own card shape (`{ type: "pip-card", tone, title, body, note, buttons }` — the old Feishu card JSON is still read for rows written before). They exist whether or not a browser is connected; a connected one is nudged. Rows still queued for Feishu at the upgrade are handed to the workspace on the first start. Detail links are not generated: the workspace is the page.
-
-`webOnly` (a protected getter on the Durable Object, true in production) is the single switch. The historical transport fixture `test/legacy-worker.ts` turns it off, which is how the Feishu-era suites keep running against the Feishu code.
+- **Reports, questions and decisions** are outbound rows on the one local channel (ADR-0003: the row settles with `providerMsgId` = row id; `GET /api/messages` reads the same rows back). The workspace derives its structured view (tone, title, body, note) from the message templates' own markers — the leading 【Thread】 prefix and tone emoji — so the API's flat text and the workspace's cards can never disagree. They exist whether or not a browser is connected; a connected one is nudged. Detail links are not generated inside the workspace: it is the page.
 
 ## Session content
 
@@ -68,8 +58,8 @@ The transport is the existing history relay (protocol §6.6) with one new field,
 | No file yet (agent just started) | "Nothing has been recorded yet" — follows once it appears |
 | File deleted | "No local record… may have been deleted" |
 | File replaced under the reader | The view restarts from the beginning (at most three times) |
-| Connector older than full reads | Such a connector ignores `format: "full"` and answers with the old summary pages, which carry no `format`; the viewer says "too old… run `shepherd upgrade`" (with Retry) instead of drawing them |
+| Connector older than full reads | Such a connector ignores `format: "full"` and answers with the old summary pages, which carry no `format`; the viewer says "too old… run `sig upgrade`" (with Retry) instead of drawing them |
 
 ## Tests
 
-`vitest.config.ts` runs the historical suites against `test/legacy-worker.ts`; `vitest.claim.config.ts` runs `test/claim-*.test.ts` against the real entry with the ADR-0004 doors (the bound `SHEPHERD_CLAIM_SECRET` stands in for what the connector writes through the Cloudflare API). `scripts/test-groups.mjs` runs both. The connector and protocol suites cover the reader and the schemas; `ui-session.test.ts` covers the browser model.
+`vitest.config.ts` runs the whole suite against the production entry with the test bindings (`SERVER_KEY` et al.). `scripts/test-groups.mjs` parallelizes the files. The connector and protocol suites cover the reader and the schemas; `ui-session.test.ts` covers the browser model, `ui-modules.test.ts` the shipped files.

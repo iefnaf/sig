@@ -6,17 +6,16 @@
   <meta name="color-scheme" content="light">
   <meta name="robots" content="noindex">
   <meta name="theme-color" content="#37624d">
-  <title>Pip · Workspace</title>
-  <link rel="icon" type="image/svg+xml" href="/app/assets/pip-icon.svg">
-  <link rel="icon" type="image/png" sizes="32x32" href="/app/assets/favicon-32.png">
-  <link rel="apple-touch-icon" sizes="180x180" href="/app/assets/apple-touch-icon.png">
+  <title>Sig · Workspace</title>
+  <link rel="icon" type="image/svg+xml" href="/brand/sig.svg">
+  <link rel="apple-touch-icon" sizes="180x180" href="/brand/sig-avatar.png">
   <link rel="stylesheet" href="/app/assets/workspace.css">
   <script type="module" src="/app/assets/workspace.js"></script>
 </head>
 <body>
   <div class="workspace" id="workspace" data-mobile="chat" data-ready="false">
     <header class="topbar">
-      <a href="/app" class="brand" data-nav="all" data-i18n-label="brandHome" aria-label="Pip · All messages"><img class="brand-mark" src="/app/assets/pip-mark.svg" width="32" height="32" alt=""><img class="brand-wordmark" src="/app/assets/pip-wordmark.svg" width="44" height="24" alt="Pip"><span class="workspace-label" data-i18n="personalAgent">your personal agent</span></a>
+      <a href="/app" class="brand" data-nav="all" data-i18n-label="brandHome" aria-label="Sig · All messages"><img class="brand-mark" src="/brand/sig.svg" width="32" height="32" alt=""><span class="brand-word">Sig</span><span class="workspace-label" data-i18n="personalAgent">your personal agent</span></a>
       <div class="global-status">
         <button class="status-button machine-status" data-action="machines"><span class="status-dot gray" id="machine-dot"></span><span data-i18n="machines">Machines</span><strong id="machine-summary">–</strong></button>
         <span class="status-divider"></span>
@@ -42,8 +41,8 @@
       </div>
     </aside>
 
-    <main class="conversation" data-i18n-label="chatLabel" aria-label="Conversation with Pip">
-      <header class="conversation-header"><div class="conversation-heading"><div class="heading-line"><h1 id="conversation-title">Pip</h1></div><p id="conversation-subtitle"></p></div><button class="icon-button detail-toggle" data-action="details" data-i18n-label="detailToggle" data-i18n-title="detailToggle" aria-label="Toggle details" aria-controls="context-panel" aria-expanded="true" title="Toggle details" data-icon="panel"></button></header>
+    <main class="conversation" data-i18n-label="chatLabel" aria-label="Conversation with Sig">
+      <header class="conversation-header"><div class="conversation-heading"><div class="heading-line"><h1 id="conversation-title">Sig</h1></div><p id="conversation-subtitle"></p></div><button class="icon-button detail-toggle" data-action="details" data-i18n-label="detailToggle" data-i18n-title="detailToggle" aria-label="Toggle details" aria-controls="context-panel" aria-expanded="true" title="Toggle details" data-icon="panel"></button></header>
       <div class="view-tabs" id="view-tabs" role="group" data-i18n-label="viewTabs" aria-label="Thread views" hidden></div>
       <div class="setup-banner" id="setup-banner" hidden></div>
       <div class="scope-banner" id="scope-banner" hidden></div>
@@ -53,7 +52,7 @@
         <form id="composer-form" class="composer">
           <div class="composer-toolbar"><button type="button" class="scope-chip" id="scope-chip" data-action="scope"><span data-icon="route"></span><span id="scope-label">Auto</span><span data-icon="chevron-down"></span></button><span class="composer-status" id="composer-status"></span></div>
           <div class="reply-chip" id="reply-chip" hidden></div>
-          <label class="sr-only" for="message-input" data-i18n="inputLabel">Message Pip</label><textarea id="message-input" rows="2" placeholder="Message Pip…" maxlength="16000"></textarea>
+          <label class="sr-only" for="message-input" data-i18n="inputLabel">Message Sig</label><textarea id="message-input" rows="2" placeholder="Message Sig…" maxlength="16000"></textarea>
           <div class="composer-bottom"><span class="composer-shortcuts"><kbd>↵</kbd> <span data-i18n="send">Send</span><span class="keyboard-separator">·</span><kbd>Shift ↵</kbd> <span data-i18n="newline">New line</span></span><button type="submit" class="send-button" id="send-button" data-i18n-label="send" aria-label="Send" disabled data-icon="arrow-up"></button></div>
         </form>
         <p class="composer-note"><span data-icon="shield"></span><span data-i18n="notifications">Decisions wait here until you answer them.</span></p>
@@ -74,6 +73,6 @@
   <dialog id="dialog" aria-labelledby="dialog-title"><div class="dialog-shell"><header class="dialog-header"><h2 id="dialog-title"></h2><button class="icon-button" data-action="close-dialog" data-i18n-label="close" aria-label="Close" data-icon="close"></button></header><div id="dialog-body"></div></div></dialog>
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
   <div class="sr-only" id="announcer" role="status" aria-live="polite"></div>
-  <noscript><p class="noscript">Pip needs JavaScript to run the workspace.</p></noscript>
+  <noscript><p class="noscript">Sig needs JavaScript to run the workspace.</p></noscript>
 </body>
 </html>

@@ -1673,7 +1673,6 @@ export function createLedger(deps: LedgerDeps) {
   const outbound = {
     enqueue(input: {
       kind: "text" | "card";
-      channel?: "feishu" | "web";
       to: string;
       threadId?: string | null;
       questionId?: string | null;
@@ -1690,15 +1689,6 @@ export function createLedger(deps: LedgerDeps) {
        *  message; the id doubles as the provider-side uuid. Omitted: a fresh one-of message. */
       id?: string;
     }): string {
-      if (input.channel === "web") {
-        const id = input.id ?? ulid();
-        sql`
-          INSERT OR IGNORE INTO sh_outbound (id, channel, kind, receiveId, threadId, questionId, payload, urgency, status, attempts, nextAttemptAt, createdAt, sentAt, providerMsgId)
-          VALUES (${id}, 'web', ${input.kind}, ${input.to}, ${input.threadId ?? null}, ${input.questionId ?? null},
-            ${JSON.stringify({ text: input.text, card: input.card, ...(input.private ? { private: true } : {}) })}, 'push', 'sent', 0, ${now()}, ${now()}, ${now()}, ${`web-outbound:${id}`})
-        `;
-        return id;
-      }
       // Issue #11 (steward.md §6.4): `urgency: push` is due NOW; a quiet row holds for the
       // merge window, ANCHORED at the oldest still-open quiet row for this channel+receiver —
       // arrivals inside an open window join it, later ones start their own.
@@ -1707,7 +1697,7 @@ export function createLedger(deps: LedgerDeps) {
         const windowMs = quietWindowMs();
         const anchor = sql<{ at: number | null }>`
           SELECT MIN(createdAt) AS at FROM sh_outbound
-          WHERE channel = 'feishu' AND receiveId = ${input.to} AND urgency = 'quiet'
+          WHERE channel = 'local' AND receiveId = ${input.to} AND urgency = 'quiet'
             AND status = 'queued' AND createdAt > ${now() - windowMs}
         `[0]?.at;
         dueAt = anchor !== null && anchor !== undefined ? anchor + windowMs : now() + windowMs;
@@ -1716,7 +1706,7 @@ export function createLedger(deps: LedgerDeps) {
       if (input.id !== undefined) {
         sql`
           INSERT OR IGNORE INTO sh_outbound (id, channel, kind, receiveId, threadId, questionId, payload, urgency, status, attempts, nextAttemptAt, createdAt)
-          VALUES (${input.id}, 'feishu', ${input.kind}, ${input.to}, ${input.threadId ?? null}, ${input.questionId ?? null},
+          VALUES (${input.id}, 'local', ${input.kind}, ${input.to}, ${input.threadId ?? null}, ${input.questionId ?? null},
                   ${payload}, ${input.urgency ?? "quiet"}, 'queued', 0, ${dueAt}, ${now()})
         `;
         return input.id;
@@ -1724,7 +1714,7 @@ export function createLedger(deps: LedgerDeps) {
       const id = ulid(); // stable across retries; doubles as the provider-side uuid
       sql`
         INSERT INTO sh_outbound (id, channel, kind, receiveId, threadId, questionId, payload, urgency, status, attempts, nextAttemptAt, createdAt)
-        VALUES (${id}, 'feishu', ${input.kind}, ${input.to}, ${input.threadId ?? null}, ${input.questionId ?? null},
+        VALUES (${id}, 'local', ${input.kind}, ${input.to}, ${input.threadId ?? null}, ${input.questionId ?? null},
                 ${payload}, ${input.urgency ?? "quiet"}, 'queued', 0, ${dueAt}, ${now()})
       `;
       return id;
@@ -1912,7 +1902,7 @@ export function createLedger(deps: LedgerDeps) {
   };
 
   const ownerInputs = {
-    record(channel: "web" | "feishu", msgId: string, text: string | null, threadId: string | null = null): void {
+    record(channel: "local" | "web" | "feishu", msgId: string, text: string | null, threadId: string | null = null): void {
       sql`
         INSERT INTO sh_inbound (channel, msgId, eventId, eventType, receivedAt, ownerAuthorized, text, threadId)
         VALUES (${channel}, ${msgId}, ${msgId}, 'message', ${now()}, 1, ${text}, ${threadId})

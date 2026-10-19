@@ -1,45 +1,51 @@
-# Pip
+# Sig
 
-Pip is a personal agent that remembers ongoing work and coordinates coding agents on the owner’s machines. The owner interacts with one continuous conversation in the web workspace.
+A personal agent steward that remembers ongoing work and coordinates coding agents across the owner’s machines. The owner talks to it through one continuous conversation: the web workspace on top, the owner API underneath.
 
 ## Language
 
+**Sig**:
+The product name, derived from Sigma and the summation symbol ∑. Previously called Shepherd.
+_Avoid_: Shepherd or Pip as the current product name.
+
+**Steward**:
+Sig’s coordinating role: the agent that owns the conversation, memory and Threads, and directs worker sessions. The interface calls it Sig.
+_Avoid_: 总管 in interface copy.
+
 **Owner**:
-The person a Pip deployment serves, who directs its work and controls its connected machines. Established by the claim: the first computer authorized through the deployment's Cloudflare account.
+The single user of a deployment — whoever holds its SERVER_KEY. No chat-platform identity is involved while the chat channel is deferred.
+_Avoid_: "bound owner", open_id.
 
-**Claim (认领)**:
-The one-time act that binds a fresh deployment to its Owner. The first computer proves, through the Cloudflare account that deployed it, that it may connect; from then on the deployment refuses every other claim.
-_Avoid_: Registration, first-login
+**Owner API**:
+The SERVER_KEY-gated HTTP surface the owner talks through: messages in, sent messages and button actions back, pairing, login links.
+_Avoid_: calling it "the bot" or "the webhook".
 
-**Pip (steward)**:
-The personal agent the owner talks to. “Steward” is its coordinating role; the interface calls it Pip.
-_Avoid_: 总管 in interface copy
+**Message**:
+One rendered item the owner reads (text plus optional opaque-action buttons) — an outbound row settled locally; a quiet-merged group shares one id and reads as one message.
+_Avoid_: "card" for anything chat-provider-specific.
 
 **Thread (事项)**:
 An ongoing matter with a goal and history, potentially carried by several worker sessions. It remains available for follow-up when idle.
-_Avoid_: A separate chat, completed task
+_Avoid_: A separate chat, completed task.
 
 **Worker session**:
-One coding agent’s execution session started by Pip on a machine, attached to a Thread.
-_Avoid_: Another steward
+One coding agent’s execution session started by Sig on a machine, attached to a Thread.
+_Avoid_: Another steward.
 
 **Session record**:
-The agent’s own file on a machine in which a worker session is written down. Pip reads it on demand and never keeps a copy.
-_Avoid_: Transcript, raw process, log
+The agent’s own file on a machine in which a worker session is written down. Sig reads it on demand and never keeps a copy.
+_Avoid_: Transcript, raw process, log.
 
 **Machine (机器)**:
 One of the owner’s computers, with available agents, repositories, and execution capacity.
 
 **Needs you (待处理)**:
 A decision awaiting the owner, such as a question, PR approval, offline arrangement, routine offer, or memory suggestion. Several decisions may belong to one Thread; some belong to no Thread.
-_Avoid_: A separate inbox
+_Avoid_: A separate inbox.
 
 **Workspace (工作台)**:
-The web view of Pip’s conversation, Threads, worker sessions, decisions, and machines.
+The web view of Sig’s conversation, Threads, worker sessions, decisions, and machines — the owner’s everyday entry. It is a view of the same conversation the owner API serves, not a second one.
 
 **Channel**:
-Where the owner and Pip talk. The web workspace carries their continuous conversation.
-_Avoid_: A separate conversation for each channel
-
-**Card**:
-A structured message from Pip — a report, a question, a decision — that may carry buttons. A decision card is open until the owner handles it.
+Where the owner and Sig talk. Everything is the one local channel for now; the workspace and the owner API are two faces of it.
+_Avoid_: A separate conversation per channel or per surface.

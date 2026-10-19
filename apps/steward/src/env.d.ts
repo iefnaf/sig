@@ -1,12 +1,11 @@
-// SERVER_KEY, SERVER_KEY_PREVIOUS, and SETUP_TOKEN are `wrangler secret put` values, not
-// declared in wrangler.jsonc, so `wrangler types` doesn't know about them; merge them into
-// the generated ambient Env here instead (both the global interface used by src and
-// Cloudflare.Env, which is what cloudflare:test's `env` is typed as). SERVER_KEY_PREVIOUS is
-// the optional rotation-window key (issue #27): while set, tokens and sealed secrets made
-// under the old SERVER_KEY keep verifying. MODEL_KEY (issue #25) is the deploy-form model
-// provider key: consumed once to seed the sealed sh_model row, deletable afterwards.
-// FEISHU_API exists only in tests (a service binding that mocks Feishu's API); production
-// leaves it unset and the adapter uses fetch.
+// SERVER_KEY and SERVER_KEY_PREVIOUS are `wrangler secret put` values, not declared in
+// wrangler.jsonc, so `wrangler types` doesn't know about them; merge them into the generated
+// ambient Env here instead (both the global interface used by src and Cloudflare.Env, which
+// is what cloudflare:test's `env` is typed as). SERVER_KEY_PREVIOUS is the optional
+// rotation-window key (issue #27): while set, tokens and sealed secrets made under the old
+// SERVER_KEY keep verifying, and it also gates the owner API during the window (ADR-0003).
+// MODEL_KEY (issue #25) is the deploy-form model provider key: consumed once to seed the
+// sealed sh_model row, deletable afterwards.
 //
 // The steward model selection (issue #6, ADR-0001 decision 11): `STEWARD_MODEL` is deploy
 // config (the root wrangler.jsonc `vars`, JSON: {provider, modelId, baseUrl?}; default
@@ -18,17 +17,7 @@
 interface Env {
   SERVER_KEY: string;
   SERVER_KEY_PREVIOUS?: string;
-  ACCESS_TEAM_DOMAIN?: string;
-  ACCESS_AUD?: string;
-  OWNER_EMAIL?: string;
-  ACCESS_CERTS?: Fetcher;
-  SETUP_TOKEN?: string;
   MODEL_KEY?: string;
-  FEISHU_API?: Fetcher;
-  /** Deploy-time var written by `wrangler deploy` (ADR-0004): this deployment's exact identity. */
-  SHEPHERD_IDENTITY?: string;
-  /** Written by `shepherd connect`'s claim step through the Cloudflare API; consumed once at /pair. */
-  SHEPHERD_CLAIM_SECRET?: string;
   STEWARD_MODEL?: string | { provider?: unknown; modelId?: unknown; baseUrl?: unknown };
   // Issue #28 (steward.md §12): USD per UTC day for the daily budget soft cap. Unset →
   // budget.ts DEFAULT_DAILY_BUDGET_USD; 0 disables automatic model wakes entirely.
@@ -39,17 +28,7 @@ declare namespace Cloudflare {
   interface Env {
     SERVER_KEY: string;
     SERVER_KEY_PREVIOUS?: string;
-    ACCESS_TEAM_DOMAIN?: string;
-    ACCESS_AUD?: string;
-    OWNER_EMAIL?: string;
-    ACCESS_CERTS?: Fetcher;
-    /** Tests only: the private half of the key the simulated Access signs with. */
-    ACCESS_PRIVATE_JWK?: string;
-    SETUP_TOKEN?: string;
     MODEL_KEY?: string;
-    FEISHU_API?: Fetcher;
-    SHEPHERD_IDENTITY?: string;
-    SHEPHERD_CLAIM_SECRET?: string;
     STEWARD_MODEL?: string | { provider?: unknown; modelId?: unknown; baseUrl?: unknown };
     DAILY_BUDGET_USD?: string | number;
   }

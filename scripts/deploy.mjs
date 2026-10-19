@@ -1,12 +1,14 @@
-// The deploy command (ADR-0004): `npm run deploy` runs `wrangler deploy`, then stamps the
-// deployment's exact identity (SHEPHERD_IDENTITY: account id + script name) so claim grants
-// can be target-checked, and prints the one step left — connecting the first computer.
-// A Deploy-to-Cloudflare deployment runs this same script as its deploy command.
+// The deploy command (ADR-0007): `npm run deploy` wraps `wrangler deploy` and prints the
+// steps that make the deployment usable — setting SERVER_KEY (the owner API's auth, ADR-0003)
+// and connecting the first machine. A Deploy-to-Cloudflare deployment runs this same script
+// as its deploy command.
 //
-// `--name <name>` (ADR-0005) overrides the Worker name from wrangler.jsonc everywhere — the
-// deploy, the identity stamp, and the printed connect step. workers.dev addresses are global
-// across accounts, so the agent runbook deploys under a collision-safe unique name instead
-// of the repository default. `--dry-run` stops after the deploy build: no identity stamp.
+// `--name <name>` overrides the Worker name from wrangler.jsonc — the deploy and the printed
+// steps. workers.dev addresses are global across accounts, so the agent runbook deploys under
+// a collision-safe unique name instead of the repository default. `--dry-run` stops after the
+// deploy build. Secrets are NOT handled here on purpose: SERVER_KEY and MODEL_KEY go through
+// the deploy form or `wrangler secret put` (docs/deploy.md); an agent orchestrates them but
+// never observes them (ADR-0007's secret discipline).
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 
@@ -29,26 +31,19 @@ if (nameFlag !== -1) {
 const dryRun = args.includes("--dry-run");
 execFileSync("npx", ["-y", "wrangler", "deploy", ...(overrideName ? ["--name", overrideName] : []), ...args], { stdio: "inherit" });
 if (dryRun) {
-  console.log("\nshepherd: dry run — identity stamp and connect step skipped.");
+  console.log("\nshepherd: dry run — next-step hints skipped.");
   process.exit(0);
 }
 
-const whoami = JSON.parse(execFileSync("npx", ["-y", "wrangler", "whoami", "--json"], { encoding: "utf8", stdio: ["ignore", "pipe", "inherit"] }));
-const account = whoami.accounts?.[0] ?? whoami.account ?? whoami;
-if (!account?.id) {
-  console.error("\nshepherd: could not read the Cloudflare account — set SHEPHERD_IDENTITY manually if needed.");
-  process.exit(1);
-}
 const name = overrideName ?? JSON.parse(readFileSync("wrangler.jsonc", "utf8").replace(/\/\/[^\n]*/g, "")).name;
-const identity = JSON.stringify({ accountId: account.id, scriptName: name });
-// `wrangler vars put` does not exist in wrangler 4.x; a secret is env-readable the same way.
-execFileSync("npx", ["-y", "wrangler", "secret", "put", "SHEPHERD_IDENTITY", "--name", name], { input: identity, stdio: ["pipe", "inherit", "inherit"] });
-
 console.log(`
-Pip is live at the URL wrangler printed above. One step left: connect your first computer.
-On a computer you want Pip to work on, run:
+Sig is deployed as "${name}" at the URL wrangler printed above. Steps that make it yours:
 
-  npx @iefnaf/shepherd connect <your Pip URL>
+1. Set SERVER_KEY if the deploy form did not (the owner API's Bearer secret):
+     npx wrangler secret put SERVER_KEY --name ${name}
+   Generate one with: openssl rand -hex 32   (keep a copy — see docs/deploy.md)
+2. On the computer you want Sig to work on, pair it:
+     POST /api/pairing   (with the SERVER_KEY Bearer)  →  prints the exact connect command
+3. Open the workspace: POST /api/login-link gives a one-time sign-in URL.
 
-The first computer to authorize with your Cloudflare account claims this Pip.
 The full walk — or an agent that runs it for you — is docs/agent-deploy.md.`);

@@ -29,29 +29,30 @@ const vitestBin = path.join(root, "node_modules", ".bin", "vitest");
 // `vitest run --reporter=json` pass. Refresh when the mix changes materially.
 const COST = {
   "routing.test.ts": 45,
+  "worker-questions.test.ts": 55,
   "relay.test.ts": 26,
   "budget.test.ts": 25,
-  "worker-questions.test.ts": 55,
-  "qr-setup.test.ts": 26,
   "intervention.test.ts": 24,
   "review-regressions.test.ts": 21,
   "e2e-loop.test.ts": 19,
   "llm-reply.test.ts": 19,
+  "web-workspace.test.ts": 20,
+  "web-workspace-cards.test.ts": 18,
   "routines.test.ts": 14,
   "notes.test.ts": 11,
-  "handoff.test.ts": 4,
-  "history-relay.test.ts": 9,
-  "outbound-queue.test.ts": 6,
-  "ledger.test.ts": 5,
   "offline-dispatch.test.ts": 10,
+  "history-relay.test.ts": 9,
   "machine-status.test.ts": 7,
+  "ledger.test.ts": 5,
+  "handoff.test.ts": 4,
   "raw-process-page.test.ts": 4,
   "dispatch.test.ts": 4,
   "alarm.test.ts": 4,
   "web-auth.test.ts": 4,
   "web-pages.test.ts": 4,
-  "web-workspace.test.ts": 20,
-  "web-workspace-cards.test.ts": 18,
+  "ui-session.test.ts": 4,
+  "ui-modules.test.ts": 4,
+  "workspace-stream.test.ts": 12,
 };
 const DEFAULT_COST = 3;
 
@@ -92,12 +93,7 @@ function runVitest(args, tag) {
 const passthrough = process.argv.slice(2);
 if (passthrough.length > 0) {
   // Single serial run — one process, one workerd, exactly the pre-group-runner behavior.
-  // claim-* files run under their own config; everything else under the default one.
-  const claim = passthrough.filter((f) => /(^|\/)claim-/.test(f));
-  const rest = passthrough.filter((f) => !(/(^|\/)claim-/.test(f)));
-  let code = 0;
-  if (rest.length > 0) code = (await runVitest(["run", ...rest])).code;
-  if (claim.length > 0 && code === 0) code = (await runVitest(["run", "--config", "vitest.claim.config.ts", ...claim])).code;
+  const { code } = await runVitest(["run", ...passthrough]);
   process.exit(code);
 }
 

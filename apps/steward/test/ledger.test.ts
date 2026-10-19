@@ -6,8 +6,6 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   configureAndBind,
   connectAndHello,
-  mockCalls,
-  mockReset,
   ownerStub,
   pairDevice,
   resetLedgerState,
@@ -16,7 +14,6 @@ import {
 
 beforeEach(async () => {
   await resetLedgerState();
-  await mockReset();
   await configureAndBind("ou_owner");
 });
 
@@ -130,7 +127,7 @@ describe("the reducer: derived state, unread, notification intents (steward.md �
     expect(card).toContain("登录 bug 修好");
     expect(card).toContain("auth/session.ts 补上刷新");
     expect(card).toContain("shepherd/t-1");
-    expect(card).toContain('"green"'); // tone by nature: done is a success
+    expect(card).toContain("✅"); // tone by nature: done is a success
 
     await sendEvents(ws, [event(workerId, 4, { type: "settled", outcome: "reported" })]);
     snap = await snapshotWhere((s) => s.threads[0]?.workers[0]?.state === "idle", "worker idle after settled");
@@ -165,7 +162,7 @@ describe("the reducer: derived state, unread, notification intents (steward.md �
     await waitWhileOutboundPending();
     const card = JSON.stringify((await cardPayloads())[0]);
     expect(card).toContain("可以给你开 sudo 吗？");
-    expect(card).toContain('"orange"');
+    expect(card).toContain("⚠️");
     // The fallback card binds the question: a quote-reply routes the answer back to the worker.
     const rows = await ownerStub().outboundRows(10);
     expect(rows.some((r) => r.kind === "card" && (r as { questionId?: string | null }).questionId !== null)).toBe(true);
@@ -187,7 +184,7 @@ describe("the reducer: derived state, unread, notification intents (steward.md �
     expect(snap.threads[0]!.questions[0]!.text).toContain("凭据");
     await waitWhileOutboundPending();
     const card = JSON.stringify((await cardPayloads())[0]);
-    expect(card).toContain('"red"');
+    expect(card).toContain("❌");
     expect(card).toContain("凭据");
   });
 
@@ -268,11 +265,10 @@ describe("the reducer: derived state, unread, notification intents (steward.md �
     expect(snap.threads[0]!.unread).toBe(true);
     await waitWhileOutboundPending();
     const card = JSON.stringify((await cardPayloads())[0]);
-    expect(card).toContain('"red"');
+    expect(card).toContain("❌");
     expect(card).toContain("not_registered_repo");
     // the failure card still links the Thread, so a quote-reply routes back to it
     const rows = await ownerStub().outboundRows(10);
     expect(rows.some((r) => r.kind === "card" && r.threadId === snap.threads[0]!.threadId)).toBe(true);
-    void (await mockCalls());
   });
 });

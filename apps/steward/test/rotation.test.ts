@@ -11,12 +11,10 @@ import {
   configureAndBind,
   connectAndHello,
   messageEvent,
-  mockCalls,
   nextClose,
   ownerStub,
   postEvent,
   resetChannelState,
-  tokenCalls,
   waitWhileOutboundPending,
 } from "./helpers.ts";
 
@@ -25,8 +23,8 @@ const PREVIOUS_SECRET = env.SERVER_KEY_PREVIOUS!;
 
 type Sql = (strings: TemplateStringsArray, ...values: unknown[]) => unknown;
 
-/** Runs raw SQL inside the DO. Call an RPC (e.g. setupState) first on a cold DO so onStart's
- * migrations have run — pairedUnderOldKey does that itself. */
+/** Runs raw SQL inside the DO. Call an RPC first on a cold DO so onStart's migrations have
+ * run — insertDevice does that itself. */
 async function execSql(fn: (sql: Sql) => void): Promise<void> {
   await runInDurableObject(ownerStub(), (instance: Steward) => {
     const sql = (instance as unknown as { sql: Sql }).sql.bind(instance);
@@ -45,15 +43,9 @@ async function envKeys(): Promise<ServerKey[]> {
   return [await serverKey(PRIMARY_SECRET), await serverKey(PREVIOUS_SECRET)];
 }
 
-/** The DO's actual key set (ADR-0004: the auth root leads, the legacy env keys follow). */
-async function doKeys(): Promise<ServerKey[]> {
-  const keys = await ownerStub().authKeys();
-  return keys;
-}
-
 async function insertDevice(deviceId: string, name: string): Promise<void> {
   // RPC first: wakes the DO through the SDK lifecycle so migrations have run.
-  await ownerStub().setupState();
+  await ownerStub().channelLogEntries(1);
   await execSql((sql) => {
     sql`INSERT OR REPLACE INTO device (deviceId, name, epoch, revoked, createdAt) VALUES (${deviceId}, ${name}, 1, 0, ${Date.now()})`;
   });
@@ -97,8 +89,8 @@ describe("SERVER_KEY rotation: device tokens (issue #27)", () => {
     const rekeyed = first.welcome.token as string;
     expect(typeof rekeyed).toBe("string");
 
-    const [primary] = await doKeys();
-    expect(await parseToken([primary!], rekeyed)).toMatchObject({ deviceId: "dev_rot_rekey", epoch: 1, keyId: primary!.id });
+    const primary = await serverKey(PRIMARY_SECRET);
+    expect(await parseToken([primary], rekeyed)).toMatchObject({ deviceId: "dev_rot_rekey", epoch: 1, keyId: primary.id });
 
     // The rekeyed token authenticates the next connection — and needs no further rekey.
     const second = await connectAndHello("dev_rot_rekey", rekeyed, 2);
@@ -111,32 +103,29 @@ describe("SERVER_KEY rotation: device tokens (issue #27)", () => {
     const legacy = await legacyTokenUnderOldKey("dev_rot_legacy");
     const { welcome } = await connectAndHello("dev_rot_legacy", legacy, 1);
     expect(typeof welcome.token).toBe("string");
-    const [primary] = await doKeys();
-    expect(await parseToken([primary!], welcome.token as string)).toMatchObject({ deviceId: "dev_rot_legacy", keyId: primary!.id });
+    const primary = await serverKey(PRIMARY_SECRET);
+    expect(await parseToken([primary], welcome.token as string)).toMatchObject({ deviceId: "dev_rot_legacy", keyId: primary.id });
   });
 
   it("once SERVER_KEY_PREVIOUS is dropped, previous-key tokens are refused at the DO layer", async () => {
     const token = await pairedUnderOldKey("dev_rot_dropped");
-    // Simulate the window closing: only the DO's own primary (the auth root) remains.
-    const [primary] = await doKeys();
-    await overrideKeys([primary!]);
+    // Simulate the operator closing the window: only the new primary remains configured.
+    await overrideKeys([await serverKey(PRIMARY_SECRET)]);
     try {
-      // The Worker's pre-check and the DO now share one live key set (ADR-0004: the fixture
-      // asks the DO), so a dropped key is refused at the door already.
       const res = await connect(token);
-      expect(res.status).toBe(401);
+      expect(res.status).toBe(101); // the Worker precheck still has the old env…
+      const ws = res.webSocket!;
+      ws.accept();
+      const closed = await nextClose(ws); // …but the DO layer refuses the stale key
+      expect(closed.code).toBe(4401);
     } finally {
-      // restore: clear the override so serverKeys() returns to its own derivation
-      await runInDurableObject(ownerStub(), (instance: Steward) => {
-        delete (instance as unknown as { serverKeys?: unknown }).serverKeys;
-      });
+      await overrideKeys(await envKeys());
     }
   });
 
   it("a primary-key token is not rekeyed (no rotation in progress)", async () => {
     await insertDevice("dev_rot_current", "fresh-machine");
-    const [primary] = await doKeys();
-    const token = await mintToken(primary!, "dev_rot_current", 1);
+    const token = await mintToken(await serverKey(PRIMARY_SECRET), "dev_rot_current", 1);
     const { welcome } = await connectAndHello("dev_rot_current", token, 1);
     expect(welcome.token).toBeUndefined();
   });
@@ -146,39 +135,6 @@ describe("SERVER_KEY rotation: sealed secrets (issue #27)", () => {
   beforeEach(async () => {
     await resetChannelState();
     await overrideKeys(await envKeys());
-  });
-
-  it("Feishu secrets sealed under the old key keep opening during the window and re-seal onto the primary", async () => {
-    await configureAndBind("ou_rot");
-    const before = await readChannelEnc("appSecretEnc");
-    expect(before).toMatch(/^v2\./);
-
-    // Simulate rotation: a brand-new primary, the old primary demoted to previous.
-    const freshPrimary = await serverKey("rotated-fresh-server-key");
-    const oldPrimary = await serverKey(PRIMARY_SECRET);
-    await overrideKeys([freshPrimary, oldPrimary]);
-
-    // Any read (here: a webhook event) opens via the demoted key and re-seals under the new one.
-    const res = await postEvent(messageEvent({ msgId: "om_rot", senderId: "ou_rot", text: "still works" }));
-    expect(res.status).toBe(200);
-
-    const after = await readChannelEnc("appSecretEnc");
-    expect(after).not.toBe(before);
-    expect(await openSecret([freshPrimary], after)).toMatchObject({ text: "sec_test_secret" });
-    expect(await ownerStub().inboundSeen("om_rot")).toBe(true);
-  });
-
-  it("the cached Feishu tenant_access_token is sealed at rest as well", async () => {
-    await configureAndBind("ou_tenant"); // setup validation fetches and caches a tenant token
-    expect((await tokenCalls(await mockCalls())).length).toBeGreaterThan(0);
-    const enc = await runInDurableObject(ownerStub(), (instance: Steward) => {
-      const sql = (instance as unknown as { sql: Sql }).sql.bind(instance);
-      return (sql`SELECT tokenEnc FROM sh_channel_token WHERE channel = 'feishu'` as { tokenEnc: string }[])[0]!.tokenEnc;
-    });
-    expect(enc).toMatch(/^v2\./);
-    const opened = await openSecret(await envKeys(), enc);
-    expect(opened?.text).toMatch(/^t_mock_/);
-    await waitWhileOutboundPending();
   });
 
   it("model API key is stored encrypted and round-trips across a rotation", async () => {
@@ -201,16 +157,6 @@ describe("SERVER_KEY rotation: sealed secrets (issue #27)", () => {
   });
 });
 
-async function readChannelEnc(column: "appSecretEnc" | "verificationTokenEnc"): Promise<string> {
-  return runInDurableObject(ownerStub(), (instance: Steward) => {
-    const sql = (instance as unknown as { sql: Sql }).sql.bind(instance);
-    const rows =
-      column === "appSecretEnc"
-        ? (sql`SELECT appSecretEnc AS enc FROM sh_channel WHERE channel = 'feishu'` as { enc: string }[])
-        : (sql`SELECT verificationTokenEnc AS enc FROM sh_channel WHERE channel = 'feishu'` as { enc: string }[]);
-    return rows[0]!.enc;
-  });
-}
 
 async function readModelRow(): Promise<{ provider: string; apiKeyEnc: string }> {
   return runInDurableObject(ownerStub(), (instance: Steward) => {

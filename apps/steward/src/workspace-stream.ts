@@ -1,4 +1,4 @@
-// Live replies (ADR-0002): while Pip is writing an answer, an open workspace shows the words as
+// Live replies (ADR-0004): while the agent is writing an answer, an open workspace shows the words as
 // they arrive. This is the only place that touches pi's experimental agent-event stream
 // (`session.events()`, pinned at 1.3.0): everything else in the workspace is plain ledger data
 // that a "something changed" nudge tells the page to refetch. If the stream changes shape or

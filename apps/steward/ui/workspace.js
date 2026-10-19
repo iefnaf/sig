@@ -1,4 +1,4 @@
-// The Pip workspace: one continuous conversation, the threads behind it, and the decisions
+// The Sig web workspace: one continuous conversation, the threads behind it, and the decisions
 // waiting for the owner. This file is the view and the wiring; what to show is decided by the
 // pure helpers in model.js and format.js. Data comes from /app/api/workspace and is kept
 // current by a WebSocket that only says "something changed" (the page then refetches).
@@ -31,7 +31,7 @@ const state = {
   connection: 'connecting',
   fatal: null, // 'signed_out' | 'logged_out' | 'unreachable'
   knownAttention: new Set(),
-  live: null, // the reply Pip is writing right now: { text, threadId, ending }
+  live: null, // the reply Sig is writing right now: { text, threadId, ending }
   skew: 0, // server clock minus this browser's clock, so relative times agree with the server's timestamps
   session: null, // within the selected thread: the worker whose recorded session fills the main pane
   viewer: null, // { workerId, handle } while that pane is mounted
@@ -218,7 +218,7 @@ function userMessage(message) {
 
 function assistantMessage(message) {
   return h('article', { class: 'message', id: message.id },
-    h('div', { class: 'message-header' }, h('img', { class: 'pip-avatar', src: '/app/assets/pip-mark.svg', width: 26, height: 26, alt: '' }), 'Pip', h('span', { class: 'message-time' }, formatClock(message.at))),
+    h('div', { class: 'message-header' }, h('img', { class: 'agent-avatar', src: '/brand/sig.svg', width: 26, height: 26, alt: '' }), 'Sig', h('span', { class: 'message-time' }, formatClock(message.at))),
     h('div', { class: 'message-body' },
       state.selected ? null : threadReference(message.threadId),
       message.card ? cardNode(message.card, message.id, message.open === true) : markup(message.text ?? '')));
@@ -227,7 +227,7 @@ function assistantMessage(message) {
 /** The reply being written, shown as it arrives; the finished message replaces it. */
 function liveMessage(live) {
   return h('article', { class: 'message live', id: 'live-reply' },
-    h('div', { class: 'message-header' }, h('img', { class: 'pip-avatar', src: '/app/assets/pip-mark.svg', width: 26, height: 26, alt: '' }), 'Pip'),
+    h('div', { class: 'message-header' }, h('img', { class: 'agent-avatar', src: '/brand/sig.svg', width: 26, height: 26, alt: '' }), 'Sig'),
     h('div', { class: 'message-body' }, markup(trimOpenMarkup(live.text)), h('span', { class: 'working-dots' }, h('i'), h('i'), h('i'))));
 }
 
@@ -246,7 +246,7 @@ function renderFeed(stick) {
     const nearBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 40;
     const oldTop = feed.scrollTop;
 
-    $('#conversation-title').textContent = thread ? thread.title : 'Pip';
+    $('#conversation-title').textContent = thread ? thread.title : 'Sig';
     $('#conversation-subtitle').textContent = thread
       ? [thread.repos.join(', '), [...new Set(thread.workers.map((worker) => worker.agent))].join(', '), thread.machine].filter(Boolean).join(' · ')
       : t('allThreads');
@@ -637,7 +637,7 @@ function renderFatal() {
   }
   const [title, body] = FATAL_COPY[state.fatal];
   const next = h('div', { class: 'fatal', id: 'fatal', role: 'alertdialog', 'aria-labelledby': 'fatal-title' },
-    h('div', { class: 'fatal-box' }, h('img', { src: '/app/assets/pip-mark.svg', alt: '' }), h('h2', { id: 'fatal-title' }, t(title)), h('p', null, t(body))));
+    h('div', { class: 'fatal-box' }, h('img', { src: '/brand/sig.svg', alt: '' }), h('h2', { id: 'fatal-title' }, t(title)), h('p', null, t(body))));
   if (current) current.replaceWith(next);
   else document.body.append(next);
 }
@@ -906,7 +906,7 @@ async function signOut() {
   unmountViewer();
   closeDialog();
   renderFatal();
-  location.assign('/app'); // back to the sign-in page (ADR-0004: the way in is a machine-minted one-time link)
+  location.assign('/app'); // back to the sign-in page (ADR-0003/0005: the way in is a one-time link minted through the owner API)
 }
 
 // ---- settings, pairing, revoking ---------------------------------------------------------------------------

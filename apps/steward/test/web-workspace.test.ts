@@ -1,4 +1,4 @@
-// The Pip web workspace's server side (ADR-0002, spec §7.3): the snapshot the page draws, owner
+// The web workspace's server side (ADR-0004, spec §7.3): the snapshot the page draws, owner
 // messages and card taps arriving over the signed session, replies that stay on the web, the
 // live nudge, and the static files. Everything runs the production path — real Worker, real
 // Durable Object, the scripted model — with the browser played by plain fetch.
@@ -11,8 +11,6 @@ import {
   configureAndBind,
   llmState,
   messageEvent,
-  mockCalls,
-  mockReset,
   modelRequests,
   ownerDm,
   ownerStub,
@@ -30,7 +28,6 @@ const BASE = "https://example.com";
 
 beforeEach(async () => {
   await resetLedgerState();
-  await mockReset();
   await configureAndBind("ou_owner");
 });
 
@@ -105,27 +102,26 @@ describe("the snapshot", () => {
     fake.close();
   });
 
-  it("shows what the owner said on either channel as they said it, and keeps credentials out", async () => {
-    await scriptModel(fauxAssistantMessage([fauxText("Hello from Pip.")]));
-    await postEvent(messageEvent({ msgId: "om_visible_1", text: "Plain <b>words</b> from Feishu" }));
+  it("shows what the owner said as they said it, and keeps credentials out", async () => {
+    await scriptModel(fauxAssistantMessage([fauxText("Hello from the local channel.")]));
+    await postEvent(messageEvent({ msgId: "om_visible_1", text: "Plain <b>words</b> over the API" }));
     await waitRunsSettled();
     await waitWhileOutboundPending();
-    const { get } = await browser(); // logging in sends `/网页`, whose reply carries a one-time link
+    const { get } = await browser();
     const workspace = await get();
     const mine = workspace.messages.filter((message) => message.role === "user");
-    expect(mine).toEqual([expect.objectContaining({ channel: "feishu", text: "Plain <b>words</b> from Feishu" })]);
-    expect(workspace.messages).toContainEqual(expect.objectContaining({ role: "assistant", channel: "feishu", text: "Hello from Pip." }));
+    expect(mine).toEqual([expect.objectContaining({ channel: "local", text: "Plain <b>words</b> over the API" })]);
+    expect(workspace.messages).toContainEqual(expect.objectContaining({ role: "assistant", channel: "local", text: "Hello from the local channel." }));
+    // The API's own login-link mint is a credential: delivered to the owner, never listed
+    // in the conversation (the outbound payload's private flag).
     const everything = JSON.stringify(workspace);
     expect(everything).not.toContain("/link/");
-    expect(everything).not.toContain("/网页");
-    expect(everything).not.toContain("已绑定"); // channel setup chatter stays in Feishu
   });
 });
 
 describe("owner messages", () => {
-  it("are persisted once, keep their words, and are answered on the web without touching Feishu", async () => {
+  it("are persisted once, keep their words, and are answered in the same conversation", async () => {
     const { get, post, csrf } = await browser();
-    await mockCalls();
     await scriptModel(fauxAssistantMessage([fauxText("Ready when you are.")]));
     const text = "Hello <script> · ⟦user text⟧";
     expect((await post("messages", { id: "message-001", text }, { csrf: "wrong" })).status).toBe(403);
@@ -136,10 +132,9 @@ describe("owner messages", () => {
     expect((await llmState()).runs).toHaveLength(1);
     expect((await post("messages", { id: "message-001", text: "changed content" })).status).toBe(409);
     const workspace = await get();
-    expect(workspace.messages.filter((m) => m.role === "user" && m.text === text)).toEqual([expect.objectContaining({ id: "user:web:message-001", channel: "web" })]);
-    expect(workspace.messages).toContainEqual(expect.objectContaining({ role: "assistant", channel: "web", text: "Ready when you are." }));
-    expect((await ownerStub().outboundRows(100)).find((r) => r.id === "reply:user:web:message-001")).toMatchObject({ channel: "web", status: "sent" });
-    expect((await mockCalls()).filter((call) => call.path.startsWith("/open-apis/im/v1/messages"))).toHaveLength(0);
+    expect(workspace.messages.filter((m) => m.role === "user" && m.text === text)).toEqual([expect.objectContaining({ id: "user:web:message-001", channel: "local" })]);
+    expect(workspace.messages).toContainEqual(expect.objectContaining({ role: "assistant", channel: "local", text: "Ready when you are." }));
+    expect((await ownerStub().outboundRows(100)).find((r) => r.id === "reply:user:web:message-001")).toMatchObject({ channel: "local", status: "sent" });
     expect(csrf).toHaveLength(64);
   });
 
@@ -206,7 +201,7 @@ describe("card taps", () => {
     await waitRunsSettled();
     const [card] = (await get()).attention;
     expect(card?.buttons).toHaveLength(2);
-    expect((await ownerStub().outboundRows(100)).find((r) => r.id === card!.id)).toMatchObject({ channel: "web" });
+    expect((await ownerStub().outboundRows(100)).find((r) => r.id === card!.id)).toMatchObject({ channel: "local" });
     expect((await post("actions", { id: "choice-forged", cardId: card!.id, action: "pr_approve" })).status).toBe(400);
     expect((await post("actions", { id: "choice-ghost1", cardId: "ask:424242", action: "ask:x:0" })).status).toBe(404);
     expect((await post("actions", { id: "choice-badbody", cardId: card!.id })).status).toBe(400);
@@ -223,7 +218,7 @@ describe("card taps", () => {
     const conflict = await post("actions", { ...choice, action: card!.buttons[1]!.action }); // the same request id may not mean another tap
     expect([conflict.status, ((await conflict.json()) as { error: string }).error]).toEqual([409, "id_conflict"]);
     expect((await llmState()).runs).toHaveLength(2);
-    expect((await ownerStub().outboundRows(100)).find((r) => r.id === "reply:user:web:choice-001")).toMatchObject({ channel: "web" });
+    expect((await ownerStub().outboundRows(100)).find((r) => r.id === "reply:user:web:choice-001")).toMatchObject({ channel: "local" });
   });
 });
 
@@ -365,7 +360,7 @@ describe("the page and its files", () => {
     expect(script.headers.get("x-content-type-options")).toBe("nosniff");
     expect(script.headers.get("cache-control")).toContain("private");
     expect((await SELF.fetch(`${BASE}/app/assets/workspace.css`, { headers: { cookie } })).headers.get("content-type")).toContain("text/css");
-    expect((await SELF.fetch(`${BASE}/app/assets/pip-mark.svg`, { headers: { cookie } })).headers.get("content-type")).toContain("image/svg+xml");
+    expect((await SELF.fetch(`${BASE}/app/assets/i18n.js`, { headers: { cookie } })).status).toBe(200);
     expect((await SELF.fetch(`${BASE}/app/assets/workspace.js`)).status).toBe(401);
     for (const name of ["nope.js", "..%2Fpackage.json", ".hidden", "a/b.js", "%2e%2e/steward.ts"]) {
       expect((await SELF.fetch(`${BASE}/app/assets/${name}`, { headers: { cookie } })).status).toBe(404);

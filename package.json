@@ -1,5 +1,5 @@
 {
-  "name": "shepherd",
+  "name": "sig",
   "private": true,
   "type": "module",
   "engines": {
@@ -16,8 +16,11 @@
   },
   "cloudflare": {
     "bindings": {
+      "SERVER_KEY": {
+        "description": "Random secret that signs connector device tokens, seals the model key at rest, and authenticates the owner API (Bearer). Generate one now: `openssl rand -hex 32` (keep a copy; see [rotating it](docs/deploy.md#secrets-and-rotation))."
+      },
       "MODEL_KEY": {
-        "description": "Your model provider's API key (default provider: DeepSeek — get one at [platform.deepseek.com](https://platform.deepseek.com)). Stored encrypted in your own Cloudflare account. You can leave this empty now and paste it into the workspace's Settings later. After deploying, protect the workspace with Cloudflare Access and set OWNER_EMAIL, ACCESS_TEAM_DOMAIN and ACCESS_AUD — until then the workspace stays closed (see docs/deploy.md)."
+        "description": "Your model provider's API key (default provider: DeepSeek — get one at [platform.deepseek.com](https://platform.deepseek.com)). Stored encrypted in your own Cloudflare account. You can leave this empty for now and set it later with `wrangler secret put MODEL_KEY`, or paste it into the web workspace's Settings page after signing in."
       }
     }
   },

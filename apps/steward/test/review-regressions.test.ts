@@ -9,7 +9,6 @@ import {
   configureAndBind,
   llmState,
   messageEvent,
-  mockReset,
   modelRequests,
   ownerStub,
   pairDevice,
@@ -28,7 +27,6 @@ import type { Ledger } from "../src/ledger.ts";
 
 beforeEach(async () => {
   await resetLedgerState();
-  await mockReset();
   await configureAndBind("ou_owner");
 });
 

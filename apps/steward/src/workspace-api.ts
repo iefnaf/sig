@@ -1,4 +1,4 @@
-// The Pip workspace's HTTP API (ADR-0002): one read endpoint and four owner mutations, all
+// The workspace's HTTP API (ADR-0004): one read endpoint and four owner mutations, all
 // behind the signed session cookie the Worker already verified. Mutations additionally need
 // the session's CSRF token in a header, a same-origin Origin, and a JSON body — so a form
 // post or a cross-site fetch can never act for the owner. Every mutation carries a client
@@ -118,7 +118,7 @@ export async function handleWorkspaceApi(request: Request, url: URL, session: Ap
       const { id } = await readJson(request);
       if (typeof id !== "string" || !REQUEST_ID.test(id)) return json({ error: "bad_request" }, 400);
       const pair = await deps.pairing(id);
-      return json({ ...pair, command: `npx @iefnaf/shepherd connect ${url.origin} ${pair.code}` });
+      return json({ ...pair, command: `npx @iefnaf/sig connect ${url.origin} ${pair.code}` });
     }
     if (url.pathname === "/app/api/settings/model" && deps.saveModel) {
       const { apiKey } = await readJson(request);

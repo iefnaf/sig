@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Shepherd's MCP server for Claude Code workers (issue #17, spike-conclusions §2 "Claude
+// Sig's MCP server for Claude Code workers (issue #17, spike-conclusions §2 "Claude
 // Code headless"): a minimal stdio MCP server exposing exactly one tool — `report` — with
 // the connector-pi.md §7.2 fields. LF-delimited JSON-RPC 2.0; initialize → tools/list →
 // tools/call is the whole conversation (~40 lines in the spike, kept that small here).
@@ -24,7 +24,7 @@ const SERVER_INFO = { name: "shepherd-report", version: "1.0.0" };
 const REPORT_TOOL = {
   name: "report",
   description:
-    "Report the outcome of this task to the user via Shepherd. This must be your LAST " +
+    "Report the outcome of this task to the user via Sig. This must be your LAST " +
     "action when the task is finished, blocked, or needs a user decision. Put questions " +
     "for the user in `question` (with status needs_decision); do not ask in plain text.",
   inputSchema: {
