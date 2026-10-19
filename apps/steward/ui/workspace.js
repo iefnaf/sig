@@ -7,7 +7,9 @@
 // or a repository contains is ever parsed as HTML.
 import { h, icon, paintIcons } from './dom.js';
 import { applyStatic, getLocale, localeTag, setLocale, t, tOr } from './i18n.js';
-import { dayKey, formatClock, formatDay, formatRelative, formatUsd, parseMarkup, trimOpenMarkup } from './format.js';
+import { dayKey, formatClock, formatDay, formatRelative, formatUsd, trimOpenMarkup } from './format.js';
+import { markup } from './markup.js';
+import { mountSessionViewer } from './session.js';
 import {
   ACTION_KEYS, FATAL_COPY, KNOWN_TITLES, attentionFor, groupByDay, groupThreads, isActiveWorker, messagesFor, previewOf, summarize, withPending, workOn,
 } from './model.js';
@@ -31,6 +33,10 @@ const state = {
   knownAttention: new Set(),
   live: null, // the reply Pip is writing right now: { text, threadId, ending }
   skew: 0, // server clock minus this browser's clock, so relative times agree with the server's timestamps
+  session: null, // within the selected thread: the worker whose recorded session fills the main pane
+  viewer: null, // { workerId, handle } while that pane is mounted
+  settings: null, // { claimed, model } from /app/api/settings
+  keyDraft: '', // the model key being typed; kept out of the dialog's redraw signature
 };
 
 // ---- small pieces ---------------------------------------------------------------------------------
@@ -77,31 +83,6 @@ function preservingFocus(container, render) {
 
 function stateBadge(value) {
   return h('span', { class: `state-badge ${stateClass(value)}` }, h('span', { class: `status-dot ${stateColor(value)}` }), stateLabel(value));
-}
-
-// ---- text with markup ------------------------------------------------------------------------------
-
-function inline(parts) {
-  return parts.map((part) => {
-    if (part.t === 'code') return h('code', null, part.text);
-    if (part.t === 'strong') return h('strong', null, part.text);
-    if (part.t === 'em') return h('em', null, part.text);
-    if (part.t === 'del') return h('del', null, part.text);
-    if (part.t === 'link') return h('a', { href: part.href, target: '_blank', rel: 'noopener noreferrer', title: part.href }, part.text);
-    return part.text;
-  });
-}
-
-function markup(text) {
-  const blocks = parseMarkup(text).map((block) => {
-    if (block.t === 'code') return h('pre', null, block.text);
-    if (block.t === 'ul' || block.t === 'ol') return h(block.t, null, block.items.map((item) => h('li', null, inline(item))));
-    if (block.t === 'h') return h(block.level <= 2 ? 'h4' : 'h5', { class: 'mk-h' }, inline(block.lines[0]));
-    if (block.t === 'quote') return h('blockquote', { class: 'mk-quote' }, block.lines.flatMap((line, index) => (index === 0 ? [inline(line)] : [h('br'), inline(line)])));
-    if (block.t === 'hr') return h('hr', { class: 'mk-hr' });
-    return h('p', null, block.lines.flatMap((line, index) => (index === 0 ? [inline(line)] : [h('br'), inline(line)])));
-  });
-  return h('div', { class: 'markup' }, blocks);
 }
 
 // ---- cards ----------------------------------------------------------------------------------------------
@@ -292,6 +273,118 @@ function renderFeed(stick) {
   });
 }
 
+// ---- the main pane: the conversation, or one worker's recorded session --------------------------------------
+
+const agentName = (agent) => ({ pi: 'pi', 'claude-code': 'Claude Code' }[agent] ?? agent);
+
+function urlFor(threadId, workerId) {
+  return threadId ? `/app/threads/${threadId}${workerId ? `/workers/${workerId}` : ''}` : '/app';
+}
+
+function findWorker(workerId) {
+  for (const thread of state.snapshot?.threads ?? []) {
+    const worker = thread.workers.find((entry) => entry.id === workerId);
+    if (worker) return worker;
+  }
+  return null;
+}
+
+function unmountViewer() {
+  state.viewer?.handle.destroy();
+  state.viewer = null;
+}
+
+/** Conversation | Agent sessions: the two ways to look at one thread. */
+function viewTabs(thread, active) {
+  return [
+    h('button', { type: 'button', class: 'view-tab', dataset: { view: 'conversation', focus: 'view:conversation' }, 'aria-pressed': String(active === 'conversation') }, icon('chat'), t('tabConversation')),
+    h('button', { type: 'button', class: 'view-tab', dataset: { view: 'sessions', focus: 'view:sessions' }, 'aria-pressed': String(active === 'sessions'), disabled: thread.workers.length ? null : true },
+      icon('layers'), t('tabSessions'), thread.workers.length ? h('span', { class: 'view-count' }, String(thread.workers.length)) : null),
+  ];
+}
+
+function renderTabs() {
+  const thread = state.selected && !state.session ? threadById(state.selected) : null;
+  const tabs = $('#view-tabs');
+  redraw('tabs', [getLocale(), thread?.id ?? null, thread?.workers.length ?? 0], () => {
+    tabs.hidden = !thread || thread.workers.length === 0;
+    tabs.replaceChildren(...(thread ? viewTabs(thread, 'conversation') : []));
+  });
+}
+
+const stateBadgeInline = (worker) => h('span', { class: 'worker-state' }, h('span', { class: `status-dot ${isActiveWorker(worker) ? 'green' : 'gray'}` }), tOr(`worker${cap(worker.state)}`, worker.state));
+
+function renderSessionHeader(thread, worker) {
+  const machine = worker.machine ?? '';
+  redraw('session-header', [getLocale(), thread.id, thread.title, worker.id, worker.state, worker.branch, worker.createdAt, thread.workers.map((entry) => [entry.id, entry.state]), minuteBucket()], () => {
+    $('#session-title').textContent = t('sessionTitle', { agent: agentName(worker.agent), machine });
+    const subtitle = $('#session-subtitle');
+    subtitle.replaceChildren(thread.title, ' · ', stateBadgeInline(worker));
+    $('#session-tabs').replaceChildren(...viewTabs(thread, 'sessions'));
+    const toolbar = $('#session-toolbar');
+    const sessions = [...thread.workers].sort((a, b) => b.createdAt - a.createdAt);
+    toolbar.hidden = sessions.length < 2;
+    if (sessions.length < 2) {
+      toolbar.replaceChildren();
+      return;
+    }
+    const select = h('select', { id: 'session-picker', 'aria-label': t('sessionPicker') },
+      sessions.map((entry) => h('option', { value: entry.id, selected: entry.id === worker.id ? true : null },
+        [agentName(entry.agent), entry.machine, entry.branch, tOr(`worker${cap(entry.state)}`, entry.state), ago(entry.createdAt)].filter(Boolean).join(' · '))));
+    select.addEventListener('change', () => go({ thread: thread.id, worker: select.value }));
+    toolbar.replaceChildren(h('label', { class: 'session-picker', for: 'session-picker' }, h('span', null, t('sessionPicker')), select));
+  });
+}
+
+function renderPane() {
+  const thread = state.selected ? threadById(state.selected) : null;
+  const worker = thread && state.session ? thread.workers.find((entry) => entry.id === state.session) ?? null : null;
+  $('.conversation').hidden = Boolean(worker);
+  $('#session-view').hidden = !worker;
+  if (!worker) {
+    unmountViewer();
+    return;
+  }
+  renderSessionHeader(thread, worker);
+  if (state.viewer?.workerId === worker.id) {
+    state.viewer.handle.update();
+    return;
+  }
+  unmountViewer();
+  state.viewer = {
+    workerId: worker.id,
+    handle: mountSessionViewer($('#session-body'), {
+      workerId: worker.id,
+      agentLabel: agentName(worker.agent),
+      isActive: () => {
+        const live = findWorker(worker.id);
+        return live ? isActiveWorker(live) : false;
+      },
+      isReachable: () => {
+        const live = findWorker(worker.id);
+        return Boolean(live && !live.unreachable && state.snapshot.machines.some((machine) => machine.name === live.machine && machine.online));
+      },
+    }),
+  };
+}
+
+/** The first thing a new deployment needs: a model key, then a machine. One notice at a time. */
+function renderSetup() {
+  const banner = $('#setup-banner');
+  const needsKey = state.settings !== null && !state.settings.model?.apiKey;
+  const needsMachine = !needsKey && state.snapshot.machines.every((machine) => machine.revoked);
+  const which = needsKey ? 'model' : needsMachine ? 'machine' : null;
+  redraw('setup', [getLocale(), which], () => {
+    banner.hidden = which === null;
+    const forKey = which === 'model';
+    banner.replaceChildren(...(which === null ? [] : [
+      icon(forKey ? 'shield' : 'laptop'),
+      h('span', null, forKey ? t('setupModel') : t('setupMachine')),
+      h('button', { type: 'button', class: 'button primary', dataset: { action: forKey ? 'account' : 'machines', focus: 'setup' } }, forKey ? t('setupModelAction') : t('setupMachineAction')),
+    ]));
+  });
+}
+
 // ---- the composer ---------------------------------------------------------------------------------------
 
 function resizeInput() {
@@ -349,7 +442,7 @@ function workerNode(thread, worker) {
   const pr = worker.pr;
   return h('div', { class: 'worker-card' },
     h('div', { class: 'worker-title' },
-      h('span', null, h('span', { class: 'agent-icon' }, worker.agent === 'pi' ? 'π' : worker.agent === 'claude' ? '✳' : worker.agent.slice(0, 1).toUpperCase()), worker.agent),
+      h('span', null, h('span', { class: 'agent-icon' }, worker.agent === 'pi' ? 'π' : worker.agent.startsWith('claude') ? '✳' : worker.agent.slice(0, 1).toUpperCase()), agentName(worker.agent)),
       h('span', { class: 'worker-state' }, h('span', { class: `status-dot ${active ? 'green' : 'gray'}` }), tOr(`worker${cap(worker.state)}`, worker.state))),
     h('div', { class: 'worker-meta' }, [worker.machine, worker.unreachable ? t('unreachable') : null].filter(Boolean).join(' · ')),
     worker.branch ? h('code', null, worker.branch) : null,
@@ -361,7 +454,7 @@ function workerNode(thread, worker) {
         : pr?.decision === 'approved' ? h('p', { class: 'worker-pr' }, t('prPending'))
           : pr?.decision === 'declined' ? h('p', { class: 'worker-pr' }, t('prDeclined')) : null,
     worker.sessionId !== null || active
-      ? h('div', { class: 'worker-actions' }, h('a', { href: `/app/threads/${thread.id}/workers/${worker.id}`, target: '_blank', rel: 'noopener' }, t('rawHistory'), icon('external'))) : null);
+      ? h('div', { class: 'worker-actions' }, h('a', { href: urlFor(thread.id, worker.id), dataset: { nav: thread.id, worker: worker.id, focus: `session:${worker.id}` } }, t('rawHistory'), icon('chevron-right'))) : null);
 }
 
 function renderContext() {
@@ -420,13 +513,55 @@ function machineCard(machine) {
   const status = machine.revoked ? t('revoked') : machine.online ? t('online') : t('offline');
   const detail = machine.revoked ? '' : machine.online ? t('slots', { used: machine.slots?.running ?? 0, total: machine.slots?.max ?? 0 })
     : machine.lastSeen ? t('lastSeen', { time: ago(machine.lastSeen) }) : t('neverConnected');
+  const confirming = state.dialog?.confirm === machine.id;
   return h('section', { class: `machine-card${machine.revoked ? ' revoked' : ''}` },
     h('h3', null, icon('laptop'), h('span', null, machine.name), h('span', { class: 'machine-availability' }, h('span', { class: `status-dot ${machine.online ? 'green' : 'gray'}` }), status)),
     detail ? h('p', null, detail) : null,
     h('dl', null,
       h('div', null, h('dt', null, t('agents')), h('dd', null, machine.agents.join(', ') || t('noneListed'))),
       h('div', null, h('dt', null, t('repositories')), h('dd', null, machine.repos.join(', ') || t('noneListed'))),
-      work.length ? h('div', null, h('dt', null, t('running')), h('dd', null, work.map((entry) => entry.title).join(' · '))) : null));
+      work.length ? h('div', null, h('dt', null, t('running')), h('dd', null, work.map((entry) => entry.title).join(' · '))) : null),
+    machine.revoked ? null : confirming
+      ? h('div', { class: 'revoke-confirm' },
+        h('p', null, t('revokeConfirm', { name: machine.name })),
+        h('div', { class: 'dialog-actions' },
+          h('button', { type: 'button', class: 'button danger', dataset: { action: 'revoke-yes', machine: machine.id, focus: `revoke-yes:${machine.id}` } }, t('revokeConfirmAction')),
+          h('button', { type: 'button', class: 'button', dataset: { action: 'revoke-no', focus: `revoke-no:${machine.id}` } }, t('actionCancel'))))
+      : h('div', { class: 'dialog-actions' }, h('button', { type: 'button', class: 'button danger', dataset: { action: 'revoke', machine: machine.id, focus: `revoke:${machine.id}` } }, t('revokeMachine'))));
+}
+
+function pairingSection() {
+  const pairing = state.dialog.pairing;
+  const ready = pairing && typeof pairing === 'object';
+  return h('section', { class: 'pairing' },
+    h('h3', null, t('addMachine')),
+    h('p', { class: 'dialog-copy' }, t('pairingHelp')),
+    ready ? [
+      h('code', { class: 'pairing-command', tabindex: '0' }, pairing.command),
+      h('div', { class: 'dialog-actions' },
+        h('button', { type: 'button', class: 'button primary', dataset: { action: 'copy-pairing' } }, icon('check'), t('pairingCopy')),
+        h('span', { class: 'dialog-hint' }, t('pairingExpires', { time: formatClock(pairing.expiresAt) }))),
+    ] : null,
+    pairing === 'failed' ? h('p', { class: 'dialog-error' }, t('pairingFailed')) : null,
+    h('div', { class: 'dialog-actions' },
+      h('button', { type: 'button', class: 'button', dataset: { action: 'create-pairing', focus: 'create-pairing' }, disabled: pairing === 'creating' ? true : null }, t('pairingCreate'))));
+}
+
+function accountSection() {
+  const settings = state.settings;
+  const model = settings?.model;
+  return [
+    h('p', { class: 'dialog-copy' }, settings ? t('accountBody') : t('settingsLoading')),
+    model ? h('section', { class: 'model-settings' },
+      h('h3', null, t('modelTitle')),
+      h('p', { class: 'dialog-copy' }, t(model.apiKey ? 'modelReady' : 'modelNoKey', { provider: model.provider, model: model.modelId })),
+      h('form', { id: 'model-form', class: 'model-form' },
+        h('label', { class: 'sr-only', for: 'model-key' }, t('modelKeyLabel')),
+        h('input', { id: 'model-key', type: 'password', autocomplete: 'off', spellcheck: 'false', placeholder: t('modelKeyPlaceholder'), value: state.keyDraft }),
+        h('button', { type: 'submit', class: 'button primary' }, t('modelSave'))),
+      h('p', { class: 'dialog-hint' }, t('modelHelp'))) : null,
+    h('div', { class: 'dialog-actions' }, h('button', { type: 'button', class: 'button danger', dataset: { action: 'sign-out' } }, t('signOut'))),
+  ];
 }
 
 function dialogContent() {
@@ -438,8 +573,7 @@ function dialogContent() {
       body: [
         h('p', { class: 'dialog-copy' }, t('machineSummary', { online: summary.machinesOnline, total: summary.machinesTotal, running: summary.running })),
         snapshot.machines.map(machineCard),
-        h('p', { class: 'dialog-copy machine-help' }, t('connectMachine')),
-        h('div', { class: 'dialog-actions' }, h('a', { class: 'button', href: '/app/machines' }, t('manageMachines'), icon('external'))),
+        pairingSection(),
       ],
     };
   }
@@ -453,32 +587,43 @@ function dialogContent() {
       ],
     };
   }
-  return {
-    title: t('accountTitle'),
-    body: [
-      h('p', { class: 'dialog-copy' }, t('accountBody')),
-      h('div', { class: 'dialog-actions' },
-        h('button', { type: 'button', class: 'button danger', dataset: { action: 'sign-out' } }, t('signOut')),
-        h('a', { class: 'button', href: '/app/machines' }, t('manageMachines'), icon('external'))),
-    ],
-  };
+  return { title: t('accountTitle'), body: accountSection() };
 }
 
+/** Rebuilds the open dialog only when what it shows changed, so a typed key or a selected command survives a refresh. */
 function renderDialog() {
   if (!state.dialog) return;
-  const { title, body } = dialogContent();
-  $('#dialog-title').textContent = title;
-  $('#dialog-body').replaceChildren(...[body].flat(Infinity).filter(Boolean));
+  const { type, rev = 0, pairing = null, confirm = null } = state.dialog;
+  const snapshot = state.snapshot;
+  const signature = [type, rev, getLocale(), pairing, confirm,
+    type === 'machines' ? [snapshot.machines, snapshot.threads.map((entry) => [entry.id, entry.state, entry.workers.map((worker) => [worker.state, worker.machine])]), minuteBucket()] : null,
+    type === 'scope' ? [state.selected, snapshot.threads.map((entry) => [entry.id, entry.title, entry.state, entry.repos])] : null,
+    type === 'account' ? state.settings : null];
+  redraw('dialog', signature, () => {
+    const { title, body } = dialogContent();
+    $('#dialog-title').textContent = title;
+    preservingFocus($('#dialog-body'), () => $('#dialog-body').replaceChildren(...[body].flat(Infinity).filter(Boolean)));
+  });
   if (!$('#dialog').open) $('#dialog').showModal();
 }
 
+/** A local change to the dialog's own state (a pairing command arrived, a confirmation opened). */
+function bumpDialog() {
+  if (!state.dialog) return;
+  state.dialog.rev = (state.dialog.rev ?? 0) + 1;
+  renderDialog();
+}
+
 function openDialog(type) {
-  state.dialog = { type };
+  state.dialog = { type, rev: 0, pairing: null, confirm: null };
+  drawn.delete('dialog');
+  if (type === 'account') void loadSettings();
   renderDialog();
 }
 
 function closeDialog() {
   state.dialog = null;
+  drawn.delete('dialog');
   if ($('#dialog').open) $('#dialog').close();
 }
 
@@ -508,6 +653,9 @@ function renderAll({ stick = false } = {}) {
   $('#workspace').dataset.ready = 'true';
   renderTop();
   renderSidebar();
+  renderPane();
+  renderTabs();
+  renderSetup();
   renderFeed(stick);
   renderContext();
   renderComposer();
@@ -522,9 +670,19 @@ async function request(path, body) {
     method: body === undefined ? 'GET' : 'POST',
     credentials: 'same-origin',
     cache: 'no-store',
+    // A sign-in that is no longer valid is answered 401 by our own Worker; anything that
+    // still manages to redirect is opaque, so treat it as "sign in again" either way.
+    redirect: 'manual',
     headers: body === undefined ? {} : { 'content-type': 'application/json', 'x-csrf-token': state.csrf },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
+  if (response.type === 'opaqueredirect') {
+    if (state.fatal !== 'logged_out' && !reloadForSignIn()) {
+      state.fatal = 'signed_out';
+      renderFatal();
+    }
+    return { status: 401, data: null };
+  }
   let data = null;
   try {
     data = await response.json();
@@ -536,6 +694,23 @@ async function request(path, body) {
     renderFatal();
   }
   return { status: response.status, data };
+}
+
+/**
+ * Access wants a fresh sign-in. Reloading lets it re-issue the token silently when its own
+ * session is still good (or shows its login page when not). Only with nothing to lose — no
+ * draft, no message in flight — and at most once a minute, so a broken setup cannot loop.
+ */
+function reloadForSignIn() {
+  if ($('#message-input').value.trim() || [...state.pending.values()].some((entry) => entry.status === 'sending')) return false;
+  try {
+    if (Date.now() - Number(sessionStorage.getItem('pip.signin-reload') ?? 0) < 60_000) return false;
+    sessionStorage.setItem('pip.signin-reload', String(Date.now()));
+  } catch {
+    return false; // no storage, no way to rate-limit: show the notice instead
+  }
+  location.reload();
+  return true;
 }
 
 let refreshing = false;
@@ -580,7 +755,12 @@ function accept(data) {
   }
   if (state.selected && !threadById(state.selected)) {
     state.selected = null; // archived or gone: fall back to the whole conversation
+    state.session = null;
     history.replaceState(null, '', '/app');
+  } else if (state.session && !threadById(state.selected)?.workers.some((worker) => worker.id === state.session)) {
+    state.session = null; // that session is not part of this thread (any more)
+    history.replaceState(null, '', urlFor(state.selected, null));
+    toast(t('sessionMissing'));
   }
   const ids = new Set(data.attention.map((item) => item.id));
   if (!first && [...ids].some((id) => !state.knownAttention.has(id))) $('#announcer').textContent = t('newDecision');
@@ -590,6 +770,14 @@ function accept(data) {
   renderAll({ stick: first });
   markSelectedRead();
   if (!socket) connect();
+  if (first) {
+    void loadSettings();
+    const dialog = { '/app/machines': 'machines', '/app/settings': 'account' }[location.pathname];
+    if (dialog) {
+      history.replaceState(null, '', '/app');
+      openDialog(dialog);
+    }
+  }
 }
 
 let reading = false;
@@ -609,7 +797,7 @@ let reconnectTimer = null;
 function connect() {
   clearTimeout(reconnectTimer);
   const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const current = new WebSocket(`${scheme}//${location.host}/agents/steward/owner?role=web&view=workspace`);
+  const current = new WebSocket(`${scheme}//${location.host}/app/ws?view=workspace`);
   socket = current;
   current.addEventListener('open', () => {
     attempts = 0;
@@ -715,30 +903,115 @@ async function signOut() {
     // The cookie is what matters; if the request failed the session simply expires on its own.
   }
   socket?.close();
+  unmountViewer();
   closeDialog();
   renderFatal();
+  location.assign('/app'); // back to the sign-in page (ADR-0004: the way in is a machine-minted one-time link)
+}
+
+// ---- settings, pairing, revoking ---------------------------------------------------------------------------
+
+async function loadSettings() {
+  try {
+    const { status, data } = await request('/app/api/settings');
+    if (status !== 200 || !data) return;
+    state.settings = data;
+    renderSetup();
+    if (state.dialog?.type === 'account') bumpDialog();
+  } catch {
+    // Settings are secondary; the workspace works without them.
+  }
+}
+
+async function saveModelKey() {
+  const apiKey = state.keyDraft.trim();
+  if (!apiKey) return;
+  try {
+    const { status } = await request('/app/api/settings/model', { apiKey });
+    if (status === 200) {
+      state.keyDraft = '';
+      toast(t('modelSaved'));
+      await loadSettings();
+      await refresh();
+    } else if (status !== 401) toast(t('modelSaveFailed'));
+  } catch {
+    toast(t('modelSaveFailed'));
+  }
+}
+
+async function createPairing() {
+  if (state.dialog?.type !== 'machines') return;
+  state.dialog.pairing = 'creating';
+  bumpDialog();
+  let pairing = 'failed';
+  try {
+    const { status, data } = await request('/app/api/pairing', { id: uuid() });
+    if (status === 200 && typeof data?.command === 'string') pairing = { command: data.command, expiresAt: data.expiresAt };
+  } catch {
+    // shown as a failure below
+  }
+  if (state.dialog?.type !== 'machines') return;
+  state.dialog.pairing = pairing;
+  bumpDialog();
+}
+
+async function copyPairing() {
+  const pairing = state.dialog?.pairing;
+  if (!pairing || typeof pairing !== 'object') return;
+  try {
+    await navigator.clipboard.writeText(pairing.command);
+    toast(t('pairingCopied'));
+  } catch {
+    toast(t('pairingCopyFailed'));
+  }
+}
+
+async function revokeMachine(deviceId) {
+  try {
+    const { status } = await request('/app/api/machines/revoke', { deviceId });
+    if (status !== 200 && status !== 401) toast(t('revokeFailed'));
+  } catch {
+    toast(t('revokeFailed'));
+  }
+  if (state.dialog) state.dialog.confirm = null;
+  await refresh();
+  bumpDialog();
 }
 
 // ---- navigation ------------------------------------------------------------------------------------------
 
 const scopeKey = () => state.selected ?? 'all';
 
-const selectedFromLocation = () => /^\/app\/threads\/([\w-]+)\/?$/.exec(location.pathname)?.[1] ?? null;
+/** Where the address says we are: a thread, and within it one worker's recorded session. */
+const routeFromLocation = () => {
+  const match = /^\/app\/threads\/([\w-]+)(?:\/workers\/([\w.-]+))?\/?$/.exec(location.pathname);
+  return { thread: match?.[1] ?? null, worker: match?.[2] ?? null };
+};
 
-function select(threadId, { push = true } = {}) {
-  const next = threadId && threadById(threadId) ? threadId : null;
+function go({ thread = null, worker = null } = {}, { push = true } = {}) {
+  const next = thread && threadById(thread) ? thread : null;
+  const nextWorker = next && worker && threadById(next).workers.some((entry) => entry.id === worker) ? worker : null;
   const input = $('#message-input');
   state.drafts.set(scopeKey(), input.value);
-  const changed = next !== state.selected;
+  const changed = next !== state.selected || nextWorker !== state.session;
   state.selected = next;
+  state.session = nextWorker;
   input.value = state.drafts.get(scopeKey()) ?? '';
   $('#send-button').disabled = !input.value.trim();
-  if (push && changed) history.pushState(null, '', next ? `/app/threads/${next}` : '/app');
+  if (push && changed) history.pushState(null, '', urlFor(next, nextWorker));
   setMobile('chat');
   $('#workspace').classList.remove('context-overlay');
   resizeInput();
   renderAll({ stick: true });
   markSelectedRead();
+}
+
+const select = (threadId, options) => go({ thread: threadId }, options);
+
+/** The session the thread's "Agent sessions" tab opens: the one working now, else the newest. */
+function latestWorker(thread) {
+  const newest = [...thread.workers].sort((a, b) => b.createdAt - a.createdAt);
+  return newest.find(isActiveWorker) ?? newest[0] ?? null;
 }
 
 function setMobile(view) {
@@ -757,7 +1030,7 @@ function detailsOpen() {
 }
 
 function syncDetailButton() {
-  $('.detail-toggle').setAttribute('aria-expanded', String(detailsOpen()));
+  for (const button of document.querySelectorAll('.detail-toggle')) button.setAttribute('aria-expanded', String(detailsOpen()));
 }
 
 function openDetails() {
@@ -775,6 +1048,7 @@ function closeDetails() {
 function changeLanguage(locale) {
   if (!setLocale(locale)) return;
   renderAll();
+  state.viewer?.handle.relabel();
   resizeInput();
 }
 
@@ -811,7 +1085,7 @@ $('#thread-search').addEventListener('input', (event) => {
   state.filter = event.target.value;
   if (state.snapshot) renderSidebar();
 });
-window.addEventListener('popstate', () => select(selectedFromLocation(), { push: false }));
+window.addEventListener('popstate', () => go(routeFromLocation(), { push: false }));
 window.addEventListener('resize', () => {
   syncDetailButton();
   resizeInput();
@@ -844,7 +1118,7 @@ document.addEventListener('click', (event) => {
   if (link && event.button === 0 && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey) {
     event.preventDefault();
     closeDialog();
-    select(link.dataset.nav === 'all' ? null : link.dataset.nav);
+    go(link.dataset.nav === 'all' ? {} : { thread: link.dataset.nav, worker: link.dataset.worker ?? null });
     return;
   }
   const button = event.target.closest('button');
@@ -853,6 +1127,13 @@ document.addEventListener('click', (event) => {
   if (dataset.locale) return changeLanguage(dataset.locale);
   if (dataset.mobileView) return setMobile(dataset.mobileView);
   if (dataset.card && dataset.action) return void act(dataset.card, dataset.action);
+  if (dataset.view) {
+    const thread = state.selected ? threadById(state.selected) : null;
+    if (!thread) return;
+    if (dataset.view === 'conversation') return go({ thread: thread.id });
+    const worker = latestWorker(thread);
+    return worker ? go({ thread: thread.id, worker: worker.id }) : undefined;
+  }
   if (dataset.reply) {
     state.replyTo = dataset.reply;
     renderComposer();
@@ -893,14 +1174,37 @@ document.addEventListener('click', (event) => {
       state.replyTo = null;
       return renderComposer();
     case 'sign-out': return void signOut();
+    case 'create-pairing': return void createPairing();
+    case 'copy-pairing': return void copyPairing();
+    case 'revoke':
+      state.dialog.confirm = dataset.machine;
+      return bumpDialog();
+    case 'revoke-no':
+      state.dialog.confirm = null;
+      return bumpDialog();
+    case 'revoke-yes': return void revokeMachine(dataset.machine);
   }
+});
+
+// The model key is typed in the settings dialog, which is not redrawn while it is being typed.
+$('#dialog').addEventListener('input', (event) => {
+  if (event.target.id === 'model-key') state.keyDraft = event.target.value;
+});
+$('#dialog').addEventListener('submit', (event) => {
+  if (event.target.id !== 'model-form') return;
+  event.preventDefault();
+  void saveModelKey();
 });
 
 // ---- start ----------------------------------------------------------------------------------------------------
 
 applyStatic();
 paintIcons();
-state.selected = selectedFromLocation();
+{
+  const route = routeFromLocation();
+  state.selected = route.thread;
+  state.session = route.worker;
+}
 resizeInput();
 renderConnection();
 void refresh();

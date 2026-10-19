@@ -52,7 +52,7 @@ export async function resetLedgerState(): Promise<void> {
     for (const table of [
       "sh_machine", "sh_repo", "sh_thread", "sh_thread_repo", "sh_thread_summary", "sh_worker", "sh_report",
       "sh_timeline", "sh_question", "sh_notify", "sh_offline_dispatch", "sh_note", "sh_note_log", "event_inbox", "worker_ack", "outbox",
-      "sh_web_link", "sh_web_session", "sh_web_request", "sh_deploy", "device", "pairing", "sh_reap_pending", "sh_pr_consent",
+      "sh_web_link", "sh_web_session", "sh_web_request", "sh_web_pairing", "sh_owner", "sh_deploy", "sh_claim", "sh_claim_grant", "device", "pairing", "sh_reap_pending", "sh_pr_consent",
       // sh_usage_day / sh_usage_cursor are NOT here: resetLlmStateForTests (called just
       // above) owns them, because pi's tables and the cursor must reset TOGETHER — dropping
       // both here would leave the cursor absent and swallow the next run's spend as a
@@ -471,6 +471,8 @@ export class FakeConnector {
   historyError: { code: string; message: string } | null = null;
   /** When true, history_req is swallowed entirely (a machine that never answers). */
   historySilent = false;
+  /** Every history_req the machine was asked (the full-session reads carry `format`/`since`). */
+  readonly historyRequests: Array<Record<string, unknown>> = [];
   /** When set, the connector drops its connection after sending this many chunks. */
   historyCloseAfterChunks: number | undefined;
   ws: WebSocket | null = null;
@@ -587,6 +589,7 @@ export class FakeConnector {
 
   /** §6.6: splits the scripted entries into chunks and sends the first window. */
   private startHistory(req: Record<string, unknown>): void {
+    this.historyRequests.push(req);
     if (this.historySilent) return;
     if (this.historyError) {
       this.send({

@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 // `npx @iefnaf/shepherd <command>` (ADR-0001 decision 10, issue #26).
 //
-//   connect <url> <code>   redeem a pairing code, then install + start the background
-//                          service (launchd agent on macOS, systemd --user unit on Linux);
+//   connect <url> [code]   claim a fresh deployment (no code: Cloudflare authorization)
+//                          or redeem a pairing code from the workspace; then install + start
+//                          the background service (launchd / systemd --user);
 //                          --foreground runs the daemon in this terminal instead
+//   login                  print a one-time sign-in link for a browser
 //   status                 service state, pairing, workers, installed assets
 //   logs [-n N] [name]     tail ~/.shepherd/logs/<name> (default connector.log)
 //   start | stop | restart control the background service (stop also disables start-at-login)
@@ -25,7 +27,9 @@ import { promisify } from "node:util";
 import { runDaemon } from "./daemon.ts";
 import { installAssets } from "./install.ts";
 import { tailFile } from "./logger.ts";
+import { claimDeployment } from "./claim.ts";
 import { connect } from "./pairing.ts";
+import { loginLink } from "./login.ts";
 import { getServiceInstaller, SHEPHERD_LABEL, type ServiceInstaller, type ServiceSpec } from "./service.ts";
 import { isWorkspaceMode, LocalStore, WORKSPACE_MODES } from "./store.ts";
 import { defaultBranch, repoTopLevel } from "./worktree.ts";
@@ -49,7 +53,8 @@ export function binEntryPath(): string {
 const USAGE = `shepherd ${VERSION} — the Shepherd connector
 
 usage:
-  shepherd connect <url> <code> [--foreground]   pair and install the background service
+  shepherd connect <url> [code] [--foreground]   claim/pair and install the service
+  shepherd login                                one-time sign-in link for a browser
   shepherd status                                 service, pairing, workers, assets
   shepherd logs [-n <lines>] [name]               tail ~/.shepherd/logs (default connector.log)
   shepherd start | stop | restart                 control the background service
@@ -120,6 +125,8 @@ async function main(argv: string[]): Promise<void> {
   switch (command) {
     case "connect":
       return connectCommand(rest);
+    case "login":
+      return loginCommand();
     case "status":
       return statusCommand();
     case "logs":
@@ -148,15 +155,33 @@ async function main(argv: string[]): Promise<void> {
 async function connectCommand(argv: string[]): Promise<void> {
   const foreground = argv.includes("--foreground");
   const [url, code] = argv.filter((a) => a !== "--foreground");
-  if (!url || !code) usage();
+  if (!url) usage();
   const dir = stateDir();
+  // A non-default SHEPHERD_HOME must stop before anything else: the launchd/systemd unit is
+  // shared machine state (fixed label), so installing from a private state directory would
+  // silently repoint the machine's own connector at it.
+  if (process.env.SHEPHERD_HOME && !foreground) {
+    fail(
+      "SHEPHERD_HOME is set to a private state directory; installing the shared background service would repoint this machine's connector. Use --foreground, or unset SHEPHERD_HOME.",
+    );
+  }
   const machineName = process.env.SHEPHERD_MACHINE_NAME ?? hostname();
 
-  // 1. Pair (protocol §5.2): redeem the code once, persist credentials in the LocalStore.
+  // 1. Claim (no code: ADR-0004 — a Cloudflare authorization proves deployment ownership) or
+  //    pair (protocol §5.2 — a one-time code from the workspace). Either way the credentials
+  //    land in the LocalStore exactly once.
   const store = new LocalStore(join(dir, "connector.sqlite"));
   let deviceId: string;
+  let loginUrl: string | undefined;
   try {
-    ({ deviceId } = await connect(url, code, machineName, { store }));
+    if (code) {
+      ({ deviceId } = await connect(url, code, machineName, { store }));
+    } else {
+      const claimed = await claimDeployment({ serverUrl: url, machineName, log: (line) => console.log(line) });
+      loginUrl = claimed.loginUrl;
+      store.saveCredentials({ serverUrl: url, deviceId: claimed.deviceId, token: claimed.token });
+      deviceId = claimed.deviceId;
+    }
   } catch (err) {
     store.close();
     fail(err instanceof Error ? err.message : String(err));
@@ -191,6 +216,11 @@ async function connectCommand(argv: string[]): Promise<void> {
   }
   const status = await installer.status();
   console.log(`paired as ${deviceId}`);
+  if (loginUrl) {
+    console.log("");
+    console.log("Open Pip in your browser (works once, for 10 minutes):");
+    console.log(`  ${loginUrl}`);
+  }
   console.log(
     `background service ${status.running ? "installed and running" : "installed"} ` +
       `(${installer.kind}: ${installer.unitPath})`,
@@ -198,6 +228,22 @@ async function connectCommand(argv: string[]): Promise<void> {
   for (const note of installer.notes) console.log(`note: ${note}`);
   console.log(`logs: ${join(dir, "logs", "connector.log")}`);
   console.log("next: shepherd status · shepherd add-repo <path> · shepherd logs");
+}
+
+// --- login --------------------------------------------------------------------------------------
+
+async function loginCommand(): Promise<void> {
+  const dir = stateDir();
+  const store = new LocalStore(join(dir, "connector.sqlite"));
+  try {
+    const link = await loginLink(store);
+    if (!link) fail("not paired yet — run `shepherd connect <url>` first");
+    console.log("Open this link in the browser you want to sign in. Works once, for 10 minutes:");
+    console.log("");
+    console.log(`  ${link}`);
+  } finally {
+    store.close();
+  }
 }
 
 // --- status / logs ---------------------------------------------------------------------------

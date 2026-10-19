@@ -19,7 +19,7 @@ async function fetchAsset(name: string): Promise<Response> {
 
 const asset = async (name: string): Promise<string> => (await fetchAsset(name)).text();
 
-const SCRIPTS = ["workspace.js", "dom.js", "format.js", "model.js", "i18n.js"];
+const SCRIPTS = ["workspace.js", "dom.js", "format.js", "model.js", "i18n.js", "markup.js", "session.js", "session-model.js"];
 
 /** The text between the parentheses of every call to `fn(…)` (not `x.fn(…)`, not `prefixfn(…)`). */
 function callArguments(source: string, fn: string): string[] {
@@ -68,6 +68,36 @@ describe("shipped files", () => {
     const script = await asset("workspace.js");
     for (const name of new Set([...script.matchAll(/\/app\/assets\/([\w.-]+)/g)].map((match) => match[1]!))) await fetchAsset(name);
   });
+
+  // workspace.js and session.js touch the DOM and cannot be loaded here, so a name imported from a
+  // sibling that does not export it would only fail when a browser first opens the page.
+  it("import only names their sibling modules really export", async () => {
+    const exported = async (name: string): Promise<Set<string>> => {
+      const source = await asset(name);
+      const names = new Set<string>();
+      for (const match of source.matchAll(/^export\s+(?:async\s+)?(?:function\*?|const|let|class)\s+([A-Za-z_$][\w$]*)/gm)) names.add(match[1]!);
+      for (const match of source.matchAll(/^export\s*\{([^}]*)\}/gm)) {
+        for (const part of match[1]!.split(",")) {
+          const alias = part.trim().split(/\s+as\s+/).pop();
+          if (alias) names.add(alias);
+        }
+      }
+      return names;
+    };
+    let checked = 0;
+    for (const script of SCRIPTS) {
+      for (const match of (await asset(script)).matchAll(/import\s*\{([^}]*)\}\s*from\s*'\.\/([\w.-]+)'/g)) {
+        const available = await exported(match[2]!);
+        for (const part of match[1]!.split(",")) {
+          const imported = part.trim().split(/\s+as\s+/)[0]!;
+          if (!imported) continue;
+          checked += 1;
+          expect(available.has(imported), `${script} imports ${imported} from ${match[2]}`).toBe(true);
+        }
+      }
+    }
+    expect(checked).toBeGreaterThan(40);
+  });
 });
 
 describe("interface copy", () => {
@@ -83,7 +113,7 @@ describe("interface copy", () => {
 
   it("covers every string the page asks for, including the data-driven ones", async () => {
     const used = new Set<string>();
-    for (const name of ["workspace.js", "workspace.html"]) {
+    for (const name of ["workspace.js", "workspace.html", "session.js"]) {
       const source = await asset(name);
       for (const args of callArguments(source, "t")) for (const key of args.matchAll(/'([A-Za-z_:]+)'/g)) used.add(key[1]!);
       for (const attribute of source.matchAll(/data-i18n(?:-[a-z]+)?="([A-Za-z_:]+)"/g)) used.add(attribute[1]!);
@@ -92,6 +122,8 @@ describe("interface copy", () => {
     for (const kind of ["question", "consent", "offline", "offer", "memory", "report", "update"]) used.add(`kind${kind[0]!.toUpperCase()}${kind.slice(1)}`);
     for (const state of ["queued", "starting", "running", "recovering", "idle", "broken"]) used.add(`worker${state[0]!.toUpperCase()}${state.slice(1)}`);
     for (const state of ["connecting", "live", "reconnecting", "disconnected"]) used.add(state);
+    // The session viewer labels the bookkeeping entries an agent writes by kind (session-model.js).
+    for (const kind of ["session", "model", "thinking_level", "compaction", "branch_summary", "custom", "label", "session_info", "usage", "context_edit", "system", "summary", "info", "error"]) used.add(`svMeta_${kind}`);
     for (const key of [...Object.values(ACTION_KEYS), ...Object.values(KNOWN_TITLES), ...Object.values(FATAL_COPY).flat()]) used.add(key);
     expect(used.size).toBeGreaterThan(60);
     expect([...used].filter((key) => !(key in STRINGS))).toEqual([]);

@@ -44,6 +44,8 @@
 
     <main class="conversation" data-i18n-label="chatLabel" aria-label="Conversation with Pip">
       <header class="conversation-header"><div class="conversation-heading"><div class="heading-line"><h1 id="conversation-title">Pip</h1></div><p id="conversation-subtitle"></p></div><button class="icon-button detail-toggle" data-action="details" data-i18n-label="detailToggle" data-i18n-title="detailToggle" aria-label="Toggle details" aria-controls="context-panel" aria-expanded="true" title="Toggle details" data-icon="panel"></button></header>
+      <div class="view-tabs" id="view-tabs" role="group" data-i18n-label="viewTabs" aria-label="Thread views" hidden></div>
+      <div class="setup-banner" id="setup-banner" hidden></div>
       <div class="scope-banner" id="scope-banner" hidden></div>
       <div class="feed" id="feed" tabindex="0" data-i18n-label="history" aria-label="Message history"></div>
       <div class="composer-area">
@@ -54,8 +56,15 @@
           <label class="sr-only" for="message-input" data-i18n="inputLabel">Message Pip</label><textarea id="message-input" rows="2" placeholder="Message Pip…" maxlength="16000"></textarea>
           <div class="composer-bottom"><span class="composer-shortcuts"><kbd>↵</kbd> <span data-i18n="send">Send</span><span class="keyboard-separator">·</span><kbd>Shift ↵</kbd> <span data-i18n="newline">New line</span></span><button type="submit" class="send-button" id="send-button" data-i18n-label="send" aria-label="Send" disabled data-icon="arrow-up"></button></div>
         </form>
-        <p class="composer-note"><span data-icon="shield"></span><span data-i18n="notifications">Decisions here. Alerts in Feishu.</span></p>
+        <p class="composer-note"><span data-icon="shield"></span><span data-i18n="notifications">Decisions wait here until you answer them.</span></p>
       </div>
+    </main>
+
+    <main class="session-view" id="session-view" data-i18n-label="sessionLabel" aria-label="Agent session" hidden>
+      <header class="conversation-header"><div class="conversation-heading"><div class="heading-line"><h1 id="session-title">Agent session</h1></div><p id="session-subtitle"></p></div><button class="icon-button detail-toggle" data-action="details" data-i18n-label="detailToggle" data-i18n-title="detailToggle" aria-label="Toggle details" aria-controls="context-panel" aria-expanded="true" title="Toggle details" data-icon="panel"></button></header>
+      <div class="view-tabs" id="session-tabs" role="group" data-i18n-label="viewTabs" aria-label="Thread views"></div>
+      <div class="session-toolbar" id="session-toolbar"></div>
+      <div class="session-body" id="session-body"></div>
     </main>
 
     <aside class="context-panel" id="context-panel" data-i18n-label="contextLabel" aria-label="Workspace and thread details"></aside>

@@ -92,11 +92,22 @@ function runVitest(args, tag) {
 const passthrough = process.argv.slice(2);
 if (passthrough.length > 0) {
   // Single serial run — one process, one workerd, exactly the pre-group-runner behavior.
-  const { code } = await runVitest(["run", ...passthrough]);
+  // claim-* files run under their own config; everything else under the default one.
+  const claim = passthrough.filter((f) => /(^|\/)claim-/.test(f));
+  const rest = passthrough.filter((f) => !(/(^|\/)claim-/.test(f)));
+  let code = 0;
+  if (rest.length > 0) code = (await runVitest(["run", ...rest])).code;
+  if (claim.length > 0 && code === 0) code = (await runVitest(["run", "--config", "vitest.claim.config.ts", ...claim])).code;
   process.exit(code);
 }
 
-const files = readdirSync(testDir).filter((f) => f.endsWith(".test.ts")).sort();
+// claim-*.test.ts run the production Worker entry with the ADR-0004 doors (vitest.claim.config.ts);
+// every other file runs the historical transport fixture (vitest.config.ts: the pre-web entry,
+// kept so the Feishu-era suites keep guarding that code).
+const isAccessTest = (f) => f.startsWith("claim-");
+const allTests = readdirSync(testDir).filter((f) => f.endsWith(".test.ts")).sort();
+const files = allTests.filter((f) => !isAccessTest(f));
+const accessFiles = allTests.filter(isAccessTest);
 if (files.length === 0) {
   console.error(`no *.test.ts files under ${testDir}`);
   process.exit(1);
@@ -125,15 +136,24 @@ console.log(
     `(groups: ${groups.map((g) => `~${g.cost}s/${g.files.length}f`).join("  ")}; per-process workerd, serial within)`,
 );
 
-const results = await Promise.all(
-  groups.map((g, i) => {
+const accessRun = accessFiles.length === 0
+  ? Promise.resolve({ code: 0, seconds: 0 })
+  : runVitest(["run", "--config", "vitest.claim.config.ts", ...accessFiles.map((f) => path.join("test", f))], `${PALETTE[groups.length % PALETTE.length]}[access: ${accessFiles.map((f) => f.replace(".test.ts", "")).join(" ")}]${RESET}`);
+const results = await Promise.all([
+  ...groups.map((g, i) => {
     if (g.files.length === 0) return Promise.resolve({ code: 0, seconds: 0 });
     return runVitest(["run", ...g.files.map((f) => path.join("test", f))], label(i, g.files));
   }),
-);
+  accessRun,
+]);
 
 let failed = false;
-for (const [i, r] of results.entries()) {
+if (accessFiles.length > 0) {
+  const r = results[results.length - 1];
+  console.log(`${r.code === 0 ? "✓" : "✗"} access: ${accessFiles.length} files in ${r.seconds.toFixed(1)}s`);
+  if (r.code !== 0) failed = true;
+}
+for (const [i, r] of results.slice(0, groups.length).entries()) {
   if (groups[i].files.length === 0) continue;
   const mark = r.code === 0 ? "✓" : "✗";
   console.log(`${mark} group ${i + 1}: ${groups[i].files.length} files in ${r.seconds.toFixed(1)}s`);

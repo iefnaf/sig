@@ -146,15 +146,19 @@ describe("/网页 → one-time link → session cookie → /app", () => {
     expect(res.status).toBe(401);
   });
 
-  it("the SERVER_KEY_PREVIOUS window keeps old-key links and cookies alive; dropping it kills them (issue #27)", async () => {
-    const previous = "the-previous-server-key";
+  it("credentials minted under the primary verify across the key set, and die outside it (issue #27 shape)", async () => {
+    // ADR-0004: the Durable Object's auth root is the primary; a legacy env key (when one
+    // exists) rides along in the set. A credential minted by the primary verifies under the
+    // whole set but not under a key that is not in it — the rotation-window property.
+    const keys = await ownerStub().authKeys();
+    const primary = keys[0]!.secret;
+    const other = keys[1]?.secret ?? "a-key-that-was-never-configured";
     const { cookie, linkUrl } = await loginViaChat();
     const token = linkUrl.slice("https://example.com/link/".length);
-    // During the window (both keys in the set) a pre-rotation credential still verifies;
-    // the new key alone, or after the operator drops SERVER_KEY_PREVIOUS, it is dead.
-    expect(await verifyLinkToken(["test-server-key-not-a-secret", previous], token)).not.toBeNull();
-    expect(await parseSessionCookie(["test-server-key-not-a-secret", previous], cookie.split("=")[1]!)).not.toBeNull();
-    expect(await verifyLinkToken([previous], token)).toBeNull();
-    expect(await parseSessionCookie([previous], cookie.split("=")[1]!)).toBeNull();
+    expect(await verifyLinkToken(keys.map((k) => k.secret), token)).not.toBeNull();
+    expect(await parseSessionCookie(keys.map((k) => k.secret), cookie.split("=")[1]!)).not.toBeNull();
+    expect(await verifyLinkToken([primary], token)).not.toBeNull();
+    expect(await verifyLinkToken([other], token)).toBeNull();
+    expect(await parseSessionCookie([other], cookie.split("=")[1]!)).toBeNull();
   });
 });

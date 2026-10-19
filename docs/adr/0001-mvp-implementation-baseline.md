@@ -1,6 +1,6 @@
 # ADR-0001: MVP implementation baseline
 
-Status: accepted (2026-10-15). Decisions 4, 7 and 12 are amended by [ADR-0002](0002-pip-web-workspace.md) (the Pip web workspace).
+Status: accepted (2026-10-15). Decisions 4, 7 and 12 are amended by [ADR-0002](0002-pip-web-workspace.md) (the Pip web workspace). Decisions 4, 7–9 and 12 are further amended by [ADR-0003](0003-web-entry-local-sessions.md) for the Web entry and local worker-session scope (implemented).
 
 Context: the spike phase concluded ([spike-conclusions.md](../spike-conclusions.md)). Before the real implementation starts, the open choices left by the [spec](../spec.md) and the [design docs](../design/) were settled in one review session. Where a design doc and the spike's field results disagreed, the spike wins.
 

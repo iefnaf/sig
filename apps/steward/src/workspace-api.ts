@@ -22,6 +22,11 @@ export interface WorkspaceApiDeps {
   submitAction(input: WorkspaceActionInput): Promise<void>;
   endSession(sid: string): void;
   audit(reason: string, detail: string): void;
+  requireOrigin?: boolean;
+  settings?(): Promise<unknown>;
+  saveModel?(apiKey: string): Promise<void>;
+  pairing?(id: string): Promise<{ code: string; expiresAt: number }>;
+  revoke?(deviceId: string): void;
 }
 
 export interface ApiSession {
@@ -99,15 +104,34 @@ export async function handleWorkspaceApi(request: Request, url: URL, session: Ap
       csrf: session.csrf,
     });
   }
+  if (url.pathname === "/app/api/settings" && request.method === "GET" && deps.settings) return json(await deps.settings());
   if (request.method !== "POST") return json({ error: "not_found" }, 404);
 
   const origin = request.headers.get("origin");
-  if (!sameSecret(request.headers.get("x-csrf-token") ?? "", session.csrf) || (origin !== null && origin !== url.origin)) {
+  if (!sameSecret(request.headers.get("x-csrf-token") ?? "", session.csrf) || (deps.requireOrigin ? origin !== url.origin : origin !== null && origin !== url.origin)) {
     return json({ error: "forbidden" }, 403);
   }
   if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json")) return json({ error: "json_required" }, 415);
 
   try {
+    if (url.pathname === "/app/api/pairing" && deps.pairing) {
+      const { id } = await readJson(request);
+      if (typeof id !== "string" || !REQUEST_ID.test(id)) return json({ error: "bad_request" }, 400);
+      const pair = await deps.pairing(id);
+      return json({ ...pair, command: `npx @iefnaf/shepherd connect ${url.origin} ${pair.code}` });
+    }
+    if (url.pathname === "/app/api/settings/model" && deps.saveModel) {
+      const { apiKey } = await readJson(request);
+      if (typeof apiKey !== "string" || !apiKey.trim() || apiKey.length > 8192) return json({ error: "bad_request" }, 400);
+      await deps.saveModel(apiKey.trim());
+      return json({ ok: true });
+    }
+    if (url.pathname === "/app/api/machines/revoke" && deps.revoke) {
+      const { deviceId } = await readJson(request);
+      if (typeof deviceId !== "string" || !deps.devices().some(d => d.deviceId === deviceId)) return json({ error: "not_found" }, 404);
+      deps.revoke(deviceId);
+      return json({ ok: true });
+    }
     if (url.pathname === "/app/api/messages") {
       const input = parseMessage(await readJson(request));
       await deps.submitMessage(input);

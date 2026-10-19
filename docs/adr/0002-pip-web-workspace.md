@@ -1,6 +1,6 @@
 # ADR-0002: Pip web workspace
 
-Status: accepted (2026-10-17). Amends ADR-0001 decisions 4, 7 and 12, which limited the web to companion pages, Feishu-only intervention, and client JavaScript for the raw-process stream only.
+Status: accepted (2026-10-17). Amends ADR-0001 decisions 4, 7 and 12, which limited the web to companion pages, Feishu-only intervention, and client JavaScript for the raw-process stream only. Its channel, onboarding and separate raw-process-page decisions are amended by [ADR-0003](0003-web-entry-local-sessions.md) (implemented).
 
 Context: the web is where the owner wants to talk to the agent day to day — read replies, answer questions, make decisions — with Feishu for pairing, login and alerts. The prototype in [`docs/design/web-workspace/`](../design/web-workspace/) settled the shape; this records the decisions behind its implementation.
 

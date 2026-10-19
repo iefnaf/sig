@@ -54,7 +54,7 @@ async function macOk(secret: string, payload: string, claimedHex: string): Promi
   );
 }
 
-async function sha256Hex(text: string): Promise<string> {
+export async function sha256Hex(text: string): Promise<string> {
   return toHex(await crypto.subtle.digest("SHA-256", enc.encode(text)));
 }
 
@@ -138,9 +138,10 @@ export interface DeviceView {
 
 export interface WebDeps {
   sql: SqlExecutor;
-  /** The key set: [0] is the primary (everything new is minted with it); the rest keep
-   * verifying during a SERVER_KEY rotation window (issue #27, auth.ts). */
-  secrets: readonly string[];
+  /** The key set, resolved lazily: [0] is the primary (everything new is minted with it);
+   * the rest keep verifying during a rotation window (issue #27). The Durable Object's own
+   * auth root leads — a fresh deployment has no env key at all (ADR-0004). */
+  secrets: () => Promise<readonly string[]>;
   ledger: Ledger;
   /** Protocol-layer `device` rows (steward.ts owns that table): deviceId, name, epoch, revoked. */
   listDevices(): Array<{ deviceId: string; name: string | null; revoked: boolean }>;
@@ -150,7 +151,9 @@ export interface WebDeps {
   machineConnected(deviceId: string): boolean;
   audit(reason: string, detail: string): void;
   /** The owner mutations behind the workspace API (steward.ts owns the conversation). */
-  workspace: Pick<WorkspaceApiDeps, "budget" | "submitMessage" | "submitAction">;
+  workspace: Pick<WorkspaceApiDeps, "budget" | "submitMessage" | "submitAction" | "settings" | "saveModel" | "pairing" | "revoke">;
+  accessOnly?: boolean;
+  sessionEnded?(sid: string): void;
   /** The workspace page: a static asset fetched through the Worker's assets binding. */
   shell(): Promise<Response>;
   now?(): number;
@@ -231,16 +234,19 @@ ${content}
 </body></html>`;
 }
 
-function loginPromptPage(message: string, status: number): Response {
+function loginPromptPage(message: string, status: number, siteUrl?: string): Response {
+  // ADR-0004: with no password and no Access, the sign-in page says the one way in — a
+  // one-time link minted on an already-paired machine. Before the first machine claimed the
+  // deployment it names the connect command instead.
   const html = `<!doctype html>
 <html lang="zh-CN">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex">
-<title>Pip</title>
-<style>body{font:15px/1.7 -apple-system,"PingFang SC","Segoe UI",sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:0 16px}main{max-width:480px}</style>
+<title>Pip · 登录</title>
+<style>body{font:15px/1.7 -apple-system,"PingFang SC","Segoe UI",sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:0 16px}main{max-width:520px}code{background:#f1f3ed;padding:1px 5px;border-radius:3px;overflow-wrap:anywhere}.hint{color:#6b7280;font-size:13px}</style>
 </head>
 <body><main>
 <p>${esc(message)}</p>
-<p class="hint">在飞书里对 Pip 发 <code>/网页</code>，取一条新的一次性登录链接（15 分钟内有效，只能打开一次）。</p>
+<p>在已配对的电脑上运行 <code>shepherd login</code>，打开它给出的链接（10 分钟内有效，只能用一次）。</p>
 </main></body></html>`;
   return new Response(html, { status, headers: { "content-type": "text/html; charset=utf-8" } });
 }
@@ -279,8 +285,8 @@ export class WebApp {
   /** Absolute one-time URL for a chat message / card button, or null before any origin is known. */
   async linkUrl(target: string): Promise<string | null> {
     const origin = this.origin();
-    if (!origin) return null;
-    const { token, expiresAt } = await mintLinkToken(this.#deps.secrets[0]!, target, this.#now());
+    if (!origin || this.#deps.accessOnly) return null; // the workspace is the only page; cards need no login link
+    const { token, expiresAt } = await mintLinkToken((await this.#deps.secrets())[0]!, target, this.#now());
     this.#sql`
       INSERT INTO sh_web_link (tokenHash, target, expiresAt, createdAt)
       VALUES (${await sha256Hex(token)}, ${target}, ${expiresAt}, ${this.#now()})
@@ -315,7 +321,7 @@ export class WebApp {
     `;
     this.#purgeExpiredWebRows(now);
     const cookie = [
-      `${SESSION_COOKIE}=${await sessionCookieValue(this.#deps.secrets[0]!, sid)}`,
+      `${SESSION_COOKIE}=${await sessionCookieValue((await this.#deps.secrets())[0]!, sid)}`,
       "Path=/",
       "HttpOnly",
       "SameSite=Lax",
@@ -339,10 +345,32 @@ export class WebApp {
     );
   }
 
+  /**
+   * Opens an application session outright (the one-time-link exchange does this via
+   * openLink; kept as its own step so the cookie shape lives in exactly one place).
+   */
+  async openSession(secure: boolean): Promise<{ sid: string; csrf: string; cookie: string }> {
+    const sid = randomHex(32);
+    const csrf = randomHex(32);
+    const now = this.#now();
+    this.#sql`INSERT INTO sh_web_session (sid, csrf, createdAt, expiresAt, lastSeenAt)
+      VALUES (${sid}, ${csrf}, ${now}, ${now + SESSION_TTL_MS}, ${now})`;
+    this.#purgeExpiredWebRows(now);
+    const cookie = [
+      `${SESSION_COOKIE}=${await sessionCookieValue((await this.#deps.secrets())[0]!, sid)}`,
+      "Path=/",
+      "HttpOnly",
+      "SameSite=Lax",
+      `Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`,
+      ...(secure ? ["Secure"] : []),
+    ].join("; ");
+    return { sid, csrf, cookie };
+  }
+
   async #sessionFromRequest(request: Request): Promise<SessionRow | null> {
     const cookie = request.headers.get("cookie") ?? "";
     const raw = cookie.split(/;\s*/).find((part) => part.startsWith(`${SESSION_COOKIE}=`))?.slice(SESSION_COOKIE.length + 1) ?? null;
-    const sid = await parseSessionCookie(this.#deps.secrets, raw);
+    const sid = await parseSessionCookie(await this.#deps.secrets(), raw);
     if (!sid) return null;
     const row = this.#sql<{ csrf: string }>`
       SELECT csrf FROM sh_web_session WHERE sid = ${sid} AND expiresAt > ${this.#now()}
@@ -361,7 +389,7 @@ export class WebApp {
     if (!session) {
       return url.pathname.startsWith("/app/api/")
         ? Response.json({ error: "auth_required" }, { status: 401, headers: { "cache-control": "no-store" } })
-        : loginPromptPage("这一页需要先登录。", 401);
+        : loginPromptPage("请先登录。", 401);
     }
 
     if (url.pathname.startsWith("/app/api/")) {
@@ -369,27 +397,28 @@ export class WebApp {
         ledger: this.#ledger,
         devices: () => this.#deviceViews().map(({ deviceId, name, online, revoked }) => ({ deviceId, name, online, revoked })),
         now: () => this.#now(),
-        endSession: (sid) => void this.#sql`DELETE FROM sh_web_session WHERE sid = ${sid}`,
+        endSession: (sid) => { this.#sql`DELETE FROM sh_web_session WHERE sid = ${sid}`; this.#deps.sessionEnded?.(sid); },
         audit: (reason, detail) => this.#deps.audit(reason, detail),
+        requireOrigin: this.#deps.accessOnly,
         ...this.#deps.workspace,
       });
     }
 
     // The workspace: /app is the whole conversation; a Thread URL (the card links and the
     // raw-process page's way back) opens the same page with that Thread selected.
-    if (request.method === "GET" && url.pathname === "/app") return this.workspaceShell(url);
+    if (request.method === "GET" && (url.pathname === "/app" || (this.#deps.accessOnly && (url.pathname === "/app/settings" || url.pathname === "/app/machines")))) return this.workspaceShell(url);
     const thread = /^\/app\/threads\/([\w-]+)$/.exec(url.pathname);
     if (thread && request.method === "GET") {
       return this.#ledger.threads.get(thread[1]!) ? this.workspaceShell(url) : new Response("not found", { status: 404 });
     }
 
     if (url.pathname === "/app/machines" && request.method === "GET") return this.machinesPage(session);
-    if (url.pathname === "/app/machines/revoke" && request.method === "POST") return this.revokeMachine(request, session);
+    if (!this.#deps.accessOnly && url.pathname === "/app/machines/revoke" && request.method === "POST") return this.revokeMachine(request, session);
 
     // L3 raw process (spec §7.4): the server-rendered shell plus the little vanilla JS that
     // streams chunks over a web-role WebSocket (ADR-0001 decision 12).
     const rawProcess = /^\/app\/threads\/([\w-]+)\/workers\/([A-Za-z0-9._-]+)$/.exec(url.pathname);
-    if (rawProcess && request.method === "GET") return this.rawProcessPage(rawProcess[1]!, rawProcess[2]!);
+    if (rawProcess && request.method === "GET") return this.#deps.accessOnly ? this.workspaceShell(url) : this.rawProcessPage(rawProcess[1]!, rawProcess[2]!);
 
     return new Response("not found", { status: 404 });
   }

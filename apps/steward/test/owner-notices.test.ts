@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { FAILED_RUN_NOTICE, NO_MODEL_KEY_NOTICE, failedRunNotice } from "../src/owner-notices.ts";
+import {
+  FAILED_RUN_NOTICE,
+  INVALID_MODEL_KEY_NOTICE,
+  INVALID_MODEL_KEY_WEB_NOTICE,
+  NO_MODEL_KEY_NOTICE,
+  NO_MODEL_KEY_WEB_NOTICE,
+  failedRunNotice,
+  isModelAuthFailure,
+} from "../src/owner-notices.ts";
 
 describe("the notice for a user run that did not complete", () => {
   it("a deployment with no model key is told so — retrying cannot fix it", () => {
@@ -12,11 +20,45 @@ describe("the notice for a user run that did not complete", () => {
     expect(notice).not.toContain("稍后再试");
   });
 
+  it("on the web the key is added in Settings, and no Feishu command is promised", () => {
+    const notice = failedRunNotice({ provider: "deepseek", apiKey: false }, true);
+    expect(notice).toBe(NO_MODEL_KEY_WEB_NOTICE);
+    expect(notice).toContain("设置");
+    expect(notice).not.toMatch(/MODEL_KEY|\/网页|\/加机器|飞书/);
+    expect(failedRunNotice({ provider: "deepseek", apiKey: true }, true)).toBe(FAILED_RUN_NOTICE);
+  });
+
   it("a keyed deployment keeps the generic failure notice", () => {
     expect(failedRunNotice({ provider: "deepseek", apiKey: true })).toBe(FAILED_RUN_NOTICE);
   });
 
   it("the faux test provider has no key by design and is never reported as missing one", () => {
     expect(failedRunNotice({ provider: "faux", apiKey: false })).toBe(FAILED_RUN_NOTICE);
+  });
+});
+
+describe("a keyed deployment whose key the provider rejects", () => {
+  // The real DeepSeek answer (pilot deployment, 2026-10-19): the pasted key was invalid.
+  const deepseek401 = '401: {"message":"Authentication Fails, Your api key: ****6eb2 is invalid","type":"authentication_error"}';
+
+  it("isModelAuthFailure recognizes the vendor wordings", () => {
+    expect(isModelAuthFailure(deepseek401)).toBe(true);
+    expect(isModelAuthFailure("403: forbidden")).toBe(true);
+    expect(isModelAuthFailure("Invalid API key provided")).toBe(true);
+    expect(isModelAuthFailure("500: upstream timeout")).toBe(false);
+    expect(isModelAuthFailure("model overloaded")).toBe(false);
+  });
+
+  it("tells the owner to fix the key, not to retry", () => {
+    expect(failedRunNotice({ provider: "deepseek", apiKey: true }, true, deepseek401)).toBe(INVALID_MODEL_KEY_WEB_NOTICE);
+    expect(failedRunNotice({ provider: "deepseek", apiKey: true }, false, deepseek401)).toBe(INVALID_MODEL_KEY_NOTICE);
+    expect(INVALID_MODEL_KEY_WEB_NOTICE).toContain("设置");
+    expect(INVALID_MODEL_KEY_WEB_NOTICE).not.toContain("稍后再试");
+  });
+
+  it("non-auth failures keep the generic notice, and a missing key outranks the detail", () => {
+    expect(failedRunNotice({ provider: "deepseek", apiKey: true }, true, "500: upstream")).toBe(FAILED_RUN_NOTICE);
+    expect(failedRunNotice({ provider: "deepseek", apiKey: true }, true, undefined)).toBe(FAILED_RUN_NOTICE);
+    expect(failedRunNotice({ provider: "deepseek", apiKey: false }, true, deepseek401)).toBe(NO_MODEL_KEY_WEB_NOTICE);
   });
 });

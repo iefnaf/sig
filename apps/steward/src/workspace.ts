@@ -72,6 +72,16 @@ const LEADING_EMOJI = /^(?:\p{Extended_Pictographic}\uFE0F?\s*)+/u;
  *  stay the single source of truth; no Feishu element tags reach the browser. */
 export function cardView(card: unknown): CardView {
   const root = obj(card);
+  // New records use the workspace shape; the legacy parser below preserves old decisions.
+  if (root.type === "pip-card") return {
+    tone: ["success", "attention", "failure", "info"].includes(str(root.tone)) ? root.tone as CardView["tone"] : "info",
+    title: str(root.title), body: Array.isArray(root.body) ? root.body.filter((s): s is string => typeof s === "string") : [],
+    note: typeof root.note === "string" ? root.note : null,
+    buttons: (Array.isArray(root.buttons) ? root.buttons : []).map(obj).filter(b => typeof b.label === "string").map(b => ({
+      label: str(b.label), ...(typeof b.action === "string" ? { action: b.action } : {}),
+      ...(typeof b.url === "string" && /^https?:\/\//i.test(b.url) ? { url: b.url } : {}), ...(b.primary === true ? { primary: true } : {}),
+    })),
+  };
   const header = obj(root.header);
   const body: string[] = [];
   const buttons: CardButton[] = [];

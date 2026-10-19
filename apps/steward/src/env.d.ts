@@ -18,9 +18,17 @@
 interface Env {
   SERVER_KEY: string;
   SERVER_KEY_PREVIOUS?: string;
-  SETUP_TOKEN: string;
+  ACCESS_TEAM_DOMAIN?: string;
+  ACCESS_AUD?: string;
+  OWNER_EMAIL?: string;
+  ACCESS_CERTS?: Fetcher;
+  SETUP_TOKEN?: string;
   MODEL_KEY?: string;
   FEISHU_API?: Fetcher;
+  /** Deploy-time var written by `wrangler deploy` (ADR-0004): this deployment's exact identity. */
+  SHEPHERD_IDENTITY?: string;
+  /** Written by `shepherd connect`'s claim step through the Cloudflare API; consumed once at /pair. */
+  SHEPHERD_CLAIM_SECRET?: string;
   STEWARD_MODEL?: string | { provider?: unknown; modelId?: unknown; baseUrl?: unknown };
   // Issue #28 (steward.md §12): USD per UTC day for the daily budget soft cap. Unset →
   // budget.ts DEFAULT_DAILY_BUDGET_USD; 0 disables automatic model wakes entirely.
@@ -31,9 +39,17 @@ declare namespace Cloudflare {
   interface Env {
     SERVER_KEY: string;
     SERVER_KEY_PREVIOUS?: string;
-    SETUP_TOKEN: string;
+    ACCESS_TEAM_DOMAIN?: string;
+    ACCESS_AUD?: string;
+    OWNER_EMAIL?: string;
+    ACCESS_CERTS?: Fetcher;
+    /** Tests only: the private half of the key the simulated Access signs with. */
+    ACCESS_PRIVATE_JWK?: string;
+    SETUP_TOKEN?: string;
     MODEL_KEY?: string;
     FEISHU_API?: Fetcher;
+    SHEPHERD_IDENTITY?: string;
+    SHEPHERD_CLAIM_SECRET?: string;
     STEWARD_MODEL?: string | { provider?: unknown; modelId?: unknown; baseUrl?: unknown };
     DAILY_BUDGET_USD?: string | number;
   }

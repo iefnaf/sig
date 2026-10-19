@@ -9,21 +9,15 @@
     "typecheck": "pnpm -r --if-present typecheck",
     "test": "pnpm -r --if-present test",
     "dev:steward": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "node scripts/deploy.mjs"
   },
   "devDependencies": {
     "typescript": "7.0.2"
   },
   "cloudflare": {
     "bindings": {
-      "SERVER_KEY": {
-        "description": "Random secret that signs connector device tokens and seals the Feishu credentials and model key at rest. Generate one now: `openssl rand -hex 32` (keep a copy; see [rotating it](docs/deploy.md#secrets-and-rotation))."
-      },
-      "SETUP_TOKEN": {
-        "description": "Random one-time password that unlocks the setup page after deploy. Generate a **different** random string: `openssl rand -hex 32`. You will need it as `?token=…` to open `https://<your-worker>.workers.dev/setup`."
-      },
       "MODEL_KEY": {
-        "description": "Your model provider's API key (default provider: DeepSeek — get one at [platform.deepseek.com](https://platform.deepseek.com)). Stored encrypted in your own Cloudflare account. You can leave this empty for now and set it later with `wrangler secret put MODEL_KEY`."
+        "description": "Your model provider's API key (default provider: DeepSeek — get one at [platform.deepseek.com](https://platform.deepseek.com)). Stored encrypted in your own Cloudflare account. You can leave this empty now and paste it into the workspace's Settings later. After deploying, protect the workspace with Cloudflare Access and set OWNER_EMAIL, ACCESS_TEAM_DOMAIN and ACCESS_AUD — until then the workspace stays closed (see docs/deploy.md)."
       }
     }
   },

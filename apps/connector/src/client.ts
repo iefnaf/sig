@@ -38,7 +38,7 @@ export interface ClientOptions {
   snapshot?: () => { agents: unknown[]; repos: unknown[]; limits: { maxWorkers: number; running: number } };
   /** L3 raw-history loader (connector-pi.md §11.4): when set, `history_req` messages are
    *  answered with windowed `history_chunk` streams; without it they get `error{unsupported}`. */
-  loadHistory?: (workerId: string, since: string | undefined, maxBytes: number) => Promise<HistoryPage>;
+  loadHistory?: (workerId: string, since: string | undefined, maxBytes: number, format?: "full") => Promise<HistoryPage>;
   pingIntervalMs?: number;
   pongTimeoutMs?: number;
   deadAfterMs?: number;
@@ -246,7 +246,7 @@ export class ConnectorClient {
       case "history_req": {
         // §6.6: same wire as cmd but deliberately outside the outbox/command log — a fresh
         // request per browser view, deduped by nothing, re-sent by nobody.
-        const req = message as { id?: unknown; workerId?: unknown; since?: unknown; maxBytes?: unknown };
+        const req = message as { id?: unknown; workerId?: unknown; since?: unknown; maxBytes?: unknown; format?: unknown };
         if (typeof req.id !== "string" || typeof req.workerId !== "string") return;
         if (this.history) {
           this.history.onRequest({
@@ -254,6 +254,7 @@ export class ConnectorClient {
             workerId: req.workerId,
             since: typeof req.since === "string" && req.since.length > 0 ? req.since : undefined,
             maxBytes: typeof req.maxBytes === "number" ? req.maxBytes : undefined,
+            ...(req.format === "full" ? { format: "full" as const } : {}),
           });
         } else {
           this.send(ws, { t: "error", re: req.id, code: "unsupported", message: "history reads are not available on this connector", retriable: false });

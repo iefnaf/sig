@@ -45,6 +45,12 @@ async function envKeys(): Promise<ServerKey[]> {
   return [await serverKey(PRIMARY_SECRET), await serverKey(PREVIOUS_SECRET)];
 }
 
+/** The DO's actual key set (ADR-0004: the auth root leads, the legacy env keys follow). */
+async function doKeys(): Promise<ServerKey[]> {
+  const keys = await ownerStub().authKeys();
+  return keys;
+}
+
 async function insertDevice(deviceId: string, name: string): Promise<void> {
   // RPC first: wakes the DO through the SDK lifecycle so migrations have run.
   await ownerStub().setupState();
@@ -91,8 +97,8 @@ describe("SERVER_KEY rotation: device tokens (issue #27)", () => {
     const rekeyed = first.welcome.token as string;
     expect(typeof rekeyed).toBe("string");
 
-    const primary = await serverKey(PRIMARY_SECRET);
-    expect(await parseToken([primary], rekeyed)).toMatchObject({ deviceId: "dev_rot_rekey", epoch: 1, keyId: primary.id });
+    const [primary] = await doKeys();
+    expect(await parseToken([primary!], rekeyed)).toMatchObject({ deviceId: "dev_rot_rekey", epoch: 1, keyId: primary!.id });
 
     // The rekeyed token authenticates the next connection — and needs no further rekey.
     const second = await connectAndHello("dev_rot_rekey", rekeyed, 2);
@@ -105,29 +111,32 @@ describe("SERVER_KEY rotation: device tokens (issue #27)", () => {
     const legacy = await legacyTokenUnderOldKey("dev_rot_legacy");
     const { welcome } = await connectAndHello("dev_rot_legacy", legacy, 1);
     expect(typeof welcome.token).toBe("string");
-    const primary = await serverKey(PRIMARY_SECRET);
-    expect(await parseToken([primary], welcome.token as string)).toMatchObject({ deviceId: "dev_rot_legacy", keyId: primary.id });
+    const [primary] = await doKeys();
+    expect(await parseToken([primary!], welcome.token as string)).toMatchObject({ deviceId: "dev_rot_legacy", keyId: primary!.id });
   });
 
   it("once SERVER_KEY_PREVIOUS is dropped, previous-key tokens are refused at the DO layer", async () => {
     const token = await pairedUnderOldKey("dev_rot_dropped");
-    // Simulate the operator closing the window: only the new primary remains configured.
-    await overrideKeys([await serverKey(PRIMARY_SECRET)]);
+    // Simulate the window closing: only the DO's own primary (the auth root) remains.
+    const [primary] = await doKeys();
+    await overrideKeys([primary!]);
     try {
+      // The Worker's pre-check and the DO now share one live key set (ADR-0004: the fixture
+      // asks the DO), so a dropped key is refused at the door already.
       const res = await connect(token);
-      expect(res.status).toBe(101); // the Worker precheck still has the old env…
-      const ws = res.webSocket!;
-      ws.accept();
-      const closed = await nextClose(ws); // …but the DO layer refuses the stale key
-      expect(closed.code).toBe(4401);
+      expect(res.status).toBe(401);
     } finally {
-      await overrideKeys(await envKeys());
+      // restore: clear the override so serverKeys() returns to its own derivation
+      await runInDurableObject(ownerStub(), (instance: Steward) => {
+        delete (instance as unknown as { serverKeys?: unknown }).serverKeys;
+      });
     }
   });
 
   it("a primary-key token is not rekeyed (no rotation in progress)", async () => {
     await insertDevice("dev_rot_current", "fresh-machine");
-    const token = await mintToken(await serverKey(PRIMARY_SECRET), "dev_rot_current", 1);
+    const [primary] = await doKeys();
+    const token = await mintToken(primary!, "dev_rot_current", 1);
     const { welcome } = await connectAndHello("dev_rot_current", token, 1);
     expect(welcome.token).toBeUndefined();
   });

@@ -1,35 +1,26 @@
 // The deploy target (issue #25): Deploy-to-Cloudflare buttons and Workers Builds read the
-// Wrangler config from the repository root, and the default deploy command `npx wrangler
-// deploy` runs there — so the steward Worker's config lives here, pointing into the monorepo
-// (ADR-0001 decision 2) instead of apps/steward/. Local dev/tests pass
-// `--config ../../wrangler.jsonc` from apps/steward.
+// Wrangler config from the repository root, and the default deploy command `npm run deploy`
+// (scripts/deploy.mjs) runs there — so the steward Worker's config lives here, pointing into
+// the monorepo (ADR-0001 decision 2). The deploy script wraps `wrangler deploy` and stamps
+// SHEPHERD_IDENTITY (account id + script name) for claim-target checks (ADR-0004).
 //
-// SERVER_KEY, SETUP_TOKEN, and MODEL_KEY are secrets, deliberately NOT declared here: they
-// are generated at deploy time through the Deploy-to-Cloudflare form (root .dev.vars.example
-// + cloudflare.bindings descriptions in the root package.json) or set manually with
-// `wrangler secret put`. See docs/deploy.md.
+// NO secrets are typed at deploy time (ADR-0004): the Durable Object generates its own signing
+// secret on first boot; the first computer claims the deployment through a Cloudflare
+// authorization (`shepherd connect <url>`); browsers sign in with machine-minted one-time
+// links. MODEL_KEY is the one optional secret (seed the model key at deploy, or paste it in
+// the workspace's Settings later). A legacy SERVER_KEY, if still set, keeps verifying.
 //
-// The steward's model selection (issue #6, ADR-0001 decision 11) is deploy config — set
-// `vars.STEWARD_MODEL` here to override the default deepseek/deepseek-flash (the eval
-// baseline), e.g.:
-//   "vars": { "STEWARD_MODEL": "{\"provider\": \"deepseek\", \"modelId\": \"deepseek-v4-pro\"}" }
-// The daily budget soft cap (issue #28, ADR-0001 decision 15) is deploy config too: set
-// `vars.DAILY_BUDGET_USD` (dollars per UTC day) to override the default $1 — past it,
-// event/routine/follow-up wakes stop reaching the model while done reports, fallback
-// pushes, digests, and replies to the owner continue:
-//   "vars": { "DAILY_BUDGET_USD": "0.5" }
-// The API key never rides in vars: it is the sealed sh_model row (seeded from MODEL_KEY at
-// deploy, or set via setModelConfig), and the provider is built with an inline
-// auth.apiKey.resolve (spike bug 7). A missing key or unknown provider/model fails visibly
-// (`sh_run` settles `unanswered`), never with a silently different model.
+// Deploy config: vars.STEWARD_MODEL (JSON: provider, modelId, baseUrl?) overrides the default
+// deepseek/deepseek-flash eval baseline (ADR-0001 decision 11); vars.DAILY_BUDGET_USD is the
+// daily model-spend soft cap in dollars per UTC day, default 1 (issue #28).
 {
   "name": "shepherd-steward",
   "main": "apps/steward/src/index.ts",
   "compatibility_date": "2026-10-10",
   "compatibility_flags": ["nodejs_compat"],
   // The Pip web workspace (ADR-0002): plain HTML/CSS/JS files, no frontend build. The Worker
-  // runs first for every request so /app/assets/* stays behind the same session-cookie gate
-  // as the rest of /app, then serves the files through the ASSETS binding.
+  // runs first for every request so /app/assets/* sits behind the same session gate as the
+  // rest of /app (ADR-0004), then serves the files through the ASSETS binding.
   "assets": { "directory": "./apps/steward/ui", "binding": "ASSETS", "run_worker_first": true },
   "durable_objects": {
     "bindings": [{ "name": "Steward", "class_name": "Steward" }]

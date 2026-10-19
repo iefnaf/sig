@@ -50,9 +50,11 @@ import {
   type MachineOfflineMessage,
   type PongMessage,
   type ResyncMessage,
+  serverKey,
   type ServerKey,
   type WelcomeMessage,
 } from "@shepherd/protocol";
+import { ensureAuthRoot } from "./auth-root.ts";
 import { bearer, resolveServerKeys } from "./auth.ts";
 import {
   FeishuAdapter,
@@ -123,7 +125,7 @@ import { renderSetupClosedPage, renderSetupPage, type SetupView } from "./setup-
 import { ambiguousWakeText, commandAttentionWakeText, escapeMarkers, verifyWakeText } from "./wake-text.ts";
 import { WorkspaceError, cardOpen, cardView, type OwnerChannel, type WorkspaceActionInput, type WorkspaceInput } from "./workspace.ts";
 import { WorkspaceStream } from "./workspace-stream.ts";
-import { WebApp, linkTargetForThread, parseSessionCookie } from "./web.ts";
+import { WebApp, linkTargetForThread, mintLinkToken, parseSessionCookie, sha256Hex } from "./web.ts";
 
 /** Messages the workspace will queue before telling the owner to wait for Pip to catch up. */
 const MAX_OPEN_WEB_RUNS = 10;
@@ -135,6 +137,8 @@ const WORKSPACE_NUDGE_MS = 150;
 interface ConnState {
   /** Set on browser connections (the L3 stream consumers); connector connections carry deviceId. */
   role?: "web";
+  sid?: string;
+  expiresAt?: number;
   deviceId: string;
   epoch: number;
   /** Key that authenticated the connection (issue #27): ≠ primary ⇒ welcome rekeys. */
@@ -332,6 +336,14 @@ function versionRangesOverlap(a: { min: number; max: number }, b: { min: number;
   return a.min <= b.max && b.min <= a.max;
 }
 
+/** What /pair's claim branch passes down after verifying the proof (ADR-0004). */
+interface ClaimGrant {
+  accountId: string;
+  scriptName: string;
+  nonce: string;
+  expiresAt: number;
+}
+
 export type PairResult =
   | { ok: true; deviceId: string; token: string }
   | { ok: false; reason: "invalid_code" }
@@ -341,11 +353,27 @@ export type PairResult =
 // generic there breaks Liskov substitutability against `Agent`'s own declarations; state is
 // cast at the read/write sites instead (same tradeoff the do-protocol spike made).
 export class Steward extends Agent<Env> {
+  /** Only the historical transport test fixture overrides this. Production always uses the web. */
+  protected get webOnly(): boolean { return true; }
+
+  private ensureWebOwner(): void {
+    const legacy = this.sql<{ ownerOpenId: string | null }>`SELECT ownerOpenId FROM sh_channel WHERE channel = 'feishu'`[0];
+    this.sql`INSERT INTO sh_owner (id, ownerId, email) VALUES (1, ${legacy?.ownerOpenId ?? "owner"}, 'claimed-owner')
+      ON CONFLICT(id) DO NOTHING`;
+  }
+
   onStart(): void {
     // Each migration commits atomically WITH its ledger row (reviews #47-2 + #48 finding 3):
     // a multi-statement rebuild can never persist half of itself, and the ledger write
     // cannot lag the commit (the copy-drop-rename migrations are not re-runnable).
     runMigrations(this.sql.bind(this), MIGRATIONS, (fn) => this.ctx.storage.transactionSync(fn));
+    if (this.webOnly) {
+      this.ensureWebOwner();
+      // Pending legacy deliveries become visible web records without losing their decision IDs.
+      this.sql`UPDATE sh_outbound SET channel = 'web', status = 'sent', sentAt = COALESCE(sentAt, ${Date.now()}),
+        providerMsgId = COALESCE(providerMsgId, id), claimToken = NULL, claimExpiresAt = NULL
+        WHERE status IN ('queued', 'sending')`;
+    }
     // Notes maintenance is daily (steward.md §2.5, issue #19): a 02:00 UTC cron, idempotent
     // by expression — re-arming at boot dedups onto the same row and never postpones it,
     // so the chain cannot die (or drift) with an evicted isolate.
@@ -525,10 +553,28 @@ export class Steward extends Agent<Env> {
 
   private appliedRootModel: string | undefined;
 
-  // The signing/sealing key set (primary = SERVER_KEY, plus SERVER_KEY_PREVIOUS during a
-  // rotation window). Overridable so tests can simulate rotation states inside the DO.
+  private authRootCache_: ServerKey[] | undefined;
+
+  /**
+   * The signing/sealing key set (ADR-0004): the Durable Object's own auth root, generated on
+   * first boot and kept in its storage — a deployment needs no hand-typed SERVER_KEY. The
+   * deploy-time SERVER_KEY, when one is still set, stays in the set so tokens and sessions
+   * minted before the upgrade keep verifying; SERVER_KEY_PREVIOUS rides along as before.
+   * Overridable so tests can simulate rotation states inside the DO.
+   */
   protected async serverKeys(): Promise<ServerKey[]> {
-    return resolveServerKeys(this.env);
+    if (!this.authRootCache_) {
+      const root = await ensureAuthRoot(this.ctx.storage);
+      const rootKey = await serverKey(root.secret);
+      const legacy = await resolveServerKeys(this.env).catch(() => [] as ServerKey[]);
+      this.authRootCache_ = [rootKey, ...legacy.filter((k) => k.id !== rootKey.id)];
+    }
+    return this.authRootCache_;
+  }
+
+  /** The Worker's stateless pre-checks use the same set (module scope caches it per isolate). */
+  async authKeys(): Promise<ServerKey[]> {
+    return this.serverKeys();
   }
 
   // Tests shrink the /pair lockout (see feishuSendTimeoutMs for the same pattern).
@@ -536,6 +582,18 @@ export class Steward extends Agent<Env> {
 
   // Tests shrink the history relay TTL to exercise the alarm-driven sweep quickly.
   protected historyRelayTtlMs = HISTORY_RELAY_TTL_DEFAULT_MS;
+  /** When the pending relay sweep fires (0: none known). Live viewers open a stream every few
+   *  seconds; one sweep per open would pile up schedule rows, and one pending sweep is enough —
+   *  it re-arms itself for the next expiry. */
+  private relaySweepAt = 0;
+
+  private armRelaySweep(): void {
+    const delayS = Math.max(1, Math.ceil(this.historyRelayTtlMs / 1000));
+    const fireAt = Date.now() + delayS * 1000;
+    if (this.relaySweepAt !== 0 && this.relaySweepAt <= fireAt) return; // an earlier sweep is already coming
+    this.relaySweepAt = fireAt;
+    void this.schedule(delayS, "sweepHistoryRelays");
+  }
 
   // Tests shrink the quiet merge window (issue #11) — 0 makes quiet rows due immediately,
   // keeping the content-path tests deterministic while the window itself has its own suite.
@@ -578,7 +636,7 @@ export class Steward extends Agent<Env> {
         return run !== null && (run.kind === "user" || run.kind === "verify") ? { threadId: run.routedThreadId } : null;
       },
       onRunEnd: () => { void this.pollRuns(); },
-      send: (frame) => { for (const connection of this.getConnections(WORKSPACE_TAG)) connection.send(frame); },
+      send: (frame) => { for (const connection of this.getConnections(WORKSPACE_TAG)) if (this.webConnectionAlive(connection)) connection.send(frame); },
       log: (reason, detail) => this.logChannel(reason, detail),
     }));
   }
@@ -590,7 +648,7 @@ export class Steward extends Agent<Env> {
     this.workspaceNudge = setTimeout(() => {
       this.workspaceNudge = undefined;
       const frame = JSON.stringify({ t: "workspace_changed" });
-      for (const connection of this.getConnections(WORKSPACE_TAG)) connection.send(frame);
+      for (const connection of this.getConnections(WORKSPACE_TAG)) if (this.webConnectionAlive(connection)) connection.send(frame);
       this.workspaceStream.ensure(); // a Durable Object that woke after hibernation re-subscribes here
     }, WORKSPACE_NUDGE_MS);
   }
@@ -598,7 +656,7 @@ export class Steward extends Agent<Env> {
   private dispatcher_?: Dispatcher;
   private webDispatcher_?: Dispatcher;
   private get dispatcher(): Dispatcher {
-    return (this.dispatcher_ ??= this.buildDispatcher("feishu"));
+    return (this.dispatcher_ ??= this.buildDispatcher(this.webOnly ? "web" : "feishu"));
   }
   /** Acknowledgements and cards from this dispatcher answer on `channel`: a tap made on the
    *  web is answered on the web, a tap made in Feishu stays in Feishu. */
@@ -715,7 +773,7 @@ export class Steward extends Agent<Env> {
   private get web(): WebApp {
     return (this.web_ ??= new WebApp({
       sql: this.sql.bind(this) as unknown as import("./schema.ts").SqlExecutor,
-      secrets: [this.env.SERVER_KEY, this.env.SERVER_KEY_PREVIOUS].filter((k): k is string => typeof k === "string" && k.length > 0),
+      secrets: async () => (await this.serverKeys()).map((k) => k.secret),
       ledger: this.ledger,
       listDevices: () =>
         this.sql<{ deviceId: string; name: string | null; revoked: number }>`
@@ -728,7 +786,15 @@ export class Steward extends Agent<Env> {
         budget: () => this.budgetState(),
         submitMessage: (input) => this.submitWorkspaceMessage(input),
         submitAction: (input) => this.submitWorkspaceAction(input),
+        ...(this.webOnly ? {
+          settings: async () => ({ claimed: this.claimState().claimed, model: await this.llmSelection() }),
+          saveModel: async (key: string) => { const selected = await this.llmSelection(); await this.setModelConfig(selected.provider, key); },
+          pairing: async (id: string) => this.webPairing(id),
+          revoke: (id: string) => { void this.revoke(id); },
+        } : {}),
       },
+      accessOnly: this.webOnly,
+      sessionEnded: (sid) => this.closeWebSession({ sid }),
       shell: () => this.env.ASSETS.fetch(new Request("https://assets.invalid/workspace.html")),
     }));
   }
@@ -781,7 +847,7 @@ export class Steward extends Agent<Env> {
       },
       startWorker: async (input) => {
         const run = await this.currentRunBinding();
-        const outcome = await this.dispatcherFor(run?.channel === "web" ? "web" : "feishu").startWorker(input);
+        const outcome = await this.dispatcherFor(await this.currentRunChannel()).startWorker(input);
         // Review #8: a dispatch in this run picks/creates the Thread the conversation is now
         // about — backfill it onto the run so the run's reply (and quote-replies to it)
         // route to that Thread, exactly like an explicit quote-route does.
@@ -995,7 +1061,7 @@ export class Steward extends Agent<Env> {
   /** The channel the executing run answers on: a run the owner started on the web keeps its
    *  questions and notices on the web; everything else (events, routines) pushes to Feishu. */
   private async currentRunChannel(): Promise<OwnerChannel> {
-    return (await this.currentRunBinding())?.channel === "web" ? "web" : "feishu";
+    return this.webOnly || (await this.currentRunBinding())?.channel === "web" ? "web" : "feishu";
   }
 
   /** Records that the *executing* run already produced user-facing output (review #9). */
@@ -1015,6 +1081,10 @@ export class Steward extends Agent<Env> {
   }
 
   private ownerOpenIdSync(): string | null {
+    if (this.webOnly) {
+      this.ensureWebOwner();
+      return this.sql<{ ownerId: string }>`SELECT ownerId FROM sh_owner WHERE id = 1`[0]?.ownerId ?? null;
+    }
     return this.sql<{ ownerOpenId: string | null }>`
       SELECT ownerOpenId FROM sh_channel WHERE channel = 'feishu'
     `[0]?.ownerOpenId ?? null;
@@ -1108,6 +1178,16 @@ export class Steward extends Agent<Env> {
   // (the Worker has already HMAC-verified the link token / session cookie before forwarding).
   async onRequest(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    if (this.webOnly) {
+      this.ensureWebOwner();
+      this.web.recordOrigin(url.origin);
+      if (url.pathname.startsWith("/link/") && request.method === "GET") {
+        const secure = url.protocol === "https:" && url.hostname !== "localhost" && url.hostname !== "127.0.0.1";
+        return this.web.openLink(url.pathname.slice("/link/".length), secure);
+      }
+      if (url.pathname !== "/app" && !url.pathname.startsWith("/app/")) return new Response("not found", { status: 404 });
+      return this.web.handle(request);
+    }
     // Every request the DO serves reveals the deployment's public origin — the source for the
     // pairing command's URL and the absolute one-time card links (web.ts owns the value).
     if (url.protocol === "https:" || url.protocol === "http:") this.web.recordOrigin(url.origin);
@@ -1153,15 +1233,12 @@ export class Steward extends Agent<Env> {
         .split(/;\s*/)
         .find((part) => part.startsWith("shepherd_session="))
         ?.slice("shepherd_session=".length) ?? null;
-      const sid = await parseSessionCookie(
-        [this.env.SERVER_KEY, this.env.SERVER_KEY_PREVIOUS].filter((k): k is string => typeof k === "string" && k.length > 0),
-        raw,
-      );
+      const sid = await parseSessionCookie((await this.serverKeys()).map((k) => k.secret), raw);
       if (!sid || !this.web.sessionAlive(sid)) {
         connection.close(CloseCode.UNAUTHORIZED, "unauthorized");
         return;
       }
-      connection.setState({ role: "web", deviceId: "", epoch: 0, keyId: "" } satisfies ConnState);
+      connection.setState({ role: "web", sid, expiresAt: Date.now() + 24 * 3600_000, deviceId: "", epoch: 0, keyId: "" } satisfies ConnState);
       if (new URL(ctx.request.url).searchParams.get("view") === "workspace") this.workspaceStream.ensure();
       return;
     }
@@ -1217,6 +1294,23 @@ export class Steward extends Agent<Env> {
     this.rearmNoticeDrain(); // the offline intents' 2-minute window starts here
   }
 
+  /** Signing out ends every browser connection that session opened. */
+  closeWebSession(input: { sid: string }): void {
+    for (const connection of this.getConnections<ConnState>("web")) {
+      if (connection.state?.sid === input.sid) connection.close(CloseCode.UNAUTHORIZED, "sign in again");
+    }
+  }
+
+  private webConnectionAlive(connection: Connection): boolean {
+    if (!this.webOnly) return true;
+    const state = connection.state as ConnState | null;
+    if (state?.role !== "web" || !state.sid || !this.web.sessionAlive(state.sid)) {
+      connection.close(CloseCode.UNAUTHORIZED, "sign in again");
+      return false;
+    }
+    return true;
+  }
+
   async onMessage(connection: Connection, raw: WSMessage): Promise<void> {
     if (typeof raw !== "string") return;
     let message: unknown;
@@ -1231,6 +1325,7 @@ export class Steward extends Agent<Env> {
     const state = connection.state as unknown as ConnState | null;
     const t = (message as { t?: unknown }).t;
     if (state?.role === "web") {
+      if (!this.webConnectionAlive(connection)) return;
       switch (t) {
         case "history_open":
           this.handleHistoryOpen(connection, message);
@@ -1331,13 +1426,14 @@ export class Steward extends Agent<Env> {
       INSERT INTO history_relay (reqId, webConnId, workerId, deviceId, maxBytes, sentBytes, expiresAt, createdAt)
       VALUES (${reqId}, ${connection.id}, ${open.workerId}, ${worker.deviceId}, ${maxBytes}, 0, ${now + this.historyRelayTtlMs}, ${now})
     `;
-    void this.schedule(Math.max(1, Math.ceil(this.historyRelayTtlMs / 1000)), "sweepHistoryRelays");
+    this.armRelaySweep();
     const req: HistoryReqMessage = {
       t: "history_req",
       id: reqId,
       workerId: open.workerId,
       maxBytes,
       ...(open.since ? { since: open.since } : {}),
+      ...(open.format ? { format: open.format } : {}),
     };
     deviceConn.send(JSON.stringify(req));
   }
@@ -1371,7 +1467,7 @@ export class Steward extends Agent<Env> {
       return;
     }
     const webConn = this.getConnection(relay.webConnId);
-    if (!webConn) {
+    if (!webConn || !this.webConnectionAlive(webConn)) {
       this.sql`DELETE FROM history_relay WHERE reqId = ${chunk.re}`;
       return;
     }
@@ -1412,10 +1508,13 @@ export class Steward extends Agent<Env> {
 
   /** Alarm-driven §6.6 termination: relays older than the TTL disappear, browser or not. */
   async sweepHistoryRelays(): Promise<void> {
+    this.relaySweepAt = 0;
     this.sql`DELETE FROM history_relay WHERE expiresAt <= ${Date.now()}`;
     const next = this.sql<{ m: number | null }>`SELECT MIN(expiresAt) AS m FROM history_relay`[0]?.m;
     if (typeof next === "number") {
-      void this.schedule(Math.max(1, Math.ceil((next - Date.now()) / 1000)), "sweepHistoryRelays");
+      const delayS = Math.max(1, Math.ceil((next - Date.now()) / 1000));
+      this.relaySweepAt = Date.now() + delayS * 1000;
+      void this.schedule(delayS, "sweepHistoryRelays");
     }
   }
 
@@ -1858,10 +1957,10 @@ export class Steward extends Agent<Env> {
   }
 
   private async drainNotifyPass(): Promise<void> {
-    const cfg = await this.loadFeishuConfig();
+    const owner = this.ownerOpenIdSync();
     for (const intent of this.ledger.notifications.pending()) {
       try {
-        if (!cfg?.ownerOpenId) continue; // no owner yet: the intent stays pending, not lost
+        if (!owner) continue; // no owner yet: the intent stays pending, not lost
         const rendered = await this.renderNotification(intent);
         if (rendered === null) {
           // Its data is gone (thread archived / worker pruned), or the news evaporated (a
@@ -1888,7 +1987,7 @@ export class Steward extends Agent<Env> {
           rendered.holdsConsentAsk !== true;
         await this.enqueueOutbound({
           kind: "card",
-          to: cfg.ownerOpenId,
+          to: owner,
           // Stable id (issue #21): the done card's [同意]/[先不要] resolves through this id
           // (`notify:report:<workerId>:<seq>`) on callback — the §3.1 rule applied to consent.
           id: `notify:${intent.dedupeKey}`,
@@ -2097,10 +2196,79 @@ export class Steward extends Agent<Env> {
 
   // `/加机器` in chat is the trigger (issue #22); `/pair` is the only HTTP consumer of the
   // code. QR/setup-page issuance was never built — chat is the canonical path now.
+  private webPairing(id: string): { code: string; expiresAt: number } {
+    const now = Date.now();
+    this.sql`DELETE FROM sh_web_pairing WHERE expiresAt <= ${now}`;
+    const existing = this.sql<{ code: string; expiresAt: number }>`SELECT code, expiresAt FROM sh_web_pairing WHERE id = ${id}`[0];
+    if (existing) return existing;
+    const result = { code: generatePairingCode(), expiresAt: now + 10 * 60_000 };
+    this.ctx.storage.transactionSync(() => {
+      this.sql`INSERT INTO pairing (code, expiresAt) VALUES (${result.code}, ${result.expiresAt})`;
+      this.sql`INSERT INTO sh_web_pairing (id, code, expiresAt) VALUES (${id}, ${result.code}, ${result.expiresAt})`;
+    });
+    return result;
+  }
+
   async createPairing(): Promise<{ code: string }> {
     const code = generatePairingCode();
     this.sql`INSERT INTO pairing (code, expiresAt) VALUES (${code}, ${Date.now() + 10 * 60_000})`;
     return { code };
+  }
+
+  // ---- claiming and device login (ADR-0004) -------------------------------------------------------
+
+  claimState(): { claimed: boolean } {
+    return { claimed: this.sql`SELECT 1 FROM sh_claim WHERE id = 1`.length > 0 };
+  }
+
+  /**
+   * Redeems a verified claim exactly once: the Worker has compared SHA-256 hashes of the
+   * SHEPHERD_CLAIM_SECRET the connector wrote through the Cloudflare API; here the claim is
+   * recorded and the device row created in one transaction, so a replayed proof can never
+   * pair twice and a claimed deployment refuses everything.
+   */
+  async redeemClaim(grant: ClaimGrant, name: string): Promise<{ ok: true; deviceId: string; token: string } | { ok: false; reason: "already_claimed" | "grant_spent" }> {
+    const now = Date.now();
+    let deviceId = "";
+    let token = "";
+    const spent = this.ctx.storage.transactionSync((): boolean => {
+      if (this.sql`SELECT 1 FROM sh_claim WHERE id = 1`.length > 0) return false;
+      if (this.sql`SELECT 1 FROM sh_claim_grant WHERE nonce = ${grant.nonce}`.length > 0) return false;
+      this.sql`INSERT INTO sh_claim_grant (nonce, redeemedAt) VALUES (${grant.nonce}, ${now})`;
+      deviceId = `dev_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
+      this.sql`INSERT INTO device (deviceId, name, epoch, createdAt) VALUES (${deviceId}, ${name}, 1, ${now})`;
+      this.sql`INSERT INTO sh_claim (id, claimedAt, accountId, scriptName) VALUES (1, ${now}, ${grant.accountId}, ${grant.scriptName})`;
+      return true;
+    });
+    if (!spent) return { ok: false, reason: this.claimState().claimed ? "already_claimed" : "grant_spent" };
+    const [primary] = await this.serverKeys();
+    token = await mintToken(primary!, deviceId, 1);
+    this.logChannel("claim_redeemed", `${grant.accountId}/${grant.scriptName} -> ${deviceId}`);
+    return { ok: true, deviceId, token };
+  }
+
+  /** The /pair handler records the public origin so login links can be absolute. */
+  async recordOrigin(origin: string): Promise<void> {
+    this.web.recordOrigin(origin);
+  }
+
+  /**
+   * A paired machine asks for a one-time browser sign-in link (the `shepherd login` command).
+   * The link is the same single-use token the Feishu-era web used (web.ts openLink), pointed at
+   * the workspace; only a live machine connection or a valid device credential may mint one.
+   */
+  async mintDeviceLoginLink(deviceId: string): Promise<string | null> {
+    const device = this.sql<{ revoked: number }>`SELECT revoked FROM device WHERE deviceId = ${deviceId}`[0];
+    if (!device || device.revoked) return null;
+    const origin = this.web.origin();
+    if (!origin) return null;
+    const { token, expiresAt } = await mintLinkToken((await this.serverKeys())[0]!.secret, "home");
+    this.sql`
+      INSERT INTO sh_web_link (tokenHash, target, expiresAt, createdAt)
+      VALUES (${await sha256Hex(token)}, 'home', ${expiresAt}, ${Date.now()})
+    `;
+    this.logChannel("login_link_minted", deviceId);
+    return `${origin}/link/${token}`;
   }
 
   // Pairing + brute-force lockout (protocol doc §5.2, issue #27). The code's entropy and the
@@ -2712,6 +2880,7 @@ export class Steward extends Agent<Env> {
 
   // Scheduled callback: keep tenant_access_token fresh even while nothing is being sent.
   async refreshChannelToken(): Promise<void> {
+    if (this.webOnly) return;
     const cfg = await this.loadFeishuConfig();
     if (!cfg) return;
     // Expiry check only — no need to decrypt just to decide whether to refresh.
@@ -2962,6 +3131,7 @@ export class Steward extends Agent<Env> {
    * was restarted, or the phase moved on) no-op via the deviceCode+phase re-checks.
    */
   async pollDeviceFlow(): Promise<void> {
+    if (this.webOnly) return; // a setup flow left running by a Feishu-era deployment has nothing to finish
     for (let hop = 0; hop < 3; hop++) {
       const row = this.qrRow();
       if (!row || (row.phase !== "awaiting_scan" && row.phase !== "awaiting_scope_scan")) return;
@@ -3468,10 +3638,15 @@ export class Steward extends Agent<Env> {
           }
           continue;
         }
+        // The provider's own error text (401 invalid key, rate limit, …) is the one thing
+        // that makes a model_error diagnosable from the outside; `wait()` drops it, so it is
+        // recovered from the transcript tail and pinned in the channel log.
+        const modelErrorDetail = result.status === "unanswered" && result.reason === "model_error" ? ((await this.modelErrorDetail()) ?? undefined) : undefined;
+        if (modelErrorDetail) this.logChannel("model_call_error", modelErrorDetail.slice(0, 300));
         // Issue #28: bring the counter current before the over-budget note reads it — the
         // run that just settled is the spend that may tip today over the cap.
         await this.syncUsageQuietly();
-        const failedNotice = run.kind === "user" && result.status !== "done" ? await this.noticeForFailedRun() : undefined;
+        const failedNotice = run.kind === "user" && result.status !== "done" ? await this.noticeForFailedRun(modelErrorDetail) : undefined;
         this.settleRun(run, result, failedNotice);
       }
     } catch (err) {
@@ -3492,12 +3667,26 @@ export class Steward extends Agent<Env> {
   /** What the owner is told when a user-triggered run did not complete. "Try again" is wrong
    *  advice for a deployment that has no model key yet (owner-notices.ts); resolved here, in the
    *  async poll, so settleRun stays synchronous. */
-  private async noticeForFailedRun(): Promise<string> {
+  private async noticeForFailedRun(modelErrorDetail?: string): Promise<string> {
     try {
-      return failedRunNotice(await this.llmSelection());
+      return failedRunNotice(await this.llmSelection(), this.webOnly, modelErrorDetail);
     } catch {
       return FAILED_RUN_NOTICE;
     }
+  }
+
+  /** The provider-facing error text of the most recent failed model call, from the
+   *  transcript tail (pi drops it from the settle summary — `wait()` reports only
+   *  `model_error`). Null when the tail has no errored assistant message. */
+  private async modelErrorDetail(): Promise<string | null> {
+    const records = (await this.piHarness.messages()) as unknown as Array<{
+      model?: Array<{ role?: string; errorMessage?: string; stopReason?: string }>;
+    }>;
+    for (let i = records.length - 1; i >= 0; i--) {
+      const msg = records[i]!.model?.[0];
+      if (msg?.role === "assistant" && msg.errorMessage) return msg.errorMessage;
+    }
+    return null;
   }
 
   private settleRun(run: RunRow, result: { status: string; reason?: string; text?: string }, failedNotice: string = FAILED_RUN_NOTICE): void {
@@ -4092,8 +4281,9 @@ export class Steward extends Agent<Env> {
      *  enqueue can never double-send. Omitted: a fresh one-of message. */
     id?: string;
   }): Promise<{ id: string }> {
-    const id = this.ledger.outbound.enqueue(input);
-    if (input.channel !== "web") void this.deliverOutbound();
+    const outbound = this.webOnly ? { ...input, channel: "web" as const, ...(input.card ? { card: { type: "pip-card", ...cardView(input.card) } } : {}) } : input;
+    const id = this.ledger.outbound.enqueue(outbound);
+    if (outbound.channel !== "web") void this.deliverOutbound();
     return { id };
   }
 
@@ -4403,6 +4593,7 @@ export class Steward extends Agent<Env> {
   }
 
   private async deliverOutboundPass(): Promise<void> {
+    if (this.webOnly) return;
     // Reclaim rows whose delivery pass died mid-send (claim expired): back to queued.
     this.ledger.outbound.reclaimExpiredClaims(Date.now());
     // Issue #11: due QUIET rows for one channel+receiver fold into a single merged message —

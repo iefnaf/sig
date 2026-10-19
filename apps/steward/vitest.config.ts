@@ -116,6 +116,9 @@ const feishuMock = async (request: Request): Promise<Response> => {
 export default defineConfig({
   plugins: [
     cloudflareTest({
+      // Historical channel regression fixture. Access and web-only flows run against src/index.ts
+      // in vitest.web.config.ts; no legacy routes are exported by the production entry.
+      main: "./test/legacy-worker.ts",
       // The Worker's config lives at the repo root (issue #25: Deploy-to-Cloudflare reads it
       // there); paths inside it resolve relative to the config file.
       wrangler: { configPath: "../../wrangler.jsonc" },
@@ -143,5 +146,6 @@ export default defineConfig({
   // script) runs balanced file groups concurrently, each loading this config — and therefore
   // its own workerd + mock state — in a separate vitest process. Keep fileParallelism false:
   // within one process the shared state above still requires serial files.
-  test: { fileParallelism: false },
+  // access-*.test.ts exercise the production entry behind a simulated Cloudflare Access: vitest.access.config.ts.
+  test: { fileParallelism: false, exclude: ["test/access-*.test.ts", "**/node_modules/**"] },
 });
