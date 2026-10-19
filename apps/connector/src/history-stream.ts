@@ -17,7 +17,7 @@ export interface HistoryStreamDeps {
   /** Wire out (the transport's current socket). Dropping frames (closed socket) is fine. */
   send: (message: HistoryChunkMessage | { t: "error"; re: string; code: string; message: string; retriable: boolean }) => void;
   /** Loads one page (WorkerManager.history: live get_entries or the session JSONL fallback). */
-  load: (workerId: string, since: string | undefined, maxBytes: number) => Promise<HistoryPage>;
+  load: (workerId: string, since: string | undefined, maxBytes: number, format?: "full") => Promise<HistoryPage>;
   now?: () => number;
   windowSize?: number;
   maxChunkBytes?: number;
@@ -53,14 +53,17 @@ export class HistoryStreams {
   }
 
   /** Handles one `history_req`; the page load runs detached, replies land when ready. */
-  onRequest(request: { id: string; workerId: string; since?: string; maxBytes?: number }): void {
+  onRequest(request: { id: string; workerId: string; since?: string; maxBytes?: number; format?: "full" }): void {
     const reqId = request.id;
     const maxBytes = Math.min(request.maxBytes ?? HISTORY_MAX_BYTES, HISTORY_MAX_BYTES);
     const now = this.#now();
     this.#streams.set(reqId, { workerId: request.workerId, chunks: [], next: 0, acked: -1, lastActivityAt: now });
     this.#armSweep();
-    this.#deps
-      .load(request.workerId, request.since, maxBytes)
+    // A summary read keeps its original three-argument call; only a full-session read names its format.
+    const loading = request.format
+      ? this.#deps.load(request.workerId, request.since, maxBytes, request.format)
+      : this.#deps.load(request.workerId, request.since, maxBytes);
+    loading
       .then((page) => this.#start(reqId, page))
       .catch((err: unknown) => {
         if (!this.#streams.has(reqId)) return; // already gone (swept / connection dropped)
@@ -156,13 +159,14 @@ export function chunkPage(reqId: string, page: HistoryPage, maxChunkBytes = HIST
       re: reqId,
       n: chunks.length,
       entries,
-      cursor: entries.length > 0 ? entries[entries.length - 1]!.id : null,
+      cursor: entries.length > 0 ? entries[entries.length - 1]!.nextCursor ?? entries[entries.length - 1]!.id : null,
+      ...(page.format ? { format: page.format } : {}),
       done: false,
     });
     entries = [];
   };
   for (const entry of page.entries) {
-    const size = byteLength({ t: "history_chunk", re: reqId, n: 0, entries: [...entries, entry], cursor: entry.id, done: false });
+    const size = byteLength({ t: "history_chunk", re: reqId, n: 0, entries: [...entries, entry], cursor: entry.nextCursor ?? entry.id, done: false, ...(page.format ? { format: page.format } : {}) });
     if (entries.length > 0 && size > maxChunkBytes) flush();
     entries.push(entry);
   }
@@ -170,7 +174,7 @@ export function chunkPage(reqId: string, page: HistoryPage, maxChunkBytes = HIST
   if (chunks.length === 0) {
     // Nothing fit the budget at all: terminate rather than leaving the browser paging on a
     // null cursor forever (re-opening would produce the same empty result).
-    chunks.push({ t: "history_chunk", re: reqId, n: 0, entries: [], cursor: null, done: true });
+    chunks.push({ t: "history_chunk", re: reqId, n: 0, entries: [], cursor: page.cursor, done: true, ...(page.format ? { format: page.format } : {}) });
     return chunks;
   }
   // The final chunk always carries done=true — that is the stream terminator for the relay

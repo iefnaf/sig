@@ -23,7 +23,13 @@ export const HISTORY_TOOLS_MAX = 50;
 export const HistoryEntrySchema = z.object({
   /** The session entry id — doubles as the pagination cursor. */
   id: z.string().min(1),
-  role: z.enum(["user", "assistant"]),
+  /** `record` is a raw recorded entry of a full-session read (`fragment` carries its text). */
+  role: z.enum(["user", "assistant", "record"]),
+  /** Full-session reads: one piece of the entry's JSON text — `data` is characters
+   * `offset`…`offset + data.length` of `total`; the browser joins the pieces and parses. */
+  fragment: z.object({ data: z.string(), offset: z.number().int().nonnegative(), total: z.number().int().positive() }).optional(),
+  /** Full-session reads: where to resume after this entry (an opaque cursor). */
+  nextCursor: z.string().optional(),
   text: z.string(),
   tools: z.array(z.object({ name: z.string(), args: z.string().optional() })).optional(),
 });
@@ -32,6 +38,7 @@ export type HistoryEntry = z.infer<typeof HistoryEntrySchema>;
 
 /** A page of normalized history: `cursor` is the last entry included; `done` marks the end. */
 export interface HistoryPage {
+  format?: "full";
   entries: HistoryEntry[];
   /** Last entry id delivered, or null when nothing fit / nothing exists. */
   cursor: string | null;
@@ -42,6 +49,7 @@ export interface HistoryPage {
 /** browser → DO: open a stream for one worker's raw transcript. */
 export const HistoryOpenMessageSchema = z.object({
   t: z.literal("history_open"),
+  format: z.literal("full").optional(),
   id: z.string().min(1),
   workerId: z.string().min(1),
   since: z.string().min(1).optional(),
@@ -53,6 +61,7 @@ export type HistoryOpenMessage = z.infer<typeof HistoryOpenMessageSchema>;
 /** DO → connector: pull one page. Not a `cmd` — never queued, persisted, or re-sent (§6.6). */
 export const HistoryReqMessageSchema = z.object({
   t: z.literal("history_req"),
+  format: z.literal("full").optional(),
   id: z.string().min(1),
   workerId: z.string().min(1),
   since: z.string().min(1).optional(),
@@ -64,6 +73,7 @@ export type HistoryReqMessage = z.infer<typeof HistoryReqMessageSchema>;
 /** connector → DO → browser: one chunk of normalized entries. */
 export const HistoryChunkMessageSchema = z.object({
   t: z.literal("history_chunk"),
+  format: z.literal("full").optional(),
   re: z.string().min(1),
   n: z.number().int().nonnegative(),
   entries: z.array(HistoryEntrySchema),

@@ -107,9 +107,9 @@ export class ConnectorApp {
       // L3 raw-history reads (§11.4): live get_entries while the process runs, the session
       // JSONL along the current branch otherwise. Logged at lifecycle level only — the
       // transcript itself never reaches the log.
-      loadHistory: (workerId, since, maxBytes) => {
-        this.log?.("history_requested", { workerId, since: since ?? null, maxBytes });
-        return this.manager.history(workerId, since, maxBytes);
+      loadHistory: (workerId, since, maxBytes, format) => {
+        this.log?.("history_requested", { workerId, since: since ?? null, maxBytes, format: format ?? "summary" });
+        return this.manager.history(workerId, since, maxBytes, format);
       },
       onWelcome: options.onWelcome,
       onClose: options.onClose,

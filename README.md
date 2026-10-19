@@ -1,4 +1,4 @@
-<img src="public/brand/sig.svg" alt="Sig logo — summation symbol" width="72" height="72">
+<img src="apps/steward/ui/brand/sig.svg" alt="Sig logo — summation symbol" width="72" height="72">
 
 # Sig
 
@@ -8,10 +8,13 @@ An always-on personal agent steward. It runs on Cloudflare Durable Objects, reme
 
 Formerly Shepherd. The CLI is now `sig`; existing deployment and session identities stay compatible ([rename decision](docs/adr/0002-sig-brand-and-compatibility.md)).
 
-Status: spec and design complete, spike phase concluded — ready for the real implementation. The chat-channel integration (Feishu) is removed for now; the owner drives the deployment through a SERVER_KEY-gated HTTP API ([ADR-0003](docs/adr/0003-owner-api-replaces-chat-channel.md)).
+Status: the chat-channel integration (Feishu) is removed for now; the owner drives the deployment through a SERVER_KEY-gated HTTP API ([ADR-0003](docs/adr/0003-owner-api-replaces-chat-channel.md)) and, day to day, through the **web workspace** — one continuous conversation with Threads, "Needs you" decisions, and your agents' session records viewed live from their machines ([ADR-0004](docs/adr/0004-web-workspace.md), [ADR-0005](docs/adr/0005-web-entry-and-local-sessions.md)).
 
 - [docs/spec.md](docs/spec.md): product requirements
-- [docs/deploy.md](docs/deploy.md): deployment guide — one-click deploy, the mainland-China custom domain, connector setup, expected costs, secret rotation
+- [docs/agent-deploy.md](docs/agent-deploy.md): the deploy runbook your coding agent executes (the primary path, [ADR-0007](docs/adr/0007-agent-driven-deploy.md))
+- [docs/deploy.md](docs/deploy.md): deployment guide — agent/button/terminal deploy, the mainland-China custom domain, connector setup, expected costs, secret rotation
+- [docs/design/web-entry.md](docs/design/web-entry.md): how owner access and the session viewer are built
+- [docs/design/web-workspace/](docs/design/web-workspace/): the workspace prototype the implementation settled its shape on (historical)
 - [docs/spike-conclusions.md](docs/spike-conclusions.md): what the spike phase validated, the integration pitfalls it uncovered, and the handover gaps
 - [docs/research/pi-integration.md](docs/research/pi-integration.md): findings from driving `pi --mode rpc`
 - [docs/research/cloudflare-do-websocket.md](docs/research/cloudflare-do-websocket.md): Durable Object WebSocket facts and limits
@@ -24,20 +27,28 @@ The spike code (protocol prototype, steward M1/M2, full e2e loop, pi-rpc scripts
 
 ## Deploying the steward
 
+**Fastest path: your own coding agent.** Give it this paragraph —
+
+> Deploy Sig for me: read `docs/agent-deploy.md` in [github.com/iefnaf/shepherd](https://github.com/iefnaf/shepherd) and follow it exactly. Stop where it says a human is needed.
+
+— and it deploys into your own Cloudflare account, sets and verifies the secrets, pairs your first machine, and opens the workspace; the owner's part is one paragraph and the first message, and no secret ever transits the agent ([ADR-0007](docs/adr/0007-agent-driven-deploy.md)).
+
+No agent at hand? The button:
+
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/iefnaf/shepherd)
 
-One click clones the repo into your own account and deploys the Worker; the deploy form generates the secrets with you — `SERVER_KEY` (an `openssl rand -hex 32` you paste) plus your model provider key. The full walk — the custom domain mainland users should bind, connector install, cost expectations, and rotation — lives in **[docs/deploy.md](docs/deploy.md)**.
+One click clones the repo into your own account and deploys the Worker; the deploy form generates the secrets with you — `SERVER_KEY` (an `openssl rand -hex 32` you paste) plus optionally your model provider key. The full walk — the custom domain mainland users should bind, connector install, cost expectations, and rotation — lives in **[docs/deploy.md](docs/deploy.md)**.
 
 From a terminal instead (the Wrangler config sits at the repo root):
 
 ```sh
 pnpm install
-wrangler deploy                  # uses ./wrangler.jsonc at the repo root
+wrangler deploy                  # uses ./wrangler.jsonc at the repo root; npm run deploy -- --name <unique> for a workers.dev-safe name
 wrangler secret put SERVER_KEY   # openssl rand -hex 32; signs device tokens, gates the owner API
-wrangler secret put MODEL_KEY    # your model provider's key
+wrangler secret put MODEL_KEY    # optional; the workspace's Settings page works too
 ```
 
-The steward's model selection is deploy config (ADR-0001 decision 11): unset `vars.STEWARD_MODEL` (root `wrangler.jsonc`) defaults to `deepseek`/`deepseek-flash` — the eval baseline; set it to pick another catalog provider or a proxy base URL. The API key never rides in vars: it is the sealed `sh_model` row inside the Durable Object (seeded once from the `MODEL_KEY` you set at deploy), and inside the Worker the provider is always built with an inline `auth.apiKey.resolve` closure over that sealed key. A missing key or an unknown provider/model fails visibly (`sh_run` settles `unanswered`) rather than silently using a different model.
+The steward's model selection is deploy config (ADR-0001 decision 11): unset `vars.STEWARD_MODEL` (root `wrangler.jsonc`) defaults to `deepseek`/`deepseek-flash` — the eval baseline; set it to pick another catalog provider or a proxy base URL. The API key never rides in vars: it is the sealed `sh_model` row inside the Durable Object (seeded once from the `MODEL_KEY` you set at deploy, or pasted into the workspace's **Settings** — which also replaces a rejected key), and inside the Worker the provider is always built with an inline `auth.apiKey.resolve` closure over that sealed key. A missing key or an unknown provider/model fails visibly (`sh_run` settles `unanswered`) rather than silently using a different model; a key the provider rejects is diagnosed in place — the workspace says to fix the key, and the provider's error text lands in the channel log as `model_call_error`.
 
 Model spend carries a daily budget soft cap (issue #28, ADR-0001 decision 15): unset `vars.DAILY_BUDGET_USD` defaults to $1 per UTC day. Past it, worker events, routine fires, and follow-ups no longer wake the model, while everything deterministic keeps working — done reports, failure/fallback pushes, digest cards, and every reply to the owner. The first reply each capped day carries a one-line notice, and `/花费` (or asking "今天花了多少钱？" verbatim) reports the day's spend straight from the counter with no model call.
 
@@ -82,7 +93,7 @@ curl -X POST https://sig.example.com/api/messages -H "$KEY" -H 'content-type: ap
 curl -X POST https://sig.example.com/api/actions -H "$KEY" -H 'content-type: application/json' \
   -d '{"cardMsgId": "<message id>", "action": "pr_approve"}'
 
-# Add a machine / open the web app:
+# Add a machine / open the web workspace:
 curl -X POST https://sig.example.com/api/pairing     -H "$KEY"   # → run this on the new machine
 curl -X POST https://sig.example.com/api/login-link  -H "$KEY"   # → one-time web login URL
 ```
@@ -122,8 +133,10 @@ State lives under `~/.shepherd/` (set `SIG_HOME` to move it; `SHEPHERD_HOME` rem
 
 Routing quality has a measurable bar: a fixed 106-case set (ported from the spike) run against the real steward extension. Any change to the steward prompt, the tool definitions, `findCandidates`, or the model must re-run it and meet the thresholds before merge — `pnpm --filter @shepherd/steward eval:routing` exits non-zero when they are missed. See [docs/routing-eval.md](docs/routing-eval.md) for the metrics, the recorded baselines, and the no-model selftest.
 
-## The companion web
+## The web workspace
 
-Report cards carry a **查看详情** link: a one-time signed URL (15 min, single use) that logs the owner in and opens the Thread timeline (L2: instructions, dispatches, reports, questions — mobile-friendly, server-rendered, no JS). Links are minted by `POST /api/login-link`; while logged in, `/app` lists all Threads and `/app/machines` lists paired machines with live online state; the 撤销 button bumps a machine's device epoch and closes its connection (4403), so a stolen token dies instantly (protocol §5.1).
+`/app` is the owner's everyday entry ([ADR-0004](docs/adr/0004-web-workspace.md)): one continuous conversation — the same local channel the owner API serves — with the Threads behind it, a "Needs you" view over open decisions (questions, PR consent, offline asks, routine and memory suggestions), machines and pairing, and the day's model spend against the budget cap. The page is plain HTML/CJS/ES modules with no frontend build and a CSP that forbids inline script and every other origin; it stays current over a browser WebSocket nudge and can show a reply as it is being written. The interface is English by default with an in-page EN/中文 switch.
 
-Each worker on a timeline links to its **原始过程** (L3 raw process, spec §7.4): the full conversation and tool calls, streamed from the machine through the Durable Object over a browser WebSocket — never stored or logged server-side (protocol doc §6.6). The connector serves it from the live pi process (`get_entries`) or, once the process is gone, by parsing the session JSONL along the current branch; entries are normalized and truncated with a 2 MB per-stream cap and a cursor for paging. Offline machines answer `machine_offline` with an explanation instead of a stream: the transcript lives on that machine only.
+The door is a one-time login link minted by `POST /api/login-link` (or a report card's 查看详情 button); opening it exchanges the token for a 7-day session cookie.
+
+Each Thread exposes its workers' **session records** ([ADR-0005](docs/adr/0005-web-entry-and-local-sessions.md)): the full recorded session — messages, tool calls and results, images, compaction notes — streamed from the machine through the Durable Object over the browser socket and never stored or logged server-side (protocol doc §6.6). The connector serves it from the live agent process or, once the process is gone, from the session file on disk, resumable with a cursor and bounded per page; an offline machine shows why the record is unavailable instead of an empty page. Machines are listed and revoked in the workspace too (撤销 bumps the device epoch and closes the connection with 4403, so a stolen token dies instantly).

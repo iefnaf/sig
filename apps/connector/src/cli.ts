@@ -153,6 +153,14 @@ async function connectCommand(argv: string[]): Promise<void> {
   const [url, code] = argv.filter((a) => a !== "--foreground");
   if (!url || !code) usage();
   const dir = stateDir();
+  // A non-default state directory must stop before anything else: the launchd/systemd unit
+  // is shared machine state (fixed label), so installing from a private state directory
+  // would silently repoint the machine's own connector at it.
+  if ((process.env.SIG_HOME ?? process.env.SHEPHERD_HOME) && !foreground) {
+    fail(
+      "SIG_HOME (or SHEPHERD_HOME) is set to a private state directory; installing the shared background service would repoint this machine's connector. Use --foreground, or unset it.",
+    );
+  }
   const machineName = process.env.SIG_MACHINE_NAME ?? process.env.SHEPHERD_MACHINE_NAME ?? hostname();
 
   // 1. Pair (protocol §5.2): redeem the code once, persist credentials in the LocalStore.

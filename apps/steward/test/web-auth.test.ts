@@ -106,9 +106,9 @@ describe("/网页 → one-time link → session cookie → /app", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("text/html");
     const html = await res.text();
-    expect(html).toContain('<meta name="viewport" content="width=device-width, initial-scale=1">'); // mobile
-    expect(html).toContain("Threads");
-    expect(html).toContain("/app/machines");
+    expect(html).toContain('name="viewport"'); // mobile
+    expect(html).toContain('id="workspace"'); // the workspace shell (ADR-0004)
+    expect(html).toContain("/app/assets/workspace.js");
   });
 
   it("marks the cookie HttpOnly, SameSite=Lax, Secure, 7-day Max-Age", async () => {
@@ -147,11 +147,9 @@ describe("/网页 → one-time link → session cookie → /app", () => {
   });
 
   it("the SERVER_KEY_PREVIOUS window keeps old-key links and cookies alive; dropping it kills them (issue #27)", async () => {
-    const previous = "the-previous-server-key";
+    const previous = "test-previous-server-key-not-a-secret";
     const { cookie, linkUrl } = await loginViaChat();
     const token = linkUrl.slice("https://example.com/link/".length);
-    // During the window (both keys in the set) a pre-rotation credential still verifies;
-    // the new key alone, or after the operator drops SERVER_KEY_PREVIOUS, it is dead.
     expect(await verifyLinkToken(["test-server-key-not-a-secret", previous], token)).not.toBeNull();
     expect(await parseSessionCookie(["test-server-key-not-a-secret", previous], cookie.split("=")[1]!)).not.toBeNull();
     expect(await verifyLinkToken([previous], token)).toBeNull();

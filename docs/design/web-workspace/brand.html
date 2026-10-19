@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title data-i18n="brandTitle">Pip · Logo</title>
+  <script src="i18n.js" defer></script>
+  <script src="brand.js" defer></script>
+  <meta name="theme-color" content="#37624d">
+  <link rel="icon" type="image/svg+xml" href="assets/pip-icon.svg">
+  <style>
+    :root { color-scheme: light; --forest: #37624d; --ink: #293f33; --cream: #f7f6ee; --sage: #eaf0e9; --line: #e4e8de; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #f1f2ed; color: var(--ink); font: 14px/1.6 -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; -webkit-font-smoothing: antialiased; }
+    a { color: inherit; text-decoration: none; }
+    a:focus-visible { outline: 2px solid var(--forest); outline-offset: 5px; }
+    img { display: block; max-width: 100%; }
+    .page { max-width: 1180px; margin: auto; padding: 32px 40px 42px; }
+    header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 26px; }
+    .brand { display: flex; align-items: center; gap: 9px; }
+    .brand > img { width: 28px; height: 28px; }
+    .brand span { margin-left: 10px; border-left: 1px solid #cfd7c8; padding-left: 18px; color: #85927c; font-size: 11px; letter-spacing: 1px; }
+    .header-actions { display: flex; align-items: center; gap: 16px; }
+    .header-actions > a { font-size: 12px; color: #718167; }
+    .language-switch { display: inline-flex; gap: 2px; padding: 2px; border: 1px solid #dce3d4; border-radius: 6px; background: #e9eee4; }
+    .language-switch button { border: 0; border-radius: 4px; background: transparent; min-width: 32px; height: 27px; padding: 0 5px; font-size: 10px; color: #87977b; cursor: pointer; }
+    .language-switch button[aria-pressed="true"] { background: #fff; color: #37624d; box-shadow: 0 1px 3px #223a1814; }
+    .language-switch button:focus-visible { outline: 2px solid #37624d; outline-offset: 2px; }
+    .hero { display: grid; grid-template-columns: 1.65fr 1fr; min-height: 360px; border: 1px solid var(--line); border-radius: 16px; overflow: hidden; }
+    .hero-primary { padding: 32px; background: var(--cream); display: flex; flex-direction: column; align-items: center; justify-content: center; position: relative; }
+    .eyebrow { font-size: 10px; letter-spacing: 1.6px; color: #889680; text-transform: uppercase; }
+    .hero-primary > .eyebrow { position: absolute; top: 24px; left: 28px; }
+    .hero-logo { width: 306px; height: 108px; margin: 8px 0 20px; }
+    .tagline { font-size: 14px; color: #738369; letter-spacing: .6px; margin: 0; }
+    .hero-dark { display: flex; flex-direction: column; align-items: center; justify-content: center; background: var(--forest); padding: 24px; position: relative; }
+    .hero-dark > img { width: 170px; height: 170px; }
+    .hero-dark .eyebrow { position: absolute; bottom: 24px; left: 0; right: 0; text-align: center; color: #b8c9b4; }
+    .concept { display: grid; grid-template-columns: 1fr 1.5fr; gap: 32px; margin: 29px 2px 30px; align-items: start; }
+    h1 { margin: 0; font-size: 22px; letter-spacing: -.5px; font-weight: 550; line-height: 1.5; }
+    .concept p { margin: 0; font-size: 12px; color: #7b8970; line-height: 1.95; max-width: 580px; }
+    .applications { display: grid; grid-template-columns: 1fr 1.15fr 1fr; gap: 16px; }
+    .card { border: 1px solid var(--line); border-radius: 12px; padding: 22px; background: #fcfdf9; min-width: 0; }
+    h2 { font-size: 11px; font-weight: 500; color: #819176; margin: 0 0 22px; }
+    .size-row { display: flex; align-items: flex-end; gap: 22px; min-height: 91px; }
+    .sample { display: flex; flex-direction: column; align-items: center; gap: 10px; }
+    .sample span { color: #9aa58e; font-size: 9px; }
+    .sample img { max-width: none; }
+    .card-note { margin: 18px 0 0; font-size: 10px; color: #8a997f; }
+    .chat-head { display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 600; }
+    .chat-head img { width: 28px; height: 28px; padding: 1px; background: var(--sage); border-radius: 7px; }
+    .chat-head span { font-size: 10px; color: #9aa58e; margin-left: auto; font-weight: 400; }
+    .chat-message { padding-left: 36px; font-size: 12px; color: #6d8061; margin: 8px 0 13px; line-height: 1.9; }
+    .chat-pill { font-size: 10px; color: var(--forest); padding: 5px 8px; background: var(--sage); border-radius: 5px; margin-left: 36px; display: inline-block; }
+    .swatches { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+    .swatch { height: 55px; border-radius: 7px; border: 1px solid #00000006; margin-bottom: 8px; }
+    .swatches span { display: block; font-size: 10px; color: #76886a; }
+    .swatches code { font: 9px ui-monospace, Menlo, monospace; color: #9aa98c; }
+    footer { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding-top: 24px; }
+    .downloads { display: flex; gap: 8px; flex-wrap: wrap; }
+    .downloads a { font-size: 11px; padding: 7px 12px; border: 1px solid #dce3d4; border-radius: 6px; color: #69815b; background: #fafcf6; }
+    .downloads a:hover { border-color: #9fb08e; background: #fff; }
+    footer p { color: #9aa68e; font-size: 10px; margin: 0; }
+    @media (max-width: 820px) { .page { padding: 24px; } .hero { min-height: 300px; } .hero-logo { width: 245px; height: auto; } .hero-dark > img { width: 130px; height: 130px; } .applications { grid-template-columns: 1fr 1fr; } .palette { grid-column: 1 / -1; } .swatches { max-width: 360px; } .concept { grid-template-columns: 1fr; gap: 12px; } footer { flex-direction: column; align-items: flex-start; } }
+    @media (max-width: 520px) { .page { padding: 20px 16px 28px; } .brand span { display: none; } .hero { grid-template-columns: 1fr; } .hero-primary { min-height: 265px; } .hero-dark { min-height: 230px; } .hero-dark > img { width: 120px; height: 120px; } .applications { grid-template-columns: 1fr; } .palette { grid-column: auto; } .concept { margin: 24px 0; } h1 { font-size: 20px; } }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header><a href="index.html" class="brand" data-i18n-label="brandHome" aria-label="Pip · All messages"><img src="assets/pip-mark.svg" alt="" width="28" height="28"><img src="assets/pip-wordmark.svg" alt="Pip" style="width:40px;height:22px" width="40" height="22"><span>VISUAL IDENTITY / 01</span></a><div class="header-actions"><div class="language-switch" role="group" data-i18n-label="language" aria-label="Language"><button type="button" data-locale="en" lang="en" aria-label="English" aria-pressed="true">EN</button><button type="button" data-locale="zh" lang="zh-CN" aria-label="简体中文" aria-pressed="false">中文</button></div><a href="index.html" data-i18n="openWorkspace">Open workspace ↗</a></div></header>
+    <section class="hero" data-i18n-label="logoVariants" aria-label="Pip logo on light and dark backgrounds">
+      <div class="hero-primary"><span class="eyebrow">Your personal agent</span><img class="hero-logo" src="assets/pip-logo.svg" width="306" height="108" data-i18n-alt="logoLockup" alt="Pip logo and wordmark"><p class="tagline">A little help, every day.</p></div>
+      <div class="hero-dark"><img src="assets/pip-mark-light.svg" width="170" height="170" data-i18n-alt="lightMark" alt="Pip light mark"><span class="eyebrow">Small name. A familiar face.</span></div>
+    </section>
+    <section class="concept"><h1 data-i18n="brandHeadline">A little p. A familiar face.</h1><p data-i18n="brandDescription">A rounded p doubles as a speech bubble. Two small eyes give Pip a face. The wordmark stays lowercase; in conversation, it’s Pip.</p></section>
+    <div class="applications">
+      <section class="card"><h2 data-i18n="smallSizes">Made for small spaces</h2><div class="size-row"><div class="sample"><img src="assets/pip-icon.svg" alt="64 px" width="64" height="64"><span>64 px</span></div><div class="sample"><img src="assets/pip-icon.svg" alt="32 px" width="32" height="32"><span>32 px</span></div><div class="sample"><img src="assets/pip-icon.svg" alt="16 px" width="16" height="16"><span>16 px</span></div></div><p class="card-note" data-i18n="logoUses">App icon · Browser tab · Avatar</p></section>
+      <section class="card"><h2 data-i18n="inConversation">In conversation</h2><div class="chat-head"><img src="assets/pip-mark.svg" alt="" width="28" height="28">Pip<span data-i18n="justNow">Just now</span></div><p class="chat-message" data-i18n="brandMessage">The login fix passed its tests. Want me to open a PR?</p><span class="chat-pill">✓ <span data-i18n="createPR">Create PR</span></span></section>
+      <section class="card palette"><h2 data-i18n="palette">Palette</h2><div class="swatches"><div><div class="swatch" style="background:#37624d"></div><span>Forest</span><code>#37624D</code></div><div><div class="swatch" style="background:#f7f6ee"></div><span>Cream</span><code>#F7F6EE</code></div><div><div class="swatch" style="background:#eaf0e9"></div><span>Sage</span><code>#EAF0E9</code></div></div></section>
+    </div>
+    <footer><div class="downloads"><a href="assets/pip-mark.svg" download data-i18n="downloadMark">Mark SVG ↓</a><a href="assets/pip-logo.svg" download data-i18n="downloadLogo">Logo SVG ↓</a><a href="assets/pip-mark.png" download data-i18n="downloadPNG">Transparent PNG ↓</a><a href="assets/pip-icon-1024.png" download data-i18n="downloadIcon">App icon PNG ↓</a></div><p data-i18n="vectorNote">Vector paths · No fonts required</p></footer>
+  </main>
+</body>
+</html>

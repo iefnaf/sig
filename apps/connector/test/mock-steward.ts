@@ -18,7 +18,7 @@ export interface MockSteward {
   waitHello: (n?: number, ms?: number) => Promise<void>;
   sendCmd: (kind: string, args: Record<string, unknown>, id?: string) => string;
   /** §6.6: push a history_req; the DO's relay role, for contract tests. */
-  sendHistoryReq: (workerId: string, opts?: { since?: string; maxBytes?: number }) => string;
+  sendHistoryReq: (workerId: string, opts?: { since?: string; maxBytes?: number; format?: "full" }) => string;
   /** §6.6: relay a browser ack for chunk `n`. */
   ackHistory: (reqId: string, n: number) => void;
   dropConn: () => void;
@@ -146,11 +146,11 @@ export function startMockSteward(): MockSteward {
   };
   const sendHistoryReq = (
     workerId: string,
-    opts: { since?: string; maxBytes?: number } = {},
+    opts: { since?: string; maxBytes?: number; format?: "full" } = {},
     id: string = randomUUID(),
   ): string => {
     // Same wire as cmd but outside the outbox semantics (§6.6): no cseq, no re-send.
-    send({ t: "history_req", id, workerId, since: opts.since, maxBytes: opts.maxBytes });
+    send({ t: "history_req", id, workerId, since: opts.since, maxBytes: opts.maxBytes, ...(opts.format ? { format: opts.format } : {}) });
     return id;
   };
 

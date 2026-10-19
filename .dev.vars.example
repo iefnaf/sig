@@ -5,5 +5,6 @@
 # to .dev.vars (repo root) next to the wrangler.jsonc you run against. See docs/deploy.md.
 SERVER_KEY=generate-with-openssl-rand-hex-32
 # Your model provider's API key (default provider: DeepSeek — ADR-0001 decision 11). It stays
-# an encrypted secret inside your own Cloudflare account; Sig never proxies it.
+# an encrypted secret inside your own Cloudflare account; Sig never proxies it. You can also
+# leave this out and paste the key in the web workspace's Settings page after signing in.
 MODEL_KEY=paste-your-model-provider-api-key

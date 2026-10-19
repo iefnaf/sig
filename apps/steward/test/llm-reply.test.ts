@@ -218,6 +218,18 @@ describe("user runs: operationId, reply delivery, idempotency (steward.md §6.3,
     const texts = await sentTexts();
     expect(texts.some((t) => t.includes("没有跑成"))).toBe(true);
   });
+
+  it("recovers the provider's error text from the transcript tail and pins it in the channel log", async () => {
+    // The pilot deployment's real failure (2026-10-19): a pasted-but-invalid DeepSeek key.
+    // `wait()` reports only `model_error`; the 401 text lives in the assistant entry.
+    const deepseek401 = '401: {"message":"Authentication Fails, Your api key: ****6eb2 is invalid","type":"authentication_error"}';
+    await scriptModel(fauxAssistantMessage([fauxText("x")], { stopReason: "error", errorMessage: deepseek401 }));
+    await dm("再发一次", "om_err_401");
+    await waitRunsSettled();
+    await waitWhileOutboundPending();
+    const logs = await ownerStub().channelLogEntries(20);
+    expect(logs.some((l) => l.reason === "model_call_error" && (l.detail ?? "").includes("****6eb2"))).toBe(true);
+  });
 });
 
 describe("the wake queue: merge window and replay safety (steward.md §5.1/§5.4/§11)", () => {

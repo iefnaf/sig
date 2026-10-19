@@ -1,7 +1,7 @@
-// The L3 page itself (issue #23, spec §7.4): the timeline links each worker to its raw
-// process; the page is server-rendered (header, machine state) plus the little vanilla JS
-// that streams chunks over a web-role WebSocket; an offline machine shows why the transcript
-// is unavailable instead of a stream (connector-pi.md §11.4).
+// The L3 raw process (issue #23, spec §7.4): the snapshot names each worker's link
+// (/app/threads/:t/workers/:w); since ADR-0004 that URL opens the workspace whose session
+// viewer streams the transcript over the browser socket — an offline machine is the viewer's
+// state, not a different server-rendered page (connector-pi.md §11.4).
 import { SELF } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
@@ -31,62 +31,40 @@ async function page(path: string, cookie: string): Promise<{ status: number; htm
   return { status: res.status, html: await res.text() };
 }
 
-describe("the timeline links to the raw process", () => {
-  it("each worker row carries a 原始过程 link to /app/threads/:t/workers/:w", async () => {
+describe("the workspace links to the raw process", () => {
+  it("each worker in the snapshot names the ids the page links /app/threads/:t/workers/:w with", async () => {
     const fake = await pairFakeConnector("mac-studio");
     await fake.connect();
     const { threadId, workerId } = await dispatchOneWorker(fake);
     const cookie = await webLogin();
 
-    const timeline = await page(`/app/threads/${threadId}`, cookie);
-    expect(timeline.status).toBe(200);
-    expect(timeline.html).toContain(`href="/app/threads/${threadId}/workers/${workerId}"`);
-    expect(timeline.html).toContain("原始过程");
+    const snapshot = await page("/app/api/workspace", cookie);
+    expect(snapshot.status).toBe(200);
+    const { threads } = JSON.parse(snapshot.html) as { threads: Array<{ id: string; workers: Array<{ id: string; sessionId: string | null }> }> };
+    expect(threads.find((thread) => thread.id === threadId)!.workers).toEqual([expect.objectContaining({ id: workerId, sessionId: workerId })]);
+    // …and that link opens the read-only raw process page.
+    expect((await page(`/app/threads/${threadId}/workers/${workerId}`, cookie)).status).toBe(200);
   });
 });
 
 describe("the raw process page", () => {
-  it("renders the worker header and the streaming script while the machine is online", async () => {
+  // ADR-0005 decision 4: the separate page is gone; the URL opens the workspace whose
+  // session viewer streams the transcript over /app/ws (the relay itself has its own suite
+  // in history-relay.test.ts; the viewer's client model in ui-session.test.ts).
+  it("opens the workspace shell, online or offline — the viewer decides availability", async () => {
     const fake = await pairFakeConnector("mac-studio");
     await fake.connect();
     const { threadId, workerId } = await dispatchOneWorker(fake);
     const cookie = await webLogin();
 
-    const { status, html } = await page(`/app/threads/${threadId}/workers/${workerId}`, cookie);
-    expect(status).toBe(200);
-    expect(html).toContain("原始过程");
-    expect(html).toContain("mac-studio");
-    expect(html).toContain(`会话 ${workerId}`);
-    expect(html).toContain("history_open"); // the vanilla stream client
-    expect(html).toContain("?role=web");
-    expect(html).toContain("history_ack");
-    // The thread link back out.
-    expect(html).toContain(`href="/app/threads/${threadId}"`);
-    expect(html).toContain("←");
-  });
+    const online = await page(`/app/threads/${threadId}/workers/${workerId}`, cookie);
+    expect(online.status).toBe(200);
+    expect(online.html).toContain('id="workspace"');
 
-  it("shows the machine_offline explanation while the machine is not connected", async () => {
-    const fake = await pairFakeConnector("mac-studio");
-    await fake.connect();
-    const { threadId, workerId } = await dispatchOneWorker(fake);
     fake.close(); // offline before the page is opened
-
-    const cookie = await webLogin();
-    const { status, html } = await page(`/app/threads/${threadId}/workers/${workerId}`, cookie);
-    expect(status).toBe(200);
-    expect(html).toContain("machine_offline");
-    expect(html).toContain("机器当前不在线");
-    expect(html).not.toContain("history_open"); // no stream to start
-  });
-
-  it("404s for an unknown worker or a worker that belongs to another thread", async () => {
-    const fake = await pairFakeConnector("mac-studio");
-    await fake.connect();
-    const { threadId, workerId } = await dispatchOneWorker(fake);
-    const cookie = await webLogin();
-
-    expect((await page(`/app/threads/${threadId}/workers/w-ghost`, cookie)).status).toBe(404);
-    expect((await page(`/app/threads/t_other/workers/${workerId}`, cookie)).status).toBe(404);
+    const offline = await page(`/app/threads/${threadId}/workers/${workerId}`, cookie);
+    expect(offline.status).toBe(200);
+    expect(offline.html).toContain('id="workspace"'); // the shell serves either way; the viewer shows why a stream cannot start
   });
 
   it("requires the login session", async () => {

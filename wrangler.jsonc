@@ -1,8 +1,9 @@
 // The deploy target (issue #25): Deploy-to-Cloudflare buttons and Workers Builds read the
 // Wrangler config from the repository root, and the default deploy command `npx wrangler
-// deploy` runs there — so the steward Worker's config lives here, pointing into the monorepo
-// (ADR-0001 decision 2) instead of apps/steward/. Local dev/tests pass
-// `--config ../../wrangler.jsonc` from apps/steward.
+// deploy` (or `npm run deploy -- --name <unique-name>`, scripts/deploy.mjs) runs there — so
+// the steward Worker's config lives here, pointing into the monorepo (ADR-0001 decision 2)
+// instead of apps/steward/. Local dev/tests pass `--config ../../wrangler.jsonc` from
+// apps/steward.
 //
 // SERVER_KEY and MODEL_KEY are secrets, deliberately NOT declared here: they
 // are generated at deploy time through the Deploy-to-Cloudflare form (root .dev.vars.example
@@ -19,14 +20,18 @@
 // pushes, digests, and replies to the owner continue:
 //   "vars": { "DAILY_BUDGET_USD": "0.5" }
 // The API key never rides in vars: it is the sealed sh_model row (seeded from MODEL_KEY at
-// deploy, or set via setModelConfig), and the provider is built with an inline
-// auth.apiKey.resolve (spike bug 7). A missing key or unknown provider/model fails visibly
-// (`sh_run` settles `unanswered`), never with a silently different model.
+// deploy, or set via setModelConfig — the web workspace's Settings page calls it), and the
+// provider is built with an inline auth.apiKey.resolve (spike bug 7). A missing key or
+// unknown provider/model fails visibly (`sh_run` settles `unanswered`), never with a
+// silently different model.
 {
   "name": "shepherd-steward",
   "main": "apps/steward/src/index.ts",
-  // Only the two brand assets are public; index.ts gates every other route.
-  "assets": { "directory": "./public", "binding": "ASSETS", "run_worker_first": true },
+  // Static assets, one directory (ADR-0004): the web workspace's plain HTML/CSS/JS files
+  // (no frontend build) plus the two brand files under brand/ — only those two are public;
+  // index.ts gates every other route, so /app/assets/* sits behind the same session gate
+  // as the rest of /app.
+  "assets": { "directory": "./apps/steward/ui", "binding": "ASSETS", "run_worker_first": true },
   "compatibility_date": "2026-10-10",
   "compatibility_flags": ["nodejs_compat"],
   "durable_objects": {

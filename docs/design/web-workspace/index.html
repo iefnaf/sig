@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Pip · Workspace</title>
+  <meta name="theme-color" content="#37624d">
+  <link rel="icon" type="image/svg+xml" href="assets/pip-icon.svg">
+  <link rel="icon" type="image/png" sizes="32x32" href="assets/favicon-32.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="assets/apple-touch-icon.png">
+  <link rel="stylesheet" href="styles.css">
+  <script src="i18n.js" defer></script>
+  <script src="fixtures.js" defer></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <div class="workspace" id="workspace" data-mobile="chat">
+    <header class="topbar">
+      <a href="#all" class="brand" data-i18n-label="brandHome" aria-label="Pip · All messages"><img class="brand-mark" src="assets/pip-mark.svg" width="32" height="32" alt=""><img class="brand-wordmark" src="assets/pip-wordmark.svg" width="44" height="24" alt="Pip"><span class="workspace-label" data-i18n="personalAgent">your personal agent</span></a>
+      <div class="global-status">
+        <button class="status-button machine-status" data-action="machines"><span class="status-dot green"></span><span data-i18n="machines">Machines</span><strong>2 / 3</strong></button>
+        <span class="status-divider"></span>
+        <span class="running-status"><span class="status-dot green pulse"></span><span data-i18n="running">Running</span><strong id="running-count">2</strong></span>
+        <button class="status-button waiting-status" data-action="attention"><span class="status-dot amber"></span><span data-i18n="needsYou">Needs you</span><strong id="waiting-count">2</strong></button>
+      </div>
+      <div class="topbar-end">
+        <span class="spend"><span data-i18n="today">Today</span> <strong>$0.18</strong></span>
+        <span class="prototype-label" data-i18n="demo" data-i18n-title="demoHint" title="Interactive prototype · Sample data">Demo</span>
+        <div class="language-switch" role="group" data-i18n-label="language" aria-label="Language"><button type="button" data-locale="en" lang="en" aria-label="English" aria-pressed="true">EN</button><button type="button" data-locale="zh" lang="zh-CN" aria-label="简体中文" aria-pressed="false">中文</button></div>
+        <button class="avatar" data-action="about" data-i18n-label="about" aria-label="About this workspace">F</button>
+      </div>
+    </header>
+
+    <aside class="sidebar" data-i18n-label="threads" aria-label="Threads">
+      <div class="sidebar-top"><span class="eyebrow" data-i18n="threads">Threads</span><button class="icon-button" data-action="new" data-i18n-title="newThread" data-i18n-label="newThread" title="New task" aria-label="New task" data-icon="plus"></button></div>
+      <a class="all-conversation active" href="#all"><span data-icon="chat"></span><span data-i18n="allMessages">All messages</span><span class="shortcut">⌘ K</span></a>
+      <label class="search-box"><span data-icon="search"></span><input id="thread-search" type="search" data-i18n-placeholder="searchThreads" data-i18n-label="searchThreads" placeholder="Search threads" aria-label="Search threads" autocomplete="off"></label>
+      <nav id="thread-list" class="thread-list" data-i18n-label="threadNavigation" aria-label="Threads by status"></nav>
+      <div class="sidebar-bottom">
+        <button class="machine-heading" data-action="machines"><span class="eyebrow"><span data-i18n="machines">Machines</span><span id="online-count">2 online</span></span><span data-icon="chevron-right"></span></button>
+        <div id="machine-list"></div>
+        <div class="sidebar-footnote"><span><img class="tiny-mark" src="assets/pip-mark.svg" width="18" height="18" alt=""><span data-i18n="pipOnline">Pip is online</span></span><button class="text-button" data-action="reset" data-i18n="reset">Reset demo</button></div>
+      </div>
+    </aside>
+
+    <main class="conversation" data-i18n-label="chatLabel" aria-label="Conversation with Pip">
+      <header class="conversation-header"><div class="conversation-heading"><div class="heading-line"><h1 id="conversation-title">Pip</h1><span class="live-label"><span class="status-dot green"></span><span data-i18n="online">Online</span></span></div><p id="conversation-subtitle">All threads</p></div><button class="icon-button detail-toggle" data-action="details" data-i18n-label="detailToggle" data-i18n-title="detailToggle" aria-label="Toggle details" aria-controls="context-panel" aria-expanded="true" title="Toggle details" data-icon="panel"></button></header>
+      <div class="scope-banner" id="scope-banner" hidden></div>
+      <div class="feed" id="feed" tabindex="0" data-i18n-label="history" aria-label="Message history"></div>
+      <div class="composer-area">
+        <div class="queued-message" id="queue" hidden></div>
+        <form id="composer-form" class="composer">
+          <div class="composer-toolbar"><button type="button" class="scope-chip" id="scope-chip" data-action="scope"><span data-icon="route"></span><span id="scope-label">Auto</span><span data-icon="chevron-down"></span></button><span class="composer-status" id="composer-status">Pip chooses the thread</span></div>
+          <label class="sr-only" for="message-input" data-i18n="inputLabel">Message Pip</label><textarea id="message-input" rows="2" placeholder="Message Pip…" maxlength="4000"></textarea>
+          <div class="composer-bottom"><span class="composer-shortcuts"><kbd>↵</kbd> <span data-i18n="send">Send</span><span class="keyboard-separator">·</span><kbd>Shift ↵</kbd> <span data-i18n="newline">New line</span></span><button type="submit" class="send-button" id="send-button" data-i18n-label="send" aria-label="Send" disabled data-icon="arrow-up"></button></div>
+        </form>
+        <p class="composer-note"><span data-icon="shield"></span><span data-i18n="notifications">Decisions here. Alerts in Feishu.</span></p>
+      </div>
+    </main>
+
+    <aside class="context-panel" id="context-panel" data-i18n-label="contextLabel" aria-label="Workspace and thread details"></aside>
+    <button class="panel-scrim" data-action="close-details" data-i18n-label="closeDetails" aria-label="Close details" tabindex="-1"></button>
+    <nav class="mobile-tabs" data-i18n-label="mainNavigation" aria-label="Main navigation"><button class="active" data-mobile-view="chat"><span data-icon="chat"></span><span data-i18n="chat">Chat</span></button><button data-mobile-view="threads"><span data-icon="layers"></span><span data-i18n="threads">Threads</span><span id="mobile-count">2</span></button><button data-action="machines"><span data-icon="monitor"></span><span data-i18n="machines">Machines</span></button></nav>
+  </div>
+  <dialog id="dialog" aria-labelledby="dialog-title"><div class="dialog-shell"><header class="dialog-header"><h2 id="dialog-title"></h2><button class="icon-button" data-action="close-dialog" data-i18n-label="close" aria-label="Close" data-icon="close"></button></header><div id="dialog-body"></div></div></dialog>
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+  <div class="sr-only" id="announcer" role="status" aria-live="polite"></div>
+</body>
+</html>

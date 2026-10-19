@@ -1,6 +1,6 @@
 // The web pages over real data (issue #22): the done-report card carries a 查看详情 one-time
-// link that lands on the Thread timeline (`views.timeline`, mobile viewport, no JS); the
-// machine page lists devices with live online state; its revoke button bumps the device
+// link that lands in the workspace with that Thread selected (ADR-0004; the timeline is in
+// the workspace snapshot, `views.workspace`); the machine page lists devices with live online state; its revoke button bumps the device
 // epoch and closes the live connector connection with 4403 (protocol §5.1); /加机器 in chat
 // issues the pairing code and answers with the npx connect command, redeemable exactly once.
 import { CloseCode } from "@shepherd/protocol";
@@ -74,7 +74,7 @@ describe("report cards carry the one-time 查看详情 link", () => {
     const linkUrl = cardJson.card.text.match(/https:\/\/example\.com\/link\/\S+/)![0]!;
     expect(linkUrl).toMatch(/^https:\/\/example\.com\/link\/wl1\.t\/t_\w+\.\d+\.[0-9a-f]{32}\.[0-9a-f]{64}$/);
 
-    // Opening the link logs in and lands directly on that Thread's timeline.
+    // Opening the link logs in and lands directly on that Thread.
     const open = await SELF.fetch(linkUrl, { redirect: "manual" });
     expect(open.status).toBe(303);
     const threadId = await ownerStub().debugSnapshot().then((s) => s.threads[0]!.threadId);
@@ -83,15 +83,18 @@ describe("report cards carry the one-time 查看详情 link", () => {
 
     const page = await SELF.fetch(`https://example.com${open.headers.get("location")!}`, { headers: { cookie } });
     expect(page.status).toBe(200);
-    const html = await page.text();
-    expect(html).toContain("修复登录 bug");
-    expect(html).toContain("指令");
-    expect(html).toContain("派发");
-    expect(html).toContain("汇报");
-    expect(html).toContain("登录 bug 修好，测试通过");
-    expect(html).toContain("mac-studio");
-    expect(html).toContain("shepherd/login");
-    expect(html).not.toContain("●"); // §6.5: opening the timeline cleared unread
+    expect(await page.text()).toContain('id="workspace"'); // the workspace shell; the page selects the Thread from the URL
+
+    // The Thread's timeline, worker and branch are what the workspace snapshot hands the page.
+    const workspace = (await (await SELF.fetch("https://example.com/app/api/workspace", { headers: { cookie } })).json()) as {
+      threads: Array<{ id: string; title: string; workers: Array<{ machine: string; branch: string | null }>; timeline: Array<{ kind: string; text: string }> }>;
+    };
+    const thread = workspace.threads.find((entry) => entry.id === threadId)!;
+    expect(thread.title).toBe("修复登录 bug");
+    expect(thread.timeline.map((entry) => entry.kind)).toEqual(expect.arrayContaining(["user_instruction", "dispatch", "report"]));
+    expect(thread.timeline.map((entry) => entry.text).join("\n")).toContain("登录 bug 修好，测试通过");
+    expect(thread.workers[0]).toMatchObject({ machine: "mac-studio" });
+    expect(thread.workers[0]!.branch).toContain("shepherd/login");
   });
 
   it("a failure card links to the timeline too", async () => {
@@ -138,32 +141,29 @@ describe("/加机器: chat-issued pairing (protocol §5.2)", () => {
   });
 });
 
-describe("the machine page: online state and revocation (protocol §5.1)", () => {
-  it("lists machines with online state, and revoke bumps the epoch and closes with 4403", async () => {
+describe("the machines dialog: online state and revocation (protocol §5.1)", () => {
+  it("lists machines with live state in the snapshot, and revoke (the workspace API) bumps the epoch and closes with 4403", async () => {
     const cookie = await webLogin();
     const fake = await pairFakeConnector("mac-studio");
     await fake.connect();
     const closed = nextClose(fake.ws!);
 
-    const page = await SELF.fetch("https://example.com/app/machines", { headers: { cookie } });
-    expect(page.status).toBe(200);
-    const html = await page.text();
-    expect(html).toContain("mac-studio");
-    expect(html).toContain("在线");
-    expect(html).toContain("pi"); // the agent kinds from hello, not [object Object]
-    expect(html).toContain("撤销");
-    expect(html).toContain("/api/pairing");
+    const snap = await (await SELF.fetch("https://example.com/app/api/workspace", { headers: { cookie } })).json() as {
+      csrf: string;
+      machines: Array<{ id: string; name: string; online: boolean; revoked?: boolean; agents: string[] }>;
+    };
+    const machine = snap.machines.find((m) => m.id === fake.deviceId);
+    expect(machine).toMatchObject({ name: "mac-studio", online: true, agents: ["pi"] }); // hello's kinds, not [object Object]
 
-    // The revoke form carries the per-session csrf token.
-    const csrf = html.match(/name="csrf" value="([0-9a-f]{64})"/)![1]!;
-    const deviceId = fake.deviceId;    const res = await SELF.fetch("https://example.com/app/machines/revoke", {
+    // The mutation needs the session's csrf token in the header (workspace-api.ts).
+    const csrf = snap.csrf as string;
+    const deviceId = fake.deviceId;
+    const res = await SELF.fetch("https://example.com/app/api/machines/revoke", {
       method: "POST",
-      headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({ csrf, deviceId }),
-      redirect: "manual",
+      headers: { cookie, "content-type": "application/json", "x-csrf-token": csrf, origin: "https://example.com" },
+      body: JSON.stringify({ deviceId }),
     });
-    expect(res.status).toBe(303);
-    expect(res.headers.get("location")).toBe("/app/machines");
+    expect(res.status).toBe(200);
 
     // The live connection closes with 4403 (CloseCode.REVOKED).
     expect((await closed).code).toBe(CloseCode.REVOKED);
@@ -174,25 +174,23 @@ describe("the machine page: online state and revocation (protocol §5.1)", () =>
     ws.accept();
     expect((await nextClose(ws)).code).toBe(CloseCode.REVOKED);
 
-    // The page shows the machine as revoked, offline, with no second revoke button.
-    const page2 = await SELF.fetch("https://example.com/app/machines", { headers: { cookie } });
-    const html2 = await page2.text();
-    expect(html2).toContain("已撤销");
-    expect(html2).not.toContain("离线"); // revoked replaces the online/offline line
+    // The snapshot shows the machine as revoked and offline.
+    const snap2 = await (await SELF.fetch("https://example.com/app/api/workspace", { headers: { cookie } })).json() as typeof snap;
+    expect(snap2.machines.find((m) => m.id === deviceId)).toMatchObject({ online: false, revoked: true });
 
     // The audit trail records who/what.
     const logs = await ownerStub().channelLogEntries(10);
     expect(logs.some((l) => l.reason === "web_machine_revoked" && l.detail === deviceId)).toBe(true);
   });
 
-  it("rejects the revoke POST without a matching csrf token", async () => {
+  it("rejects the revoke without a matching csrf token", async () => {
     const cookie = await webLogin();
     const fake = await pairFakeConnector("mac-studio");
     await fake.connect();
-    const res = await SELF.fetch("https://example.com/app/machines/revoke", {
+    const res = await SELF.fetch("https://example.com/app/api/machines/revoke", {
       method: "POST",
-      headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({ csrf: "0".repeat(32), deviceId: fake.deviceId }),
+      headers: { cookie, "content-type": "application/json", "x-csrf-token": "0".repeat(64), origin: "https://example.com" },
+      body: JSON.stringify({ deviceId: fake.deviceId }),
     });
     expect(res.status).toBe(403);
     // Machine untouched: still listed online.

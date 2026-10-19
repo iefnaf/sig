@@ -107,11 +107,23 @@ import {
 import { MIGRATIONS, runMigrations } from "./schema.ts";
 import { openSecret, sealSecret } from "./secretbox.ts";
 import { ambiguousWakeText, commandAttentionWakeText, escapeMarkers, verifyWakeText } from "./wake-text.ts";
+import { WorkspaceError, cardOpen, cardView, type WorkspaceActionInput, type WorkspaceInput } from "./workspace.ts";
+import { WorkspaceStream } from "./workspace-stream.ts";
 import { WebApp, linkTargetForThread, parseSessionCookie } from "./web.ts";
 
+/** Messages the workspace will queue before telling the owner to wait for the steward to catch up. */
+const MAX_OPEN_USER_RUNS = 10;
+/** Connection tag of browsers that opened the workspace (`?role=web&view=workspace`). */
+const WORKSPACE_TAG = "workspace";
+/** How long a burst of ledger writes is coalesced into one `workspace_changed` frame. */
+const WORKSPACE_NUDGE_MS = 150;
+
 interface ConnState {
-  /** Set on browser connections (the L3 stream consumers); connector connections carry deviceId. */
+  /** Set on browser connections (the L3 stream and workspace consumers); connector connections carry deviceId. */
   role?: "web";
+  /** Set on workspace connections: the session that opened them (signing out closes them). */
+  sid?: string;
+  expiresAt?: number;
   deviceId: string;
   epoch: number;
   /** Key that authenticated the connection (issue #27): ≠ primary ⇒ welcome rekeys. */
@@ -323,6 +335,7 @@ export class Steward extends Agent<Env> {
     // Routine/follow-up rows and their SDK schedules live in different stores — a crash
     // between INSERT and schedule() must not silently kill a routine (issue #20, §11).
     void this.reconcileRoutineSchedules();
+    void this.recoverWorkspaceInputs();
   }
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -482,6 +495,18 @@ export class Steward extends Agent<Env> {
 
   // Tests shrink the history relay TTL to exercise the alarm-driven sweep quickly.
   protected historyRelayTtlMs = HISTORY_RELAY_TTL_DEFAULT_MS;
+  /** When the pending relay sweep fires (0: none known). Live viewers open a stream every few
+   *  seconds; one sweep per open would pile up schedule rows, and one pending sweep is enough —
+   *  it re-arms itself for the next expiry. */
+  private relaySweepAt = 0;
+
+  private armRelaySweep(): void {
+    const delayS = Math.max(1, Math.ceil(this.historyRelayTtlMs / 1000));
+    const fireAt = Date.now() + delayS * 1000;
+    if (this.relaySweepAt !== 0 && this.relaySweepAt <= fireAt) return; // an earlier sweep is already coming
+    this.relaySweepAt = fireAt;
+    void this.schedule(delayS, "sweepHistoryRelays");
+  }
 
   // Tests shrink the quiet merge window (issue #11) — 0 makes quiet rows due immediately,
   // keeping the content-path tests deterministic while the window itself has its own suite.
@@ -492,10 +517,54 @@ export class Steward extends Agent<Env> {
   private ledger_?: Ledger;
   private get ledger(): Ledger {
     return (this.ledger_ ??= createLedger({
-      sql: this.sql.bind(this) as unknown as LedgerSql,
+      sql: this.watchedSql(),
       tx: (fn) => this.ctx.storage.transactionSync(fn),
       quietWindowMs: () => this.quietMergeMs,
     }));
+  }
+
+  /** The ledger's SQL, with one addition: any write tells the connected workspaces that
+   *  something changed (ADR-0004). The ledger owns every table the workspace shows, so this
+   *  one seam covers messages, decisions, Thread state and machines without a hook at each
+   *  writer. */
+  private watchedSql(): LedgerSql {
+    const sql = this.sql.bind(this) as unknown as LedgerSql;
+    return ((strings: TemplateStringsArray, ...values: (string | number | boolean | null)[]) => {
+      const rows = sql(strings, ...values);
+      if (/^\s*(?:INSERT|UPDATE|DELETE|REPLACE)\b/i.test(strings[0] ?? "")) this.notifyWorkspaces();
+      return rows;
+    }) as LedgerSql;
+  }
+
+  private workspaceNudge: ReturnType<typeof setTimeout> | undefined;
+
+  /** Live reply text for the open workspaces (workspace-stream.ts): held only while one is connected. */
+  private workspaceStream_?: WorkspaceStream;
+  private get workspaceStream(): WorkspaceStream {
+    return (this.workspaceStream_ ??= new WorkspaceStream({
+      open: () => this.piHarness.session().events(),
+      audience: () => [...this.getConnections(WORKSPACE_TAG)].length,
+      // Only the owner's own conversation is shown live; event and routine runs write bookkeeping nobody is sent.
+      forOwner: async () => {
+        const run = await this.currentRunBinding();
+        return run !== null && (run.kind === "user" || run.kind === "verify") ? { threadId: run.routedThreadId } : null;
+      },
+      onRunEnd: () => { void this.pollRuns(); },
+      send: (frame) => { for (const connection of this.getConnections(WORKSPACE_TAG)) if (this.webConnectionAlive(connection)) connection.send(frame); },
+      log: (reason, detail) => this.logChannel(reason, detail),
+    }));
+  }
+
+  /** Tells every open workspace to refetch. Bursts of writes (one event touches many rows)
+   *  collapse into a single frame; a workspace that missed one catches up on reconnect. */
+  private notifyWorkspaces(): void {
+    if (this.workspaceNudge !== undefined) return;
+    this.workspaceNudge = setTimeout(() => {
+      this.workspaceNudge = undefined;
+      const frame = JSON.stringify({ t: "workspace_changed" });
+      for (const connection of this.getConnections(WORKSPACE_TAG)) if (this.webConnectionAlive(connection)) connection.send(frame);
+      this.workspaceStream.ensure(); // a Durable Object that woke after hibernation re-subscribes here
+    }, WORKSPACE_NUDGE_MS);
   }
 
   private dispatcher_?: Dispatcher;
@@ -526,10 +595,10 @@ export class Steward extends Agent<Env> {
         }
       },
       commandExists: (cmdId) => this.sql`SELECT 1 AS one FROM outbox WHERE cmdId = ${cmdId}`.length > 0,
-      sendText: async (text, threadId) => {
+      sendText: async (text, threadId, opts) => {
         const owner = this.ownerOpenIdSync();
         if (!owner) return;
-        await this.enqueueOutbound({ kind: "text", to: owner, text, threadId: threadId ?? null, urgency: "push" });
+        await this.enqueueOutbound({ kind: "text", to: owner, text, threadId: threadId ?? null, urgency: "push", ...(opts?.private ? { private: true } : {}) });
       },
       sendCard: async (card, threadId, id) => {
         const owner = this.ownerOpenIdSync();
@@ -618,6 +687,17 @@ export class Steward extends Agent<Env> {
       revokeDevice: (deviceId) => void this.revoke(deviceId),
       machineConnected: (deviceId) => this.connFor(deviceId) !== undefined,
       audit: (reason, detail) => this.logChannel(reason, detail),
+      workspace: {
+        budget: () => this.budgetState(),
+        submitMessage: (input) => this.submitWorkspaceMessage(input),
+        submitAction: (input) => this.submitWorkspaceAction(input),
+        settings: async () => ({ model: await this.llmSelection() }),
+        saveModel: async (key: string) => { const selected = await this.llmSelection(); await this.setModelConfig(selected.provider, key); },
+        pairing: (id: string) => this.webPairing(id),
+        revoke: (id: string) => { this.logChannel("web_machine_revoked", id); void this.revoke(id); },
+      },
+      sessionEnded: (sid) => this.closeWebSession({ sid }),
+      shell: () => this.env.ASSETS.fetch(new Request("https://assets.invalid/workspace.html")),
     }));
   }
 
@@ -1006,7 +1086,8 @@ export class Steward extends Agent<Env> {
   async getConnectionTags(_connection: Connection, ctx: ConnectionContext): Promise<string[]> {
     // §5.3: the role query param routes/tags the connection; legitimacy is decided by the
     // credential — device token for connectors (onConnect), session cookie for browsers.
-    if (new URL(ctx.request.url).searchParams.get("role") === "web") return ["web"];
+    const params = new URL(ctx.request.url).searchParams;
+    if (params.get("role") === "web") return params.get("view") === "workspace" ? ["web", WORKSPACE_TAG] : ["web"];
     const parsed = await parseToken(await this.serverKeys(), bearer(ctx.request));
     return parsed ? [`dev:${parsed.deviceId}`] : [];
   }
@@ -1031,7 +1112,8 @@ export class Steward extends Agent<Env> {
         connection.close(CloseCode.UNAUTHORIZED, "unauthorized");
         return;
       }
-      connection.setState({ role: "web", deviceId: "", epoch: 0, keyId: "" } satisfies ConnState);
+      connection.setState({ role: "web", sid, expiresAt: Date.now() + 24 * 3600_000, deviceId: "", epoch: 0, keyId: "" } satisfies ConnState);
+      if (new URL(ctx.request.url).searchParams.get("view") === "workspace") this.workspaceStream.ensure();
       return;
     }
     const parsed = await parseToken(await this.serverKeys(), bearer(ctx.request));
@@ -1063,6 +1145,8 @@ export class Steward extends Agent<Env> {
     if (state.role === "web") {
       // §6.6 termination: the browser closing its connection ends every stream it opened.
       this.sql`DELETE FROM history_relay WHERE webConnId = ${connection.id}`;
+      // Nobody left watching a workspace: let go of pi's event stream (the close may still list this socket).
+      if ([...this.getConnections(WORKSPACE_TAG)].every((other) => other.id === connection.id)) void this.workspaceStream_?.stop();
       return;
     }
     if (!state.deviceId) return;
@@ -1081,7 +1165,25 @@ export class Steward extends Agent<Env> {
       this.getConnection(relay.webConnId)?.send(JSON.stringify({ t: "machine_offline", re: relay.reqId } satisfies MachineOfflineMessage));
     }
     this.ledger.machines.setOnline(state.deviceId, false);
-    this.rearmNoticeDrain(); // the offline intents' 2-minute window starts here
+    this.rearmNoticeDrain(); // a recovery intent may now be counting down its debounce
+  }
+
+  /** Signing out ends every browser connection that session opened. */
+  closeWebSession(input: { sid: string }): void {
+    for (const connection of this.getConnections<ConnState>("web")) {
+      if (connection.state?.sid === input.sid) connection.close(CloseCode.UNAUTHORIZED, "sign in again");
+    }
+  }
+
+  /** A workspace socket is alive only while its session is: an expired or signed-out session
+   *  loses its live updates and stream with an explicit close. */
+  private webConnectionAlive(connection: Connection): boolean {
+    const state = connection.state as ConnState | null;
+    if (state?.role !== "web" || !state.sid || !this.web.sessionAlive(state.sid)) {
+      connection.close(CloseCode.UNAUTHORIZED, "sign in again");
+      return false;
+    }
+    return true;
   }
 
   async onMessage(connection: Connection, raw: WSMessage): Promise<void> {
@@ -1098,6 +1200,7 @@ export class Steward extends Agent<Env> {
     const state = connection.state as unknown as ConnState | null;
     const t = (message as { t?: unknown }).t;
     if (state?.role === "web") {
+      if (!this.webConnectionAlive(connection)) return;
       switch (t) {
         case "history_open":
           this.handleHistoryOpen(connection, message);
@@ -1198,13 +1301,14 @@ export class Steward extends Agent<Env> {
       INSERT INTO history_relay (reqId, webConnId, workerId, deviceId, maxBytes, sentBytes, expiresAt, createdAt)
       VALUES (${reqId}, ${connection.id}, ${open.workerId}, ${worker.deviceId}, ${maxBytes}, 0, ${now + this.historyRelayTtlMs}, ${now})
     `;
-    void this.schedule(Math.max(1, Math.ceil(this.historyRelayTtlMs / 1000)), "sweepHistoryRelays");
+    this.armRelaySweep();
     const req: HistoryReqMessage = {
       t: "history_req",
       id: reqId,
       workerId: open.workerId,
       maxBytes,
       ...(open.since ? { since: open.since } : {}),
+      ...(open.format ? { format: open.format } : {}),
     };
     deviceConn.send(JSON.stringify(req));
   }
@@ -1238,7 +1342,7 @@ export class Steward extends Agent<Env> {
       return;
     }
     const webConn = this.getConnection(relay.webConnId);
-    if (!webConn) {
+    if (!webConn || !this.webConnectionAlive(webConn)) {
       this.sql`DELETE FROM history_relay WHERE reqId = ${chunk.re}`;
       return;
     }
@@ -1279,10 +1383,13 @@ export class Steward extends Agent<Env> {
 
   /** Alarm-driven §6.6 termination: relays older than the TTL disappear, browser or not. */
   async sweepHistoryRelays(): Promise<void> {
+    this.relaySweepAt = 0;
     this.sql`DELETE FROM history_relay WHERE expiresAt <= ${Date.now()}`;
     const next = this.sql<{ m: number | null }>`SELECT MIN(expiresAt) AS m FROM history_relay`[0]?.m;
     if (typeof next === "number") {
-      void this.schedule(Math.max(1, Math.ceil((next - Date.now()) / 1000)), "sweepHistoryRelays");
+      const delayS = Math.max(1, Math.ceil((next - Date.now()) / 1000));
+      this.relaySweepAt = Date.now() + delayS * 1000;
+      void this.schedule(delayS, "sweepHistoryRelays");
     }
   }
 
@@ -1960,8 +2067,23 @@ export class Steward extends Agent<Env> {
     };
   }
 
-  // `/加机器` in chat is the trigger (issue #22); `/pair` is the only HTTP consumer of the
-  // code. QR/setup-page issuance was never built — chat is the canonical path now.
+  // `/加机器` in chat and `POST /api/pairing` are the triggers (issue #22); `/pair` is the
+  // only HTTP consumer of the code. The workspace's own mint is idempotent on the client's
+  // request id (sh_web_pairing): a retried "add machine" gets the same code back, not a
+  // second one.
+  private async webPairing(id: string): Promise<{ code: string; expiresAt: number }> {
+    const now = Date.now();
+    this.sql`DELETE FROM sh_web_pairing WHERE expiresAt <= ${now}`;
+    const existing = this.sql<{ code: string; expiresAt: number }>`SELECT code, expiresAt FROM sh_web_pairing WHERE id = ${id}`[0];
+    if (existing) return existing;
+    const result = { code: generatePairingCode(), expiresAt: now + 10 * 60_000 };
+    this.ctx.storage.transactionSync(() => {
+      this.sql`INSERT INTO pairing (code, expiresAt) VALUES (${result.code}, ${result.expiresAt})`;
+      this.sql`INSERT INTO sh_web_pairing (id, code, expiresAt) VALUES (${id}, ${result.code}, ${result.expiresAt})`;
+    });
+    return result;
+  }
+
   async createPairing(): Promise<{ code: string }> {
     const code = generatePairingCode();
     this.sql`INSERT INTO pairing (code, expiresAt) VALUES (${code}, ${Date.now() + 10 * 60_000})`;
@@ -2572,8 +2694,8 @@ export class Steward extends Agent<Env> {
       return Response.json({ id, deduped: true });
     }
     this.sql`
-      INSERT INTO sh_inbound (channel, msgId, eventId, eventType, receivedAt, ownerAuthorized)
-      VALUES ('local', ${id}, NULL, 'api', ${Date.now()}, 1)
+      INSERT INTO sh_inbound (channel, msgId, eventId, eventType, receivedAt, ownerAuthorized, text)
+      VALUES ('local', ${id}, NULL, 'api', ${Date.now()}, 1, ${body.text})
     `;
     // The spend readout stays deterministic (issue #28): it must answer with the model gone.
     const command = parseOwnerCommand(body.text);
@@ -2681,10 +2803,14 @@ export class Steward extends Agent<Env> {
     // all seen).
     const quotedThreadIds = input.parentId ? this.ledger.outbound.threadIdsForProviderMsg(input.parentId) : [];
     for (const quotedThreadId of quotedThreadIds) this.ledger.threads.markRead(quotedThreadId);
-    const routed = quotedThreadIds.length === 1 ? quotedThreadIds[0]! : null;
+    const routed = input.routedThreadId ?? (quotedThreadIds.length === 1 ? quotedThreadIds[0]! : null);
     const routedRow = input.parentId ? this.ledger.outbound.rowForProviderMsg(input.parentId) : null;
     const routedThread = routed ? this.ledger.threads.get(routed) : null;
-    if (routedThread) {
+    // What the owner said belongs to the conversation the workspace shows (ADR-0004): a
+    // typed message, a card choice, or an answer to a worker, with the Thread it landed on.
+    // Idempotent on (channel, msgId); the COALESCE keeps a row already inserted without text.
+    this.ledger.ownerInputs.record("local", input.msgId, input.text, routedThread?.threadId ?? null);
+    if (routedThread && input.parentId) {
       this.ledger.threads.markRead(routedThread.threadId); // a reply means the report was seen (§6.5)
       // Review #7: a reply routed to a Thread with an open question IS the answer — close it
       // (the deterministic path only closed on re-dispatch, leaving waiting_you stuck when
@@ -2739,6 +2865,98 @@ export class Steward extends Agent<Env> {
     void this.pollRuns();
   }
 
+  /** In-flight workspace requests by key, so a retry that arrives while the first attempt is
+   *  still running waits for it instead of racing it. */
+  private readonly webInputs = new Map<string, Promise<void>>();
+
+  /**
+   * An owner message typed in the workspace (ADR-0004). The client's request id is the
+   * idempotency key: the same id and payload is one effect no matter how many times it is
+   * retried, and the same id with different content is refused rather than silently ignored.
+   * The message enters the same local-channel conversation the API serves — one conversation,
+   * two views.
+   */
+  private async submitWorkspaceMessage(input: WorkspaceInput): Promise<void> {
+    const payload = JSON.stringify(input);
+    const previous = this.ledger.webRequests.get(input.id);
+    if (previous && previous.payload !== payload) throw new WorkspaceError("id_conflict", 409);
+    if (previous?.status === "done") return;
+    const pending = this.webInputs.get(input.id);
+    if (pending) return pending;
+    const thread = input.threadId ? this.ledger.threads.get(input.threadId) : null;
+    if (input.threadId && !thread) throw new WorkspaceError("thread_not_found", 404);
+    // Answering a card or message quotes it, exactly like an API `replyTo`: the card's
+    // Thread (and a worker question bound to it) decide where the answer goes.
+    const quoted = input.replyTo ? this.ledger.outbound.row(input.replyTo) : null;
+    if (input.replyTo && !quoted) throw new WorkspaceError("reply_target_not_found", 404);
+    const parentId = typeof quoted?.providerMsgId === "string" ? quoted.providerMsgId : undefined;
+    if (!previous && this.ledger.runs.openRows().filter((r) => r.kind === "user").length >= MAX_OPEN_USER_RUNS) {
+      throw new WorkspaceError("queue_full", 429);
+    }
+    const msgId = `web:${input.id}`;
+    this.ctx.storage.transactionSync(() => {
+      this.ledger.webRequests.start(input.id, payload);
+    });
+    const work = this.submitUserMessage({
+      msgId, text: input.text, ...(parentId ? { parentId } : {}),
+      routedThreadId: thread?.threadId ?? null,
+      ...(thread ? { prefilledNote: `（系统注：用户指定这条消息归属 Thread「${escapeMarkers(thread.title)}」（${thread.threadId}）。）\n` } : {}),
+    }).then(() => { this.ledger.webRequests.complete(input.id); }).finally(() => { this.webInputs.delete(input.id); });
+    this.webInputs.set(input.id, work);
+    return work;
+  }
+
+  /**
+   * A button pressed on a card in the workspace. It enters the same handlers an API action
+   * does — the outbound row behind the card, not the browser, decides what the button means.
+   * The button must be one the card really carries, and the decision must still be open:
+   * forged and stale taps are refused.
+   */
+  private async submitWorkspaceAction(input: WorkspaceActionInput): Promise<void> {
+    const key = `action:${input.id}`;
+    const payload = JSON.stringify(input);
+    const previous = this.ledger.webRequests.get(key);
+    if (previous && previous.payload !== payload) throw new WorkspaceError("id_conflict", 409);
+    if (previous?.status === "done") return;
+    const pending = this.webInputs.get(key);
+    if (pending) return pending;
+    const row = this.ledger.outbound.row(input.cardId);
+    if (!row || row.kind !== "card") throw new WorkspaceError("card_not_found", 404);
+    const view = cardView((JSON.parse(String(row.payload)) as { card?: unknown }).card);
+    if (!view.buttons.some((button) => button.action === input.action)) throw new WorkspaceError("bad_action", 400);
+    const questionId = typeof row.questionId === "string" ? row.questionId : null;
+    if (!previous && !cardOpen(this.ledger, { id: input.cardId, questionId }, view)) throw new WorkspaceError("already_handled", 409);
+    // Handlers find the card again through its provider message id; a local-channel card
+    // always has one once settled.
+    const cardMsgId = typeof row.providerMsgId === "string" ? row.providerMsgId : null;
+    if (cardMsgId === null) throw new WorkspaceError("card_pending", 409);
+    const owner = this.ownerOpenIdSync();
+    if (owner === null) throw new WorkspaceError("not_ready", 409);
+    const eventId = `web:${input.id}`;
+    this.ctx.storage.transactionSync(() => {
+      this.ledger.webRequests.start(key, payload);
+      this.sql`
+        INSERT OR IGNORE INTO sh_inbound (channel, msgId, eventId, eventType, receivedAt, ownerAuthorized)
+        VALUES ('local', ${eventId}, NULL, 'action', ${Date.now()}, 1)
+      `;
+    });
+    const work = this.dispatchCardAction({ msgId: eventId, action: input.action, cardMsgId })
+      .then(() => { this.ledger.webRequests.complete(key); }).finally(() => { this.webInputs.delete(key); });
+    this.webInputs.set(key, work);
+    return work;
+  }
+
+  /** A boot-time replay of workspace message requests the crash interrupted mid-way (the
+   *  sh_web_request row is the durable intent); card taps are not replayed — the card is
+   *  still open if it never landed, and the owner can press again with a fresh request id. */
+  private async recoverWorkspaceInputs(): Promise<void> {
+    for (const row of this.ledger.webRequests.pending()) {
+      if (row.id.startsWith("action:")) continue;
+      try { await this.submitWorkspaceMessage(JSON.parse(row.payload) as WorkspaceInput); }
+      catch (error) { this.logChannel("web_recovery_failed", `${row.id} ${errorText(error)}`); }
+    }
+  }
+
   /**
    * The alarm-driven run settler (steward.md §6.3): while sh_run rows are open, re-arm every
    * RUN_POLL_S seconds; on settlement a user run's final text is enqueued as the reply, and
@@ -2769,10 +2987,15 @@ export class Steward extends Agent<Env> {
           }
           continue;
         }
+        // The provider's own error text (401 invalid key, rate limit, …) is the one thing
+        // that makes a model_error diagnosable from the outside; `wait()` drops it, so it is
+        // recovered from the transcript tail and pinned in the channel log.
+        const modelErrorDetail = result.status === "unanswered" && result.reason === "model_error" ? ((await this.modelErrorDetail()) ?? undefined) : undefined;
+        if (modelErrorDetail) this.logChannel("model_call_error", modelErrorDetail.slice(0, 300));
         // Issue #28: bring the counter current before the over-budget note reads it — the
         // run that just settled is the spend that may tip today over the cap.
         await this.syncUsageQuietly();
-        const failedNotice = run.kind === "user" && result.status !== "done" ? await this.noticeForFailedRun() : undefined;
+        const failedNotice = run.kind === "user" && result.status !== "done" ? await this.noticeForFailedRun(modelErrorDetail) : undefined;
         this.settleRun(run, result, failedNotice);
       }
     } catch (err) {
@@ -2793,12 +3016,28 @@ export class Steward extends Agent<Env> {
   /** What the owner is told when a user-triggered run did not complete. "Try again" is wrong
    *  advice for a deployment that has no model key yet (owner-notices.ts); resolved here, in the
    *  async poll, so settleRun stays synchronous. */
-  private async noticeForFailedRun(): Promise<string> {
+  private async noticeForFailedRun(modelErrorDetail?: string): Promise<string> {
     try {
-      return failedRunNotice(await this.llmSelection());
+      // The workspace is always part of the deployment now (ADR-0004): its Settings page is
+      // where a rejected or missing model key gets fixed.
+      return failedRunNotice(await this.llmSelection(), true, modelErrorDetail);
     } catch {
       return FAILED_RUN_NOTICE;
     }
+  }
+
+  /** The provider-facing error text of the most recent failed model call, from the
+   *  transcript tail (pi drops it from the settle summary — `wait()` reports only
+   *  `model_error`). Null when the tail has no errored assistant message. */
+  private async modelErrorDetail(): Promise<string | null> {
+    const records = (await this.piHarness.messages()) as unknown as Array<{
+      model?: Array<{ role?: string; errorMessage?: string; stopReason?: string }>;
+    }>;
+    for (let i = records.length - 1; i >= 0; i--) {
+      const msg = records[i]!.model?.[0];
+      if (msg?.role === "assistant" && msg.errorMessage) return msg.errorMessage;
+    }
+    return null;
   }
 
   private settleRun(run: RunRow, result: { status: string; reason?: string; text?: string }, failedNotice: string = FAILED_RUN_NOTICE): void {
@@ -3376,6 +3615,9 @@ export class Steward extends Agent<Env> {
     urgency?: "push" | "quiet";
     /** Structured merge section (issue #11) — carried in the payload for quiet rows. */
     part?: QuietSection;
+    /** Credential or channel-setup text (a login link, a pairing command): delivered to the
+     *  owner, but never shown in the workspace's conversation. */
+    private?: boolean;
     /** Stable dedupe key (review #6): retries/replays of the same logical message converge on
      *  one row (INSERT OR IGNORE) — the id doubles as the provider-side uuid, so a repeated
      *  enqueue can never double-send. Omitted: a fresh one-of message. */
@@ -3589,6 +3831,12 @@ export class Steward extends Agent<Env> {
     this.llmModels.faux.setSteps(steps);
   }
 
+  /** Makes scripted replies arrive word by word (tokens per second), so a live view can watch one being written. */
+  async fauxStreamAt(tokensPerSecond: number | undefined): Promise<void> {
+    if (!this.llmModels.faux) throw new Error("STEWARD_MODEL is not the faux provider");
+    this.llmModels.faux.streamAt(tokensPerSecond);
+  }
+
   /** The captured model requests (after beforeRequest): input texts + injected briefs. */
   async fauxRequests(): Promise<FauxRequestRecord[]> {
     if (!this.llmModels.faux) throw new Error("STEWARD_MODEL is not the faux provider");
@@ -3622,6 +3870,8 @@ export class Steward extends Agent<Env> {
 
   /** Test-only: wipes the pi conversation (dispose + drop pi_* tables) and the run/wake rows. */
   async resetLlmStateForTests(): Promise<void> {
+    await this.workspaceStream_?.stop();
+    this.workspaceStream_ = undefined;
     await this.piHarness.dispose();
     const tables = this.sql<{ name: string }>`
       SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'pi_%'

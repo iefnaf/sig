@@ -1,10 +1,14 @@
 # Sig Product Requirements Document (Spec)
 
-> Status: draft v0.1, a consolidation of conclusions from the product discussion phase.
+> Status: draft v0.2.
 >
 > **Update (ADR-0003):** the chat-channel requirement (Feishu) is deferred. The owner
-> interacts through a SERVER_KEY-gated HTTP API and the signed-link web; everything else in
+> interacts through a SERVER_KEY-gated HTTP API and the web workspace; everything else in
 > this document stands. The channel sections remain as the future-integration design.
+>
+> **Update (ADR-0004/0005):** the web workspace is the owner's everyday entry — one
+> continuous conversation over the API's local channel, with Threads, "Needs you" decisions,
+> and worker session records read on demand from their machines ([web entry](design/web-entry.md)).
 > This document defines only **product requirements and boundaries** and does not cover specific technical implementation approaches. Technology-related assumptions and items to verify are collected in the "Items to Verify" section.
 
 ## 1. Overview

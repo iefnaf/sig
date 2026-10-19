@@ -323,12 +323,22 @@ describe("viewing a Thread clears unread (steward.md §6.5)", () => {
     return { fake, threadId: dispatched.threadId, cardMsgId: card!.providerMsgId! };
   }
 
-  it("opening the Thread on the web clears unread", async () => {
+  it("opening the Thread in the workspace clears unread", async () => {
     const { fake, threadId } = await threadWithUnreadCard();
     expect((await ownerStub().debugSnapshot()).threads[0]!.unread).toBe(true);
     const cookie = await webLogin();
+    // The deep link loads the workspace with the Thread selected; the page then tells the
+    // server the owner is looking at it (the read endpoint) — loading alone is not reading.
     const page = await SELF.fetch(`https://example.com/app/threads/${threadId}`, { headers: { cookie } });
     expect(page.status).toBe(200);
+    await expectUnread(threadId, true);
+    const { csrf } = (await (await SELF.fetch("https://example.com/app/api/workspace", { headers: { cookie } })).json()) as { csrf: string };
+    const read = await SELF.fetch(`https://example.com/app/api/threads/${threadId}/read`, {
+      method: "POST",
+      headers: { cookie, "content-type": "application/json", "x-csrf-token": csrf },
+      body: "{}",
+    });
+    expect(read.status).toBe(200);
     await expectUnread(threadId, false);
     fake.close();
   }, 30_000);

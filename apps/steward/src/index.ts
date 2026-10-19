@@ -8,7 +8,7 @@ import { parseSessionCookie, verifyLinkToken } from "./web.ts";
 export { Steward };
 
 function json(body: unknown, status = 200): Response {
-  return Response.json(body, { status });
+  return Response.json(body, { status, headers: { "cache-control": "no-store" } });
 }
 
 function htmlPage(body: string, status = 200): Response {
@@ -18,6 +18,14 @@ function htmlPage(body: string, status = 200): Response {
 // The web's shared "get a fresh link" page (web.ts renders the full variant inside the DO;
 // this stateless twin answers rejected probes without waking it).
 const LINK_HINT = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex"><title>Sig</title>${BRAND_HEAD}<style>${BRAND_STYLE}body{font:15px/1.7 -apple-system,"PingFang SC",sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:0 16px}main{max-width:480px}</style></head><body><main>${BRAND_LOCKUP}<p>链接无效或已过期。</p><p style="opacity:.75;font-size:13px">新的登录链接用 <code>POST /api/login-link</code> 签发（15 分钟内有效，只能打开一次）。</p></main></body></html>`;
+
+/** The session cookie's raw value, if the request carries one. */
+function sessionCookie(request: Request): string | null {
+  return (request.headers.get("cookie") ?? "")
+    .split(/;\s*/)
+    .find((part) => part.startsWith("shepherd_session="))
+    ?.slice("shepherd_session=".length) ?? null;
+}
 
 // Length-independent comparison so the API gate never leaks the key byte-by-byte.
 function constantTimeEquals(got: string, want: string): boolean {
@@ -78,7 +86,7 @@ export default {
         // Brute-force lockout (protocol doc §5.2): per-IP and global, 5 failures → 15 min.
         return new Response(JSON.stringify({ error: "rate_limited" }), {
           status: 429,
-          headers: { "content-type": "application/json", "retry-after": String(result.retryAfterSec) },
+          headers: { "content-type": "application/json", "retry-after": String(result.retryAfterSec), "cache-control": "no-store" },
         });
       }
       return json({ error: "invalid code" }, 400);
@@ -111,10 +119,38 @@ export default {
 
     // Web app pages: session-cookie gated. A request without a well-formed cookie is rejected
     // here (no DO wake); a well-formed one is forwarded — session liveness stays in the DO.
+    // The workspace's JSON API answers JSON (ADR-0004: the static app's fetches), pages the
+    // sign-in hint.
     if ((url.pathname === "/app" || url.pathname.startsWith("/app/")) && (request.method === "GET" || request.method === "POST")) {
-      const cookie = request.headers.get("cookie") ?? "";
-      const raw = cookie.split(/;\s*/).find((part) => part.startsWith("shepherd_session="))?.slice("shepherd_session=".length) ?? null;
-      if (!(await parseSessionCookie(webVerifyKeys(env), raw))) return htmlPage(LINK_HINT.replace("链接无效或已过期。", "这一页需要先登录。"), 401);
+      const raw = sessionCookie(request);
+      if (!(await parseSessionCookie(webVerifyKeys(env), raw))) {
+        return url.pathname.startsWith("/app/api/") || url.pathname === "/app/ws"
+          ? json({ error: "auth_required" }, 401)
+          : htmlPage(LINK_HINT.replace("链接无效或已过期。", "这一页需要先登录。"), 401);
+      }
+      // The workspace's own static files (ADR-0004): plain HTML/CSS/ES modules under the
+      // assets directory, served through the ASSETS binding here — behind the same session
+      // gate as the rest of /app, without waking the Durable Object.
+      if (request.method === "GET" && url.pathname.startsWith("/app/assets/")) {
+        const name = url.pathname.slice("/app/assets/".length);
+        if (!/^[A-Za-z0-9][\w.-]*$/.test(name)) return new Response("not found", { status: 404 });
+        const asset = await env.ASSETS.fetch(new Request(new URL(`/${name}`, url.origin), request));
+        const headers = new Headers(asset.headers);
+        headers.set("cache-control", "private, max-age=0, must-revalidate");
+        headers.set("x-content-type-options", "nosniff");
+        return new Response(asset.body, { status: asset.status, headers });
+      }
+      // The workspace's browser socket (ADR-0004): the same agent socket as the machines',
+      // tagged role=web — onBeforeConnect re-checks the session cookie, and the DO judges
+      // liveness. `view` (workspace | session) rides along for the DO's connection tags.
+      if (url.pathname === "/app/ws") {
+        if (request.method !== "GET" || request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+          return new Response("not found", { status: 404 });
+        }
+        url.pathname = "/agents/steward/owner";
+        url.searchParams.set("role", "web");
+        return (await routeAgentRequest(new Request(url, request), env)) ?? new Response("not found", { status: 404 });
+      }
       const stub = await getAgentByName(env.Steward, "owner");
       return stub.fetch(request);
     }
@@ -143,12 +179,7 @@ export default {
             }
             if (!sameHost) return new Response("unauthorized", { status: 401 });
           }
-          const cookie = req.headers.get("cookie") ?? "";
-          const raw = cookie
-            .split(/;\s*/)
-            .find((part) => part.startsWith("shepherd_session="))
-            ?.slice("shepherd_session=".length) ?? null;
-          if (!(await parseSessionCookie(webVerifyKeys(env), raw))) return new Response("unauthorized", { status: 401 });
+          if (!(await parseSessionCookie(webVerifyKeys(env), sessionCookie(req)))) return new Response("unauthorized", { status: 401 });
           return;
         }
         const parsed = await parseToken(await resolveServerKeys(env), bearer(req));

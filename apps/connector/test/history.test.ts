@@ -2,7 +2,7 @@
 // `history_chunk`s driven by acks (§6.6), and WorkerManager.history picks the right source —
 // live `get_entries` while the process runs (fake-pi), the session JSONL along the current
 // branch once it is gone (connector-pi.md §11.4).
-import { rmSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ConnectorApp } from "../src/connector-app.ts";
@@ -223,4 +223,107 @@ describe("history_req over the real transport (§6.6)", () => {
     await new Promise((resolve) => setTimeout(resolve, 300));
     expect(mock.historyChunksFor(reqId)).toHaveLength(2);
   }, 90_000);
+});
+
+/** Joins the fragments of a full read back into the recorded JSON lines. */
+function recordsOf(entries: Array<{ id: string; fragment?: { data: string; offset: number; total: number } }>): Array<Record<string, any>> {
+  const lines: string[] = [];
+  let open: string[] = [];
+  for (const entry of entries) {
+    const fragment = entry.fragment!;
+    if (fragment.offset === 0) open = [];
+    open.push(fragment.data);
+    if (open.join("").length === fragment.total) lines.push(open.join(""));
+  }
+  return lines.map((text) => JSON.parse(text));
+}
+
+describe("full session reads (ADR-0003)", () => {
+  it("serve the agent's own file record for record, whether or not its process is running", async () => {
+    const scenario = writeScenario(dir, "scenario", [conversationRun("fix the login bug", "Done, tests pass")]);
+    await startWorker(scenario);
+
+    for (const phase of ["running", "stopped"]) {
+      if (phase === "stopped") await app.manager.stopProcess(WORKER);
+      const page = await app.manager.history(WORKER, undefined, 1024 * 1024, "full");
+      expect(page.format, phase).toBe("full");
+      expect(page.done, phase).toBe(true);
+      const records = recordsOf(page.entries);
+      const ids = records.filter((record) => record.type === "message").map((record) => record.id);
+      expect(ids, phase).toEqual(["e2", "s1", "s2"]);
+      // Nothing summarized: the tool call keeps its full arguments, the text its full length.
+      const assistant = records.find((record) => record.id === "s2")!;
+      expect(assistant.message.content[1]).toEqual({ type: "toolCall", id: "c1", name: "edit", arguments: { file_path: "src/auth/session.ts" } });
+    }
+  }, 60_000);
+
+  it("answer no_history for a worker that has recorded nothing", async () => {
+    const solo = new WorkerManager({ store, stateDir });
+    store.upsertWorker({ workerId: "w-no-record", threadId: "t", repoId: repo, mode: "write", state: "broken" });
+    await expect(solo.history("w-no-record", undefined, 1024 * 1024, "full")).rejects.toMatchObject({ code: "no_history" });
+    await expect(solo.history("w-unknown", undefined, 1024 * 1024, "full")).rejects.toMatchObject({ code: "not_found" });
+    solo.stop();
+  });
+
+  it("find a Claude Code worker's transcript in Claude Code's own folder", async () => {
+    const config = join(dir, "claude-config");
+    const sessionId = "0b7a5d5e-6f1b-5c0e-9a53-8a5b1d3c2e10";
+    const folder = join(config, "projects", "elsewhere");
+    mkdirSync(folder, { recursive: true });
+    const records = [
+      { type: "user", uuid: "u1", parentUuid: null, message: { role: "user", content: "fix it" } },
+      { type: "assistant", uuid: "u2", parentUuid: "u1", message: { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Bash", input: { command: "ls" } }] } },
+    ];
+    writeFileSync(join(folder, `${sessionId}.jsonl`), `${records.map((record) => JSON.stringify(record)).join("\n")}\n`);
+    store.upsertWorker({ workerId: "w-claude", threadId: "t", repoId: repo, mode: "write", state: "idle", agent: "claude-code", sessionId });
+    const previous = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = config;
+    const solo = new WorkerManager({ store, stateDir });
+    try {
+      const page = await solo.history("w-claude", undefined, 1024 * 1024, "full");
+      expect(recordsOf(page.entries)).toEqual(records);
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = previous;
+      solo.stop();
+    }
+  });
+});
+
+describe("full history_req over the real transport", () => {
+  it("streams fragments marked as a full read, resumable from the cursor", async () => {
+    const scenario = writeScenario(dir, "scenario", [bulkConversationRun(30)]);
+    await startWorker(scenario);
+
+    const first = mock.sendHistoryReq(WORKER, { format: "full", maxBytes: 40_000 });
+    const cut = await waitFor(() => {
+      const got = mock.historyChunksFor(first);
+      for (const chunk of got) mock.ackHistory(first, chunk.n as number); // release the window like the browser
+      return got.length > 0 && got[got.length - 1]!.done === true ? got : undefined;
+    }, 20_000, "the first page");
+    expect(cut.every((chunk) => chunk.format === "full")).toBe(true);
+    const last = cut[cut.length - 1]!;
+    expect(last.truncated).toBe(true); // the budget ran out; there is more
+    expect(typeof last.cursor).toBe("string");
+
+    const second = mock.sendHistoryReq(WORKER, { format: "full", since: last.cursor as string, maxBytes: 2 * 1024 * 1024 });
+    const rest = await waitFor(() => {
+      const got = mock.historyChunksFor(second);
+      for (const chunk of got) mock.ackHistory(second, chunk.n as number);
+      return got.length > 0 && got[got.length - 1]!.done === true ? got : undefined;
+    }, 20_000, "the rest");
+    expect(rest[rest.length - 1]!.truncated).toBeUndefined();
+
+    const entries = [...cut, ...rest].flatMap((chunk) => chunk.entries as Array<{ id: string; fragment?: { data: string; offset: number; total: number } }>);
+    const messages = recordsOf(entries).filter((record) => record.type === "message").map((record) => record.id);
+    expect(messages).toEqual(["e2", ...Array.from({ length: 30 }, (_, i) => `b${i}`)]);
+  }, 90_000);
+
+  it("answers a missing record with error{no_history}", async () => {
+    const scenario = writeScenario(dir, "scenario", [conversationRun("u", "a")]);
+    await startWorker(scenario);
+    store.upsertWorker({ workerId: "w-bare", threadId: "t", repoId: repo, mode: "write", state: "broken" });
+    const reqId = mock.sendHistoryReq("w-bare", { format: "full" });
+    expect(await waitFor(() => mock.errorsFor(reqId), 10_000, "error reply")).toMatchObject({ t: "error", re: reqId, code: "no_history" });
+  }, 60_000);
 });

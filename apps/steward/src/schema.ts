@@ -837,4 +837,36 @@ export const MIGRATIONS: readonly Migration[] = [
       });
     },
   },
+  {
+    // The web workspace (ADR-0004): the conversation the browser draws is the owner's
+    // inputs (sh_inbound keeps their text from now on) plus the outbound rows; web requests
+    // are made idempotent by the client's request id (sh_web_request). Existing messages
+    // reappear in the transcript from the runs they started — less the routing note the
+    // steward prepended to the run text, which was never the owner's words.
+    id: "019_web_workspace",
+    up: (sql) => {
+      ignoringDuplicateColumn(() => { sql`ALTER TABLE sh_inbound ADD COLUMN text TEXT`; });
+      ignoringDuplicateColumn(() => { sql`ALTER TABLE sh_inbound ADD COLUMN threadId TEXT`; });
+      for (const run of sql<{ operationId: string; text: string }>`SELECT operationId, text FROM sh_run WHERE kind = 'user'`) {
+        const text = run.text.replace(/^（系统注：[^\n]*）\n/, "");
+        sql`UPDATE sh_inbound SET text = ${text} WHERE msgId = ${run.operationId.slice("user:".length)} AND text IS NULL`;
+      }
+      sql`CREATE TABLE IF NOT EXISTS sh_web_request (
+        id TEXT PRIMARY KEY, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', createdAt INTEGER NOT NULL
+      )`;
+    },
+  },
+  {
+    // The workspace's idempotent pairing mints (ADR-0004): a retried "add machine" request
+    // gets the same one-time code back instead of a second one. The owner needs no row —
+    // ADR-0003: whoever holds SERVER_KEY is the owner.
+    id: "020_web_owner",
+    up: (sql) => {
+      sql`CREATE TABLE IF NOT EXISTS sh_web_session (
+        sid TEXT PRIMARY KEY, csrf TEXT NOT NULL,
+        createdAt INTEGER NOT NULL, expiresAt INTEGER NOT NULL, lastSeenAt INTEGER NOT NULL
+      )`; // 009_web's table, restated so this migration never depends on running after it
+      sql`CREATE TABLE IF NOT EXISTS sh_web_pairing (id TEXT PRIMARY KEY, code TEXT NOT NULL, expiresAt INTEGER NOT NULL)`;
+    },
+  },
 ];

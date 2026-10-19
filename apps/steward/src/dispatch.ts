@@ -199,7 +199,9 @@ export interface DispatcherDeps {
   commandExists: (cmdId: string) => boolean;
   /** Releases a held command with no expiry; refuses if it already left the DO. */
   waitForCommand: (cmdId: string) => boolean;
-  sendText: (text: string, threadId?: string | null) => Promise<void>;
+  /** `private`: the text carries a credential (login link, pairing code) — delivered to the owner,
+   *  never shown in the workspace's conversation. */
+  sendText: (text: string, threadId?: string | null, opts?: { private?: boolean }) => Promise<void>;
   sendCard: (card: unknown, threadId: string, id?: string) => Promise<void>;
   /** Issues a one-time pairing code (protocol §5.2) for `/加机器`. */
   createPairing: () => Promise<{ code: string }>;
@@ -494,6 +496,8 @@ export class Dispatcher {
       url
         ? `一次性登录链接（15 分钟内有效，只能打开一次）：\n${url}`
         : "暂时不知道本部署的对外地址，发过一条消息后再试。",
+      null,
+      { private: true },
     );
   }
 
@@ -513,6 +517,8 @@ export class Dispatcher {
         `npx @iefnaf/sig connect ${origin} ${code}`,
         "（配对码 10 分钟内有效，只能使用一次；接好后它会自动上线，直接问我就能看到。）",
       ].join("\n"),
+      null,
+      { private: true },
     );
   }
 

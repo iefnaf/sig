@@ -2,7 +2,7 @@
 // pins; the two headline ones (#1 alarm survival, #3 run binding) run against the REAL alarm
 // loop with no manual pollRuns/drainWakes nudging — exactly the production path the review
 // found broken.
-import { runInDurableObject } from "cloudflare:test";
+import { SELF, runInDurableObject } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import {
@@ -19,11 +19,11 @@ import {
   waitForSentText,
   waitRunsSettled,
   waitWhileOutboundPending,
+  webLogin,
 } from "./helpers.ts";
 import type { Steward } from "../src/steward.ts";
 import { buildSituationBrief } from "../src/llm/brief.ts";
-import { renderTimeline } from "../src/web.ts";
-import type { Ledger, TimelineView } from "../src/ledger.ts";
+import type { Ledger } from "../src/ledger.ts";
 
 beforeEach(async () => {
   await resetLedgerState();
@@ -200,19 +200,20 @@ describe("review #5 (round 2): budget invariants — no omission is ever silent"
   });
 });
 
-describe("review #2: timeline meta escapes model-writable values", () => {
-  it("a goal containing HTML renders inert", () => {
-    const view = {
-      thread: { threadId: "t_1", title: "标题", goal: '<img src=x onerror="alert(1)">', summary: null, summaryAt: null, state: "idle", unread: false, lastMachine: null, lastActivityAt: 0, archived: false, createdFromMsg: null, createdAt: Date.now() },
-      entries: [],
-      workers: [{ workerId: "w_1", threadId: "t_1", deviceId: "d", repoId: null, agent: "pi<script>", mode: "write", state: "idle", sessionId: null, branch: null, cmdId: null, lastOutcome: null, lastEventAt: null, lastProgress: null, createdAt: 0, machineName: "mac<b>" }],
-      openQuestion: null,
-    } as unknown as TimelineView;
-    const html = renderTimeline(view, Date.now());
-    expect(html).not.toContain('<img src=x');
-    expect(html).toContain("&lt;img src=x");
-    expect(html).toContain("pi&lt;script&gt;");
-    expect(html).toContain("mac&lt;b&gt;");
+describe("review #2: model-writable values reach the page as data, never as markup", () => {
+  it("a goal, title and worker name containing HTML come back verbatim in JSON", async () => {
+    const goal = '<img src=x onerror="alert(1)">';
+    await runInDurableObject(ownerStub(), (instance: Steward) => {
+      const ledger = (instance as unknown as { ledger: Ledger }).ledger;
+      ledger.threads.create({ title: "标题<script>alert(1)</script>", goal, repoIds: [] });
+    });
+    const cookie = await webLogin();
+    const response = await SELF.fetch("https://example.com/app/api/workspace", { headers: { cookie } });
+    // The server never renders these into HTML; the page draws them from text nodes (ui-modules.test.ts
+    // pins that the page's own files have no HTML sink).
+    expect(response.headers.get("content-type")).toContain("application/json");
+    const { threads } = (await response.json()) as { threads: Array<{ title: string; goal: string }> };
+    expect(threads).toEqual([expect.objectContaining({ title: "标题<script>alert(1)</script>", goal })]);
   });
 });
 
