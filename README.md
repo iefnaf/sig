@@ -96,3 +96,7 @@ The cloud agent uses **`@earendil-works/pi-durable`** for its agent runtime and 
 - [Architecture](docs/design/steward.md) · [Product spec](docs/spec.md) · [Routing eval](docs/routing-eval.md) — for contributors.
 
 Sig was previously called Shepherd. Some internal identifiers and the local `~/.shepherd/` directory retain that name so existing deployments and sessions keep working.
+
+## License
+
+Sig is released under the [MIT License](LICENSE).

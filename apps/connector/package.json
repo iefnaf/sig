@@ -1,6 +1,6 @@
 {
   "name": "@nightboats/sig",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Sig connector: pairs this machine with your steward and runs pi workers as a background service.",
   "type": "module",
   "bin": {
@@ -8,7 +8,8 @@
   },
   "files": [
     "bin",
-    "dist"
+    "dist",
+    "brand"
   ],
   "engines": {
     "node": ">=22.18.0"
@@ -21,7 +22,7 @@
     "url": "git+https://github.com/iefnaf/sig.git",
     "directory": "apps/connector"
   },
-  "license": "UNLICENSED",
+  "license": "MIT",
   "scripts": {
     "build": "node build.mjs",
     "prepack": "node build.mjs",
