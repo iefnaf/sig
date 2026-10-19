@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 128 128" fill="none">
+  <title>Sig — your agents, summed</title>
+  <desc>Three colored pieces form Sigma, the summation symbol, bringing agents across machines into one personal agent.</desc>
+  <path fill="#DF806D" d="M24 20H104V36H24Z"/>
+  <path fill="#438CA9" d="M24 36H48L76 64L48 92H24L52 64Z"/>
+  <path fill="#D9A441" d="M24 92H104V108H24Z"/>
+</svg>
