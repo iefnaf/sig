@@ -2,16 +2,16 @@
 
 A Sig deployment lives entirely in **your own Cloudflare account**: one Worker (the steward, with its Durable Object), no third-party service in the middle. Around it you connect machines, each running a small connector process. This guide walks the whole path: deploy → custom domain → model key → connector, then everything operational (costs, secret rotation, updates).
 
-There is no chat channel for now ([ADR-0003](adr/0003-owner-api-replaces-chat-channel.md)): you drive the deployment through the `SERVER_KEY`-gated HTTP API (`POST /api/messages` and friends — see the [README](../README.md#talking-to-it-the-owner-api)) and the web workspace — one continuous conversation with Threads, decisions and worker session viewing ([ADR-0004](adr/0004-web-workspace.md)).
+There is no chat channel for now ([ADR-0003](adr/0003-owner-api-replaces-chat-channel.md)): you drive the deployment through the `SERVER_KEY`-gated HTTP API (`POST /api/messages` and friends — see [Usage and API](usage.md#the-owner-api)) and the web workspace — one continuous conversation with Threads, decisions and worker session viewing ([ADR-0004](adr/0004-web-workspace.md)).
 
 ## Two ways to deploy
 
-- **With your coding agent** — the primary channel ([ADR-0007](adr/0007-agent-driven-deploy.md)). Hand the agent one paragraph pointing at [`docs/agent-deploy.md`](agent-deploy.md); it deploys under a collision-safe unique name, sets and verifies the secrets, pairs the first machine, and opens the workspace for you. `npm run deploy -- --name <name>` wraps the deploy step.
+- **With your coding agent** — the primary channel ([ADR-0007](adr/0007-agent-driven-deploy.md)). Use the [two prompts in the README](../README.md#get-started-with-two-prompts): [agent-deploy.md](agent-deploy.md) deploys Sig, configures the secrets, and opens the workspace; [agent-connect.md](agent-connect.md) installs and pairs each machine separately. `npm run deploy -- --name <name>` wraps the deploy step.
 - **One-click / by hand** — the Deploy-to-Cloudflare button or a terminal, below.
 
 ## One-click deploy
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/iefnaf/shepherd)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/iefnaf/sig)
 
 The form clones the repo into your own account and asks for two secrets:
 
@@ -23,7 +23,7 @@ The form clones the repo into your own account and asks for two secrets:
 From a terminal instead:
 
 ```sh
-git clone https://github.com/<you>/shepherd && cd shepherd
+git clone https://github.com/iefnaf/sig && cd sig
 pnpm install
 wrangler deploy
 wrangler secret put SERVER_KEY
@@ -72,6 +72,8 @@ The API key never rides in vars: it is the sealed `sh_model` row inside the Dura
 The daily budget soft cap (issue #28): `vars.DAILY_BUDGET_USD` (dollars per UTC day, default $1, `0` disables automatic model wakes). Past it, events/routines/follow-ups stop waking the model while done reports, pushes, digests, and replies continue.
 
 ## Connecting a machine
+
+For agent-guided setup, follow [agent-connect.md](agent-connect.md), including a source-install fallback if the npm package is unavailable. Install the CLI with `npm install --global @iefnaf/sig` (or that source fallback) before using the `sig` management commands below.
 
 Each machine you want to dispatch work to runs a small daemon that holds a WebSocket to the steward and drives the local coding agents. Ask your deployment for a pairing code:
 
