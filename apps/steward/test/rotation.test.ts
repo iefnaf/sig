@@ -11,12 +11,10 @@ import {
   configureAndBind,
   connectAndHello,
   messageEvent,
-  mockCalls,
   nextClose,
   ownerStub,
   postEvent,
   resetChannelState,
-  tokenCalls,
   waitWhileOutboundPending,
 } from "./helpers.ts";
 
@@ -25,8 +23,8 @@ const PREVIOUS_SECRET = env.SERVER_KEY_PREVIOUS!;
 
 type Sql = (strings: TemplateStringsArray, ...values: unknown[]) => unknown;
 
-/** Runs raw SQL inside the DO. Call an RPC (e.g. setupState) first on a cold DO so onStart's
- * migrations have run — pairedUnderOldKey does that itself. */
+/** Runs raw SQL inside the DO. Call an RPC first on a cold DO so onStart's migrations have
+ * run — insertDevice does that itself. */
 async function execSql(fn: (sql: Sql) => void): Promise<void> {
   await runInDurableObject(ownerStub(), (instance: Steward) => {
     const sql = (instance as unknown as { sql: Sql }).sql.bind(instance);
@@ -47,7 +45,7 @@ async function envKeys(): Promise<ServerKey[]> {
 
 async function insertDevice(deviceId: string, name: string): Promise<void> {
   // RPC first: wakes the DO through the SDK lifecycle so migrations have run.
-  await ownerStub().setupState();
+  await ownerStub().channelLogEntries(1);
   await execSql((sql) => {
     sql`INSERT OR REPLACE INTO device (deviceId, name, epoch, revoked, createdAt) VALUES (${deviceId}, ${name}, 1, 0, ${Date.now()})`;
   });
@@ -139,39 +137,6 @@ describe("SERVER_KEY rotation: sealed secrets (issue #27)", () => {
     await overrideKeys(await envKeys());
   });
 
-  it("Feishu secrets sealed under the old key keep opening during the window and re-seal onto the primary", async () => {
-    await configureAndBind("ou_rot");
-    const before = await readChannelEnc("appSecretEnc");
-    expect(before).toMatch(/^v2\./);
-
-    // Simulate rotation: a brand-new primary, the old primary demoted to previous.
-    const freshPrimary = await serverKey("rotated-fresh-server-key");
-    const oldPrimary = await serverKey(PRIMARY_SECRET);
-    await overrideKeys([freshPrimary, oldPrimary]);
-
-    // Any read (here: a webhook event) opens via the demoted key and re-seals under the new one.
-    const res = await postEvent(messageEvent({ msgId: "om_rot", senderId: "ou_rot", text: "still works" }));
-    expect(res.status).toBe(200);
-
-    const after = await readChannelEnc("appSecretEnc");
-    expect(after).not.toBe(before);
-    expect(await openSecret([freshPrimary], after)).toMatchObject({ text: "sec_test_secret" });
-    expect(await ownerStub().inboundSeen("om_rot")).toBe(true);
-  });
-
-  it("the cached Feishu tenant_access_token is sealed at rest as well", async () => {
-    await configureAndBind("ou_tenant"); // setup validation fetches and caches a tenant token
-    expect((await tokenCalls(await mockCalls())).length).toBeGreaterThan(0);
-    const enc = await runInDurableObject(ownerStub(), (instance: Steward) => {
-      const sql = (instance as unknown as { sql: Sql }).sql.bind(instance);
-      return (sql`SELECT tokenEnc FROM sh_channel_token WHERE channel = 'feishu'` as { tokenEnc: string }[])[0]!.tokenEnc;
-    });
-    expect(enc).toMatch(/^v2\./);
-    const opened = await openSecret(await envKeys(), enc);
-    expect(opened?.text).toMatch(/^t_mock_/);
-    await waitWhileOutboundPending();
-  });
-
   it("model API key is stored encrypted and round-trips across a rotation", async () => {
     await ownerStub().setModelConfig("deepseek", "sk-model-secret-123");
     const row = await readModelRow();
@@ -192,16 +157,6 @@ describe("SERVER_KEY rotation: sealed secrets (issue #27)", () => {
   });
 });
 
-async function readChannelEnc(column: "appSecretEnc" | "verificationTokenEnc"): Promise<string> {
-  return runInDurableObject(ownerStub(), (instance: Steward) => {
-    const sql = (instance as unknown as { sql: Sql }).sql.bind(instance);
-    const rows =
-      column === "appSecretEnc"
-        ? (sql`SELECT appSecretEnc AS enc FROM sh_channel WHERE channel = 'feishu'` as { enc: string }[])
-        : (sql`SELECT verificationTokenEnc AS enc FROM sh_channel WHERE channel = 'feishu'` as { enc: string }[]);
-    return rows[0]!.enc;
-  });
-}
 
 async function readModelRow(): Promise<{ provider: string; apiKeyEnc: string }> {
   return runInDurableObject(ownerStub(), (instance: Steward) => {

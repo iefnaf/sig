@@ -8,7 +8,6 @@ import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi
 import {
   configureAndBind,
   messageEvent,
-  mockReset,
   modelRequests,
   llmState,
   ownerStub,
@@ -23,7 +22,6 @@ import type { FakeConnector } from "./helpers.ts";
 
 beforeEach(async () => {
   await resetLedgerState();
-  await mockReset();
   await configureAndBind("ou_owner");
 });
 
@@ -32,22 +30,8 @@ async function dm(text: string, msgId = `om_${crypto.randomUUID().slice(0, 8)}`,
 }
 
 /** A card-action event on one of our sent cards (the webhook shape the adapter parses). */
-function cardActionEvent(cardMsgId: string, action: string, eventId = `evt_card_${crypto.randomUUID().slice(0, 8)}`) {
-  return {
-    schema: "2.0",
-    header: {
-      event_id: eventId,
-      event_type: "card.action.trigger",
-      create_time: String(Date.now()),
-      token: "verify-token",
-      app_id: "cli_test_app",
-    },
-    event: {
-      operator: { open_id: "ou_owner" },
-      action: { value: { action } },
-      context: { open_message_id: cardMsgId },
-    },
-  };
+function cardActionEvent(cardMsgId: string, action: string) {
+  return { cardMsgId, action };
 }
 
 async function connectedMachine(name = "mac-studio"): Promise<FakeConnector> {
@@ -263,10 +247,10 @@ describe("ask_user candidate buttons and click routing (steward.md §3.3/§9.1, 
       (r) => r.kind === "card" && r.status === "sent" && JSON.stringify(r.payload).includes("指哪件事"),
     );
     expect(askCards).toHaveLength(1);
-    const card = JSON.parse(askCards[0]!.payload as string) as { card?: { elements?: Array<{ tag?: string; actions?: Array<{ text?: { content?: string }; value?: { action?: string } }> }> } };
-    const buttons = (card.card?.elements ?? []).flatMap((e) => e.actions ?? []);
-    expect(buttons.map((btn) => btn.text?.content)).toEqual(["登录页报错", "登录页样式", "新开一件事"]);
-    const pickFirst = buttons[0]!.value!.action!;
+    const card = JSON.parse(askCards[0]!.payload as string) as { card?: { buttons?: Array<{ label?: string; action?: string }> } };
+    const buttons = card.card?.buttons ?? [];
+    expect(buttons.map((btn) => btn.label)).toEqual(["登录页报错", "登录页样式", "新开一件事"]);
+    const pickFirst = buttons[0]!.action!;
     expect(pickFirst.startsWith("ask:")).toBe(true);
     const qid = pickFirst.split(":")[1]!;
     const question = (await ownerStub().debugSnapshot()).questions.find((q) => q.qid === qid);
@@ -287,7 +271,7 @@ describe("ask_user candidate buttons and click routing (steward.md §3.3/§9.1, 
     const snap = await ownerStub().debugSnapshot();
     expect(snap.questions.find((q) => q.qid === qid)?.status).toBe("answered");
     const runs = (await llmState()).runs;
-    const clickRun = runs.find((r) => r.operationId.startsWith("user:evt_card_"));
+    const clickRun = runs.find((r) => r.operationId.startsWith("user:act:"));
     expect(clickRun?.routedThreadId).toBe(a.threadId);
     fake.close();
   }, 30_000);
@@ -307,14 +291,14 @@ describe("ask_user candidate buttons and click routing (steward.md §3.3/§9.1, 
     await waitWhileOutboundPending();
     const askCards = (await ownerStub().outboundRows(30)).filter((r) => r.kind === "card" && r.status === "sent" && JSON.stringify(r.payload).includes("指哪件事"));
     expect(askCards).toHaveLength(1);
-    const card = JSON.parse(askCards[0]!.payload as string) as { card?: { elements?: Array<{ actions?: Array<{ value?: { action?: string } }> }> } };
-    const newButton = (card.card?.elements ?? []).flatMap((e) => e.actions ?? []).find((btn) => btn.value?.action?.startsWith("asknew:"));
+    const card = JSON.parse(askCards[0]!.payload as string) as { card?: { buttons?: Array<{ action?: string }> } };
+    const newButton = (card.card?.buttons ?? []).find((btn) => btn.action?.startsWith("asknew:"));
     expect(newButton).toBeTruthy();
 
-    await postEvent(cardActionEvent(askCards[0]!.providerMsgId!, newButton!.value!.action!));
+    await postEvent(cardActionEvent(askCards[0]!.providerMsgId!, newButton!.action!));
     await waitRunsSettled();
     const runs = (await llmState()).runs;
-    const clickRun = runs.find((r) => r.operationId.startsWith("user:evt_card_"));
+    const clickRun = runs.find((r) => r.operationId.startsWith("user:act:"));
     expect(clickRun).toMatchObject({ kind: "user", routedThreadId: null, status: "settled" });
     const inputs = (await llmState()).inputs;
     expect(inputs.some((i) => i.text.includes("新开一件事"))).toBe(true);
@@ -337,15 +321,15 @@ describe("ask_user candidate buttons and click routing (steward.md §3.3/§9.1, 
       (r) => r.kind === "card" && r.status === "sent" && r.threadId === threadId && JSON.stringify(r.payload).includes("用哪个方案修"),
     );
     expect(askCards).toHaveLength(1);
-    const card = JSON.parse(askCards[0]!.payload as string) as { card?: { elements?: Array<{ actions?: Array<{ value?: { action?: string } }> }> } };
-    const first = (card.card?.elements ?? []).flatMap((e) => e.actions ?? [])[0]!.value!.action!;
+    const card = JSON.parse(askCards[0]!.payload as string) as { card?: { buttons?: Array<{ action?: string }> } };
+    const first = (card.card?.buttons ?? [])[0]!.action!;
     await postEvent(cardActionEvent(askCards[0]!.providerMsgId!, first));
     const cmds = await fake.waitForCmds(2); // 1 = seeding, 2 = the click run's attach
     expect(cmds[1]!.kind).toBe("send"); // same-machine attach resumes (issue #8)
     expect(String((cmds[1]!.args as Record<string, unknown>).text)).toContain("按方案A修");
     await waitRunsSettled();
     const runs = (await llmState()).runs;
-    const clickRun = runs.find((r) => r.operationId.startsWith("user:evt_card_"));
+    const clickRun = runs.find((r) => r.operationId.startsWith("user:act:"));
     expect(clickRun?.routedThreadId).toBe(threadId);
     fake.close();
   }, 30_000);
@@ -362,14 +346,14 @@ describe("ask_user candidate buttons and click routing (steward.md §3.3/§9.1, 
     await waitRunsSettled();
     await waitWhileOutboundPending();
     const askCards = (await ownerStub().outboundRows(30)).filter((r) => r.kind === "card" && r.status === "sent" && JSON.stringify(r.payload).includes("用哪个方案"));
-    const card = JSON.parse(askCards[0]!.payload as string) as { card?: { elements?: Array<{ actions?: Array<{ value?: { action?: string } }> }> } };
-    const first = (card.card?.elements ?? []).flatMap((e) => e.actions ?? [])[0]!.value!.action!;
-    await postEvent(cardActionEvent(askCards[0]!.providerMsgId!, first, "evt_card_first"));
+    const card = JSON.parse(askCards[0]!.payload as string) as { card?: { buttons?: Array<{ action?: string }> } };
+    const first = (card.card?.buttons ?? [])[0]!.action!;
+    await postEvent(cardActionEvent(askCards[0]!.providerMsgId!, first));
     await waitRunsSettled();
     const runsAfterFirst = (await llmState()).runs.length;
     // Feishu would not redeliver the same eventId (sh_inbound dedup) — but a second, fresh
     // event clicking the same button of the now-answered question must also not start a run.
-    await postEvent(cardActionEvent(askCards[0]!.providerMsgId!, first, "evt_card_second"));
+    await postEvent(cardActionEvent(askCards[0]!.providerMsgId!, first));
     await new Promise((resolve) => setTimeout(resolve, 300));
     await waitWhileOutboundPending();
     expect((await llmState()).runs.length).toBe(runsAfterFirst);
@@ -516,8 +500,8 @@ describe("content markers never leak into steward inputs (wake-text.ts invariant
       (r) => r.kind === "card" && r.status === "sent" && JSON.stringify(r.payload).includes("要执行"),
     );
     expect(askCards).toHaveLength(1);
-    const card = JSON.parse(askCards[0]!.payload as string) as { card?: { elements?: Array<{ actions?: Array<{ value?: { action?: string } }> }> } };
-    const first = (card.card?.elements ?? []).flatMap((e) => e.actions ?? [])[0]!.value!.action!;
+    const card = JSON.parse(askCards[0]!.payload as string) as { card?: { buttons?: Array<{ action?: string }> } };
+    const first = (card.card?.buttons ?? [])[0]!.action!;
     await postEvent(cardActionEvent(askCards[0]!.providerMsgId!, first));
     await waitRunsSettled();
     // The click's input: the note embeds the (escaped) question text, so find it by content.

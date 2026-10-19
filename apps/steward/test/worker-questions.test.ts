@@ -13,8 +13,6 @@ import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi
 import {
   configureAndBind,
   messageEvent,
-  mockCalls,
-  mockReset,
   modelRequests,
   llmState,
   ownerStub,
@@ -29,7 +27,6 @@ import type { FakeConnector } from "./helpers.ts";
 
 beforeEach(async () => {
   await resetLedgerState();
-  await mockReset();
   await configureAndBind("ou_owner");
 });
 
@@ -56,22 +53,8 @@ async function allToolResults(): Promise<string[]> {
   return (await modelRequests()).map((r) => r.lastToolResult).filter((t): t is string => t !== null);
 }
 
-function cardActionEvent(cardMsgId: string, action: string, eventId = `evt_card_${crypto.randomUUID().slice(0, 8)}`) {
-  return {
-    schema: "2.0",
-    header: {
-      event_id: eventId,
-      event_type: "card.action.trigger",
-      create_time: String(Date.now()),
-      token: "verify-token",
-      app_id: "cli_test_app",
-    },
-    event: {
-      operator: { open_id: "ou_owner" },
-      action: { value: { action } },
-      context: { open_message_id: cardMsgId },
-    },
-  };
+function cardActionEvent(cardMsgId: string, action: string) {
+  return { cardMsgId, action };
 }
 
 /** A dispatched, RUNNING worker on a connected machine (no scripted run — events by hand). */
@@ -97,8 +80,8 @@ async function waitFor<T>(get: () => Promise<T>, pred: (v: T) => boolean, what: 
 }
 
 const firstAskAction = (card: SentCard): string => {
-  const parsed = JSON.parse(card.payload as string) as { card?: { elements?: Array<{ actions?: Array<{ value?: { action?: string } }> }> } };
-  const action = (parsed.card?.elements ?? []).flatMap((e) => e.actions ?? []).find((btn) => btn.value?.action?.startsWith("ask:"))?.value?.action;
+  const parsed = JSON.parse(card.payload as string) as { card?: { buttons?: Array<{ action?: string }> } };
+  const action = (parsed.card?.buttons ?? []).find((btn) => btn.action?.startsWith("ask:"))?.action;
   if (!action) throw new Error(`no ask button on card: ${card.payload}`);
   return action;
 };
@@ -130,7 +113,6 @@ describe("blocked / needs_decision reports (steward.md §5.3, AC1)", () => {
     await waitWhileOutboundPending();
     expect((await sentCards())).toHaveLength(0);
     fake.close();
-    void (await mockCalls());
   }, 30_000);
 
   it("a high-priority block merging into an earlier pending wake upgrades it (§5.4)", async () => {
@@ -211,7 +193,6 @@ describe("answer_worker (steward.md §4.3/§7.2, AC2)", () => {
     await waitWhileOutboundPending();
     expect((await sentCards()).filter((c) => JSON.stringify(c.payload).includes("目标分支"))).toHaveLength(0);
     fake.close();
-    void (await mockCalls());
   }, 45_000);
 
   it("answer_worker refuses failure-class and unreported questions — those are the user's, not the worker's", async () => {
@@ -250,7 +231,6 @@ describe("answer_worker (steward.md §4.3/§7.2, AC2)", () => {
     }
     expect(fake.cmds.filter((c) => c.kind === "send")).toHaveLength(0);
     fake.close();
-    void (await mockCalls());
   }, 30_000);
 });
 
@@ -289,7 +269,7 @@ describe("the 90-second fallback (steward.md §5.3, AC3 — fault injection: the
     // Verbatim: the worker's exact question text, attention-toned, from data — no LLM.
     const payload = JSON.stringify(JSON.parse(card!.payload as string));
     expect(payload).toContain("可以给我开 psql 超级权限吗？");
-    expect(payload).toContain('"orange"');
+    expect(payload).toContain("⚠️"); // attention-toned badge
     // The card binds the question — a quote-reply routes the answer to the worker.
     expect(card!.questionId).toBe(q.qid);
 
@@ -302,7 +282,6 @@ describe("the 90-second fallback (steward.md §5.3, AC3 — fault injection: the
     expect(after.questions.find((x) => x.qid === q.qid)).toMatchObject({ status: "open" }); // still waiting for the user
     expect(after.pendingNotifications.filter((n) => n.questionId === q.qid)).toHaveLength(0);
     fake.close();
-    void (await mockCalls());
   }, 45_000);
 });
 
@@ -344,7 +323,6 @@ describe("the user's answer reaches the worker (steward.md §4.3, AC4)", () => {
     // No LLM run for the answer — the relay is deterministic.
     expect((await llmState()).runs.length).toBe(runsBefore);
     fake.close();
-    void (await mockCalls());
   }, 45_000);
 
   it("an option button on the steward's forwarded ask relays the click and closes the question", async () => {
@@ -394,7 +372,6 @@ describe("the user's answer reaches the worker (steward.md §4.3, AC4)", () => {
     await waitWhileOutboundPending();
     expect((await sentCards()).filter((c) => JSON.stringify(c.payload).includes("回滚上一个版本"))).toHaveLength(1);
     fake.close();
-    void (await mockCalls());
   }, 45_000);
 
   it("an answer while the machine is offline still closes the question (the command queues for its return)", async () => {
@@ -453,7 +430,6 @@ describe("review findings (PR #52)", () => {
     // The failure question closed via the routed-reply path (the steward sees it answered).
     expect((await ownerStub().debugSnapshot()).questions.find((x) => x.qid === q.qid)).toMatchObject({ status: "answered" });
     fake.close();
-    void (await mockCalls());
   }, 45_000);
 
   it("F1: a quote-reply to an error:context card reaches the steward too (the dead session is never prompted)", async () => {
@@ -475,7 +451,6 @@ describe("review findings (PR #52)", () => {
     expect(fake.cmds.filter((c) => c.kind === "send")).toHaveLength(0);
     expect((await llmState()).runs.some((r) => r.kind === "user" && r.text.includes("开个新会话"))).toBe(true);
     fake.close();
-    void (await mockCalls());
   }, 45_000);
 
   it("F2: a quote-reply to an ANSWERED question's card never answers a later, different question", async () => {
@@ -516,7 +491,6 @@ describe("review findings (PR #52)", () => {
     // The thread's open question closed via the routed-reply path (pre-#10 semantics).
     expect((await ownerStub().debugSnapshot()).questions.find((x) => x.qid === q2.qid)).toMatchObject({ status: "answered" });
     fake.close();
-    void (await mockCalls());
   }, 60_000);
 
   it("F3: a sweep that forwarded nothing this pass still drains an intent stranded by a restart", async () => {
@@ -542,7 +516,6 @@ describe("review findings (PR #52)", () => {
     expect(card).toBeTruthy();
     expect(card!.questionId).toBe(q.qid);
     fake.close();
-    void (await mockCalls());
   }, 45_000);
 
   it("F5: notify_user resolution:'question' keeps the question open; 'done' closes it", async () => {
@@ -601,7 +574,6 @@ describe("review findings (PR #52)", () => {
     snap = await ownerStub().debugSnapshot();
     expect(snap.questions.find((x) => x.qid === q.qid)).toMatchObject({ status: "answered" });
     fake.close();
-    void (await mockCalls());
   }, 60_000);
 
   it("F6: the fallback card forwards a long, multi-line question VERBATIM (no clip, no collapse)", async () => {
@@ -632,7 +604,6 @@ describe("review findings (PR #52)", () => {
     // …and the line breaks are preserved, not whitespace-collapsed.
     expect(payload).toContain("\\n3. 迁移窗口");
     fake.close();
-    void (await mockCalls());
   }, 45_000);
 
   it("F7: notify_user with a stale questionId is refused — the model sees the error and nothing is sent", async () => {
@@ -663,7 +634,6 @@ describe("review findings (PR #52)", () => {
     // Nothing was sent, and no card claimed a handling that never happened.
     expect((await sentCards()).filter((c) => JSON.stringify(c.payload).includes("已核实"))).toHaveLength(0);
     fake.close();
-    void (await mockCalls());
   }, 45_000);
 });
 
@@ -682,14 +652,13 @@ describe("settled outcomes and broken follow the rules table (steward.md §5.3, 
     await waitWhileOutboundPending();
     const cards = await sentCards();
     expect(cards).toHaveLength(1);
-    expect(JSON.stringify(JSON.parse(cards[0]!.payload as string))).toContain('"red"');
+    expect(JSON.stringify(JSON.parse(cards[0]!.payload as string))).toContain("❌"); // failure-toned badge
     // Failure questions carry no fallback deadline — expiring the window must not re-ask.
     await ownerStub().shrinkQuestionWindowForTest(0);
     await ownerStub().sweepQuestionFallbackForTest();
     await waitWhileOutboundPending();
     expect((await sentCards())).toHaveLength(1);
     fake.close();
-    void (await mockCalls());
   }, 30_000);
 
   it("error:context pushes and suggests a fresh session; error:transient stays completely silent", async () => {
@@ -719,7 +688,6 @@ describe("settled outcomes and broken follow the rules table (steward.md §5.3, 
     expect(cards).toHaveLength(1);
     expect(JSON.stringify(JSON.parse(cards[0]!.payload as string))).toContain("上下文超长");
     fake.close();
-    void (await mockCalls());
   }, 30_000);
 
   it("unreported opens a question and wakes the steward with the last text, but never pushes on its own", async () => {
@@ -744,7 +712,6 @@ describe("settled outcomes and broken follow the rules table (steward.md §5.3, 
     expect((await sentCards())).toHaveLength(0);
     expect((await ownerStub().debugSnapshot()).pendingNotifications.filter((n) => n.questionId === q.qid)).toHaveLength(0);
     fake.close();
-    void (await mockCalls());
   }, 30_000);
 
   it("the broken event opens a question, pushes, and wakes the steward", async () => {
@@ -766,6 +733,5 @@ describe("settled outcomes and broken follow the rules table (steward.md §5.3, 
     expect(cards).toHaveLength(1);
     expect(JSON.stringify(JSON.parse(cards[0]!.payload as string))).toContain("自动重启两次后仍失败");
     fake.close();
-    void (await mockCalls());
   }, 30_000);
 });

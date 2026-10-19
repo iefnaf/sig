@@ -47,7 +47,7 @@ describe("runMigrations", () => {
     const id = env.Steward.idFromName(`test-migrations-${crypto.randomUUID()}`);
     // Warm the DO through a plain RPC first: runInDurableObject on a cold instance does not
     // await onStart, and the migration probe below must not race the boot migrations.
-    await (env.Steward.get(id) as unknown as { setupState: () => Promise<unknown> }).setupState();
+    await (env.Steward.get(id) as unknown as { channelLogEntries: (n: number) => Promise<unknown[]> }).channelLogEntries(1);
 
     await runInDurableObject(env.Steward.get(id), async (instance: Steward) => {
       const sql = (instance as unknown as { sql: SqlExecutor }).sql.bind(instance);

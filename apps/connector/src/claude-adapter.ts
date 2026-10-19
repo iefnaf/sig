@@ -1,7 +1,7 @@
 // ClaudeAdapter: the second AgentAdapter implementation (issue #17, ADR-0001 decision 3;
 // connector-pi.md §15 item 8; spike-conclusions §2 "Claude Code headless"). Claude Code
 // becomes a worker the steward can dispatch to: headless `claude -p` with stream-json
-// output, a Shepherd MCP `report` tool, and the SAME outcome-adjudication path as pi.
+// output, a Sig MCP `report` tool, and the SAME outcome-adjudication path as pi.
 //
 // Where the agents differ, the capabilities say so honestly (§3) and the WorkerManager
 // degrades: headless print mode has no control channel after stdin hits EOF, so there is no

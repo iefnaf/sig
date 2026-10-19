@@ -1,4 +1,4 @@
-// The Shepherd MCP report server (issue #17): stdio JSON-RPC 2.0, one tool (`report`),
+// The Sig MCP report server (issue #17): stdio JSON-RPC 2.0, one tool (`report`),
 // §7.2 fields — driven over its real stdio pipe exactly like Claude Code drives it
 // (initialize → notifications/initialized → tools/list → tools/call).
 import { spawnSync } from "node:child_process";

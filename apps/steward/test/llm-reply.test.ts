@@ -8,7 +8,6 @@ import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi
 import {
   configureAndBind,
   messageEvent,
-  mockReset,
   modelRequests,
   llmState,
   ownerStub,
@@ -28,7 +27,6 @@ import type { FakeConnector } from "./helpers.ts";
 
 beforeEach(async () => {
   await resetLedgerState();
-  await mockReset();
   await configureAndBind("ou_owner");
 });
 
@@ -411,9 +409,8 @@ describe("the tools (steward.md §4.3)", () => {
     );
     expect(askCards).toHaveLength(1);
     expect(askCards[0]!.threadId).toBe(threadId);
-    const card = JSON.parse(askCards[0]!.payload as string) as { card?: { elements?: Array<{ tag?: string; actions?: Array<{ value?: { action?: string } }> }> } };
-    const actions = (card.card?.elements ?? []).flatMap((e) => e.actions ?? []);
-    expect(actions.map((a) => a.value?.action?.startsWith("ask:"))).toEqual([true, true]);
+    const card = JSON.parse(askCards[0]!.payload as string) as { card?: { buttons?: Array<{ action?: string }> } };
+    expect((card.card?.buttons ?? []).map((b) => b.action?.startsWith("ask:"))).toEqual([true, true]);
     // control.terminate ended the turn: no second model request happened after ask_user.
     const requests = await modelRequests();
     expect(requests.filter((r) => r.userText.includes("接下来怎么办")).length).toBeLessThanOrEqual(1);

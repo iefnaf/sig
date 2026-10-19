@@ -30,13 +30,13 @@ export interface DaemonHandle {
 export async function runDaemon(options: DaemonOptions): Promise<DaemonHandle> {
   const dbPath = join(options.stateDir, "connector.sqlite");
   if (!existsSync(dbPath)) {
-    throw new Error(`not paired: no local store at ${dbPath}; run \`shepherd connect <url> <code>\` first`);
+    throw new Error(`not paired: no local store at ${dbPath}; run \`sig connect <url> <code>\` first`);
   }
   const store = new LocalStore(dbPath);
   const credentials = store.getCredentials();
   if (!credentials) {
     store.close();
-    throw new Error("not paired: no credentials in the local store; run `shepherd connect <url> <code>` first");
+    throw new Error("not paired: no credentials in the local store; run `sig connect <url> <code>` first");
   }
 
   // The device token is the one secret the daemon holds; the logger scrubs it from every line.

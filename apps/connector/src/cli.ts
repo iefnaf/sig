@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// `npx @iefnaf/shepherd <command>` (ADR-0001 decision 10, issue #26).
+// `npx @iefnaf/sig <command>` (ADR-0002, superseding ADR-0001 decision 10).
 //
 //   connect <url> <code>   redeem a pairing code, then install + start the background
 //                          service (launchd agent on macOS, systemd --user unit on Linux);
@@ -8,7 +8,7 @@
 //   logs [-n N] [name]     tail ~/.shepherd/logs/<name> (default connector.log)
 //   start | stop | restart control the background service (stop also disables start-at-login)
 //   uninstall              stop the service and remove its unit (keeps ~/.shepherd data)
-//   upgrade [--version V]  npm-install @iefnaf/shepherd (default @latest) and restart the
+//   upgrade [--version V]  npm-install @iefnaf/sig (default @latest) and restart the
 //                          service; the fresh daemon rewrites the versioned pi assets
 //   add-repo <path>        register a repository so start_worker may run in it (§8.1)
 //   repo-config <path> [--workspace worktree|serial|main] [--approve|--no-approve]
@@ -37,32 +37,34 @@ const exec = promisify(execFile);
 const DEFAULT_PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
 function stateDir(): string {
-  return process.env.SHEPHERD_HOME ?? join(homedir(), ".shepherd");
+  // Keep the existing store by default: rebranding must not lose paired machines.
+  return process.env.SIG_HOME ?? process.env.SHEPHERD_HOME ?? join(homedir(), ".shepherd");
 }
 
 /** The bin wrapper this package ships; both src/cli.ts (dev) and dist/cli.js sit one
- * directory below the package root, so ../bin/shepherd.js is correct in either layout. */
+ * directory below the package root, so ../bin/sig.js is correct in either layout. */
 export function binEntryPath(): string {
-  return join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "shepherd.js");
+  return join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "sig.js");
 }
 
-const USAGE = `shepherd ${VERSION} — the Shepherd connector
+const USAGE = `sig ${VERSION} — the Sig connector
 
 usage:
-  shepherd connect <url> <code> [--foreground]   pair and install the background service
-  shepherd status                                 service, pairing, workers, assets
-  shepherd logs [-n <lines>] [name]               tail ~/.shepherd/logs (default connector.log)
-  shepherd start | stop | restart                 control the background service
-  shepherd uninstall                              remove the service (keeps ~/.shepherd data)
-  shepherd upgrade [--version <version>]          replace the package and restart the service
-  shepherd add-repo <path>                        register a repository for start_worker
-  shepherd repo-config <path> [options]           per-repo local settings (workspace mode,
+  sig connect <url> <code> [--foreground]   pair and install the background service
+  sig status                                 service, pairing, workers, assets
+  sig logs [-n <lines>] [name]               tail ~/.shepherd/logs (default connector.log)
+  sig start | stop | restart                 control the background service
+  sig uninstall                              remove the service (keeps ~/.shepherd data)
+  sig upgrade [--version <version>]          replace the package and restart the service
+  sig add-repo <path>                        register a repository for start_worker
+  sig repo-config <path> [options]           per-repo local settings (workspace mode,
                                                   project trust); never settable remotely
-  shepherd daemon                                 internal: run the connector daemon
+  sig daemon                                 internal: run the connector daemon
 
 environment:
-  SHEPHERD_HOME         state directory (default ~/.shepherd)
-  SHEPHERD_MACHINE_NAME machine name reported to the steward`;
+  SIG_HOME         state directory (default ~/.shepherd, preserved across the rename)
+  SIG_MACHINE_NAME machine name reported to the steward
+  SHEPHERD_HOME / SHEPHERD_MACHINE_NAME remain supported as fallback aliases`;
 
 function usage(code = 2): never {
   console.error(USAGE);
@@ -70,7 +72,7 @@ function usage(code = 2): never {
 }
 
 function fail(message: string): never {
-  console.error(`shepherd: ${message}`);
+  console.error(`sig: ${message}`);
   process.exit(1);
 }
 
@@ -96,8 +98,9 @@ function requireInstaller(): ServiceInstaller {
 
 function serviceSpec(entryPath: string): ServiceSpec {
   const dir = stateDir();
-  const env: Record<string, string> = { PATH: process.env.PATH ?? DEFAULT_PATH };
-  if (process.env.SHEPHERD_HOME) env.SHEPHERD_HOME = process.env.SHEPHERD_HOME;
+  const env: Record<string, string> = { PATH: process.env.PATH ?? DEFAULT_PATH, SIG_HOME: dir };
+  const machineName = process.env.SIG_MACHINE_NAME ?? process.env.SHEPHERD_MACHINE_NAME;
+  if (machineName) env.SIG_MACHINE_NAME = machineName;
   return {
     label: SHEPHERD_LABEL,
     nodePath: process.execPath,
@@ -150,7 +153,7 @@ async function connectCommand(argv: string[]): Promise<void> {
   const [url, code] = argv.filter((a) => a !== "--foreground");
   if (!url || !code) usage();
   const dir = stateDir();
-  const machineName = process.env.SHEPHERD_MACHINE_NAME ?? hostname();
+  const machineName = process.env.SIG_MACHINE_NAME ?? process.env.SHEPHERD_MACHINE_NAME ?? hostname();
 
   // 1. Pair (protocol §5.2): redeem the code once, persist credentials in the LocalStore.
   const store = new LocalStore(join(dir, "connector.sqlite"));
@@ -197,14 +200,14 @@ async function connectCommand(argv: string[]): Promise<void> {
   );
   for (const note of installer.notes) console.log(`note: ${note}`);
   console.log(`logs: ${join(dir, "logs", "connector.log")}`);
-  console.log("next: shepherd status · shepherd add-repo <path> · shepherd logs");
+  console.log("next: sig status · sig add-repo <path> · sig logs");
 }
 
 // --- status / logs ---------------------------------------------------------------------------
 
 async function statusCommand(): Promise<void> {
   const dir = stateDir();
-  console.log(`shepherd ${VERSION} (node ${process.version}, ${process.platform})`);
+  console.log(`sig ${VERSION} (node ${process.version}, ${process.platform})`);
 
   const installer = getServiceInstaller(serviceSpec(binEntryPath()));
   if (installer) {
@@ -219,7 +222,7 @@ async function statusCommand(): Promise<void> {
 
   const dbPath = join(dir, "connector.sqlite");
   if (!existsSync(dbPath)) {
-    console.log("paired:   not paired (run `shepherd connect <url> <code>`)");
+    console.log("paired:   not paired (run `sig connect <url> <code>`)");
     return;
   }
   const store = new LocalStore(dbPath);
@@ -228,7 +231,7 @@ async function statusCommand(): Promise<void> {
     if (credentials) {
       console.log(`paired:   ${credentials.deviceId} → ${credentials.serverUrl} (connEpoch ${credentials.connEpoch})`);
     } else {
-      console.log("paired:   no credentials (run `shepherd connect <url> <code>`)");
+      console.log("paired:   no credentials (run `sig connect <url> <code>`)");
     }
     const workers = store.listWorkers();
     const byState = new Map<string, number>();
@@ -241,7 +244,7 @@ async function statusCommand(): Promise<void> {
     const repos = store.listRepos();
     const repoLine =
       repos.length === 0
-        ? "none (shepherd add-repo <path>)"
+        ? "none (sig add-repo <path>)"
         : repos.map((r) => `${r.name}[${r.workspace}${r.approved ? ", approved" : ""}]`).join(", ");
     console.log(`repos:    ${repoLine}`);
   } finally {
@@ -323,7 +326,7 @@ async function daemonCommand(): Promise<void> {
   const dir = stateDir();
   let handle;
   try {
-    handle = await runDaemon({ stateDir: dir, machineName: process.env.SHEPHERD_MACHINE_NAME ?? hostname() });
+    handle = await runDaemon({ stateDir: dir, machineName: process.env.SIG_MACHINE_NAME ?? process.env.SHEPHERD_MACHINE_NAME ?? hostname() });
   } catch (err) {
     fail(err instanceof Error ? err.message : String(err));
   }
@@ -343,7 +346,7 @@ async function daemonCommand(): Promise<void> {
 
 // --- add-repo --------------------------------------------------------------------------------
 
-/** `shepherd add-repo <path>`: registers the repository (resolving subdirectories to the
+/** `sig add-repo <path>`: registers the repository (resolving subdirectories to the
  * repo root) in the local whitelist. Runs entirely on-machine (§8.1/§13): a remote
  * steward can never add entries, only see them. */
 async function addRepo(path: string | undefined): Promise<void> {
@@ -363,7 +366,7 @@ async function addRepo(path: string | undefined): Promise<void> {
   try {
     store.addRepo({ repoId: topLevel, name, path: topLevel, defaultBranch: branch, remote });
     console.log(`registered ${name} (${topLevel})${branch ? ` default branch: ${branch}` : ""}`);
-    console.log("next: shepherd repo-config <path> to pick the workspace mode or approve the project");
+    console.log("next: sig repo-config <path> to pick the workspace mode or approve the project");
   } finally {
     store.close();
   }
@@ -397,7 +400,7 @@ function parseRepoConfigArgv(argv: string[]): { path?: string; workspace?: strin
   return { path: positional[0], workspace, approve };
 }
 
-/** `shepherd repo-config <path> [--workspace worktree|serial|main] [--approve|--no-approve]`
+/** `sig repo-config <path> [--workspace worktree|serial|main] [--approve|--no-approve]`
  * (§8.2/§13, issue #16): the per-repo settings that live only in the connector's local
  * store. A command from the steward carrying them is rejected; this is the only writer.
  * With no settings flags it just prints the current configuration. */
@@ -413,7 +416,7 @@ async function repoConfig(argv: string[]): Promise<void> {
   try {
     const repo = store.getRepo(topLevel);
     if (!repo) {
-      fail(`${topLevel} is not registered; run 'shepherd add-repo ${path}' first`);
+      fail(`${topLevel} is not registered; run 'sig add-repo ${path}' first`);
     }
     if (workspace === undefined && approve === undefined) {
       // Read-only invocation: show the current settings.

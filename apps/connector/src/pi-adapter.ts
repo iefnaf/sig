@@ -40,7 +40,7 @@ export interface PiAdapterOptions {
 
 /** Env for the agent child (§4.2: "inherit the user's environment; the connector's own
  * credentials are not passed through", issue #27). The connector's state lives under
- * SHEPHERD_* variables (SHEPHERD_HOME points at the SQLite file holding the device token),
+ * SIG_* and legacy SHEPHERD_* variables (the home setting locates the device-token store),
  * so the whole namespace is stripped; the device token itself never was an env var. */
 export function childEnv(
   source: Record<string, string | undefined> = process.env,
@@ -48,7 +48,7 @@ export function childEnv(
 ): Record<string, string | undefined> {
   const env: Record<string, string | undefined> = {};
   for (const [key, value] of Object.entries(source)) {
-    if (key.startsWith("SHEPHERD_")) continue;
+    if (key.startsWith("SIG_") || key.startsWith("SHEPHERD_")) continue;
     env[key] = value;
   }
   if (extra) Object.assign(env, extra);

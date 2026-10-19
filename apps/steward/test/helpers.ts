@@ -17,7 +17,8 @@ type Sql = (strings: TemplateStringsArray, ...values: unknown[]) => unknown;
 export async function resetChannelState(): Promise<void> {
   // Any RPC first: it flows through the SDK lifecycle, which runs onStart() → migrations.
   // Hitting runInDurableObject on a cold DO would find no sh_* tables yet.
-  await ownerStub().setupState();
+  // Any RPC first: it flows through the SDK lifecycle, which runs onStart() → migrations.
+  await ownerStub().channelLogEntries(1);
   await runInDurableObject(ownerStub(), (instance: Steward) => {
     // `.bind` matters: the SDK's sql tagged template reads `this.ctx`, so it must be invoked
     // through the instance (the outbox tests use method-call form for the same reason).
@@ -124,128 +125,53 @@ export async function waitRunsSettled(timeoutMs = 10_000): Promise<void> {
   }
 }
 
-// ---- Feishu mock (service binding FEISHU_API, wired in vitest.config.ts) ----
+// ---- The owner API (ADR-0003): SERVER_KEY-gated /api/* on the Worker --------------------------
 
-export interface MockReply {
-  status?: number;
-  body?: unknown;
-  delayMs?: number;
+const API_HEADERS = { "content-type": "application/json", Authorization: "Bearer test-server-key-not-a-secret" } as const;
+
+export interface ApiMessageButton {
+  label: string;
+  action?: string;
+  url?: string;
+  primary?: boolean;
 }
 
-export interface RecordedCall {
-  method: string;
-  path: string;
-  url: string;
-  body: string | null;
-  at: number;
+export interface ApiMessage {
+  id: string;
+  text: string;
+  buttons: ApiMessageButton[];
+  threadId: string | null;
+  questionId: string | null;
+  sentAt: number;
 }
 
-const MOCK = "https://feishu.invalid";
-
-// vitest.config.ts always binds FEISHU_API; the optionality only exists for production.
-function feishuMock(): Fetcher {
-  if (!env.FEISHU_API) throw new Error("FEISHU_API service binding missing — check vitest.config.ts");
-  return env.FEISHU_API;
-}
-
-export async function mockReset(): Promise<void> {
-  await feishuMock().fetch(`${MOCK}/__control/reset`, { method: "POST" });
-}
-
-export async function mockQueue(...replies: MockReply[]): Promise<void> {
-  await feishuMock().fetch(`${MOCK}/__control/queue`, { method: "POST", body: JSON.stringify(replies) });
-}
-
-/** Scripts the device flow (see vitest.config.ts): `begin`/`polls` are FIFO arrays whose last entry repeats. */
-export async function mockRegistration(script: { begin?: unknown[]; polls?: unknown[] }): Promise<void> {
-  await feishuMock().fetch(`${MOCK}/__control/registration`, { method: "POST", body: JSON.stringify(script) });
-}
-
-export async function mockCalls(): Promise<RecordedCall[]> {
-  const res = await feishuMock().fetch(`${MOCK}/__control/calls`, { method: "POST" });
-  return res.json();
-}
-
-export function sendCalls(calls: RecordedCall[]): RecordedCall[] {
-  return calls.filter((c) => c.method === "POST" && c.path.startsWith("/open-apis/im/v1/messages"));
-}
-
-export function tokenCalls(calls: RecordedCall[]): RecordedCall[] {
-  return calls.filter((c) => c.path.startsWith("/open-apis/auth/v3/tenant_access_token"));
-}
-
-export function registrationCalls(calls: RecordedCall[]): RecordedCall[] {
-  return calls.filter((c) => c.path === "/oauth/v1/app/registration");
-}
-
-export function configPatchCalls(calls: RecordedCall[]): RecordedCall[] {
-  return calls.filter((c) => c.method === "PATCH" && /\/open-apis\/application\/v7\/applications\/[^/]+\/config$/.test(c.path));
-}
-
-// The credentials every helper below uses; the webhook's verification token must match
-// `messageEvent({ token })` and `urlVerification({ token })`.
-export const TEST_APP_ID = "cli_test_app";
-export const TEST_APP_SECRET = "sec_test_secret";
-export const TEST_VERIFY_TOKEN = "verify-token";
-export const SETUP_URL = "https://example.com/setup?token=test-setup-token-not-a-secret";
-
-export async function submitSetupCredentials(
-  appId = TEST_APP_ID,
-  appSecret = TEST_APP_SECRET,
-  verificationToken = TEST_VERIFY_TOKEN,
-): Promise<Response> {
-  const body = new URLSearchParams({ action: "manual", appId, appSecret, verificationToken });
-  return SELF.fetch(SETUP_URL, {
-    method: "POST",
-    body,
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-  });
-}
-
-/** Posts a setup-page action (QR flow start / scope scan / webhook PATCH). */
-export function postSetupAction(action: string): Promise<Response> {
-  return SELF.fetch(SETUP_URL, {
-    method: "POST",
-    body: new URLSearchParams({ action }),
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-  });
-}
-
-/** Polls the QR state machine until the given phase appears (alarm-driven, so async). */
-export async function waitForQrPhase(phase: string | string[], timeoutMs = 20_000): Promise<void> {
-  const wanted = Array.isArray(phase) ? phase : [phase];
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const row = await ownerStub().qrSetupState();
-    if (row && wanted.includes(row.phase)) return;
-    if (Date.now() > deadline) throw new Error(`qr phase ${wanted.join("|")} not reached; now: ${row?.phase ?? "none"} err=${row?.lastError ?? "-"}`);
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-}
-
-/** The decrypted channel config, read inside the DO — tests need the QR-generated verification token. */
-export interface ChannelConfigView {
-  appId: string;
-  appSecret: string;
-  verificationToken: string;
-  ownerOpenId: string | null;
-  brand: "feishu" | "lark";
-  source: "manual" | "qr";
-  webhookStatus: string | null;
-}
-export async function readChannelConfig(): Promise<ChannelConfigView | null> {
-  return runInDurableObject(ownerStub(), async (instance: Steward) => {
-    const load = (instance as unknown as { loadFeishuConfig: () => Promise<ChannelConfigView | null> }).loadFeishuConfig;
-    return await load.call(instance);
-  });
-}
-
-/** Submits credentials and binds `ou_owner` with a first DM; the confirmation send settles. */
-export async function configureAndBind(senderId = "ou_owner"): Promise<void> {
-  await submitSetupCredentials();
-  const res = await postEvent(messageEvent({ msgId: `om_bind_${senderId}`, senderId, text: "hi" }));
+/** The sent messages the owner reads back (GET /api/messages), oldest first. */
+export async function apiMessages(after = 0, limit = 50): Promise<{ messages: ApiMessage[]; cursor: number; hasMore: boolean }> {
+  const res = await SELF.fetch(`https://example.com/api/messages?after=${after}&limit=${limit}`, { headers: API_HEADERS });
   expect(res.status).toBe(200);
-  await waitWhileOutboundPending();
+  return (await res.json()) as { messages: ApiMessage[]; cursor: number; hasMore: boolean };
+}
+
+/** POST /api/pairing — the machine-add flow (was the chat /加机器 command). */
+export async function mintPairing(): Promise<{ code: string; command: string }> {
+  const res = await SELF.fetch("https://example.com/api/pairing", { method: "POST", headers: API_HEADERS });
+  expect(res.status).toBe(200);
+  return (await res.json()) as { code: string; command: string };
+}
+
+/** POST /api/login-link — a fresh one-time web login link (was the chat /网页 command). */
+export async function mintLoginLink(): Promise<string> {
+  const res = await SELF.fetch("https://example.com/api/login-link", { method: "POST", headers: API_HEADERS });
+  expect(res.status).toBe(200);
+  return ((await res.json()) as { url: string }).url;
+}
+
+/** /** Submits credentials and binds `ou_owner` with a first DM; the confirmation send settles. */
+/** ADR-0003: the owner is implicit — whoever holds SERVER_KEY. Tests keep this as their
+ *  "the deployment is ready" step: one real API request, so the DO records the deployment
+ *  origin (card timeline links and the pairing command need it). */
+export async function configureAndBind(_senderId = "ou_owner"): Promise<void> {
+  await mintLoginLink();
 }
 
 export interface MessageEventOptions {
@@ -260,50 +186,35 @@ export interface MessageEventOptions {
   appId?: string;
 }
 
+/** The owner's inbound message (POST /api/messages); the legacy Feishu-only options
+ *  (senderId/chatType/messageType/token/appId) are accepted and ignored. */
 export function messageEvent(opts: MessageEventOptions = {}) {
-  const now = Date.now();
   return {
-    schema: "2.0",
-    header: {
-      event_id: `evt_${opts.msgId ?? "om_default"}`,
-      event_type: "im.message.receive_v1",
-      create_time: String(opts.createTime ?? now),
-      token: opts.token ?? TEST_VERIFY_TOKEN,
-      app_id: opts.appId ?? TEST_APP_ID,
-    },
-    event: {
-      message: {
-        message_id: opts.msgId ?? "om_default",
-        root_id: "",
-        parent_id: opts.parentId ?? "",
-        create_time: String(opts.createTime ?? now),
-        chat_id: "oc_default",
-        chat_type: opts.chatType ?? "p2p",
-        message_type: opts.messageType ?? "text",
-        content: JSON.stringify({ text: opts.text ?? "hello" }),
-      },
-      sender: {
-        sender_id: { open_id: opts.senderId ?? "ou_owner" },
-        sender_type: "user",
-        tenant_key: "tenant",
-      },
-    },
+    msgId: opts.msgId ?? `om_${crypto.randomUUID().slice(0, 8)}`,
+    text: opts.text ?? "hello",
+    ...(opts.parentId ? { parentId: opts.parentId } : {}),
   };
 }
 
+/** Posts an owner message — or, when the body is `{cardMsgId, action}`, a button callback
+ *  (POST /api/actions). One helper, both inbound shapes, zero churn at the call sites. */
 export function postEvent(body: unknown): Promise<Response> {
-  return SELF.fetch("https://example.com/channels/feishu/events", {
+  const b = body as { cardMsgId?: string; action?: string; msgId?: string; text?: string; parentId?: string };
+  if (typeof b.cardMsgId === "string" && typeof b.action === "string") {
+    return SELF.fetch("https://example.com/api/actions", {
+      method: "POST",
+      headers: API_HEADERS,
+      body: JSON.stringify({ cardMsgId: b.cardMsgId, action: b.action }),
+    });
+  }
+  return SELF.fetch("https://example.com/api/messages", {
     method: "POST",
-    body: JSON.stringify(body),
-    headers: { "content-type": "application/json" },
+    headers: API_HEADERS,
+    body: JSON.stringify({ id: b.msgId, text: b.text, ...(b.parentId ? { replyTo: b.parentId } : {}) }),
   });
 }
 
-export function urlVerification(token = TEST_VERIFY_TOKEN): Promise<Response> {
-  return postEvent({ type: "url_verification", challenge: "ch-123", token });
-}
-
-/** Polls until no sh_outbound row is queued/sending (the void-fired delivery settled).
+/** Polls until no sh_outbound row is queued/sending (the void-fired delivery settled)./** Polls until no sh_outbound row is queued/sending (the void-fired delivery settled).
  *  Quiet rows legitimately wait out the 60 s merge window (issue #11) — waiting that out
  *  would time every content test out, so the helper TIME-TRAVELS them due instead (the
  *  window's own timing behavior has its dedicated suite in report-merge.test.ts). */
@@ -737,14 +648,9 @@ export async function ownerDm(text: string): Promise<void> {
   await waitWhileOutboundPending();
 }
 
-/** Logs in via /网页 and returns the session cookie header value. */
+/** Logs in via POST /api/login-link and returns the session cookie header value. */
 export async function webLogin(): Promise<string> {
-  await ownerDm("/网页");
-  const rows = await ownerStub().outboundRows(20);
-  const texts = rows
-    .filter((r) => r.kind === "text" && r.status === "sent")
-    .map((r) => JSON.parse(r.payload as string).text as string);
-  const linkUrl = texts.join(" ").match(/https:\/\/example\.com\/link\/\S+/)![0]!;
+  const linkUrl = await mintLoginLink();
   const res = await SELF.fetch(linkUrl, { redirect: "manual" });
   if (res.status !== 303) throw new Error(`link did not log in: ${res.status}`);
   return res.headers.get("set-cookie")!.split(";")[0]!;

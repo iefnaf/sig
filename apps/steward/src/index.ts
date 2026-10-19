@@ -1,6 +1,7 @@
 import { getAgentByName, routeAgentRequest } from "agents";
 import { parseToken } from "@shepherd/protocol";
 import { bearer, resolveServerKeys } from "./auth.ts";
+import { AVATAR_PATH, LOGO_PATH, BRAND_HEAD, BRAND_LOCKUP, BRAND_STYLE } from "./brand.ts";
 import { Steward } from "./steward.ts";
 import { parseSessionCookie, verifyLinkToken } from "./web.ts";
 
@@ -16,14 +17,23 @@ function htmlPage(body: string, status = 200): Response {
 
 // The web's shared "get a fresh link" page (web.ts renders the full variant inside the DO;
 // this stateless twin answers rejected probes without waking it).
-const LINK_HINT = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex"><title>Shepherd</title><style>body{font:15px/1.7 -apple-system,"PingFang SC",sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:0 16px}main{max-width:480px}</style></head><body><main><p>链接无效或已过期。</p><p style="opacity:.75;font-size:13px">在飞书里对总管发 <code>/网页</code>，取一条新的一次性登录链接（15 分钟内有效，只能打开一次）。</p></main></body></html>`;
+const LINK_HINT = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex"><title>Sig</title>${BRAND_HEAD}<style>${BRAND_STYLE}body{font:15px/1.7 -apple-system,"PingFang SC",sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:0 16px}main{max-width:480px}</style></head><body><main>${BRAND_LOCKUP}<p>链接无效或已过期。</p><p style="opacity:.75;font-size:13px">新的登录链接用 <code>POST /api/login-link</code> 签发（15 分钟内有效，只能打开一次）。</p></main></body></html>`;
 
-// Length-independent comparison so the setup gate does not leak the token byte-by-byte.
-function setupTokenMatches(got: string | null, want: string): boolean {
-  if (!got || got.length !== want.length) return false;
+// Length-independent comparison so the API gate never leaks the key byte-by-byte.
+function constantTimeEquals(got: string, want: string): boolean {
+  if (got.length !== want.length) return false;
   let diff = 0;
   for (let i = 0; i < want.length; i++) diff |= got.charCodeAt(i) ^ want.charCodeAt(i);
   return diff === 0;
+}
+
+/** ADR-0003: with no chat channel, the owner API is gated by SERVER_KEY itself — whoever can
+ *  deploy (or rotate) the secrets is the owner. SERVER_KEY_PREVIOUS is accepted too, so a
+ *  client configured with the old key keeps working through a rotation window (issue #27).
+ *  Checked here, statelessly, so a bad key never wakes the Durable Object. */
+function apiAuthorized(request: Request, env: Env): boolean {
+  const got = bearer(request);
+  return got !== null && webVerifyKeys(env).some((key) => constantTimeEquals(got, key));
 }
 
 // The raw signing secrets for web verification: primary first, SERVER_KEY_PREVIOUS during a
@@ -35,6 +45,13 @@ function webVerifyKeys(env: { SERVER_KEY: string; SERVER_KEY_PREVIOUS?: string }
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+
+    // Brand assets are public and do not wake the Durable Object. Everything else
+    // continues through the existing authentication gates, including unknown assets.
+    if ((request.method === "GET" || request.method === "HEAD") &&
+        (url.pathname === LOGO_PATH || url.pathname === AVATAR_PATH)) {
+      return env.ASSETS.fetch(request);
+    }
 
     if (url.pathname === "/pair" && request.method === "POST") {
       let body: unknown;
@@ -67,24 +84,19 @@ export default {
       return json({ error: "invalid code" }, 400);
     }
 
-    // The setup page opens only with SETUP_TOKEN (ADR-0001 decision 8) and 404s otherwise —
-    // including once the owner is bound, which the DO decides permanently. The token check is
-    // stateless so probes never wake the Durable Object.
-    if (url.pathname === "/setup" && (request.method === "GET" || request.method === "POST")) {
-      if (!env.SETUP_TOKEN || !setupTokenMatches(url.searchParams.get("token"), env.SETUP_TOKEN)) {
-        return new Response("not found", { status: 404 });
-      }
+    // The owner API (ADR-0003): the SERVER_KEY bearer is the auth; the Durable Object serves
+    // the actual handlers. GET /api/messages is the owner's read side (polling sent rows).
+    if (url.pathname.startsWith("/api/") && url.pathname.split("/").length === 3) {
+      const allowed =
+        (url.pathname === "/api/messages" && (request.method === "POST" || request.method === "GET")) ||
+        (url.pathname === "/api/actions" && request.method === "POST") ||
+        (url.pathname === "/api/pairing" && request.method === "POST") ||
+        (url.pathname === "/api/login-link" && request.method === "POST");
+      if (!allowed) return new Response("not found", { status: 404 });
+      if (!apiAuthorized(request, env)) return new Response("unauthorized", { status: 401 });
       const stub = await getAgentByName(env.Steward, "owner");
       return stub.fetch(request);
     }
-
-    // Feishu event webhook (steward.md §9.1): one of the two unauthenticated entry points
-    // (ADR-0001 decision 7) — the DO validates Feishu's verification token itself.
-    if (url.pathname === "/channels/feishu/events" && request.method === "POST") {
-      const stub = await getAgentByName(env.Steward, "owner");
-      return stub.fetch(request);
-    }
-
     // The one-time signed link (spec §7.3 / §12.2): possession of a valid HMAC is the auth,
     // the same "stateless pre-check, then forward" pattern as the device token — invalid or
     // expired links are answered here and never wake the Durable Object. The key set includes

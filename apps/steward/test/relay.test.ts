@@ -8,7 +8,6 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   configureAndBind,
   messageEvent,
-  mockReset,
   ownerStub,
   pairFakeConnector,
   postEvent,
@@ -20,7 +19,6 @@ import {
 
 beforeEach(async () => {
   await resetLedgerState();
-  await mockReset();
   await configureAndBind("ou_owner");
 });
 
@@ -335,18 +333,8 @@ describe("the resume send failing reverts the worker and tells the user", () => 
 });
 
 /** A card-action event on one of our sent cards (the webhook shape the adapter parses). */
-function cardActionEvent(cardMsgId: string, action: string, eventId = `evt_card_${crypto.randomUUID().slice(0, 8)}`) {
-  return {
-    schema: "2.0",
-    header: {
-      event_id: eventId,
-      event_type: "card.action.trigger",
-      create_time: String(Date.now()),
-      token: "verify-token",
-      app_id: "cli_test_app",
-    },
-    event: { operator: { open_id: "ou_owner" }, action: { value: { action } }, context: { open_message_id: cardMsgId } },
-  };
+function cardActionEvent(cardMsgId: string, action: string) {
+  return { cardMsgId, action };
 }
 
 describe("PR #54 review findings", () => {

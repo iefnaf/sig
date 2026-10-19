@@ -11,7 +11,6 @@ import {
   configureAndBind,
   llmState,
   messageEvent,
-  mockReset,
   modelRequests,
   ownerStub,
   pairFakeConnector,
@@ -25,12 +24,10 @@ import type { Steward } from "../src/steward.ts";
 import { digestCard, digestIsEmpty } from "../src/report-template.ts";
 import { describeSchedule, parseAtIso, validateRoutineSpec } from "../src/routines.ts";
 import { followupWakeText, routineWakeText } from "../src/wake-text.ts";
-import { TEST_APP_ID, TEST_VERIFY_TOKEN } from "./helpers.ts";
 import type { FakeConnector } from "./helpers.ts";
 
 beforeEach(async () => {
   await resetLedgerState();
-  await mockReset();
   await configureAndBind("ou_owner");
 });
 
@@ -78,22 +75,8 @@ async function waitFor<T>(get: () => Promise<T>, pred: (v: T) => boolean, what: 
 }
 
 /** A card.action.trigger callback on the card the DO sent with `providerMsgId`. */
-function cardActionEvent(providerMsgId: string, action: string, eventId = `evt_card_${crypto.randomUUID().slice(0, 8)}`) {
-  return {
-    schema: "2.0",
-    header: {
-      event_id: eventId,
-      event_type: "card.action.trigger",
-      create_time: String(Date.now()),
-      token: TEST_VERIFY_TOKEN,
-      app_id: TEST_APP_ID,
-    },
-    event: {
-      operator: { open_id: "ou_owner" },
-      action: { value: { action } },
-      context: { open_message_id: providerMsgId },
-    },
-  };
+function cardActionEvent(providerMsgId: string, action: string) {
+  return { cardMsgId: providerMsgId, action };
 }
 
 /** Pairs + connects a machine (repo-a) with autorun off — the digest's "running" fodder. */
@@ -163,9 +146,7 @@ describe("pure helpers (routines.ts, wake-text.ts, report-template.ts)", () => {
     const cardJson = JSON.stringify(card);
     expect(cardJson).toContain("6 个在跑");
     expect(cardJson).toContain("另有 2 件未列出"); // 6 lines, 4 shown — the count is stated
-    const didLines = (card.elements as Array<{ text?: { content?: string } }>).flatMap((e) =>
-      (e.text?.content ?? "").split("\n"),
-    );
+    const didLines = card.text.split("\n");
     expect(didLines.filter((l) => l.startsWith("- 「任务")).length).toBe(4); // renderReportCard's cap held
     expect(didLines.some((l) => l.includes("任务 5") || l.includes("任务 6"))).toBe(false); // …and the cut is counted
   });
@@ -541,7 +522,7 @@ describe("routine suggestions: a button, nothing else (spec §8.3, steward.md §
     expect(JSON.stringify(offer!.payload)).toContain("routine_accept");
 
     // The owner taps 创建: the offer's stored spec becomes a routine, traced to om_sugg_1.
-    await postEvent(cardActionEvent(offer!.providerMsgId!, "routine_accept", "evt_tap_1"));
+    await postEvent(cardActionEvent(offer!.providerMsgId!, "routine_accept"));
     await waitWhileOutboundPending();
     let snap = await snapshot();
     expect(snap.routines).toHaveLength(1);
@@ -552,7 +533,7 @@ describe("routine suggestions: a button, nothing else (spec §8.3, steward.md §
     expect((await routineSchedules()).some((s) => s.callback === "fireRoutine")).toBe(true);
 
     // A second tap changes nothing.
-    await postEvent(cardActionEvent(offer!.providerMsgId!, "routine_accept", "evt_tap_2"));
+    await postEvent(cardActionEvent(offer!.providerMsgId!, "routine_accept"));
     await waitWhileOutboundPending();
     snap = await snapshot();
     expect(snap.routines).toHaveLength(1);
@@ -570,7 +551,7 @@ describe("routine suggestions: a button, nothing else (spec §8.3, steward.md §
     const offer = rows.find((r) => r.id.startsWith("offer:") && r.status === "sent");
     expect(offer).toBeTruthy();
 
-    await postEvent(cardActionEvent(offer!.providerMsgId!, "routine_decline", "evt_tap_3"));
+    await postEvent(cardActionEvent(offer!.providerMsgId!, "routine_decline"));
     await waitWhileOutboundPending();
     const snap = await snapshot();
     expect(snap.routines).toHaveLength(0);

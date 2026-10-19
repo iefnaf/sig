@@ -266,7 +266,7 @@ export class Dispatcher {
     if (repoRows.length === 0) {
       return {
         kind: "refused",
-        reason: `没有机器登记过仓库「${input.repoRef}」。请告诉用户先在那台机器上 shepherd add-repo 并重连，或换一个他提过的仓库。`,
+        reason: `没有机器登记过仓库「${input.repoRef}」。请告诉用户先在那台机器上 sig add-repo 并重连，或换一个他提过的仓库。`,
       };
     }
     // Issue #17: the steward can target an agent (hello.agents is the menu) — but only
@@ -510,7 +510,7 @@ export class Dispatcher {
     await this.#deps.sendText(
       [
         "在要接入的那台电脑的终端里运行：",
-        `npx @iefnaf/shepherd connect ${origin} ${code}`,
+        `npx @iefnaf/sig connect ${origin} ${code}`,
         "（配对码 10 分钟内有效，只能使用一次；接好后它会自动上线，直接问我就能看到。）",
       ].join("\n"),
     );

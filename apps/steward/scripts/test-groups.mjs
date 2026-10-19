@@ -32,7 +32,6 @@ const COST = {
   "relay.test.ts": 26,
   "budget.test.ts": 25,
   "worker-questions.test.ts": 55,
-  "qr-setup.test.ts": 26,
   "intervention.test.ts": 24,
   "review-regressions.test.ts": 21,
   "e2e-loop.test.ts": 19,

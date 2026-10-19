@@ -12,8 +12,6 @@ import {
   FakeConnector,
   configureAndBind,
   messageEvent,
-  mockCalls,
-  mockReset,
   ownerStub,
   pairDevice,
   postEvent,
@@ -23,7 +21,6 @@ import {
 
 beforeEach(async () => {
   await resetLedgerState();
-  await mockReset();
   await configureAndBind("ou_owner");
 });
 
@@ -109,17 +106,7 @@ async function restoreSweepMaintenance(): Promise<void> {
 
 /** A card.action trigger for the ask card's buttons (the wait_online flow). */
 function cardActionEvent(cardMsgId: string, action: string) {
-  return {
-    schema: "2.0",
-    header: {
-      event_id: `evt_card_${crypto.randomUUID().slice(0, 8)}`,
-      event_type: "card.action.trigger",
-      create_time: String(Date.now()),
-      token: "verify-token",
-      app_id: "cli_test_app",
-    },
-    event: { operator: { open_id: "ou_owner" }, action: { value: { action } }, context: { open_message_id: cardMsgId } },
-  };
+  return { cardMsgId, action };
 }
 
 async function workerRow(workerId: string) {
@@ -176,17 +163,16 @@ describe("the §8.4 stall alarm (online machine, lastEventAt + 20 min)", () => {
     expect(row!.thread.unread).toBe(true);
     const [card] = await sentCards();
     expect(card?.threadId).toBe(threadId);
-    const cardJson = JSON.parse(card!.payload as string) as { card: { header: unknown; elements: unknown[] } };
-    expect(JSON.stringify(cardJson.card.header)).toContain("没有任何动静");
-    expect(JSON.stringify(cardJson.card.header)).toContain("orange");
-    expect(JSON.stringify(cardJson.card.elements)).toContain("mac-studio");
+    const cardJson = JSON.parse(card!.payload as string) as { card: { text: string } };
+    expect(cardJson.card.text).toContain("没有任何动静");
+    expect(cardJson.card.text).toContain("⚠️");
+    expect(cardJson.card.text).toContain("mac-studio");
     expect(row!.thread.timeline.some((e) => e.kind === "stall" && e.text.includes("分钟没有任何动静"))).toBe(true);
 
     // The same stall never notifies twice — the dedupe key carries lastEventAt.
     expect(await sweep()).toEqual({ stalled: 0, reaped: 0 });
     expect((await sentCards()).length).toBe(1);
     fake.close();
-    void (await mockCalls());
   }, 30_000);
 
   it("resets on the next event: a second silent period notifies again", async () => {
@@ -206,7 +192,6 @@ describe("the §8.4 stall alarm (online machine, lastEventAt + 20 min)", () => {
     await waitWhileOutboundPending();
     expect((await sentCards()).length).toBe(2);
     fake.close();
-    void (await mockCalls());
   }, 30_000);
 
   it("is driven by the real scheduled alarm, not just explicit calls", async () => {
@@ -235,7 +220,6 @@ describe("the §8.4 stall alarm (online machine, lastEventAt + 20 min)", () => {
     } finally {
       fake.close();
       await restoreSweepMaintenance();
-      void (await mockCalls());
     }
   }, 30_000);
 });
@@ -266,7 +250,6 @@ describe("the reap sweep (running + offline 10 min, or online-but-silent 45 min 
     const back = await workerRow(workerId);
     expect(back!.worker.state).toBe("running");
     expect(back!.thread.timeline.some((e) => e.kind === "resumed")).toBe(true);
-    void (await mockCalls());
   }, 30_000);
 
   it("keeps an offline worker that went silent less than 10 minutes ago", async () => {
@@ -278,7 +261,6 @@ describe("the reap sweep (running + offline 10 min, or online-but-silent 45 min 
     expect(await sweep()).toEqual({ stalled: 0, reaped: 0 });
     expect((await workerRow(workerId))!.worker.state).toBe("running");
     fake.close();
-    void (await mockCalls());
   }, 30_000);
 
   it("reaps an online-but-silent worker at 45 minutes (the connector forgot it)", async () => {
@@ -300,7 +282,6 @@ describe("the reap sweep (running + offline 10 min, or online-but-silent 45 min 
     await waitWhileOutboundPending();
     expect((await sentCards()).length).toBe(1); // the stall notice, nothing new for the reap
     fake.close();
-    void (await mockCalls());
   }, 30_000);
 
   it("never touches workers outside active states (idle after settling)", async () => {
@@ -313,7 +294,6 @@ describe("the reap sweep (running + offline 10 min, or online-but-silent 45 min 
     expect(await sweep()).toEqual({ stalled: 0, reaped: 0 });
     expect((await workerRow(workerId))!.worker.state).toBe("idle");
     fake.close();
-    void (await mockCalls());
   }, 30_000);
 });
 
@@ -344,7 +324,6 @@ describe("the connector watchdog's events reaching the ledger (error:stall)", ()
     const [card] = await sentCards();
     expect(JSON.stringify(JSON.parse(card!.payload as string))).toContain("运行出错");
     fake.close();
-    void (await mockCalls());
   }, 30_000);
 });
 
@@ -364,7 +343,6 @@ describe("a reaped worker that is alive recovers (issue #13 review finding 2)", 
     await backdate(workerId, 21);
     expect(await sweep()).toEqual({ stalled: 1, reaped: 0 });
     fake.close();
-    void (await mockCalls());
   }, 30_000);
 
   it("resumes via the parked connector snapshot once redelivery catches up (offline reap)", async () => {
@@ -385,7 +363,6 @@ describe("a reaped worker that is alive recovers (issue #13 review finding 2)", 
     expect(String(row!.worker.lastProgress)).toContain("offline-2");
     expect(row!.thread.timeline.some((e) => e.kind === "resumed" && e.text.includes("快照对账"))).toBe(true);
     fake.close();
-    void (await mockCalls());
   }, 30_000);
 
   it("a parked snapshot that says the run ended wins over backfilled progress", async () => {
@@ -406,7 +383,6 @@ describe("a reaped worker that is alive recovers (issue #13 review finding 2)", 
     expect(row.worker.state).toBe("lost");
     expect(String(row.worker.lastProgress)).toContain("dying-2"); // the events were applied…
     fake.close();
-    void (await mockCalls());
   }, 30_000);
 });
 
@@ -424,7 +400,6 @@ describe("offline duration is measured, not assumed (issue #13 review finding 4)
     await setMachineOffline(11);
     expect(await sweep()).toEqual({ stalled: 0, reaped: 1 });
     expect((await workerRow(workerId))!.worker.state).toBe("lost");
-    void (await mockCalls());
   }, 30_000);
 });
 
@@ -454,7 +429,7 @@ describe("a queued start_worker is never reaped into a duplicate dispatch (issue
     expect(outcome.kind).toBe("asked_offline");
     await waitWhileOutboundPending();
     const [askCard] = await sentCards(); // the offline ask card
-    expect(askCard?.providerMsgId).toMatch(/^om_mock_/);
+    expect(askCard?.providerMsgId).toBeTruthy();
 
     // 1st click 「排队等上线」: one worker `starting`, one queued start_worker.
     await postEvent(cardActionEvent(String(askCard!.providerMsgId), "wait_online"));
@@ -505,7 +480,6 @@ describe("a queued start_worker is never reaped into a duplicate dispatch (issue
     // The ask card plus the failure push — exactly two cards, and no duplicate dispatch.
     expect((await sentCards()).length).toBe(2);
     fake.close();
-    void (await mockCalls());
   }, 40_000);
 
   it("reaps a delivered-but-never-started worker only at the online-silent horizon (cmd done)", async () => {
@@ -520,7 +494,6 @@ describe("a queued start_worker is never reaped into a duplicate dispatch (issue
     expect(await sweep()).toEqual({ stalled: 0, reaped: 1 });
     await waitForWorkerState(workerId, "lost");
     fake.close();
-    void (await mockCalls());
   }, 30_000);
 
   it("keeps a delivered-but-never-started worker while the command is still in flight (sent)", async () => {
@@ -533,7 +506,6 @@ describe("a queued start_worker is never reaped into a duplicate dispatch (issue
     expect(await sweep()).toEqual({ stalled: 0, reaped: 0 }); // sent = maybe delivering: wait
     expect((await workerRow(workerId))!.worker.state).toBe("starting");
     fake.close();
-    void (await mockCalls());
   }, 30_000);
 });
 
@@ -579,7 +551,6 @@ describe("terminal start_worker verdicts close wedged starting workers (PR #41 r
     await waitWhileOutboundPending();
     const [card] = await sentCards();
     expect(JSON.stringify(JSON.parse(card!.payload as string))).toContain("命令过期未送达");
-    void (await mockCalls());
   }, 30_000);
 
   it("an ambiguous start_worker closes as quiet lost+reaped at the silent horizon — and resurrects if alive", async () => {
@@ -600,7 +571,6 @@ describe("terminal start_worker verdicts close wedged starting workers (PR #41 r
     const back = await waitForWorkerState(workerId, "running");
     expect(back!.worker.lastOutcome).toBeNull();
     fake.close();
-    void (await mockCalls());
   }, 30_000);
 
   it("a worker whose command row never existed closes with a start-failure push", async () => {
@@ -617,7 +587,6 @@ describe("terminal start_worker verdicts close wedged starting workers (PR #41 r
     await waitWhileOutboundPending();
     expect((await sentCards()).length).toBe(1);
     fake.close();
-    void (await mockCalls());
   }, 30_000);
 
   it("an accepted-but-never-resulted start_worker closes at the online-silent horizon (PR #46 review finding 1)", async () => {
@@ -634,7 +603,6 @@ describe("terminal start_worker verdicts close wedged starting workers (PR #41 r
     await waitWhileOutboundPending();
     expect((await sentCards()).length).toBe(0); // quiet: the run may be alive on the machine
     fake.close();
-    void (await mockCalls());
   }, 30_000);
 
   it("a serial-queued worker is reaped only when its machine measurably disappears, never by silence (merge with #16)", async () => {
@@ -658,7 +626,6 @@ describe("terminal start_worker verdicts close wedged starting workers (PR #41 r
     expect(row!.thread.state).toBe("idle");
     await waitWhileOutboundPending();
     expect((await sentCards()).length).toBe(0);
-    void (await mockCalls());
   }, 30_000);
 
   it("a LONE queued worker keeps the sweep chain armed: the real alarm reaps it when the machine disappears (PR #46 review round 3, finding 1)", async () => {
@@ -686,7 +653,6 @@ describe("terminal start_worker verdicts close wedged starting workers (PR #41 r
       expect(row!.thread.state).toBe("idle");
     } finally {
       await restoreSweepMaintenance();
-      void (await mockCalls());
     }
   }, 30_000);
 
@@ -700,6 +666,5 @@ describe("terminal start_worker verdicts close wedged starting workers (PR #41 r
     const row = await waitForWorkerState(workerId, "lost");
     expect(row!.worker.lastOutcome).toBe("reaped");
     expect(row!.thread.state).toBe("idle");
-    void (await mockCalls());
   }, 30_000);
 });

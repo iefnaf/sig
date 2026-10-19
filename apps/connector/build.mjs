@@ -1,5 +1,5 @@
 // Build for the published npm package (issue #26): bundle the CLI into a single plain-JS
-// ESM file so `npx @iefnaf/shepherd` needs no TypeScript stripping and no workspace deps
+// ESM file so `npx @iefnaf/sig` needs no TypeScript stripping and no workspace deps
 // (@shepherd/protocol and ws are bundled in; node: builtins stay external). The pi
 // extension is NOT bundled — pi loads it as a file — so it is copied verbatim to
 // dist/ext/, where install.ts resolves it via import.meta.url.

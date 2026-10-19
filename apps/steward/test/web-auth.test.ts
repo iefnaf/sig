@@ -88,7 +88,7 @@ describe("the worker-layer gate: invalid links never reach the DO", () => {
     for (const token of ["garbage", "wl1.home.1.2.3", `${(await mintLinkToken("wrong-key", "home")).token}`]) {
       const res = await SELF.fetch(`https://example.com/link/${token}`, { redirect: "manual" });
       expect(res.status).toBe(410);
-      expect(await res.text()).toContain("/网页");
+      expect(await res.text()).toContain("/api/login-link");
     }
     // Valid shape but long-expired: still rejected statelessly.
     const expired = await mintLinkToken("test-server-key-not-a-secret", "home", Date.now() - LINK_TTL_MS - 1);

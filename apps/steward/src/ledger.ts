@@ -1683,7 +1683,7 @@ export function createLedger(deps: LedgerDeps) {
         const windowMs = quietWindowMs();
         const anchor = sql<{ at: number | null }>`
           SELECT MIN(createdAt) AS at FROM sh_outbound
-          WHERE channel = 'feishu' AND receiveId = ${input.to} AND urgency = 'quiet'
+          WHERE channel = 'local' AND receiveId = ${input.to} AND urgency = 'quiet'
             AND status = 'queued' AND createdAt > ${now() - windowMs}
         `[0]?.at;
         dueAt = anchor !== null && anchor !== undefined ? anchor + windowMs : now() + windowMs;
@@ -1692,7 +1692,7 @@ export function createLedger(deps: LedgerDeps) {
       if (input.id !== undefined) {
         sql`
           INSERT OR IGNORE INTO sh_outbound (id, channel, kind, receiveId, threadId, questionId, payload, urgency, status, attempts, nextAttemptAt, createdAt)
-          VALUES (${input.id}, 'feishu', ${input.kind}, ${input.to}, ${input.threadId ?? null}, ${input.questionId ?? null},
+          VALUES (${input.id}, 'local', ${input.kind}, ${input.to}, ${input.threadId ?? null}, ${input.questionId ?? null},
                   ${payload}, ${input.urgency ?? "quiet"}, 'queued', 0, ${dueAt}, ${now()})
         `;
         return input.id;
@@ -1700,7 +1700,7 @@ export function createLedger(deps: LedgerDeps) {
       const id = ulid(); // stable across retries; doubles as the provider-side uuid
       sql`
         INSERT INTO sh_outbound (id, channel, kind, receiveId, threadId, questionId, payload, urgency, status, attempts, nextAttemptAt, createdAt)
-        VALUES (${id}, 'feishu', ${input.kind}, ${input.to}, ${input.threadId ?? null}, ${input.questionId ?? null},
+        VALUES (${id}, 'local', ${input.kind}, ${input.to}, ${input.threadId ?? null}, ${input.questionId ?? null},
                 ${payload}, ${input.urgency ?? "quiet"}, 'queued', 0, ${dueAt}, ${now()})
       `;
       return id;

@@ -1,249 +1,78 @@
 // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
 
-exports[`card snapshots (issue #11) > consent-carrying done report (issue #21): the ask replaces needs-you, [同意]/[先不要] ride along 1`] = `
+exports[`message snapshots (issue #11) > consent-carrying done report (issue #21): the ask replaces needs-you, [同意]/[先不要] ride along 1`] = `
 {
-  "config": {
-    "wide_screen_mode": true,
-  },
-  "elements": [
+  "buttons": [
     {
-      "tag": "div",
-      "text": {
-        "content": "**做了什么**
-- auth/session.ts 里补上了 token 过期后的刷新
-- 测试通过
-- 分支 shepherd/login-1，2 个提交，未推送",
-        "tag": "lark_md",
-      },
+      "action": "pr_approve",
+      "label": "同意",
+      "primary": true,
     },
     {
-      "tag": "hr",
+      "action": "pr_decline",
+      "label": "先不要",
     },
     {
-      "tag": "div",
-      "text": {
-        "content": "**需要你**：分支 shepherd/login-1（2 个提交）还没推送。点「同意」我会推送并创建 PR；选「先不要」就先留在机器上。",
-        "tag": "lark_md",
-      },
-    },
-    {
-      "actions": [
-        {
-          "tag": "button",
-          "text": {
-            "content": "同意",
-            "tag": "plain_text",
-          },
-          "type": "primary",
-          "value": {
-            "action": "pr_approve",
-          },
-        },
-        {
-          "tag": "button",
-          "text": {
-            "content": "先不要",
-            "tag": "plain_text",
-          },
-          "type": "default",
-          "value": {
-            "action": "pr_decline",
-          },
-        },
-      ],
-      "tag": "action",
-    },
-    {
-      "actions": [
-        {
-          "tag": "button",
-          "text": {
-            "content": "查看详情",
-            "tag": "plain_text",
-          },
-          "type": "default",
-          "url": "https://example.com/link/wl1.t/t_test.1.0abc",
-        },
-      ],
-      "tag": "action",
-    },
-    {
-      "elements": [
-        {
-          "content": "Thread「修复登录 bug」 · pi @ mac-studio · 引用回复可继续这个 Thread",
-          "tag": "plain_text",
-        },
-      ],
-      "tag": "note",
+      "label": "查看详情",
+      "url": "https://example.com/link/wl1.t/t_test.1.0abc",
     },
   ],
-  "header": {
-    "template": "green",
-    "title": {
-      "content": "✅ 登录 bug 修好，测试通过",
-      "tag": "plain_text",
-    },
-  },
+  "text": "✅ 登录 bug 修好，测试通过
+
+做了什么：
+- auth/session.ts 里补上了 token 过期后的刷新
+- 测试通过
+- 分支 shepherd/login-1，2 个提交，未推送
+
+需要你：分支 shepherd/login-1（2 个提交）还没推送。点「同意」我会推送并创建 PR；选「先不要」就先留在机器上。
+
+详情：https://example.com/link/wl1.t/t_test.1.0abc
+
+Thread「修复登录 bug」 · pi @ mac-studio · 引用回复可继续这个 Thread",
 }
 `;
 
-exports[`card snapshots (issue #11) > merged done reports: one card, each Thread keeps its three parts 1`] = `
-{
-  "config": {
-    "wide_screen_mode": true,
-  },
-  "elements": [
-    {
-      "tag": "div",
-      "text": {
-        "content": "两条记忆按 90 天规则整理完毕（归档 1 条，无新增）。",
-        "tag": "lark_md",
-      },
-    },
-    {
-      "tag": "hr",
-    },
-    {
-      "tag": "div",
-      "text": {
-        "content": "**✅ 「修复登录 bug」登录 bug 修好，测试通过**",
-        "tag": "lark_md",
-      },
-    },
-    {
-      "tag": "div",
-      "text": {
-        "content": "- auth/session.ts 里补上了 token 过期后的刷新
+exports[`message snapshots (issue #11) > merged done reports: one message, each Thread keeps its three parts 1`] = `
+"✅ 合并汇报：2 件事
+
+两条记忆按 90 天规则整理完毕（归档 1 条，无新增）。
+
+**✅ 「修复登录 bug」登录 bug 修好，测试通过**
+- auth/session.ts 里补上了 token 过期后的刷新
 - 测试通过
-- 分支 shepherd/login-1，2 个提交，已推送",
-        "tag": "lark_md",
-      },
-    },
-    {
-      "actions": [
-        {
-          "tag": "button",
-          "text": {
-            "content": "查看详情 · 修复登录 bug",
-            "tag": "plain_text",
-          },
-          "type": "default",
-          "url": "https://example.com/link/wl1.t/t_test.1.0abc",
-        },
-      ],
-      "tag": "action",
-    },
-    {
-      "tag": "hr",
-    },
-    {
-      "tag": "div",
-      "text": {
-        "content": "**✅ 「退款接口幂等」退款接口补齐幂等，回归通过**",
-        "tag": "lark_md",
-      },
-    },
-    {
-      "tag": "div",
-      "text": {
-        "content": "- payment/refund.ts 加了幂等键
+- 分支 shepherd/login-1，2 个提交，已推送
+详情：https://example.com/link/wl1.t/t_test.1.0abc
+
+**✅ 「退款接口幂等」退款接口补齐幂等，回归通过**
+- payment/refund.ts 加了幂等键
 - 补 2 个用例
 - 测试通过
 - 分支 shepherd/refund-1，1 个提交，已推送
-**需要你**：遗留：旧渠道还没覆盖",
-        "tag": "lark_md",
-      },
-    },
-    {
-      "actions": [
-        {
-          "tag": "button",
-          "text": {
-            "content": "查看详情 · 退款接口幂等",
-            "tag": "plain_text",
-          },
-          "type": "default",
-          "url": "https://example.com/link/wl1.t/t_two.1.0def",
-        },
-      ],
-      "tag": "action",
-    },
-    {
-      "elements": [
-        {
-          "content": "合并汇报（2 件事） · 点「查看详情」看对应时间线 · 引用回复可继续对应事项",
-          "tag": "plain_text",
-        },
-      ],
-      "tag": "note",
-    },
-  ],
-  "header": {
-    "template": "green",
-    "title": {
-      "content": "✅ 合并汇报：2 件事",
-      "tag": "plain_text",
-    },
-  },
-}
+**需要你**：遗留：旧渠道还没覆盖
+详情：https://example.com/link/wl1.t/t_two.1.0def
+
+（各件事的详情链接见上；引用回复可继续对应事项）"
 `;
 
-exports[`card snapshots (issue #11) > single done report: the fixed three-part card 1`] = `
+exports[`message snapshots (issue #11) > single done report: the fixed three-part message 1`] = `
 {
-  "config": {
-    "wide_screen_mode": true,
-  },
-  "elements": [
+  "buttons": [
     {
-      "tag": "div",
-      "text": {
-        "content": "**做了什么**
-- auth/session.ts 里补上了 token 过期后的刷新
-- 测试通过
-- 分支 shepherd/login-1，2 个提交，已推送",
-        "tag": "lark_md",
-      },
-    },
-    {
-      "tag": "hr",
-    },
-    {
-      "tag": "div",
-      "text": {
-        "content": "**需要你**：建议下一步：跑一遍全量测试",
-        "tag": "lark_md",
-      },
-    },
-    {
-      "actions": [
-        {
-          "tag": "button",
-          "text": {
-            "content": "查看详情",
-            "tag": "plain_text",
-          },
-          "type": "default",
-          "url": "https://example.com/link/wl1.t/t_test.1.0abc",
-        },
-      ],
-      "tag": "action",
-    },
-    {
-      "elements": [
-        {
-          "content": "Thread「修复登录 bug」 · pi @ mac-studio · 引用回复可继续这个 Thread",
-          "tag": "plain_text",
-        },
-      ],
-      "tag": "note",
+      "label": "查看详情",
+      "url": "https://example.com/link/wl1.t/t_test.1.0abc",
     },
   ],
-  "header": {
-    "template": "green",
-    "title": {
-      "content": "✅ 登录 bug 修好，测试通过",
-      "tag": "plain_text",
-    },
-  },
+  "text": "✅ 登录 bug 修好，测试通过
+
+做了什么：
+- auth/session.ts 里补上了 token 过期后的刷新
+- 测试通过
+- 分支 shepherd/login-1，2 个提交，已推送
+
+需要你：建议下一步：跑一遍全量测试
+
+详情：https://example.com/link/wl1.t/t_test.1.0abc
+
+Thread「修复登录 bug」 · pi @ mac-studio · 引用回复可继续这个 Thread",
 }
 `;

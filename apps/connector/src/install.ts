@@ -8,7 +8,7 @@ import { VERSION } from "./version.ts";
 export const SHEPHERD_VERSION = VERSION;
 
 /** The appended system prompt (§7.3). Item 5 mitigates the AGENTS.md prompt-injection surface. */
-export const WORKER_SYSTEM_PROMPT = `You are a worker dispatched by Shepherd, working on the user's behalf in the current directory.
+export const WORKER_SYSTEM_PROMPT = `You are a worker dispatched by Sig, working on the user's behalf in the current directory.
 
 1. Work only inside the current directory.
 2. When you finish, are blocked, or need the user to make a decision, call the \`report\` tool, and make it your last action. Put questions that need a user answer into \`question\` with status \`needs_decision\`; do not ask the user in plain text.

@@ -11,8 +11,6 @@ import {
   FakeConnector,
   configureAndBind,
   messageEvent,
-  mockCalls,
-  mockReset,
   modelRequests,
   llmState,
   ownerStub,
@@ -20,7 +18,6 @@ import {
   postEvent,
   resetLedgerState,
   scriptModel,
-  sendCalls,
   waitRunsSettled,
   waitWhileOutboundPending,
 } from "./helpers.ts";
@@ -28,7 +25,6 @@ import type { ShOutboundRow } from "../src/steward.ts";
 
 beforeEach(async () => {
   await resetLedgerState();
-  await mockReset();
   await configureAndBind("ou_owner");
 });
 
@@ -123,9 +119,9 @@ describe("the happy loop: natural language → tool dispatch → done card → e
     await waitWhileOutboundPending();
     const [card1] = await sentCards();
     expect(card1?.threadId).toBe(threadId);
-    const cardJson = JSON.parse(card1!.payload as string) as { card: { header: unknown; elements: unknown[] } };
-    expect(JSON.stringify(cardJson.card.header)).toContain("green");
-    expect(JSON.stringify(cardJson.card.header)).toContain("登录 bug 修好，测试通过");
+    const cardJson = JSON.parse(card1!.payload as string) as { card: { text: string } };
+    expect(cardJson.card.text).toContain("✅");
+    expect(cardJson.card.text).toContain("登录 bug 修好，测试通过");
 
     // --- the event wake: the model does bookkeeping; its plain text never reaches the user ---
     await scriptModel(
@@ -204,7 +200,6 @@ describe("the happy loop: natural language → tool dispatch → done card → e
     expect(JSON.stringify(JSON.parse(cards[1]!.payload as string))).toContain("单元测试补齐");
     expect(cards[1]!.threadId).toBe(threadId);
     fake.close();
-    void (await mockCalls());
   }, 45_000);
 });
 
@@ -253,17 +248,7 @@ describe("offline machines (spike bug 4 → protocol §7.3): the Thread remember
     expect(fake.cmds).toHaveLength(1); // nothing was delivered to a dead socket
 
     // --- the owner waits: the deadline is cleared and the resume delivers at hello ---------
-    const click = await postEvent({
-      schema: "2.0",
-      header: {
-        event_id: `evt_wait_${crypto.randomUUID().slice(0, 8)}`,
-        event_type: "card.action.trigger",
-        create_time: String(Date.now()),
-        token: "verify-token",
-        app_id: "cli_test_app",
-      },
-      event: { operator: { open_id: "ou_owner" }, action: { value: { action: "wait_online" } }, context: { open_message_id: askCard!.providerMsgId! } },
-    });
+    const click = await postEvent({ cardMsgId: askCard!.providerMsgId!, action: "wait_online" });
     expect(click.status).toBe(200);
     await waitWhileOutboundPending();
     expect((await sentTexts()).some((t) => t.includes("已排队"))).toBe(true);
@@ -286,7 +271,6 @@ describe("offline machines (spike bug 4 → protocol §7.3): the Thread remember
     await waitWhileOutboundPending();
     expect((await sentCards()).length).toBe(3); // leg-1 done + the ask card + leg-2 done
     fake.close();
-    void (await mockCalls());
   }, 30_000);
 });
 
@@ -317,23 +301,13 @@ describe("the offline-ask card: buttons resolve the Thread via providerMsgId (§
     await waitRunsSettled();
     await waitWhileOutboundPending();
     const [askCard] = await sentCards();
-    expect(askCard?.providerMsgId).toMatch(/^om_mock_/);
+    expect(askCard?.providerMsgId).toBeTruthy(); // ADR-0003: the row id (or merged uuid) is the message id
     const ask = JSON.stringify(JSON.parse(askCard!.payload as string));
     expect(ask).toContain("不在线");
     expect(ask).toContain("等它上线");
 
     // --- the click: the callback carries only open_message_id + action, no thread data ------
-    const click = await postEvent({
-      schema: "2.0",
-      header: {
-        event_id: `evt_card_${crypto.randomUUID().slice(0, 8)}`,
-        event_type: "card.action.trigger",
-        create_time: String(Date.now()),
-        token: "verify-token",
-        app_id: "cli_test_app",
-      },
-      event: { operator: { open_id: "ou_owner" }, action: { value: { action: "wait_online" } }, context: { open_message_id: askCard!.providerMsgId! } },
-    });
+    const click = await postEvent({ cardMsgId: askCard!.providerMsgId!, action: "wait_online" });
     expect(click.status).toBe(200);
     expect((await ownerStub().outboxRow(parkedCmdId))?.notAfter).toBeNull(); // wait cleared the hold
     const queued = await snapshotWhere((s) => s.threads[0]?.workers.length === 1, "worker still parked");
@@ -349,7 +323,6 @@ describe("the offline-ask card: buttons resolve the Thread via providerMsgId (§
     await waitWhileOutboundPending();
     expect((await sentCards()).length).toBeGreaterThanOrEqual(2); // ask card + done card (+ waited-start notice)
     fake.close();
-    void (await mockCalls());
   }, 30_000);
 });
 
@@ -377,7 +350,6 @@ describe("status questions answer from the situation, without dispatching", () =
     const runs = (await llmState()).runs;
     expect(runs.filter((r) => r.kind === "user")).toHaveLength(2);
     expect(runs.every((r) => r.status === "settled")).toBe(true);
-    expect(sendCalls(await mockCalls()).length).toBeGreaterThan(0);
-    void (await mockCalls());
+    expect((await ownerStub().outboundRows(50)).some((r) => r.status === "sent")).toBe(true);
   }, 30_000);
 });

@@ -8,7 +8,6 @@ import { isSpendQuery } from "../src/budget.ts";
 import { chooseMachine, parseOwnerCommand, type MachineCandidate } from "../src/dispatch.ts";
 import {
   configureAndBind,
-  mockReset,
   ownerStub,
   pairFakeConnector,
   resetLedgerState,
@@ -157,7 +156,6 @@ describe("chooseMachine: ADR-0001 decision 6, deterministic", () => {
 describe("the dispatch service (Dispatcher.startWorker)", () => {
   beforeEach(async () => {
     await resetLedgerState();
-    await mockReset();
     await configureAndBind("ou_owner");
   });
 
@@ -279,7 +277,6 @@ describe("the dispatch service (Dispatcher.startWorker)", () => {
 describe("the dispatch service: interventions on a broken worker are refused up front (PR #45 review #6)", () => {
   beforeEach(async () => {
     await resetLedgerState();
-    await mockReset();
     await configureAndBind("ou_owner");
   });
 
@@ -335,7 +332,6 @@ describe("the dispatch service: interventions on a broken worker are refused up 
 describe("the dispatch service: agent targeting (issue #17)", () => {
   beforeEach(async () => {
     await resetLedgerState();
-    await mockReset();
     await configureAndBind("ou_owner");
   });
 
