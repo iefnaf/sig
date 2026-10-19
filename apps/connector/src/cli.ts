@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// `npx @iefnaf/sig <command>` (ADR-0002, superseding ADR-0001 decision 10).
+// `npx @nightboats/sig <command>` (ADR-0002; npm scope: ADR-0008).
 //
 //   connect <url> <code>   redeem a pairing code, then install + start the background
 //                          service (launchd agent on macOS, systemd --user unit on Linux);
@@ -8,7 +8,7 @@
 //   logs [-n N] [name]     tail ~/.shepherd/logs/<name> (default connector.log)
 //   start | stop | restart control the background service (stop also disables start-at-login)
 //   uninstall              stop the service and remove its unit (keeps ~/.shepherd data)
-//   upgrade [--version V]  npm-install @iefnaf/sig (default @latest) and restart the
+//   upgrade [--version V]  npm-install @nightboats/sig (default @latest) and restart the
 //                          service; the fresh daemon rewrites the versioned pi assets
 //   add-repo <path>        register a repository so start_worker may run in it (§8.1)
 //   repo-config <path> [--workspace worktree|serial|main] [--approve|--no-approve]

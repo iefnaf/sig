@@ -28,7 +28,7 @@ The owner is whoever holds `SERVER_KEY` (ADR-0003): no owner row, no messaging i
 ## Owner workflow without Feishu
 
 - **Settings** (`/app/api/settings`, `/app/api/settings/model`): the model selection (`apiKey` is a boolean — the key is never returned). Saving re-seals the key under `SERVER_KEY`.
-- **Pairing** (`/app/api/pairing`): mints a one-time code (10 minutes) keyed by the client's request id, so a retry gets the same code, and returns the full `npx @iefnaf/sig connect <origin> <code>` command. It is shown only in the machines panel, never in the conversation feed (`private: true` on the outbound row).
+- **Pairing** (`/app/api/pairing`): mints a one-time code (10 minutes) keyed by the client's request id, so a retry gets the same code, and returns the full `npx @nightboats/sig connect <origin> <code>` command. It is shown only in the machines panel, never in the conversation feed (`private: true` on the outbound row).
 - **Revoke** (`/app/api/machines/revoke`): bumps the device epoch and closes the connection with `4403`.
 - **First run**: the page asks for settings (a model key) and then a machine, one notice at a time.
 - **Reports, questions and decisions** are outbound rows on the one local channel (ADR-0003: the row settles with `providerMsgId` = row id; `GET /api/messages` reads the same rows back). The workspace derives its structured view (tone, title, body, note) from the message templates' own markers — the leading 【Thread】 prefix and tone emoji — so the API's flat text and the workspace's cards can never disagree. They exist whether or not a browser is connected; a connected one is nudged. Detail links are not generated inside the workspace: it is the page.

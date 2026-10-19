@@ -514,7 +514,7 @@ export class Dispatcher {
     await this.#deps.sendText(
       [
         "在要接入的那台电脑的终端里运行：",
-        `npx @iefnaf/sig connect ${origin} ${code}`,
+        `npx @nightboats/sig connect ${origin} ${code}`,
         "（配对码 10 分钟内有效，只能使用一次；接好后它会自动上线，直接问我就能看到。）",
       ].join("\n"),
       null,

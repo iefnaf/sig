@@ -10,7 +10,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { defaultExec, type Exec, type ServiceInstaller } from "./service.ts";
 
-export const PACKAGE_NAME = "@iefnaf/sig";
+export const PACKAGE_NAME = "@nightboats/sig";
 
 export interface UpgradeOptions {
   /** Explicit version; default "latest". */

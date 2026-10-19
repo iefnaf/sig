@@ -118,7 +118,7 @@ export async function handleWorkspaceApi(request: Request, url: URL, session: Ap
       const { id } = await readJson(request);
       if (typeof id !== "string" || !REQUEST_ID.test(id)) return json({ error: "bad_request" }, 400);
       const pair = await deps.pairing(id);
-      return json({ ...pair, command: `npx @iefnaf/sig connect ${url.origin} ${pair.code}` });
+      return json({ ...pair, command: `npx @nightboats/sig connect ${url.origin} ${pair.code}` });
     }
     if (url.pathname === "/app/api/settings/model" && deps.saveModel) {
       const { apiKey } = await readJson(request);
