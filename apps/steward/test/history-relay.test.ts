@@ -12,7 +12,6 @@ import {
   FakeConnector,
   configureAndBind,
   connectWeb,
-  mockReset,
   nextClose,
   ownerStub,
   pairFakeConnector,
@@ -87,7 +86,6 @@ function openStream(ws: WebSocket, workerId: string, opts: { maxBytes?: number; 
 
 beforeEach(async () => {
   await resetLedgerState();
-  await mockReset();
   await configureAndBind("ou_owner");
 });
 

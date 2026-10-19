@@ -11,8 +11,6 @@ import {
   FakeConnector,
   configureAndBind,
   messageEvent,
-  mockCalls,
-  mockReset,
   modelRequests,
   llmState,
   ownerStub,
@@ -26,7 +24,6 @@ import {
 
 beforeEach(async () => {
   await resetLedgerState();
-  await mockReset();
   await configureAndBind("ou_owner");
 });
 
@@ -104,7 +101,6 @@ describe("send_to_worker (steward.md §4.3, connector-pi.md §6.2)", () => {
     expect(snap.threads[0]!.timeline.some((e) => e.kind === "intervention" && e.text.includes("改用 pnpm"))).toBe(true);
     expect(snap.threads[0]!.threadId).toBe(threadId);
     fake.close();
-    void (await mockCalls());
   }, 30_000);
 
   it("intent=after maps to follow_up in the reply; idle workers get an immediate prompt", async () => {
@@ -126,7 +122,6 @@ describe("send_to_worker (steward.md §4.3, connector-pi.md §6.2)", () => {
     expect(results.some((r) => r.includes("空闲") && r.includes("立即"))).toBe(true);
     expect(results.some((r) => r.includes("after_current_tools"))).toBe(false);
     fake.close();
-    void (await mockCalls());
   }, 30_000);
 
   it("an event-triggered run cannot send without a verifiable provenanceRef (§7.2)", async () => {
@@ -142,7 +137,6 @@ describe("send_to_worker (steward.md §4.3, connector-pi.md §6.2)", () => {
     expect(results.some((r) => r.includes("refused") && r.includes("provenanceRef"))).toBe(true);
     expect(fake.cmds).toHaveLength(1); // nothing was sent to the connector
     fake.close();
-    void (await mockCalls());
   }, 30_000);
 });
 
@@ -163,7 +157,6 @@ describe("interrupt_worker (steward.md §7.2: basis ∈ {user_explicit, user_rep
     expect(results.some((r) => r.includes("refused") && r.includes("om_nonexistent"))).toBe(true); // bogus ref
     expect(fake.cmds).toHaveLength(1); // only the original start_worker — no interrupt left the DO
     fake.close();
-    void (await mockCalls());
   }, 30_000);
 
   it("an event-triggered interrupt with a real user message id passes the gate", async () => {
@@ -181,7 +174,6 @@ describe("interrupt_worker (steward.md §7.2: basis ∈ {user_explicit, user_rep
     await waitRunsSettled();
     expect((await toolResults()).some((r) => r.includes("已发出中断"))).toBe(true);
     fake.close();
-    void (await mockCalls());
   }, 30_000);
 
   it("blocks inferred/other bases at the hook; a user-explicit basis enqueues the interrupt", async () => {
@@ -210,7 +202,6 @@ describe("interrupt_worker (steward.md §7.2: basis ∈ {user_explicit, user_rep
     expect(results.some((r) => r.includes("已发出中断"))).toBe(true);
     expect((await sentTexts()).some((t) => t.includes("已停下"))).toBe(true);
     fake.close();
-    void (await mockCalls());
   }, 30_000);
 
   it("refuses an unknown worker instead of enqueueing garbage", async () => {
@@ -224,7 +215,6 @@ describe("interrupt_worker (steward.md §7.2: basis ∈ {user_explicit, user_rep
     expect(fake.cmds).toHaveLength(1); // only the original start_worker
     expect((await toolResults()).some((r) => r.includes("refused"))).toBe(true);
     fake.close();
-    void (await mockCalls());
   }, 30_000);
 });
 
@@ -245,7 +235,6 @@ describe("queue_returned events (connector-pi.md §6.2/§11.1)", () => {
     expect(wakeRun!.text).toContain(threadId);
     expect(wakeRun!.text).toContain("未送达");
     fake.close();
-    void (await mockCalls());
   }, 30_000);
 });
 
@@ -290,6 +279,5 @@ describe("the live-equivalent loop: an interrupt flips the Thread to idle within
     await waitWhileOutboundPending();
     expect((await sentTexts()).some((t) => t.includes("已发出停止"))).toBe(true);
     fake.close();
-    void (await mockCalls());
   }, 30_000);
 });

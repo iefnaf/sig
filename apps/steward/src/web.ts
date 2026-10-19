@@ -15,6 +15,7 @@
 // revoke button) are logged to the audit trail like every other management action.
 import type { Ledger, TimelineView, ThreadListEntry } from "./ledger.ts";
 import type { SqlExecutor } from "./schema.ts";
+import { BRAND_HEAD, BRAND_LOCKUP, BRAND_STYLE } from "./brand.ts";
 
 export const LINK_TTL_MS = 15 * 60_000;
 export const SESSION_TTL_MS = 7 * 24 * 60 * 60_000;
@@ -207,12 +208,13 @@ function layout(title: string, active: "threads" | "machines", content: string):
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
-<title>${esc(title)} · Shepherd</title>
+<title>${esc(title)} · Sig</title>
+${BRAND_HEAD}
 <style>
+  ${BRAND_STYLE}
   :root { color-scheme: light dark; }
   body { font: 15px/1.7 -apple-system, "PingFang SC", "Segoe UI", sans-serif; margin: 0; padding: 0 0 48px; }
   header { display: flex; align-items: center; gap: 16px; padding: 10px 16px; border-bottom: 1px solid rgba(127,127,127,.3); position: sticky; top: 0; background: inherit; }
-  header .brand { font-weight: 700; }
   header a { color: inherit; text-decoration: none; opacity: .75; padding: 4px 2px; }
   header a.active { opacity: 1; border-bottom: 2px solid #3370ff; }
   main { max-width: 720px; margin: 0 auto; padding: 0 16px; }
@@ -243,7 +245,7 @@ function layout(title: string, active: "threads" | "machines", content: string):
 </style>
 </head>
 <body>
-<header><span class="brand">Shepherd</span>${nav("/app", "threads", "Threads")}${nav("/app/machines", "machines", "机器")}</header>
+<header>${BRAND_LOCKUP}${nav("/app", "threads", "Threads")}${nav("/app/machines", "machines", "机器")}</header>
 <main>
 ${content}
 </main>
@@ -254,12 +256,14 @@ function loginPromptPage(message: string, status: number): Response {
   const html = `<!doctype html>
 <html lang="zh-CN">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex">
-<title>Shepherd</title>
-<style>body{font:15px/1.7 -apple-system,"PingFang SC","Segoe UI",sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:0 16px}main{max-width:480px}</style>
+<title>Sig</title>
+${BRAND_HEAD}
+<style>${BRAND_STYLE}body{font:15px/1.7 -apple-system,"PingFang SC","Segoe UI",sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:0 16px}main{max-width:480px}</style>
 </head>
 <body><main>
+${BRAND_LOCKUP}
 <p>${esc(message)}</p>
-<p class="hint">在飞书里对总管发 <code>/网页</code>，取一条新的一次性登录链接（15 分钟内有效，只能打开一次）。</p>
+<p class="hint">新的登录链接用 <code>POST /api/login-link</code> 签发（15 分钟内有效，只能打开一次）。</p>
 </main></body></html>`;
   return new Response(html, { status, headers: { "content-type": "text/html; charset=utf-8" } });
 }
@@ -412,7 +416,7 @@ export class WebApp {
 </a>`;
     });
     const content = `<h1>Threads</h1>
-<div class="threads">${rows.length > 0 ? rows.join("\n") : '<p class="empty">还没有任何 Thread。在飞书里发「/派发 &lt;repo&gt; &lt;要做的事&gt;」开始。</p>'}</div>`;
+<div class="threads">${rows.length > 0 ? rows.join("\n") : '<p class="empty">还没有任何 Thread。给 <code>POST /api/messages</code> 发第一条指令开始。</p>'}</div>`;
     return html(layout("Threads", "threads", content));
   }
 
@@ -506,8 +510,8 @@ ${action}
 </div>`;
     });
     const content = `<h1>机器</h1>
-<p class="hint">要添加机器，在飞书里发 <code>/加机器</code>，把返回的命令放到那台机器的终端里运行。</p>
-${rows.length > 0 ? rows.join("\n") : '<p class="empty">还没有配对过机器。在飞书里发「/加机器」开始。</p>'}`;
+<p class="hint">要添加机器，用 <code>POST /api/pairing</code> 取配对命令，放到那台机器的终端里运行。</p>
+${rows.length > 0 ? rows.join("\n") : '<p class="empty">还没有配对过机器。用 POST /api/pairing 取一条配对命令开始。</p>'}`;
     return html(layout("机器", "machines", content));
   }
 

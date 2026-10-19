@@ -65,7 +65,7 @@ describe("POST /pair brute-force lockout (protocol doc §5.2, issue #27)", () =>
 
   beforeEach(async () => {
     // Failure buckets are shared DO state (the lock is the point); start each case clean.
-    await ownerStub().setupState();
+    await ownerStub().channelLogEntries(1);
     await runInDurableObject(ownerStub(), (instance: Steward) => {
       const sql = (instance as unknown as { sql: (s: TemplateStringsArray) => void }).sql.bind(instance);
       sql`DELETE FROM pair_fail`;

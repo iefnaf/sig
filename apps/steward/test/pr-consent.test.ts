@@ -11,7 +11,7 @@ import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi
 import type { ShOutboundRow } from "../src/steward.ts";
 import {
   configureAndBind,
-  mockReset,
+  messageEvent,
   ownerStub,
   pairFakeConnector,
   postEvent,
@@ -24,7 +24,6 @@ import type { FakeConnector } from "./helpers.ts";
 
 beforeEach(async () => {
   await resetLedgerState();
-  await mockReset();
   await configureAndBind("ou_owner");
 });
 
@@ -42,32 +41,14 @@ async function sentCards(): Promise<SentCard[]> {
   return rows.filter((r) => r.kind === "card" && r.status === "sent") as unknown as SentCard[];
 }
 
-function cardActionEvent(cardMsgId: string, action: string, eventId = `evt_card_${crypto.randomUUID().slice(0, 8)}`) {
-  return {
-    schema: "2.0",
-    header: {
-      event_id: eventId,
-      event_type: "card.action.trigger",
-      create_time: String(Date.now()),
-      token: "verify-token",
-      app_id: "cli_test_app",
-    },
-    event: {
-      operator: { open_id: "ou_owner" },
-      action: { value: { action } },
-      context: { open_message_id: cardMsgId },
-    },
-  };
+function cardActionEvent(cardMsgId: string, action: string) {
+  return { cardMsgId, action };
 }
 
 /** Every button of the card (consent buttons carry pr_ actions; 查看详情/打开 PR are URL buttons). */
 function buttonsOf(card: SentCard): Array<{ label?: string; action?: string; url?: string }> {
-  const parsed = JSON.parse(card.payload as string) as { card?: { elements?: Array<{ actions?: Array<Record<string, unknown>> }> } };
-  return (parsed.card?.elements ?? []).flatMap((e) => e.actions ?? []).map((btn) => ({
-    label: (btn.text as { content?: string } | undefined)?.content,
-    action: (btn.value as { action?: string } | undefined)?.action,
-    url: typeof btn.url === "string" ? btn.url : undefined,
-  }));
+  const parsed = JSON.parse(card.payload as string) as { card?: { buttons?: Array<{ label?: string; action?: string; url?: string }> } };
+  return parsed.card?.buttons ?? [];
 }
 
 /** Only the consent gate's [同意]/[先不要] — the details link is a URL button, not an action. */
@@ -110,7 +91,7 @@ async function doneReport(overrides: { git?: Record<string, unknown> } = {}): Pr
     fauxAssistantMessage([fauxToolCall("start_worker", { prompt: "修复登录 bug", repoRef: "repo-a", newTitle: "修复登录 bug", basis: "user_explicit" })], { stopReason: "toolUse" }),
     fauxAssistantMessage([fauxText("已派发。")]),
   );
-  await postEvent({ schema: "2.0", header: { event_id: `evt_dm_${crypto.randomUUID().slice(0, 8)}`, event_type: "im.message.receive_v1", create_time: String(Date.now()), token: "verify-token", app_id: "cli_test_app" }, event: { sender: { sender_id: { open_id: "ou_owner" } }, message: { message_id: `om_${crypto.randomUUID().slice(0, 8)}`, chat_type: "p2p", message_type: "text", content: JSON.stringify({ text: "帮我把 repo-a 里那个登录 bug 修了" }) } } });
+  await postEvent(messageEvent({ text: "帮我把 repo-a 里那个登录 bug 修了" }));
   const [startCmd] = await fake.waitForCmds(1);
   const workerId = String((startCmd!.args as Record<string, unknown>).workerId);
   const threadId = String((startCmd!.args as Record<string, unknown>).threadId);
@@ -149,8 +130,8 @@ describe("done cards carry the consent buttons (AC1)", () => {
     const { card } = await doneReport();
     const buttons = consentButtonsOf(card);
     expect(buttons).toEqual([
-      { label: "同意", action: "pr_approve", url: undefined },
-      { label: "先不要", action: "pr_decline", url: undefined },
+      { label: "同意", action: "pr_approve", primary: true },
+      { label: "先不要", action: "pr_decline" },
     ]);
     expect(card.payload).toContain("shepherd/login-1");
     expect(card.payload).toContain("还没推送");
@@ -214,7 +195,7 @@ describe("[同意] → pr_worker → PR URL back in the chat (AC2)", () => {
     ).then((cards) => cards.find((c) => JSON.stringify(c.payload).includes("pull/7"))!);
     expect(prCard.threadId).toBe(threadId);
     const buttons = buttonsOf(prCard);
-    expect(buttons).toContainEqual({ label: "打开 PR", action: undefined, url: "https://github.com/example/repo-a/pull/7" });
+    expect(buttons).toContainEqual({ label: "打开 PR", url: "https://github.com/example/repo-a/pull/7", primary: true });
     expect(JSON.stringify(prCard.payload)).toContain("PR 已创建");
 
     // The URL is on the consent row, so a repeated click answers honestly (no second PR).
@@ -230,7 +211,7 @@ describe("[同意] → pr_worker → PR URL back in the chat (AC2)", () => {
     const { fake, card } = await doneReport();
     await postEvent(cardActionEvent(card.providerMsgId!, "pr_approve"));
     await waitFor(() => fake.cmds, (c) => c.some((x) => x.kind === "pr_worker"), "first pr_worker");
-    await postEvent(cardActionEvent(card.providerMsgId!, "pr_approve", "evt_card_second"));
+    await postEvent(cardActionEvent(card.providerMsgId!, "pr_approve"));
     await waitWhileOutboundPending();
     expect(fake.cmds.filter((c) => c.kind === "pr_worker")).toHaveLength(1);
     const texts = await sentTexts();
@@ -288,7 +269,7 @@ describe("failures come back as a three-part failure report (AC4)", () => {
       "failure card sent",
     ).then((cards) => cards.find((c) => JSON.stringify(c.payload).includes("推送 / 创建 PR 失败"))!);
     const payload = JSON.stringify(failCard.payload);
-    expect(payload).toContain("red"); // three-part failure tone
+    expect(payload).toContain("❌"); // three-part failure tone
     expect(payload).toContain(needle);
     expect(payload).toContain("再点一次「同意」"); // the retry contract
     expect(failCard.threadId).toBe(threadId);
@@ -307,7 +288,7 @@ describe("failures come back as a three-part failure report (AC4)", () => {
     );
     expect(snap.prConsent.find((c) => c.workerId === workerId)!.failure).toContain(message.slice(0, 20));
 
-    await postEvent(cardActionEvent(card.providerMsgId!, "pr_approve", "evt_card_retry"));
+    await postEvent(cardActionEvent(card.providerMsgId!, "pr_approve"));
     const retry = await waitFor(
       () => fake.cmds.filter((c) => c.kind === "pr_worker").length,
       (n) => n >= 2,
@@ -364,7 +345,7 @@ describe("review round 1 findings", () => {
 
     // The re-tap (retry): fresh cmdId, and its failure must land as a SECOND card — the
     // prfail: dedupe key is attempt-scoped now (review #1's bug: INSERT OR IGNORE swallowed it).
-    await postEvent(cardActionEvent(card.providerMsgId!, "pr_approve", "evt_card_r2"));
+    await postEvent(cardActionEvent(card.providerMsgId!, "pr_approve"));
     const second = await waitFor(
       () => fake.cmds.filter((c) => c.kind === "pr_worker")[1],
       (c) => c !== undefined,
@@ -393,7 +374,7 @@ describe("review round 1 findings", () => {
     expect(snap.prConsent.find((c) => c.workerId === workerId)!.url).toBeNull();
 
     // The wedge is broken: a re-tap retries (fresh attempt) instead of "in flight" forever.
-    await postEvent(cardActionEvent(card.providerMsgId!, "pr_approve", "evt_card_amb2"));
+    await postEvent(cardActionEvent(card.providerMsgId!, "pr_approve"));
     const second = await waitFor(
       () => fake.cmds.filter((c) => c.kind === "pr_worker")[1],
       (c) => c !== undefined,
@@ -505,7 +486,7 @@ describe("review round 1 findings", () => {
     const prCmd = await waitFor(() => fake.cmds.find((c) => c.kind === "pr_worker"), (c) => c !== undefined, "cmd sent")!;
     await fake.emit("pr_created", workerId, { type: "pr_created", cmdId: prCmd!.id, url: "https://github.com/example/repo-a/pull/11", branch: "shepherd/login-1" });
     await waitFor(() => sentCards(), (cs) => cs.some((c) => JSON.stringify(c.payload).includes("pull/11")), "first PR card");
-    await postEvent(cardActionEvent(card2.providerMsgId!, "pr_approve", "evt_card_c2"));
+    await postEvent(cardActionEvent(card2.providerMsgId!, "pr_approve"));
     await waitWhileOutboundPending();
     expect(fake.cmds.filter((c) => c.kind === "pr_worker")).toHaveLength(1);
     const texts = await sentTexts();

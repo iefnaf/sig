@@ -12,7 +12,6 @@ import {
   configureAndBind,
   connect,
   messageEvent,
-  mockReset,
   nextClose,
   ownerDm,
   ownerStub,
@@ -25,7 +24,6 @@ import {
 
 beforeEach(async () => {
   await resetLedgerState();
-  await mockReset();
   await configureAndBind("ou_owner");
   // The /加机器 test redeems a real code through POST /pair; the brute-force lockout's
   // GLOBAL failure bucket (issue #27) survives resetLedgerState and other test files
@@ -71,10 +69,9 @@ describe("report cards carry the one-time 查看详情 link", () => {
 
     const [card] = await sentCards();
     expect(card).toBeDefined();
-    const cardJson = JSON.parse(card!.payload as string) as { card: { elements: unknown[] } };
-    const action = JSON.stringify(cardJson.card.elements);
-    expect(action).toContain("查看详情");
-    const linkUrl = action.match(/https:\/\/example\.com\/link\/(\S+?)"/)![0]!.replace(/"$/, "");
+    const cardJson = JSON.parse(card!.payload as string) as { card: { text: string; buttons: Array<{ label?: string }> } };
+    expect(cardJson.card.buttons.some((b) => b.label === "查看详情")).toBe(true);
+    const linkUrl = cardJson.card.text.match(/https:\/\/example\.com\/link\/\S+/)![0]!;
     expect(linkUrl).toMatch(/^https:\/\/example\.com\/link\/wl1\.t\/t_\w+\.\d+\.[0-9a-f]{32}\.[0-9a-f]{64}$/);
 
     // Opening the link logs in and lands directly on that Thread's timeline.
@@ -110,17 +107,17 @@ describe("report cards carry the one-time 查看详情 link", () => {
     await ownerStub().sweepQuestionFallbackForTest();
     await waitWhileOutboundPending();
     const [card] = await sentCards();
-    const action = JSON.stringify(JSON.parse(card!.payload as string).card.elements);
-    expect(action).toContain("查看详情");
-    expect(action).toMatch(/\/link\/wl1\.t\/t_\w+\./);
+    const msg = JSON.parse(card!.payload as string) as { card: { text: string; buttons: Array<{ label?: string }> } };
+    expect(msg.card.buttons.some((b) => b.label === "查看详情")).toBe(true);
+    expect(msg.card.text).toMatch(/\/link\/wl1\.t\/t_\w+\./);
   });
 });
 
 describe("/加机器: chat-issued pairing (protocol §5.2)", () => {
-  it("replies with npx @iefnaf/shepherd connect <url> <code>, single-use", async () => {
+  it("replies with npx @iefnaf/sig connect <url> <code>, single-use", async () => {
     await ownerDm("/加机器");
     const text = (await sentTexts()).join("\n");
-    const match = text.match(/npx @iefnaf\/shepherd connect (\S+) (\w{8})/);
+    const match = text.match(/npx @iefnaf\/sig connect (\S+) (\w{8})/);
     expect(match).not.toBeNull();
     expect(match![1]).toBe("https://example.com"); // origin learned from the webhook hit
 
@@ -155,7 +152,7 @@ describe("the machine page: online state and revocation (protocol §5.1)", () =>
     expect(html).toContain("在线");
     expect(html).toContain("pi"); // the agent kinds from hello, not [object Object]
     expect(html).toContain("撤销");
-    expect(html).toContain("/加机器");
+    expect(html).toContain("/api/pairing");
 
     // The revoke form carries the per-session csrf token.
     const csrf = html.match(/name="csrf" value="([0-9a-f]{64})"/)![1]!;

@@ -4,7 +4,7 @@
 // (ADR-0001 decision 2) instead of apps/steward/. Local dev/tests pass
 // `--config ../../wrangler.jsonc` from apps/steward.
 //
-// SERVER_KEY, SETUP_TOKEN, and MODEL_KEY are secrets, deliberately NOT declared here: they
+// SERVER_KEY and MODEL_KEY are secrets, deliberately NOT declared here: they
 // are generated at deploy time through the Deploy-to-Cloudflare form (root .dev.vars.example
 // + cloudflare.bindings descriptions in the root package.json) or set manually with
 // `wrangler secret put`. See docs/deploy.md.
@@ -25,6 +25,8 @@
 {
   "name": "shepherd-steward",
   "main": "apps/steward/src/index.ts",
+  // Only the two brand assets are public; index.ts gates every other route.
+  "assets": { "directory": "./public", "binding": "ASSETS", "run_worker_first": true },
   "compatibility_date": "2026-10-10",
   "compatibility_flags": ["nodejs_compat"],
   "durable_objects": {

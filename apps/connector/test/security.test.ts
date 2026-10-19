@@ -9,6 +9,9 @@ import { childEnv, PiAdapter } from "../src/pi-adapter.ts";
 import { fakePiCommand, makeGitRepo, tmpDir, waitFor } from "./helpers.ts";
 
 const POISON: Record<string, string> = {
+  SIG_HOME: "/home/attacker-guess/sig-state",
+  SIG_MACHINE_NAME: "sig-machine",
+  SIG_DEVICE_TOKEN: "sig-secret-token",
   SHEPHERD_HOME: "/home/attacker-guess/.shepherd",
   SHEPHERD_MACHINE_NAME: "mac-studio",
   SHEPHERD_DEVICE_TOKEN: "st1.abcdef12.dev_secret.1.123." + "f".repeat(64),

@@ -7,9 +7,9 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { SELF, runInDurableObject } from "cloudflare:test";
 import {
   configureAndBind,
-  mockReset,
   ownerStub,
   pairFakeConnector,
+  postEvent,
   resetLedgerState,
   waitWhileOutboundPending,
 } from "./helpers.ts";
@@ -37,7 +37,6 @@ async function snapshotWhere(pred: (snap: DebugSnap) => boolean, what: string, t
 
 beforeEach(async () => {
   await resetLedgerState();
-  await mockReset();
   await configureAndBind("ou_owner");
 });
 
@@ -56,27 +55,9 @@ async function askCardOf(cmdId: string): Promise<ShOutboundRow | undefined> {
   return (await ownerStub().outboundRows(30)).find((r) => r.id === `offline:${cmdId}`);
 }
 
-/** Clicks a button on a card (dedup by distinct event ids, like Feishu redeliveries). */
+/** Clicks a button on a message (POST /api/actions; the DO dedups on message+action). */
 async function click(card: ShOutboundRow, action: string): Promise<Response> {
-  return postCardAction(card.providerMsgId!, action);
-}
-
-async function postCardAction(cardMsgId: string, action: string): Promise<Response> {
-  return SELF.fetch("https://example.com/channels/feishu/events", {
-    method: "POST",
-    body: JSON.stringify({
-      schema: "2.0",
-      header: {
-        event_id: `evt_card_${crypto.randomUUID().slice(0, 10)}`,
-        event_type: "card.action.trigger",
-        create_time: String(Date.now()),
-        token: "verify-token",
-        app_id: "cli_test_app",
-      },
-      event: { operator: { open_id: "ou_owner" }, action: { value: { action } }, context: { open_message_id: cardMsgId } },
-    }),
-    headers: { "content-type": "application/json" },
-  });
+  return postEvent({ cardMsgId: card.providerMsgId!, action });
 }
 
 /** Machine A goes offline after registering repo-a; B is online with the same repo. */

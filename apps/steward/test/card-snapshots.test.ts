@@ -1,26 +1,25 @@
-// Card snapshots and card budget (issue #11, spec §7.5–7.6 / steward.md §6.4): the single
-// done-report card and the merged quiet card are stable wire formats — a snapshot change is
-// a deliberate, reviewable edit, never an accident. Pure unit tests: no DO, no LLM.
+// Message snapshots and the merge budget (issue #11, spec §7.5–7.6 / steward.md §6.4): the
+// single done-report message and the merged quiet message are stable formats — a snapshot
+// change is a deliberate, reviewable edit, never an accident. Pure unit tests: no DO, no LLM.
+// ADR-0003: messages are locally rendered text (+ buttons), read back via GET /api/messages.
 import { describe, expect, it } from "vitest";
 import type { ReportRow, WorkerRow } from "../src/ledger.ts";
 import {
-  MERGED_CARD_BUDGET_BYTES,
-  MERGED_TEXT_BUDGET_BYTES,
   MAX_RAW_NEEDS_YOU_BYTES,
+  MERGED_TEXT_BUDGET_BYTES,
   byteLength,
   clipBytes,
   didBullets,
   mergeQuietOutbound,
+  mergedSectionsText,
   mergedSendUuid,
   needsYouOf,
-  renderMergedCard,
   renderReportCard,
   reportCardFor,
   sectionFromPayload,
   toneOfReport,
   type QuietSection,
 } from "../src/report-template.ts";
-import { MAX_SERIALIZED_BYTES } from "../src/channel/feishu.ts";
 
 function report(overrides: Partial<ReportRow> = {}): ReportRow {
   return {
@@ -36,7 +35,7 @@ function report(overrides: Partial<ReportRow> = {}): ReportRow {
     question: null,
     next: null,
     // pushed: an ORDINARY completion (nothing left to ask) — issue #21 gives unpushed write
-    // completions their own consent-card snapshot below.
+    // completions their own consent-message snapshot below.
     git: { branch: "shepherd/login-1", base: "main", ahead: 2, dirty: 0, filesChanged: 2, insertions: 30, deletions: 4, pushed: true },
     ...overrides,
   };
@@ -61,8 +60,8 @@ const worker: WorkerRow = {
   createdAt: 1,
 };
 
-describe("card snapshots (issue #11)", () => {
-  it("single done report: the fixed three-part card", () => {
+describe("message snapshots (issue #11)", () => {
+  it("single done report: the fixed three-part message", () => {
     const done = report({ next: "跑一遍全量测试" });
     const card = reportCardFor(done, worker, "mac-studio", "修复登录 bug", "https://example.com/link/wl1.t/t_test.1.0abc");
     expect(card).toMatchSnapshot();
@@ -74,7 +73,7 @@ describe("card snapshots (issue #11)", () => {
     expect(card).toMatchSnapshot();
   });
 
-  it("merged done reports: one card, each Thread keeps its three parts", () => {
+  it("merged done reports: one message, each Thread keeps its three parts", () => {
     const first = report();
     const second = report({
       workerId: "w_two",
@@ -109,11 +108,11 @@ describe("card snapshots (issue #11)", () => {
         detailsUrl: "https://example.com/link/wl1.t/t_two.1.0def",
       },
     ];
-    expect(renderMergedCard(sections)).toMatchSnapshot();
+    expect(mergedSectionsText(sections)).toMatchSnapshot();
   });
 });
 
-describe("card size budget (issue #11: cards stay under 30 KB)", () => {
+describe("message size budget (issue #11: one merged message stays readable)", () => {
   const fatSection = (i: number): QuietSection => ({
     kind: "report",
     tone: "success",
@@ -125,26 +124,20 @@ describe("card size budget (issue #11: cards stay under 30 KB)", () => {
     footer: `Thread「事项标题第 ${i} 号」 · pi @ mac-studio · 引用回复可继续这个 Thread`,
   });
 
-  it("keeps a merged card under the transport cap and counts what did not fit", () => {
-    const card = renderMergedCard(Array.from({ length: 40 }, (_, i) => fatSection(i + 1)));
-    const bytes = byteLength(JSON.stringify(card));
-    expect(bytes).toBeLessThanOrEqual(MERGED_CARD_BUDGET_BYTES);
-    expect(bytes).toBeLessThan(MAX_SERIALIZED_BYTES);
-    const json = JSON.stringify(card);
-    expect(json).toContain("另有"); // overflow is COUNTED in the footer, never silently dropped
-    expect(json).toContain("合并汇报：40 件事"); // the header still tells the whole truth
+  it("keeps a merged message under the budget and counts what did not fit", () => {
+    const text = mergedSectionsText(Array.from({ length: 40 }, (_, i) => fatSection(i + 1)));
+    expect(byteLength(text)).toBeLessThanOrEqual(MERGED_TEXT_BUDGET_BYTES + 512); // head + tail allowance
+    expect(text).toContain("另有"); // overflow is COUNTED in the tail, never silently dropped
+    expect(text).toContain("合并汇报：40 件事"); // the head still tells the whole truth
   });
 
   it("text sections count against the SAME budget as report sections (PR #58 review)", () => {
     // A full notes-maintenance bookkeeping text (~4 KB) plus budget-filling report sections
-    // used to ride OUTSIDE the budget and push the card past the transport cap.
+    // used to ride OUTSIDE the budget and bloat the merged message.
     const fatText = { kind: "text" as const, text: `记忆整理：${"一条已归档的记忆。".repeat(160)}` };
-    const card = renderMergedCard([fatText, ...Array.from({ length: 40 }, (_, i) => fatSection(i + 1))]);
-    const bytes = byteLength(JSON.stringify(card));
-    expect(bytes).toBeLessThanOrEqual(MERGED_CARD_BUDGET_BYTES);
-    expect(bytes).toBeLessThan(MAX_SERIALIZED_BYTES);
-    const json = JSON.stringify(card);
-    expect(json).toContain("另有"); // the text div that did not fit is counted too
+    const text = mergedSectionsText([fatText, ...Array.from({ length: 40 }, (_, i) => fatSection(i + 1))]);
+    expect(byteLength(text)).toBeLessThanOrEqual(MERGED_TEXT_BUDGET_BYTES + 512);
+    expect(text).toContain("另有"); // the text block that did not fit is counted too
   });
 
   it("a merged pure-text group is budgeted — merging never aggregates past the cap (PR #58 review)", () => {
@@ -153,9 +146,7 @@ describe("card size budget (issue #11: cards stay under 30 KB)", () => {
       text: `第 ${i} 条整理记录：${"细节".repeat(300)}`, // ~1.8 KB each — 30 × 1.8 KB ≫ 28 KB
     }));
     const merged = mergeQuietOutbound(texts);
-    expect(merged.kind).toBe("text");
-    if (merged.kind !== "text") return;
-    expect(byteLength(JSON.stringify({ text: merged.text }))).toBeLessThanOrEqual(MERGED_TEXT_BUDGET_BYTES);
+    expect(byteLength(merged.text)).toBeLessThanOrEqual(MERGED_TEXT_BUDGET_BYTES);
     expect(merged.text).toContain("另有"); // the unlisted texts are counted, never silently dropped
     expect(merged.text).toContain("第 0 条"); // arrival order kept
   });
@@ -163,12 +154,12 @@ describe("card size budget (issue #11: cards stay under 30 KB)", () => {
   it("mergedSendUuid is membership-scoped: stable across retries and reorderings, fresh for a joiner", () => {
     const a = ["01AAA", "01BBB", "01CCC"];
     expect(mergedSendUuid(a)).toBe(mergedSendUuid([...a].reverse())); // membership, not order
-    expect(mergedSendUuid(a)).toBe(mergedSendUuid([...a])); // same members → same uuid on retry
-    expect(mergedSendUuid(a)).not.toBe(mergedSendUuid([...a, "01DDD"])); // a late joiner → fresh uuid
-    expect(mergedSendUuid(a).length).toBeLessThanOrEqual(64); // Feishu uuid limit
+    expect(mergedSendUuid(a)).toBe(mergedSendUuid([...a])); // same members → same id on retry
+    expect(mergedSendUuid(a)).not.toBe(mergedSendUuid([...a, "01DDD"])); // a late joiner → fresh id
+    expect(mergedSendUuid(a).length).toBeLessThanOrEqual(64);
   });
 
-  it("a single card with a pathological verbatim question is clipped inside the cap", () => {
+  it("a single message with a pathological verbatim question is clipped inside the cap", () => {
     const longQuestion = "这是一个非常长的追问，".repeat(4_000); // ~52 KB of CJK
     const card = renderReportCard({
       tone: "attention",
@@ -179,57 +170,48 @@ describe("card size budget (issue #11: cards stay under 30 KB)", () => {
       threadTitle: "长问题",
       footer: "f",
     });
-    expect(byteLength(JSON.stringify(card))).toBeLessThan(MAX_SERIALIZED_BYTES);
+    expect(byteLength(card.text)).toBeLessThanOrEqual(MAX_RAW_NEEDS_YOU_BYTES + 512);
     // The clip keeps a marker so nobody mistakes it for the full question.
-    expect(JSON.stringify(card)).toContain("…");
+    expect(card.text).toContain("…");
     expect(clipBytes(longQuestion, MAX_RAW_NEEDS_YOU_BYTES).endsWith("…")).toBe(true);
     expect(clipBytes("短问题", MAX_RAW_NEEDS_YOU_BYTES)).toBe("短问题"); // short text untouched
   });
 
-  it("quiet texts merge into one text; anything report-shaped becomes a card", () => {
+  it("quiet texts merge into one text; anything report-shaped becomes a merged report message", () => {
     const texts = mergeQuietOutbound([
       { kind: "text", text: "第一条整理完成。" },
       { kind: "text", text: "第二条整理完成。" },
     ]);
-    expect(texts).toEqual({ kind: "text", text: "第一条整理完成。\n\n第二条整理完成。" });
+    expect(texts).toEqual({ text: "第一条整理完成。\n\n第二条整理完成。" });
 
-    const card = mergeQuietOutbound([
+    const merged = mergeQuietOutbound([
       { kind: "text", text: "整理完成。" },
       { kind: "report", tone: "success", conclusion: "修好了", did: ["a.ts"], threadTitle: "修复登录 bug" },
     ]);
-    expect(card.kind).toBe("card");
-    expect(JSON.stringify(card)).toContain("修复登录 bug");
+    expect(merged.text).toContain("合并汇报");
+    expect(merged.text).toContain("修复登录 bug");
   });
 
   it("the merged tone is the worst of the sections — one glance still says if anything broke", () => {
-    const green = renderMergedCard([
+    const warn = mergedSectionsText([
       { kind: "report", tone: "success", conclusion: "a", did: [], threadTitle: "A" },
       { kind: "report", tone: "attention", conclusion: "b", did: [], threadTitle: "B" },
     ]);
-    expect(JSON.stringify(green.header)).toContain("orange");
-    const red = renderMergedCard([
+    expect(warn).toContain("⚠️ 合并汇报");
+    const red = mergedSectionsText([
       { kind: "report", tone: "success", conclusion: "a", did: [], threadTitle: "A" },
       { kind: "report", tone: "failure", conclusion: "b", did: [], threadTitle: "B" },
     ]);
-    expect(JSON.stringify(red.header)).toContain("red");
+    expect(red).toContain("❌ 合并汇报");
   });
 
-  it("sectionFromPayload: the stored part wins; text rows pass through; a partless card degrades to its texts", () => {
+  it("sectionFromPayload: the stored part wins; text rows pass through; a partless card degrades to its text", () => {
     const part = { kind: "report" as const, tone: "success" as const, conclusion: "c", did: ["d"], threadTitle: "T" };
     expect(sectionFromPayload({ part })).toEqual(part);
     expect(sectionFromPayload({ text: "一条普通文本" })).toEqual({ kind: "text", text: "一条普通文本" });
-    // An unexpected quiet card (no part written at enqueue time) still merges: its header
-    // title and markdown bodies fold into a text section instead of blocking the merge.
-    const section = sectionFromPayload({
-      card: {
-        header: { title: { content: "✅ 某事完成" } },
-        elements: [
-          { tag: "div", text: { tag: "lark_md", content: "- 改了 a.ts" } },
-          { tag: "hr" },
-          { tag: "action", actions: [{ tag: "button", text: { tag: "plain_text", content: "查看详情" } }] },
-        ],
-      },
-    });
+    // An unexpected quiet card (no part written at enqueue time) still merges: its rendered
+    // text folds into a text section instead of blocking the merge.
+    const section = sectionFromPayload({ card: { text: "✅ 某事完成\n- 改了 a.ts" } });
     expect(section).toEqual({ kind: "text", text: "✅ 某事完成\n- 改了 a.ts" });
     expect(sectionFromPayload({})).toBeNull();
   });

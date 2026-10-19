@@ -1,5 +1,11 @@
 # Design: the steward (Durable Object internals)
 
+> **Status note (ADR-0003):** the Feishu channel this design describes — QR onboarding,
+> the webhook inbound, cards — is removed for now. The owner talks to the deployment through
+> the SERVER_KEY-gated `/api/*` routes; outbound rows render locally as text + buttons. The
+> rest of this document (ledger, routing, routines, questions) still describes the system.
+
+
 Status: draft v0.1. Based on: the [product spec](../spec.md), the [connector–DO protocol](connector-do-protocol.md), and [protocol spike field tests](../research/do-protocol-spike.md).
 
 This document designs the half that lives inside the Durable Object: **the memory module, routing, Thread management, event processing, notification policy, proactive behavior, and how the steward (the LLM) uses them**. The connector side is in [connector-pi.md](connector-pi.md); the transport protocol is in [connector-do-protocol.md](connector-do-protocol.md).
@@ -18,7 +24,7 @@ This document designs the half that lives inside the Durable Object: **the memor
  Feishu / web / connectors              (remaining layers: see the protocol and connector designs)
         │
  ┌──────▼───────────────────────────────────────────────────────────────────────────────┐
- │ Shepherd DO (singleton "owner", an Agents SDK Agent)                                   │
+ │ Sig DO (singleton "owner", an Agents SDK Agent)                                        │
  │                                                                                        │
  │  Channel adapters        Protocol gateway             Web read model                   │
  │  (dedup in, send out)    (connector/browser, outbox)  (timeline, memory page)          │
@@ -35,7 +41,7 @@ This document designs the half that lives inside the Durable Object: **the memor
  │  │   Notes                              │       └────────────────────────────────────┘ │
  │  │   retrieval / forgetting / summaries │                                              │
  │  └──────────────────────────────────────┘                                              │
- │          one shared SQLite (Shepherd's tables + pi-durable's own tables)               │
+ │          one shared SQLite (Sig's tables + pi-durable's own tables)                    │
  └──────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -364,7 +370,7 @@ For `unsafe` tools the command ID is taken from the tool task ID: `cmdId = "tool
 
 (The actual text is written at implementation time; these are the rules it must contain.)
 
-1. You are Shepherd's steward: you never write code yourself; you only dispatch and remember.
+1. You are Sig's steward: you never write code yourself; you only dispatch and remember.
 2. Input starting with `⟦` is not something the user said — it is a system event. In event-triggered runs, **do not emit user-facing text**: call `notify_user` when the user must be notified, `no_action` when there is nothing to do.
 3. Read the situation brief before every action; when routing is uncertain you must `ask_user` — never guess.
 4. Reports have exactly three parts, in a fixed format, kept short.

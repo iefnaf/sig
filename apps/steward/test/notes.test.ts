@@ -14,7 +14,6 @@ import {
   configureAndBind,
   connectAndHello,
   messageEvent,
-  mockReset,
   modelRequests,
   ownerStub,
   pairDevice,
@@ -24,8 +23,6 @@ import {
   scriptModel,
   waitRunsSettled,
   waitWhileOutboundPending,
-  TEST_APP_ID,
-  TEST_VERIFY_TOKEN,
 } from "./helpers.ts";
 
 // The DO-side surface the unit tests reach through (private fields are typed away, the same
@@ -38,7 +35,7 @@ async function inNotesDo(fn: (n: Notes, ledger: Ledger, sql: RawSql) => void | P
   const stub = env.Steward.get(id);
   // An RPC first (helpers.ts's pattern): it flows through the SDK lifecycle → onStart() →
   // migrations. runInDurableObject on a cold DO would find no sh_* tables yet.
-  await stub.setupState();
+  await stub.channelLogEntries(1);
   await runInDurableObject(stub, (instance: Steward) => {
     const ledger = (instance as unknown as { ledger: Ledger }).ledger;
     const sql = (instance as unknown as { sql: RawSql }).sql.bind(instance) as unknown as RawSql;
@@ -577,7 +574,6 @@ describe("notes unit: context and the resident section", () => {
 
 beforeEach(async () => {
   await resetLedgerState();
-  await mockReset();
   await configureAndBind("ou_owner");
 });
 
@@ -1356,11 +1352,7 @@ describe("notes daily maintenance: the alarm, the ask, the reports (issue #19)",
     expect((await ownerStub().debugSnapshot()).notes.find((n) => n.noteId === noteId)?.layer).toBe("resident");
 
     // 归档: sinks to the archive, logged, and the reply confirms it is searchable.
-    await postEvent({
-      schema: "2.0",
-      header: { event_id: `evt_na_${crypto.randomUUID().slice(0, 8)}`, event_type: "card.action.trigger", create_time: String(Date.now()), token: TEST_VERIFY_TOKEN, app_id: TEST_APP_ID },
-      event: { operator: { open_id: "ou_owner" }, action: { value: { action: "note_archive" } }, context: { open_message_id: ask!.providerMsgId } },
-    });
+    await postEvent({ cardMsgId: ask!.providerMsgId, action: "note_archive" });
     await waitForSentContaining("已归档");
     expect((await ownerStub().debugSnapshot()).notes.find((n) => n.noteId === noteId)?.layer).toBe("archive");
   });
@@ -1372,11 +1364,7 @@ describe("notes daily maintenance: the alarm, the ask, the reports (issue #19)",
     const ask = rows.find((r) => r.id.startsWith(`noteask:${noteId}:`) && r.kind === "card");
     expect(ask).toBeDefined();
 
-    await postEvent({
-      schema: "2.0",
-      header: { event_id: `evt_nk_${crypto.randomUUID().slice(0, 8)}`, event_type: "card.action.trigger", create_time: String(Date.now()), token: TEST_VERIFY_TOKEN, app_id: TEST_APP_ID },
-      event: { operator: { open_id: "ou_owner" }, action: { value: { action: "note_keep" } }, context: { open_message_id: ask!.providerMsgId } },
-    });
+    await postEvent({ cardMsgId: ask!.providerMsgId, action: "note_keep" });
     await waitForSentContaining("保留这条记忆");
     const note = (await ownerStub().debugSnapshot()).notes.find((n) => n.noteId === noteId);
     expect(note).toMatchObject({ layer: "resident", pinned: false });
@@ -1455,11 +1443,7 @@ describe("notes daily maintenance: the alarm, the ask, the reports (issue #19)",
         UPDATE sh_note SET layer = 'archive' WHERE noteId = ${noteId}
       `;
     });
-    await postEvent({
-      schema: "2.0",
-      header: { event_id: `evt_nk2_${crypto.randomUUID().slice(0, 8)}`, event_type: "card.action.trigger", create_time: String(Date.now()), token: TEST_VERIFY_TOKEN, app_id: TEST_APP_ID },
-      event: { operator: { open_id: "ou_owner" }, action: { value: { action: "note_keep" } }, context: { open_message_id: ask.providerMsgId } },
-    });
+    await postEvent({ cardMsgId: ask.providerMsgId, action: "note_keep" });
     await waitForSentContaining("已经不在常驻层");
     const note = (await ownerStub().debugSnapshot()).notes.find((n) => n.noteId === noteId)!;
     expect(note.layer).toBe("archive");

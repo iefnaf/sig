@@ -14,7 +14,6 @@ import {
   configureAndBind,
   llmState,
   messageEvent,
-  mockReset,
   ownerStub,
   pairFakeConnector,
   postEvent,
@@ -31,7 +30,6 @@ import type { Ledger } from "../src/ledger.ts";
 
 beforeEach(async () => {
   await resetLedgerState();
-  await mockReset();
   await configureAndBind("ou_owner");
   await ownerStub().setBudgetForTest(undefined); // the deploy config (default $1) again
   await ownerStub().resetBudgetForTest(); // every test starts from a virgin counter
