@@ -53,6 +53,7 @@ const COST = {
   "ui-session.test.ts": 4,
   "ui-modules.test.ts": 4,
   "workspace-stream.test.ts": 12,
+  "verify-sweep-grid.test.ts": 7,
 };
 const DEFAULT_COST = 3;
 
