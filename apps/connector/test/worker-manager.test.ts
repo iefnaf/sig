@@ -2,6 +2,7 @@ import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { WorkerManager, type StartWorkerArgs } from "../src/worker-manager.ts";
+import { VERSION } from "../src/version.ts";
 import { LocalStore } from "../src/store.ts";
 import { EventLog } from "../src/events.ts";
 import { isLockHeld, lockPath } from "../src/locks.ts";
@@ -361,8 +362,8 @@ describe("WorkerManager over fake-pi (connector-pi.md §4–§8, §11)", () => {
     store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
     await manager.startWorker("cmd-assets-1", args());
     await waitFor(() => settled(), 15_000, "settled event");
-    const ext = join(stateDir, "ext", "shepherd-pi-0.1.0.ts");
-    const prompt = join(stateDir, "prompts", "worker-0.1.0.md");
+    const ext = join(stateDir, "ext", `shepherd-pi-${VERSION}.ts`);
+    const prompt = join(stateDir, "prompts", `worker-${VERSION}.md`);
     expect(existsSync(ext)).toBe(true);
     expect(existsSync(prompt)).toBe(true);
     expect(readFileSync(ext, "utf8")).toContain("shepherd.report-reminder");
