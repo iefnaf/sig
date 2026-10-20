@@ -23,6 +23,8 @@ export interface ConnectorAppOptions {
   stateDir: string;
   machineName?: string;
   WebSocketImpl?: ClientOptions["WebSocketImpl"];
+  /** Per-URL `ws` proxy agent (issue #68), forwarded to the client. */
+  wsAgent?: ClientOptions["wsAgent"];
   /** Every agent to drive (issue #17); defaults to pi plus Claude Code when installed.
    *  Overrides `adapter` when both are given. */
   adapters?: AgentAdapter[];
@@ -101,6 +103,7 @@ export class ConnectorApp {
       store: options.store,
       machineName: options.machineName,
       WebSocketImpl: options.WebSocketImpl,
+      wsAgent: options.wsAgent,
       handleCommand: (cmd: CmdMessage) => this.runCommand(cmd),
       snapshot: () => this.snapshot(),
       workersSnapshot: () => this.workersSnapshot(),

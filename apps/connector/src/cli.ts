@@ -3,8 +3,12 @@
 //
 //   connect <url> <code>   redeem a pairing code, then install + start the background
 //                          service (launchd agent on macOS, systemd --user unit on Linux);
-//                          --foreground runs the daemon in this terminal instead
+//                          --foreground runs the daemon in this terminal instead;
+//                          --proxy <url> routes fetch/ws/git/workers through an HTTP
+//                          proxy (issue #68) and stores it for the service
 //   status                 service state, pairing, workers, installed assets
+//   proxy [<url>|--clear]  show / set / clear the stored proxy (loopback never proxied)
+//   doctor                 pairing, service, proxy, and reachability diagnosis
 //   logs [-n N] [name]     tail ~/.shepherd/logs/<name> (default connector.log)
 //   start | stop | restart control the background service (stop also disables start-at-login)
 //   uninstall              stop the service and remove its unit (keeps ~/.shepherd data)
@@ -22,10 +26,19 @@ import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { Agent, EnvHttpProxyAgent } from "undici";
 import { runDaemon } from "./daemon.ts";
 import { installAssets } from "./install.ts";
 import { tailFile } from "./logger.ts";
 import { connect } from "./pairing.ts";
+import {
+  DEFAULT_NO_PROXY,
+  applyProxy,
+  normalizeProxyConfig,
+  proxyLogFields,
+  resolveProxyConfig,
+  type ProxyConfig,
+} from "./proxy.ts";
 import { getServiceInstaller, SHEPHERD_LABEL, type ServiceInstaller, type ServiceSpec } from "./service.ts";
 import { isWorkspaceMode, LocalStore, WORKSPACE_MODES } from "./store.ts";
 import { defaultBranch, repoTopLevel } from "./worktree.ts";
@@ -50,8 +63,15 @@ export function binEntryPath(): string {
 const USAGE = `sig ${VERSION} — the Sig connector
 
 usage:
-  sig connect <url> <code> [--foreground]   pair and install the background service
+  sig connect <url> <code> [--proxy <url>] [--foreground]
+                                          pair and install the background service; --proxy
+                                          routes both channels through an HTTP proxy
+                                          (issue #68; also captured from HTTPS_PROXY)
   sig status                                 service, pairing, workers, assets
+  sig proxy [<url> | --clear] [--no-proxy <list>]
+                                          show / set / clear the stored proxy (no_proxy
+                                          bypasses hosts; loopback always bypassed)
+  sig doctor                                 pairing, service, proxy, and reachability check
   sig logs [-n <lines>] [name]               tail ~/.shepherd/logs (default connector.log)
   sig start | stop | restart                 control the background service
   sig uninstall                              remove the service (keeps ~/.shepherd data)
@@ -64,6 +84,7 @@ usage:
 environment:
   SIG_HOME         state directory (default ~/.shepherd, preserved across the rename)
   SIG_MACHINE_NAME machine name reported to the steward
+  HTTPS_PROXY      captured into the stored proxy by 'sig connect' when no --proxy is given
   SHEPHERD_HOME / SHEPHERD_MACHINE_NAME remain supported as fallback aliases`;
 
 function usage(code = 2): never {
@@ -125,6 +146,10 @@ async function main(argv: string[]): Promise<void> {
       return connectCommand(rest);
     case "status":
       return statusCommand();
+    case "proxy":
+      return proxyCommand(rest);
+    case "doctor":
+      return doctorCommand();
     case "logs":
       return logsCommand(rest);
     case "start":
@@ -149,9 +174,11 @@ async function main(argv: string[]): Promise<void> {
 // --- connect ---------------------------------------------------------------------------------
 
 async function connectCommand(argv: string[]): Promise<void> {
-  const foreground = argv.includes("--foreground");
-  const [url, code] = argv.filter((a) => a !== "--foreground");
+  const { value: proxyFlag, rest: afterProxy } = takeFlag(argv, "--proxy");
+  const foreground = afterProxy.includes("--foreground");
+  const [url, code] = afterProxy.filter((a) => a !== "--foreground");
   if (!url || !code) usage();
+  if (proxyFlag !== undefined && !proxyFlag) fail("--proxy needs a value, e.g. --proxy http://127.0.0.1:7890");
   const dir = stateDir();
   // A non-default state directory must stop before anything else: the launchd/systemd unit
   // is shared machine state (fixed label), so installing from a private state directory
@@ -163,8 +190,22 @@ async function connectCommand(argv: string[]): Promise<void> {
   }
   const machineName = process.env.SIG_MACHINE_NAME ?? process.env.SHEPHERD_MACHINE_NAME ?? hostname();
 
-  // 1. Pair (protocol §5.2): redeem the code once, persist credentials in the LocalStore.
+  // 1. Proxy (issue #68), resolved before pairing so the /pair fetch itself goes through
+  //    it. An explicit --proxy wins; a stored config is kept; otherwise the shell's
+  //    HTTPS_PROXY is captured into storage — the background service never depends on an
+  //    inherited environment. Git children and pi workers follow via process.env.
   const store = new LocalStore(join(dir, "connector.sqlite"));
+  const resolvedProxy = resolveProxyConfig({ flag: proxyFlag, stored: store.getProxyConfig(), env: process.env });
+  if (resolvedProxy.config) {
+    applyProxy(resolvedProxy.config);
+    store.setProxyConfig(resolvedProxy.config);
+    const fields = proxyLogFields(resolvedProxy.config);
+    console.log(
+      `proxy: ${fields.proxy} (no_proxy: ${fields.noProxy}, from ${resolvedProxy.source}) — stored; the service, git, and workers inherit it`,
+    );
+  }
+
+  // 2. Pair (protocol §5.2): redeem the code once, persist credentials in the LocalStore.
   let deviceId: string;
   try {
     ({ deviceId } = await connect(url, code, machineName, { store }));
@@ -212,6 +253,161 @@ async function connectCommand(argv: string[]): Promise<void> {
 }
 
 // --- status / logs ---------------------------------------------------------------------------
+
+// --- proxy / doctor (issue #68) ---------------------------------------------------------------
+
+/** `sig proxy [url] | --clear [--no-proxy <list>]`: show, set, or clear the stored proxy.
+ *  The running service picks the change up on its next start (`sig restart`). */
+async function proxyCommand(argv: string[]): Promise<void> {
+  const { value: noProxyFlag, rest: afterNoProxy } = takeFlag(argv, "--no-proxy");
+  const clear = afterNoProxy.includes("--clear");
+  const positional = afterNoProxy.filter((a) => !a.startsWith("--"));
+  if (clear && positional.length > 0) usage();
+  if (positional.length > 1) usage();
+  if (!clear && positional.length === 0 && noProxyFlag !== undefined) usage();
+  const dbPath = join(stateDir(), "connector.sqlite");
+  if (!existsSync(dbPath)) {
+    if (positional.length === 0 && !clear) {
+      console.log("proxy: none (not paired yet)");
+      return;
+    }
+    fail("not paired yet — pair with `sig connect <url> <code>` first");
+  }
+  const store = new LocalStore(dbPath);
+  try {
+    if (clear) {
+      store.clearProxyConfig();
+      console.log("proxy: cleared");
+    } else if (positional[0]) {
+      const config = normalizeProxyConfig(positional[0], noProxyFlag);
+      store.setProxyConfig(config);
+      const fields = proxyLogFields(config);
+      console.log(`proxy: ${fields.proxy} (no_proxy: ${fields.noProxy}) stored`);
+    } else {
+      const config = store.getProxyConfig();
+      if (config) {
+        const fields = proxyLogFields(config);
+        console.log(`proxy: ${fields.proxy} (no_proxy: ${fields.noProxy})`);
+      } else {
+        console.log("proxy: none");
+      }
+    }
+  } finally {
+    store.close();
+  }
+  await noteServiceRestart();
+}
+
+/** One-line reminder when the background service is up: it re-reads the proxy on start. */
+async function noteServiceRestart(): Promise<void> {
+  try {
+    const installer = getServiceInstaller(serviceSpec(binEntryPath()));
+    if (!installer) return;
+    const status = await installer.status();
+    if (status.installed && status.running) console.log("note: run `sig restart` for the running service to pick this up");
+  } catch {
+    // Service state is a nicety here, never a failure of the command itself.
+  }
+}
+
+/** `sig doctor`: pairing, service, proxy, and reachability of the steward — direct vs via
+ *  the configured proxy — with the next action spelled out. Exits non-zero when no path
+ *  to the steward works. */
+async function doctorCommand(): Promise<void> {
+  let healthy = true;
+  console.log(`sig ${VERSION} · node ${process.version} · ${process.platform}/${process.arch}`);
+
+  const [major, minor] = process.versions.node.split(".").map(Number) as [number, number, ...number[]];
+  const nodeOk = major > 22 || (major === 22 && minor >= 18);
+  console.log(`node ≥ 22.18:        ${nodeOk ? "ok" : "FAIL — upgrade Node"}`);
+  if (!nodeOk) healthy = false;
+
+  const dbPath = join(stateDir(), "connector.sqlite");
+  let serverUrl: string | null = null;
+  let config: ProxyConfig | null = null;
+  if (!existsSync(dbPath)) {
+    console.log("paired:             not paired — `sig connect <url> <code>`");
+    healthy = false;
+  } else {
+    const store = new LocalStore(dbPath);
+    try {
+      const credentials = store.getCredentials();
+      if (!credentials) {
+        console.log("paired:             no credentials — `sig connect <url> <code>`");
+        healthy = false;
+      } else {
+        serverUrl = credentials.serverUrl;
+        console.log(`paired:             ${credentials.deviceId} → ${credentials.serverUrl}`);
+      }
+      config = store.getProxyConfig();
+    } finally {
+      store.close();
+    }
+  }
+
+  try {
+    const installer = getServiceInstaller(serviceSpec(binEntryPath()));
+    if (installer) {
+      const status = await installer.status();
+      const detail = status.installed
+        ? status.running
+          ? `running${status.pid ? ` (pid ${status.pid})` : ""}`
+          : "installed, not running — `sig start`"
+        : "not installed";
+      console.log(`service:            ${detail} (${installer.kind})`);
+    } else {
+      console.log("service:            not supported on this platform — use `sig connect --foreground`");
+    }
+  } catch (err) {
+    console.log(`service:            unknown (${err instanceof Error ? err.message : String(err)})`);
+  }
+
+  if (config) {
+    const fields = proxyLogFields(config);
+    console.log(`proxy:              ${fields.proxy} (no_proxy: ${fields.noProxy})`);
+  } else {
+    console.log("proxy:              none");
+  }
+
+  if (serverUrl) {
+    // Any HTTP response proves the path (401 is the expected unauthenticated gate).
+    const probe = async (dispatcher: unknown): Promise<{ ok: boolean; detail: string }> => {
+      try {
+        const res = await fetch(`${serverUrl}/app`, {
+          dispatcher,
+          signal: AbortSignal.timeout(8000),
+        } as RequestInit & { dispatcher?: unknown });
+        return { ok: true, detail: `HTTP ${res.status}` };
+      } catch (err) {
+        const cause = (err as { cause?: { code?: string } })?.cause?.code;
+        return { ok: false, detail: cause ?? (err instanceof Error ? err.message : String(err)) };
+      }
+    };
+    // A fresh Agent bypasses any active global dispatcher — the direct probe must be direct.
+    const direct = await probe(new Agent({ connect: { timeout: 5000 } }));
+    console.log(`reach direct:       ${direct.ok ? "ok" : "FAIL"} (${direct.detail})`);
+    let viaProxy: { ok: boolean; detail: string } | null = null;
+    if (config) {
+      viaProxy = await probe(
+        new EnvHttpProxyAgent({ httpProxy: config.url, httpsProxy: config.url, noProxy: config.noProxy?.trim() || DEFAULT_NO_PROXY }),
+      );
+      console.log(`reach via proxy:    ${viaProxy.ok ? "ok" : "FAIL"} (${viaProxy.detail})`);
+    }
+    if (direct.ok) {
+      console.log("the steward answers directly — the proxy is optional");
+    } else if (viaProxy?.ok) {
+      console.log("direct is blocked but the configured proxy works — expected on filtered networks");
+    } else if (!config) {
+      healthy = false;
+      console.log(`cannot reach ${serverUrl} directly and no proxy is configured — on filtered networks: sig proxy http://127.0.0.1:7890`);
+    } else {
+      healthy = false;
+      console.log("neither direct nor the configured proxy reaches the steward — check the proxy client is running and its port");
+    }
+  }
+
+  process.exitCode = healthy ? 0 : 1;
+}
 
 async function statusCommand(): Promise<void> {
   const dir = stateDir();

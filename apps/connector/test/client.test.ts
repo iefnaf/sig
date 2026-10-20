@@ -86,6 +86,27 @@ describe("ConnectorClient", () => {
     expect(hello.connEpoch).toBe(1);
   });
 
+  it("passes the ws proxy agent for proxied targets and none for bypassed ones (issue #68)", () => {
+    const agent = {} as never; // opaque token: the wiring, not the agent, is under test
+    const proxied = new ConnectorClient({
+      store,
+      WebSocketImpl: FakeWebSocket as never,
+      wsAgent: (url) => (url.startsWith("wss://example.com") ? agent : undefined),
+    });
+    proxied.start();
+    const withAgent = FakeWebSocket.instances.at(-1)!;
+    expect((withAgent.options as { agent?: unknown }).agent).toBe(agent);
+
+    const bypassed = new ConnectorClient({
+      store,
+      WebSocketImpl: FakeWebSocket as never,
+      wsAgent: () => undefined,
+    });
+    bypassed.start();
+    const withoutAgent = FakeWebSocket.instances.at(-1)!;
+    expect((withoutAgent.options as { agent?: unknown }).agent).toBeUndefined();
+  });
+
   it("calls onWelcome and resets backoff when a welcome arrives", () => {
     const onWelcome = vi.fn();
     const client = new ConnectorClient({ store, WebSocketImpl: FakeWebSocket as never, onWelcome });

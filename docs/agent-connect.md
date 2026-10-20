@@ -9,7 +9,7 @@ You are a coding agent running on a computer the owner wants to connect to an ex
 - Check the intended local coding agent: pi (`pi --version`) is the default; installed Claude Code (`claude --version`) is also supported. These CLIs are separate from the connector. If missing, install the owner's chosen agent using its official instructions. Have the owner complete its login or provider setup directly, keeping credentials out of chat and logs. The cloud model key does not configure the local coding agent.
 - If `sig` is already installed, run `sig status` first. Preserve a correct pairing. If it points to a different deployment, confirm the intended replacement before pairing again.
 - Check for `SIG_HOME` or `SHEPHERD_HOME` overrides without dumping the environment. A custom state directory cannot install the shared background service; resolve the intended setup or use `--foreground`.
-- Verify that the deployment URL is reachable. An unauthenticated `GET /app` returning 401 is expected. Resolve network or custom-domain issues before pairing.
+- Verify that the deployment URL is reachable. An unauthenticated `GET /app` returning 401 is expected. On a network where the URL is only reachable through a local HTTP proxy (filtered networks, mainland China), connect with `sig connect <url> <code> --proxy http://127.0.0.1:7890` — both channels (fetch, WebSocket), the connector's `git` calls, and worker children follow it, and the choice is stored so the background service needs no inherited environment. An `HTTPS_PROXY` already set in the shell is captured automatically; `sig doctor` diagnoses direct-vs-proxy reachability when things fail.
 
 Do not read credential stores or ask the owner to paste SERVER_KEY, model keys, login links, or device tokens into chat. Pairing needs a short-lived code, not the owner's permanent SERVER_KEY.
 
@@ -50,7 +50,7 @@ The workspace generates a command shaped like:
 npx @nightboats/sig connect https://sig.example.com <pairing-code>
 ```
 
-Use the installed CLI with the URL and code from that command:
+Use the installed CLI with the URL and code from that command (append `--proxy <url>` on filtered networks — see step 0):
 
 ```sh
 sig connect https://sig.example.com <pairing-code>

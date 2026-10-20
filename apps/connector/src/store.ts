@@ -12,6 +12,7 @@ import { DatabaseSync } from "node:sqlite";
 import { chmodSync, existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import type { ProcRef } from "./descendants.ts";
+import { normalizeProxyConfig, type ProxyConfig } from "./proxy.ts";
 
 export interface Credentials {
   serverUrl: string;
@@ -125,6 +126,13 @@ export class LocalStore {
       args TEXT NOT NULL,
       queuedAt INTEGER NOT NULL
     )`);
+    // Issue #68: machine-local proxy config (key "proxy"). Stored here — not in the service
+    // unit's environment — so the background daemon reads it at boot and both its channels
+    // (fetch, ws) plus every child (git, pi workers via childEnv) follow it.
+    this.db.exec(`CREATE TABLE IF NOT EXISTS config (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    )`);
     chmodSync(path, 0o600);
   }
 
@@ -173,6 +181,32 @@ export class LocalStore {
 
   clearCredentials(): void {
     this.db.exec("DELETE FROM credentials");
+  }
+
+  // --- Machine-local config (issue #68) -------------------------------------------------------
+
+  /** The stored proxy config, or null. A row that no longer parses is treated as absent
+   *  (hand-edited or from a future format) rather than failing the daemon's boot. */
+  getProxyConfig(): ProxyConfig | null {
+    const row = this.db.prepare("SELECT value FROM config WHERE key = 'proxy'").get() as { value: string } | undefined;
+    if (!row) return null;
+    try {
+      const parsed = JSON.parse(row.value) as { url?: unknown; noProxy?: unknown };
+      if (typeof parsed.url !== "string") return null;
+      return normalizeProxyConfig(parsed.url, typeof parsed.noProxy === "string" ? parsed.noProxy : undefined);
+    } catch {
+      return null;
+    }
+  }
+
+  setProxyConfig(config: ProxyConfig): void {
+    this.db
+      .prepare("INSERT INTO config (key, value) VALUES ('proxy', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+      .run(JSON.stringify(config));
+  }
+
+  clearProxyConfig(): void {
+    this.db.prepare("DELETE FROM config WHERE key = 'proxy'").run();
   }
 
   close(): void {
