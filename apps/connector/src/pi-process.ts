@@ -92,6 +92,11 @@ export class PiProcess {
     // and never removed.
     child.stdout.on("data", (chunk: Buffer) => this.onStdoutChunk(chunk));
     child.stderr.on("data", (chunk: Buffer) => this.appendStderr(chunk));
+    // A stdin write after the child died emits EPIPE on the stream; without a listener
+    // that is an uncaught exception (it took down CI and would take down the daemon).
+    // Lifecycle is owned by the exit/error handlers below — a failed write past death is
+    // expected: fire-and-forget sends no-op, and pending calls reject via their timeout.
+    child.stdin.on("error", () => {});
     child.on("error", (err) => this.handleExit(null, null, err));
     child.on("exit", (code, signal) => this.handleExit(code, signal));
   }

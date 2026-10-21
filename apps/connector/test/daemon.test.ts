@@ -3,6 +3,7 @@
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { getGlobalDispatcher, setGlobalDispatcher } from "undici";
 import { runDaemon, type DaemonHandle } from "../src/daemon.ts";
 import { LocalStore } from "../src/store.ts";
 import { VERSION } from "../src/version.ts";
@@ -67,6 +68,54 @@ describe("runDaemon", () => {
     expect(log).toContain("daemon_start");
     expect(log).toContain("welcomed");
     expect(log).not.toContain(mock.token); // no keys in ~/.shepherd/logs
+  }, 20_000);
+
+  it("activates a stored proxy at boot and still bypasses loopback for the connection (issue #68)", async () => {
+    // A dead proxy port on loopback: if the daemon ever routed the mock steward through
+    // it, the connection would fail — welcomed proves loopback stayed direct.
+    const envKeys = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy"] as const;
+    const savedEnv: Record<string, string | undefined> = {};
+    for (const key of envKeys) savedEnv[key] = process.env[key];
+    const savedDispatcher = getGlobalDispatcher();
+    const scenario = writeScenario(dir, "idle", []);
+
+    store = new LocalStore(join(stateDir, "connector.sqlite"));
+    store.setProxyConfig({ url: "http://127.0.0.1:1/" });
+    store.close();
+
+    try {
+      handle = await runDaemon({
+        stateDir,
+        machineName: "proxied-machine",
+        adapter: fakePiAdapter(stateDir, scenario),
+      });
+      await mock.waitConnected();
+      await mock.waitHello();
+
+      const logPath = join(stateDir, "logs", "connector.log");
+      await waitFor(
+        () => (existsSync(logPath) ? readFileSync(logPath, "utf8").includes("proxy_enabled") : undefined),
+        5000,
+        "proxy_enabled log line",
+      );
+      const log = readFileSync(logPath, "utf8");
+      expect(log).toContain("proxy_enabled");
+      expect(log).toContain('"source":"stored"');
+      expect(log).toContain('"proxy":"http://127.0.0.1:1"');
+      // Children (git, pi workers) see the env the daemon exported.
+      expect(process.env.HTTPS_PROXY).toBe("http://127.0.0.1:1/");
+      await waitFor(
+        () => (existsSync(logPath) ? readFileSync(logPath, "utf8").includes("welcomed") : undefined),
+        5000,
+        "welcomed log line",
+      );
+    } finally {
+      for (const key of envKeys) {
+        if (savedEnv[key] === undefined) delete process.env[key];
+        else process.env[key] = savedEnv[key];
+      }
+      setGlobalDispatcher(savedDispatcher as import("undici").Dispatcher);
+    }
   }, 20_000);
 
   it("refuses to start without credentials", async () => {

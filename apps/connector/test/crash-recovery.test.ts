@@ -91,8 +91,25 @@ afterEach(async () => {
   apps.length = 0;
   await mock.close();
   store.close();
-  rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
+  await removeTree(dir);
 });
+
+/** rmSync that tolerates a lingering git child: simulateCrash deliberately leaves a
+ *  `git worktree add` mid-flight (nothing kills or awaits it), and on a loaded CI runner
+ *  it can still be writing .git for seconds. Node's built-in maxRetries gives up after
+ *  ~200ms — retry with a real budget instead of failing the next test's teardown. */
+async function removeTree(path: string): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      rmSync(path, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if ((code !== "ENOTEMPTY" && code !== "EBUSY") || attempt >= 20) throw err;
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+  }
+}
 
 function bootApp(adapter: CrashWindowAdapter): ConnectorApp {
   const app = new ConnectorApp({ store, stateDir, adapter });

@@ -62,4 +62,28 @@ describe("LocalStore", () => {
     expect(store.getCredentials()).toBeNull();
     store.close();
   });
+
+  it("round-trips, clears, and re-reads the proxy config across a reopen (issue #68)", () => {
+    const store = new LocalStore(dbPath);
+    expect(store.getProxyConfig()).toBeNull();
+    store.setProxyConfig({ url: "http://127.0.0.1:7890/", noProxy: ".corp.example" });
+    expect(store.getProxyConfig()).toEqual({ url: "http://127.0.0.1:7890/", noProxy: ".corp.example" });
+    store.clearProxyConfig();
+    expect(store.getProxyConfig()).toBeNull();
+    // Re-set, close, reopen: the daemon reads it at every boot.
+    store.setProxyConfig({ url: "http://127.0.0.1:7890/" });
+    store.close();
+    const reopened = new LocalStore(dbPath);
+    expect(reopened.getProxyConfig()).toEqual({ url: "http://127.0.0.1:7890/" });
+    reopened.close();
+  });
+
+  it("treats a proxy row that no longer parses as absent instead of failing boot", () => {
+    const store = new LocalStore(dbPath);
+    store.setProxyConfig({ url: "http://127.0.0.1:7890/" });
+    // Corrupt the row the way a hand-edit or future format would.
+    store.database.prepare("UPDATE config SET value = ? WHERE key = 'proxy'").run("{not json");
+    expect(store.getProxyConfig()).toBeNull();
+    store.close();
+  });
 });

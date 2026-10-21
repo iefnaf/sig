@@ -17,6 +17,7 @@ import { CommandLog, type CommandResult } from "./commands.ts";
 import { EventLog, type StoredEvent } from "./events.ts";
 import { HistoryStreams } from "./history-stream.ts";
 import type { HistoryPage } from "@shepherd/protocol";
+import type { Agent } from "node:http";
 import type { LocalStore } from "./store.ts";
 import { VERSION } from "./version.ts";
 
@@ -26,6 +27,9 @@ export interface ClientOptions {
   store: LocalStore;
   machineName?: string;
   WebSocketImpl?: typeof WebSocket;
+  /** Per-URL `ws` agent (issue #68): returns an https/http proxy agent for targets that
+   *  should be proxied, undefined for bypassed targets (loopback, no_proxy). */
+  wsAgent?: (url: string) => Agent | undefined;
   onWelcome?: (welcome: WelcomeMessage) => void;
   onClose?: (code: number, reason: string) => void;
   minBackoffMs?: number;
@@ -139,7 +143,8 @@ export class ConnectorClient {
     const connEpoch = this.store.nextConnEpoch();
 
     const wsUrl = `${toWsOrigin(credentials.serverUrl)}/agents/steward/owner?role=connector&proto=1`;
-    const ws = new this.WebSocketImpl(wsUrl, { headers: { authorization: `Bearer ${credentials.token}` } });
+    const agent = this.options.wsAgent?.(wsUrl);
+    const ws = new this.WebSocketImpl(wsUrl, agent ? { headers: { authorization: `Bearer ${credentials.token}` }, agent } : { headers: { authorization: `Bearer ${credentials.token}` } });
     this.ws = ws;
 
     ws.on("open", () => {
