@@ -97,6 +97,30 @@ describe("no_proxy matching", () => {
     expect(hostBypassed("example.com", 8443, "example.com:443")).toBe(false);
     expect(hostBypassed("example.com", 8443, "example.com")).toBe(true);
   });
+
+  it("consults every entry of a multi-entry list, not just the first", () => {
+    expect(hostBypassed("x.corp.example", 443, "localhost,.corp.example")).toBe(true);
+    expect(shouldProxy("https://x.corp.example/x", { ...config, noProxy: "localhost,.corp.example" })).toBe(false);
+    expect(shouldProxy("https://internal.example/x", { ...config, noProxy: ".corp.example,internal.example" })).toBe(false);
+    // A port-mismatched entry is skipped; later entries are still consulted.
+    expect(hostBypassed("x.corp.example", 8443, "other.com:443,.corp.example")).toBe(true);
+    // And a listed host later in the list is not bypassed by an earlier non-entry alone.
+    expect(shouldProxy("https://example.com/x", { ...config, noProxy: "other.com,example.com" })).toBe(false);
+  });
+
+  it("defaults wss to 443 and ws to 80 — the steward channel's effective ports", () => {
+    expect(shouldProxy("wss://example.com/x", { ...config, noProxy: "example.com:443" })).toBe(false);
+    expect(shouldProxy("wss://example.com/x", { ...config, noProxy: "example.com:80" })).toBe(true);
+    expect(shouldProxy("ws://example.com/x", { ...config, noProxy: "example.com:80" })).toBe(false);
+  });
+
+  it("keeps IPv6 entries whole — bracketed and bare — when matching", () => {
+    expect(shouldProxy("wss://[2001:db8::1]/x", { ...config, noProxy: "[2001:db8::1]" })).toBe(false);
+    expect(shouldProxy("https://[2001:db8::1]:8443/x", { ...config, noProxy: "[2001:db8::1]:8443" })).toBe(false);
+    expect(shouldProxy("https://[2001:db8::1]:8443/x", { ...config, noProxy: "[2001:db8::1]:443" })).toBe(true);
+    expect(shouldProxy("https://[2001:db8::1]/x", { ...config, noProxy: "2001:db8::1" })).toBe(false);
+    expect(shouldProxy("wss://[::1]/x", config)).toBe(false); // loopback still hard-bypassed
+  });
 });
 
 describe("proxyEnvFor", () => {
@@ -109,8 +133,14 @@ describe("proxyEnvFor", () => {
     expect(env.no_proxy).toBe(DEFAULT_NO_PROXY);
   });
 
-  it("carries a custom no_proxy list", () => {
-    expect(proxyEnvFor({ url: "http://127.0.0.1:7890", noProxy: ".corp.example" }).NO_PROXY).toBe(".corp.example");
+  it("carries a custom no_proxy list — merged with the loopback defaults", () => {
+    // EnvHttpProxyAgent (the fetch channel) has no loopback bypass of its own, so the
+    // exported list always keeps the defaults ("loopback never proxied" invariant).
+    expect(proxyEnvFor({ url: "http://127.0.0.1:7890", noProxy: ".corp.example" }).NO_PROXY).toBe(
+      "localhost,127.0.0.1,::1,.corp.example",
+    );
+    // A custom entry equal to a default is deduplicated, and `*` keeps matching everything.
+    expect(proxyEnvFor({ url: "http://127.0.0.1:7890", noProxy: "localhost,*" }).NO_PROXY).toBe("localhost,127.0.0.1,::1,*");
   });
 });
 
@@ -137,7 +167,7 @@ describe("applyProxy", () => {
     await withCleanProxyState(() => {
       const application = applyProxy({ url: "http://127.0.0.1:7890", noProxy: ".corp.example" });
       expect(process.env.HTTPS_PROXY).toBe("http://127.0.0.1:7890");
-      expect(process.env.NO_PROXY).toBe(".corp.example");
+      expect(process.env.NO_PROXY).toBe("localhost,127.0.0.1,::1,.corp.example");
       expect(getGlobalDispatcher()).toBeInstanceOf(EnvHttpProxyAgent);
 
       const remote = application.wsAgentFor("wss://sig.example.workers.dev/agents/steward/owner");

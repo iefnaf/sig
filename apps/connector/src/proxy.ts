@@ -55,16 +55,34 @@ export function normalizeProxyConfig(url: string, noProxy?: string): ProxyConfig
   return config;
 }
 
-/** Standard-ish no_proxy matching: comma-separated entries; `*` bypasses everything;
- *  a leading `.` or `*.` suffix-matches subdomains; `host:port` entries match only that
- *  port. Loopback is handled separately (always bypassed) — an empty list proxies every
- *  non-loopback host. */
+/** Splits a no_proxy entry into its host and optional port, keeping IPv6 literals whole:
+ *  `example.com:443` → [example.com, 443]; `[::1]:443` → [::1, 443]; a bare `2001:db8::1`
+ *  (more than one colon — a port can't be told apart, curl's reading) stays one host. */
+function splitNoProxyEntry(entry: string): [host: string, port: string | undefined] {
+  if (entry.startsWith("[")) {
+    const close = entry.indexOf("]");
+    if (close !== -1) {
+      const rest = entry.slice(close + 1);
+      return [entry.slice(1, close), rest.startsWith(":") && rest.length > 1 ? rest.slice(1) : undefined];
+    }
+  }
+  if (entry.split(":").length > 2) return [entry, undefined];
+  const separator = entry.lastIndexOf(":");
+  if (separator === -1) return [entry, undefined];
+  return [entry.slice(0, separator), entry.slice(separator + 1)];
+}
+
+/** Standard-ish no_proxy matching: comma-separated entries, any of which can bypass
+ *  (curl semantics — every entry is consulted); `*` bypasses everything; a leading `.` or
+ *  `*.` suffix-matches subdomains; `host:port` entries match only that port; IPv6 literals
+ *  stay whole. Loopback is handled separately (always bypassed) — an empty list proxies
+ *  every non-loopback host. */
 export function hostBypassed(host: string, port: number | null, noProxy: string | undefined): boolean {
   const hostname = host.toLowerCase();
   const list = (noProxy ?? "").split(",").map((entry) => entry.trim().toLowerCase()).filter(Boolean);
   for (const entry of list) {
     if (entry === "*") return true;
-    const [entryHost, entryPort] = entry.split(":", 2) as [string, string | undefined];
+    const [entryHost, entryPort] = splitNoProxyEntry(entry);
     // "example.com:443" only matches that port; a bare host matches any port.
     if (entryPort !== undefined && port !== null && String(port) !== entryPort) continue;
     if (entryHost === hostname) return true;
@@ -72,7 +90,7 @@ export function hostBypassed(host: string, port: number | null, noProxy: string 
     // no_proxy semantics); look-alikes (notexample.com) never match.
     const suffix = entryHost.replace(/^\*?\./, "");
     if (suffix !== entryHost && (hostname === suffix || hostname.endsWith(`.${suffix}`))) return true;
-    return false;
+    // No match on this entry — a later entry may still bypass, so keep scanning.
   }
   return false;
 }
@@ -85,12 +103,31 @@ export function shouldProxy(targetUrl: string, config: ProxyConfig): boolean {
   } catch {
     return false;
   }
-  const hostname = parsed.hostname.toLowerCase();
+  // WHATWG URLs keep brackets on IPv6 hostnames (`wss://[::1]/` → `[::1]`); strip them so
+  // loopback and no_proxy entries match the unbracketed form both sides write.
+  const hostname = parsed.hostname.toLowerCase().replace(/^\[(.+)\]$/, "$1");
   if (ALWAYS_BYPASS.has(hostname) || hostname.endsWith(".localhost")) return false;
   // An explicit port or the scheme's default — so `example.com:443` matches an
-  // https://example.com URL that never spelled the port out.
-  const port = parsed.port ? Number(parsed.port) : parsed.protocol === "https:" ? 443 : 80;
+  // https://example.com URL that never spelled the port out (wss defaults to 443 and ws
+  // to 80, the steward WebSocket's effective ports).
+  const port = parsed.port
+    ? Number(parsed.port)
+    : parsed.protocol === "https:" || parsed.protocol === "wss:"
+      ? 443
+      : 80;
   return !hostBypassed(hostname, port, config.noProxy);
+}
+
+/** The no_proxy list actually exported to the fetch channel and children: the user's
+ *  entries with the loopback defaults merged in. EnvHttpProxyAgent has no loopback bypass
+ *  of its own, so the exported list — not just the ws matcher — has to carry the
+ *  "loopback is never proxied" invariant. */
+export function effectiveNoProxy(config: ProxyConfig): string {
+  const entries = new Set(DEFAULT_NO_PROXY.split(",").map((entry) => entry.trim()).filter(Boolean));
+  for (const entry of (config.noProxy ?? "").split(",").map((entry) => entry.trim()).filter(Boolean)) {
+    entries.add(entry);
+  }
+  return [...entries].join(",");
 }
 
 /** The env vars children and EnvHttpProxyAgent see: both cases, because git/curl read the
@@ -101,7 +138,7 @@ export function proxyEnvFor(config: ProxyConfig): Record<string, string> {
     https_proxy: config.url,
     HTTP_PROXY: config.url,
     http_proxy: config.url,
-    NO_PROXY: config.noProxy?.trim() || DEFAULT_NO_PROXY,
+    NO_PROXY: effectiveNoProxy(config),
   };
   value.no_proxy = value.NO_PROXY!;
   return value;

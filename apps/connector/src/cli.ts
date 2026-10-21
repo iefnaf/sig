@@ -32,8 +32,8 @@ import { installAssets } from "./install.ts";
 import { tailFile } from "./logger.ts";
 import { connect } from "./pairing.ts";
 import {
-  DEFAULT_NO_PROXY,
   applyProxy,
+  effectiveNoProxy,
   normalizeProxyConfig,
   proxyLogFields,
   resolveProxyConfig,
@@ -97,13 +97,15 @@ function fail(message: string): never {
   process.exit(1);
 }
 
-/** Removes one `--flag [value]` pair from argv, returning [value, rest]. */
-function takeFlag(argv: string[], flag: string): { value?: string; rest: string[] } {
+/** Removes one `--flag [value]` pair from argv, returning [present, value, rest]. `value`
+ *  is undefined both when the flag is absent and when it trails the argv without a value —
+ *  `present` tells the two apart so a missing value can fail loudly. */
+function takeFlag(argv: string[], flag: string): { present: boolean; value?: string; rest: string[] } {
   const index = argv.indexOf(flag);
-  if (index === -1) return { rest: argv };
+  if (index === -1) return { present: false, rest: argv };
   const value = argv[index + 1];
   const rest = [...argv.slice(0, index), ...(value === undefined ? [] : argv.slice(index + 2))];
-  return { value, rest };
+  return { present: true, value, rest };
 }
 
 function requireInstaller(): ServiceInstaller {
@@ -174,11 +176,11 @@ async function main(argv: string[]): Promise<void> {
 // --- connect ---------------------------------------------------------------------------------
 
 async function connectCommand(argv: string[]): Promise<void> {
-  const { value: proxyFlag, rest: afterProxy } = takeFlag(argv, "--proxy");
+  const { present: proxyPresent, value: proxyFlag, rest: afterProxy } = takeFlag(argv, "--proxy");
   const foreground = afterProxy.includes("--foreground");
   const [url, code] = afterProxy.filter((a) => a !== "--foreground");
   if (!url || !code) usage();
-  if (proxyFlag !== undefined && !proxyFlag) fail("--proxy needs a value, e.g. --proxy http://127.0.0.1:7890");
+  if (proxyPresent && !proxyFlag) fail("--proxy needs a value, e.g. --proxy http://127.0.0.1:7890");
   const dir = stateDir();
   // A non-default state directory must stop before anything else: the launchd/systemd unit
   // is shared machine state (fixed label), so installing from a private state directory
@@ -259,12 +261,13 @@ async function connectCommand(argv: string[]): Promise<void> {
 /** `sig proxy [url] | --clear [--no-proxy <list>]`: show, set, or clear the stored proxy.
  *  The running service picks the change up on its next start (`sig restart`). */
 async function proxyCommand(argv: string[]): Promise<void> {
-  const { value: noProxyFlag, rest: afterNoProxy } = takeFlag(argv, "--no-proxy");
+  const { present: noProxyPresent, value: noProxyFlag, rest: afterNoProxy } = takeFlag(argv, "--no-proxy");
   const clear = afterNoProxy.includes("--clear");
   const positional = afterNoProxy.filter((a) => !a.startsWith("--"));
   if (clear && positional.length > 0) usage();
   if (positional.length > 1) usage();
-  if (!clear && positional.length === 0 && noProxyFlag !== undefined) usage();
+  if (!clear && positional.length === 0 && noProxyPresent) usage();
+  if (noProxyPresent && !noProxyFlag) fail("--no-proxy needs a value, e.g. --no-proxy localhost,.corp.example");
   const dbPath = join(stateDir(), "connector.sqlite");
   if (!existsSync(dbPath)) {
     if (positional.length === 0 && !clear) {
@@ -389,7 +392,7 @@ async function doctorCommand(): Promise<void> {
     let viaProxy: { ok: boolean; detail: string } | null = null;
     if (config) {
       viaProxy = await probe(
-        new EnvHttpProxyAgent({ httpProxy: config.url, httpsProxy: config.url, noProxy: config.noProxy?.trim() || DEFAULT_NO_PROXY }),
+        new EnvHttpProxyAgent({ httpProxy: config.url, httpsProxy: config.url, noProxy: effectiveNoProxy(config) }),
       );
       console.log(`reach via proxy:    ${viaProxy.ok ? "ok" : "FAIL"} (${viaProxy.detail})`);
     }
