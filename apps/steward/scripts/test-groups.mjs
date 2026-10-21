@@ -41,7 +41,7 @@ const COST = {
   "routines.test.ts": 14,
   "notes.test.ts": 11,
   "offline-dispatch.test.ts": 10,
-  "history-relay.test.ts": 9,
+  "history-relay.test.ts": 18,
   "machine-status.test.ts": 7,
   "ledger.test.ts": 5,
   "handoff.test.ts": 4,
@@ -53,6 +53,7 @@ const COST = {
   "ui-session.test.ts": 4,
   "ui-modules.test.ts": 4,
   "workspace-stream.test.ts": 12,
+  "verify-sweep-grid.test.ts": 7,
 };
 const DEFAULT_COST = 3;
 
