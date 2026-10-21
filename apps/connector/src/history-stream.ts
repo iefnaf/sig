@@ -11,7 +11,7 @@ import {
   HISTORY_WINDOW_SIZE,
   type HistoryChunkMessage,
   type HistoryPage,
-} from "@shepherd/protocol";
+} from "@nightboats/protocol";
 
 export interface HistoryStreamDeps {
   /** Wire out (the transport's current socket). Dropping frames (closed socket) is fine. */

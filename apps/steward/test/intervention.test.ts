@@ -67,8 +67,8 @@ async function dispatchRunning(prompt = "修复登录 bug"): Promise<RunningWork
   const workerId = String((cmd!.args as Record<string, unknown>).workerId);
   const threadId = String((cmd!.args as Record<string, unknown>).threadId);
   fake.send({ t: "cmd_ack", re: cmd!.id, status: "accepted" });
-  fake.send({ t: "cmd_result", re: cmd!.id, ok: true, data: { sessionId: workerId, branch: "shepherd/x-1" } });
-  await fake.emit("started", workerId, { sessionId: workerId, branch: "shepherd/x-1" });
+  fake.send({ t: "cmd_result", re: cmd!.id, ok: true, data: { sessionId: workerId, branch: "sig/x-1" } });
+  await fake.emit("started", workerId, { sessionId: workerId, branch: "sig/x-1" });
   await waitRunsSettled();
   return { fake, workerId, threadId };
 }

@@ -12,11 +12,11 @@ import {
   ulid,
   type CmdMessage,
   type WelcomeMessage,
-} from "@shepherd/protocol";
+} from "@nightboats/protocol";
 import { CommandLog, type CommandResult } from "./commands.ts";
 import { EventLog, type StoredEvent } from "./events.ts";
 import { HistoryStreams } from "./history-stream.ts";
-import type { HistoryPage } from "@shepherd/protocol";
+import type { HistoryPage } from "@nightboats/protocol";
 import type { Agent } from "node:http";
 import type { LocalStore } from "./store.ts";
 import { VERSION } from "./version.ts";
@@ -314,7 +314,7 @@ export class ConnectorClient {
       this.commands.settle(cmd.id, result);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "ERR_INVALID_STATE") throw err;
-      console.error("[shepherd] late command settle skipped (store closed):", cmd.id);
+      console.error("[sig] late command settle skipped (store closed):", cmd.id);
       return;
     }
     this.send(ws, { t: "cmd_result", re: cmd.id, ok: result.ok, data: result.data, error: result.error });

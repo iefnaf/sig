@@ -5,12 +5,12 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { getServiceInstaller, SHEPHERD_LABEL, type Exec, type ExecResult, type ServiceSpec } from "../src/service.ts";
+import { getServiceInstaller, SIG_LABEL, type Exec, type ExecResult, type ServiceSpec } from "../src/service.ts";
 
 let home: string;
 
 beforeEach(() => {
-  home = mkdtempSync(join(tmpdir(), "shepherd-service-test-"));
+  home = mkdtempSync(join(tmpdir(), "sig-service-test-"));
 });
 
 afterEach(() => {
@@ -37,13 +37,13 @@ function recordingExec(handler?: (file: string, args: string[]) => ExecResult | 
 
 function spec(overrides: Partial<ServiceSpec> = {}): ServiceSpec {
   return {
-    label: SHEPHERD_LABEL,
+    label: SIG_LABEL,
     nodePath: "/usr/local/bin/node",
-    entryPath: "/opt/pkg/bin/shepherd.js",
+    entryPath: "/opt/pkg/bin/sig.js",
     args: ["daemon"],
     env: { PATH: "/usr/local/bin:/usr/bin:/bin" },
-    stateDir: join(home, ".shepherd"),
-    logDir: join(home, ".shepherd", "logs"),
+    stateDir: join(home, ".sig"),
+    logDir: join(home, ".sig", "logs"),
     ...overrides,
   };
 }
@@ -74,20 +74,20 @@ describe("LaunchdService", () => {
 
     await installer.install();
 
-    const plist = join(home, "Library", "LaunchAgents", `${SHEPHERD_LABEL}.plist`);
+    const plist = join(home, "Library", "LaunchAgents", `${SIG_LABEL}.plist`);
     expect(existsSync(plist)).toBe(true);
     const content = readFileSync(plist, "utf8");
-    expect(content).toContain(`<string>${SHEPHERD_LABEL}</string>`);
+    expect(content).toContain(`<string>${SIG_LABEL}</string>`);
     expect(content).toContain("<string>/usr/local/bin/node</string>");
-    expect(content).toContain("<string>/opt/pkg/bin/shepherd.js</string>");
+    expect(content).toContain("<string>/opt/pkg/bin/sig.js</string>");
     expect(content).toContain("<string>daemon</string>");
     expect(content).toContain("<key>KeepAlive</key>");
     expect(content).toContain("<true/>");
     expect(content).toContain("<key>PATH</key>");
-    expect(content).toContain(join(home, ".shepherd", "logs", "launchd.out.log"));
+    expect(content).toContain(join(home, ".sig", "logs", "launchd.out.log"));
 
-    expect(calls[0]).toEqual({ file: "launchctl", args: ["print", `gui/501/${SHEPHERD_LABEL}`] });
-    expect(calls[1]).toEqual({ file: "launchctl", args: ["enable", `gui/501/${SHEPHERD_LABEL}`] });
+    expect(calls[0]).toEqual({ file: "launchctl", args: ["print", `gui/501/${SIG_LABEL}`] });
+    expect(calls[1]).toEqual({ file: "launchctl", args: ["enable", `gui/501/${SIG_LABEL}`] });
     expect(calls[2]).toEqual({ file: "launchctl", args: ["bootstrap", "gui/501", plist] });
   });
 
@@ -110,7 +110,7 @@ describe("LaunchdService", () => {
     await installer.install();
 
     const bootouts = calls.filter((c) => c.args[0] === "bootout");
-    expect(bootouts).toEqual([{ file: "launchctl", args: ["bootout", `gui/501/${SHEPHERD_LABEL}`] }]);
+    expect(bootouts).toEqual([{ file: "launchctl", args: ["bootout", `gui/501/${SIG_LABEL}`] }]);
     expect(bootstraps).toBe(1); // the retry never runs: bootout settled first
   });
 
@@ -174,9 +174,9 @@ describe("LaunchdService", () => {
 
     await installer.restart();
     expect(calls).toEqual([
-      { file: "launchctl", args: ["enable", `gui/501/${SHEPHERD_LABEL}`] },
-      { file: "launchctl", args: ["print", `gui/501/${SHEPHERD_LABEL}`] },
-      { file: "launchctl", args: ["kickstart", "-k", `gui/501/${SHEPHERD_LABEL}`] },
+      { file: "launchctl", args: ["enable", `gui/501/${SIG_LABEL}`] },
+      { file: "launchctl", args: ["print", `gui/501/${SIG_LABEL}`] },
+      { file: "launchctl", args: ["kickstart", "-k", `gui/501/${SIG_LABEL}`] },
     ]);
   });
 
@@ -232,16 +232,16 @@ describe("SystemdService", () => {
 
     await installer.install();
 
-    const unit = join(home, ".config/systemd/user", `${SHEPHERD_LABEL}.service`);
+    const unit = join(home, ".config/systemd/user", `${SIG_LABEL}.service`);
     expect(existsSync(unit)).toBe(true);
     const content = readFileSync(unit, "utf8");
-    expect(content).toContain("ExecStart=/usr/local/bin/node /opt/pkg/bin/shepherd.js daemon");
+    expect(content).toContain("ExecStart=/usr/local/bin/node /opt/pkg/bin/sig.js daemon");
     expect(content).toContain('Environment="PATH=/usr/local/bin:/usr/bin:/bin"');
     expect(content).toContain("Restart=on-failure");
     expect(content).toContain("WantedBy=default.target");
 
     expect(calls[0]).toEqual({ file: "systemctl", args: ["--user", "daemon-reload"] });
-    expect(calls[1]).toEqual({ file: "systemctl", args: ["--user", "enable", "--now", `${SHEPHERD_LABEL}.service`] });
+    expect(calls[1]).toEqual({ file: "systemctl", args: ["--user", "enable", "--now", `${SIG_LABEL}.service`] });
     expect(calls.some((c) => c.file === "loginctl")).toBe(true); // best-effort lingering
   });
 
@@ -259,11 +259,11 @@ describe("SystemdService", () => {
     const installer = getServiceInstaller(spec(), deps(exec))!;
 
     await installer.stop();
-    expect(calls[0]).toEqual({ file: "systemctl", args: ["--user", "disable", "--now", `${SHEPHERD_LABEL}.service`] });
+    expect(calls[0]).toEqual({ file: "systemctl", args: ["--user", "disable", "--now", `${SIG_LABEL}.service`] });
 
     calls.length = 0;
     await installer.start();
-    expect(calls[0]).toEqual({ file: "systemctl", args: ["--user", "enable", "--now", `${SHEPHERD_LABEL}.service`] });
+    expect(calls[0]).toEqual({ file: "systemctl", args: ["--user", "enable", "--now", `${SIG_LABEL}.service`] });
   });
 
   it("uninstall removes the unit and reloads the manager", async () => {

@@ -11,7 +11,7 @@ import { normalizeSessionEntries, readSessionHistory } from "../src/session-hist
 let dir: string;
 
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "shepherd-session-history-"));
+  dir = mkdtempSync(join(tmpdir(), "sig-session-history-"));
 });
 
 afterEach(() => {
@@ -33,7 +33,7 @@ function assistantMessage(content: unknown, stopReason = "stop"): Record<string,
 /** A session whose live branch is e1 → e2 → e3(toolResult) → e7, with e6 forked off e1. */
 function branchFixture(): Array<Record<string, unknown>> {
   return [
-    entry("e1", null, userMessage("/shepherd cmd-1\nFix the login bug")),
+    entry("e1", null, userMessage("/sig cmd-1\nFix the login bug")),
     entry("e2", "e1", assistantMessage([{ type: "text", text: "Working on it" }, { type: "toolCall", id: "c1", name: "edit", arguments: { file_path: "src/auth/session.ts" } }])),
     entry("e3", "e2", { type: "message", message: { role: "toolResult", toolCallId: "c1", toolName: "edit", content: [] } }),
     entry("e4", "e2", { type: "usage", tokens: { input: 10 } }),
@@ -60,7 +60,7 @@ describe("readSessionHistory (JSONL along the current branch)", () => {
     expect(page.done).toBe(true);
     expect(page.cursor).toBe("e7");
     expect(page.entries).toEqual([
-      { id: "e1", role: "user", text: "/shepherd cmd-1\nFix the login bug" },
+      { id: "e1", role: "user", text: "/sig cmd-1\nFix the login bug" },
       {
         id: "e2",
         role: "assistant",

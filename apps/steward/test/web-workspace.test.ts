@@ -241,7 +241,7 @@ describe("the read endpoint and signing out", () => {
     const { cookie, post } = await browser();
     const response = await post("logout", {});
     expect(response.status).toBe(200);
-    expect(response.headers.get("set-cookie")).toMatch(/shepherd_session=;.*Max-Age=0/);
+    expect(response.headers.get("set-cookie")).toMatch(/sig_session=;.*Max-Age=0/);
     const after = await SELF.fetch(`${BASE}/app/api/workspace`, { headers: { cookie } });
     expect(after.status).toBe(401);
     expect(await after.json()).toEqual({ error: "auth_required" });
@@ -308,7 +308,7 @@ describe("live updates", () => {
     const dispatched = await ownerStub().dispatchForTest({ prompt: "fix it", repoRef: "repo-a", newTitle: "Fix it" });
     if (dispatched.kind !== "dispatched") throw new Error(JSON.stringify(dispatched));
     fake.send({ t: "cmd_ack", re: (await fake.waitForCmds(1))[0]!.id, status: "accepted" });
-    await fake.emit("started", dispatched.workerId, { sessionId: dispatched.workerId, branch: "shepherd/x-1" });
+    await fake.emit("started", dispatched.workerId, { sessionId: dispatched.workerId, branch: "sig/x-1" });
     await scriptModel(fauxAssistantMessage([fauxText("Private bookkeeping the owner is never sent.")]));
     await fake.emit("report", dispatched.workerId, { type: "report", status: "done", summary: "Done", changes: [], tests: { ran: false } });
     await fake.emit("settled", dispatched.workerId, { type: "settled", outcome: "reported" });

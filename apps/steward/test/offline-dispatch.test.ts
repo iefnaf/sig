@@ -115,7 +115,7 @@ describe("dispatch at an offline machine: hold + ask (protocol §7.3)", () => {
     expect(again.status).toBe(200);
     await waitWhileOutboundPending();
 
-    offline.queueRun({ status: "done", summary: "排队后完成", branch: "shepherd/wait-1" });
+    offline.queueRun({ status: "done", summary: "排队后完成", branch: "sig/wait-1" });
     await offline.connect();
     const [cmd] = await offline.waitForCmds(1);
     expect(cmd!.notAfter).toBeNull(); // delivered because the wait cleared the deadline
@@ -283,7 +283,7 @@ describe("dispatch at an offline machine: hold + ask (protocol §7.3)", () => {
     await waitWhileOutboundPending();
 
     // The machine returns and the start is actually delivered before the cancel tap.
-    offline.queueRun({ status: "done", summary: "已完成", branch: "shepherd/late-1" });
+    offline.queueRun({ status: "done", summary: "已完成", branch: "sig/late-1" });
     await offline.connect();
     await offline.waitForCmds(1);
     await new Promise((resolve) => setTimeout(resolve, 200));

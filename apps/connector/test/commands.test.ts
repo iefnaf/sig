@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { CmdMessage } from "@shepherd/protocol";
+import type { CmdMessage } from "@nightboats/protocol";
 import { ConnectorClient } from "../src/client.ts";
 import { LocalStore } from "../src/store.ts";
 import { startMockSteward, type MockSteward } from "./mock-steward.ts";
@@ -13,7 +13,7 @@ let mock: MockSteward;
 let port: number;
 
 beforeEach(async () => {
-  dir = mkdtempSync(join(tmpdir(), "shepherd-connector-commands-"));
+  dir = mkdtempSync(join(tmpdir(), "sig-connector-commands-"));
   store = new LocalStore(join(dir, "connector.sqlite"));
   mock = startMockSteward();
   port = await mock.listen();

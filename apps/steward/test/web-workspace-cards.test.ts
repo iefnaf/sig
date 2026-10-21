@@ -76,11 +76,11 @@ async function doneReport(): Promise<{ fake: FakeConnector; workerId: string; th
   await waitRunsSettled();
   await waitWhileOutboundPending();
   fake.send({ t: "cmd_ack", re: startCmd!.id, status: "accepted" });
-  fake.send({ t: "cmd_result", re: startCmd!.id, ok: true, data: { sessionId: workerId, branch: "shepherd/login-1" } });
-  await fake.emit("started", workerId, { sessionId: workerId, branch: "shepherd/login-1" });
+  fake.send({ t: "cmd_result", re: startCmd!.id, ok: true, data: { sessionId: workerId, branch: "sig/login-1" } });
+  await fake.emit("started", workerId, { sessionId: workerId, branch: "sig/login-1" });
   await fake.emit("report", workerId, {
     type: "report", status: "done", summary: "Login bug fixed, tests pass", changes: ["auth/session.ts waits for recovery"], tests: { ran: true, passed: true },
-    git: { branch: "shepherd/login-1", base: "main", ahead: 2, dirty: 0, filesChanged: 1, insertions: 5, deletions: 1, pushed: false },
+    git: { branch: "sig/login-1", base: "main", ahead: 2, dirty: 0, filesChanged: 1, insertions: 5, deletions: 1, pushed: false },
   });
   await fake.emit("settled", workerId, { type: "settled", outcome: "reported" });
   await scriptModel(fauxAssistantMessage([fauxToolCall("update_thread", { threadId, summary: "Fixed." })], { stopReason: "toolUse" }), fauxAssistantMessage([fauxText("Recorded.")]));
@@ -104,7 +104,7 @@ describe("pull request consent", () => {
     const command = (await waitFor(() => fake.cmds.find((cmd) => cmd.kind === "pr_worker"), (cmd) => cmd !== undefined, "pr_worker command"))!;
     expect(command).toMatchObject({ workerId });
     expect(fake.cmds.length - before).toBe(1);
-    expect((await webTexts()).some((text) => text.includes("正在推送") && text.includes("shepherd/login-1"))).toBe(true);
+    expect((await webTexts()).some((text) => text.includes("正在推送") && text.includes("sig/login-1"))).toBe(true);
 
     const after = await get();
     expect(after.attention.find((entry) => entry.id === cardId)).toBeUndefined();
@@ -201,7 +201,7 @@ describe("a question a worker asked", () => {
     const dispatched = await ownerStub().dispatchForTest({ prompt: "migrate the schema", repoRef: "repo-a", newTitle: "Migrate the schema" });
     if (dispatched.kind !== "dispatched") throw new Error(JSON.stringify(dispatched));
     fake.send({ t: "cmd_ack", re: (await fake.waitForCmds(1))[0]!.id, status: "accepted" });
-    await fake.emit("started", dispatched.workerId, { sessionId: dispatched.workerId, branch: "shepherd/x-1" });
+    await fake.emit("started", dispatched.workerId, { sessionId: dispatched.workerId, branch: "sig/x-1" });
     await fake.emit("report", dispatched.workerId, { type: "report", status: "needs_decision", summary: "An old index exists", question: "Drop the old search_index too?" });
     const question = (await waitFor(() => ownerStub().debugSnapshot(), (snap) => snap.questions.some((q) => q.workerId === dispatched.workerId && q.status === "open"), "question opened")).questions.find((q) => q.workerId === dispatched.workerId)!;
     // The steward is down, so the deterministic fallback forwards the worker's own words.

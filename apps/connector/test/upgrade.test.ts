@@ -10,7 +10,7 @@ import type { Exec, ExecResult, ServiceInstaller, ServiceStatus } from "../src/s
 let dir: string;
 
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "shepherd-upgrade-test-"));
+  dir = mkdtempSync(join(tmpdir(), "sig-upgrade-test-"));
 });
 
 afterEach(() => {

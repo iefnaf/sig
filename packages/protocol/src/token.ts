@@ -1,7 +1,7 @@
 // Device token, see docs/design/connector-do-protocol.md §5.1.
 // Format: st1.<keyId>.<deviceId>.<epoch>.<issuedAt>.<mac>
 //   mac   = HMAC-SHA256(secret, "st1." + keyId + "." + deviceId + "." + epoch + "." + issuedAt)
-//   keyId = first 8 hex chars of SHA-256("shepherd:keyid:v1:" + secret)
+//   keyId = first 8 hex chars of SHA-256("sig:keyid:v1:" + secret)
 // The keyId makes SERVER_KEY rotatable (issue #27): the verifier keeps a set of keys — the
 // current SERVER_KEY plus SERVER_KEY_PREVIOUS during a rotation window — and picks the one the
 // token names. Tokens minted before the keyId existed (five segments, no keyId) are tried
@@ -15,7 +15,7 @@ export interface ServerKey {
 }
 
 export async function deriveKeyId(secret: string): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", enc.encode(`shepherd:keyid:v1:${secret}`));
+  const digest = await crypto.subtle.digest("SHA-256", enc.encode(`sig:keyid:v1:${secret}`));
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 8);
 }
 

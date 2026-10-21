@@ -33,7 +33,7 @@ export interface PiProcessOptions {
   /** Keep only the last N bytes of stderr (connector-pi.md §4.4). */
   stderrTailBytes?: number;
   /** When set, stderr is also appended (redacted, capped) to this file — the per-worker
-   * tail the design keeps under ~/.shepherd/logs/ (§12). */
+   * tail the design keeps under ~/.sig/logs/ (§12). */
   stderrFile?: string;
   /** Cap for the stderr file; defaults to the same 64 KiB as the in-memory tail. */
   stderrFileMaxBytes?: number;
@@ -201,7 +201,7 @@ export class PiProcess {
         record = JSON.parse(line) as Record<string, unknown>;
       } catch {
         // §9.4: an unparseable line is logged and dropped; do not terminate.
-        this.stderrTail += `\n[shepherd] unparseable stdout line: ${line.slice(0, 200)}\n`;
+        this.stderrTail += `\n[sig] unparseable stdout line: ${line.slice(0, 200)}\n`;
         continue;
       }
       this.dispatch(record);
@@ -247,7 +247,7 @@ export class PiProcess {
     if (this.exited) return;
     this.exited = true;
     this.exitInfo = { code, signal };
-    if (error) this.appendStderr(Buffer.from(`\n[shepherd] spawn error: ${error.message}\n`));
+    if (error) this.appendStderr(Buffer.from(`\n[sig] spawn error: ${error.message}\n`));
     const failure = new RpcError(
       `pi process exited (code=${code} signal=${signal})${this.stderrTail ? `; stderr tail:\n${this.stderrTail.slice(-2000)}` : ""}`,
     );

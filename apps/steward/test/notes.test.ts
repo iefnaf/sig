@@ -815,8 +815,8 @@ describe("notes trust gates: the evidence rules (PR #44 review finding 3)", () =
     const [cmd] = await fake.waitForCmds(1);
     const workerId = String((cmd!.args as Record<string, unknown>).workerId);
     fake.send({ t: "cmd_ack", re: cmd!.id, status: "accepted" });
-    fake.send({ t: "cmd_result", re: cmd!.id, ok: true, data: { sessionId: workerId, branch: "shepherd/x-1" } });
-    await fake.emit("started", workerId, { sessionId: workerId, branch: "shepherd/x-1" });
+    fake.send({ t: "cmd_result", re: cmd!.id, ok: true, data: { sessionId: workerId, branch: "sig/x-1" } });
+    await fake.emit("started", workerId, { sessionId: workerId, branch: "sig/x-1" });
 
     // The report wake (⟦event⟧) fires after the 3s merge window; during that run the model
     // tries to store a worker-claimed "preference" as user_said — the tool refuses: in an

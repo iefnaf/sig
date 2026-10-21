@@ -1,9 +1,9 @@
 // LIVE verification of the consent gate's machine half (issue #21 AC5) — run explicitly:
 //
-//   SHEPHERD_PR_LIVE=1 npx vitest run test/pr-live.test.ts
+//   SIG_PR_LIVE=1 npx vitest run test/pr-live.test.ts
 //
 // It creates a PRIVATE scratch repo under the authenticated gh account, commits a change on
-// a shepherd/* branch in a local clone, runs the REAL pr_worker path (real `git push`, real
+// a sig/* branch in a local clone, runs the REAL pr_worker path (real `git push`, real
 // `gh pr create`, no exec seam), and asserts the pr_created event carries a working PR URL.
 // The scratch repo is deleted again in the cleanup hook. Skipped without the env var, so CI
 // never touches the network or the account.
@@ -22,12 +22,12 @@ import { WorkerManager } from "../src/worker-manager.ts";
 import { fakePiAdapter, git, writeScenario } from "./helpers.ts";
 
 const exec = promisify(execFile);
-const LIVE = process.env.SHEPHERD_PR_LIVE === "1";
+const LIVE = process.env.SIG_PR_LIVE === "1";
 
 describe.skipIf(!LIVE)("pr_worker against a real repo (issue #21 AC5)", () => {
-  const dir = join(tmpdir(), `shepherd-pr-live-${process.pid}-${Date.now()}`);
+  const dir = join(tmpdir(), `sig-pr-live-${process.pid}-${Date.now()}`);
   const stateDir = join(dir, "state");
-  const repoName = `shepherd-pr-gate-verify-${Date.now()}`;
+  const repoName = `sig-pr-gate-verify-${Date.now()}`;
   let store: LocalStore;
   let manager: WorkerManager;
   const events: Array<Record<string, unknown>> = [];
@@ -51,8 +51,8 @@ describe.skipIf(!LIVE)("pr_worker against a real repo (issue #21 AC5)", () => {
     mkdirSync(stateDir, { recursive: true });
     const clone = join(dir, "clone");
     await exec("git", ["clone", `https://github.com/${who}/${repoName}.git`, clone]);
-    await git(clone, ["config", "user.email", "verify@shepherd.local"]);
-    await git(clone, ["config", "user.name", "Shepherd Verify"]);
+    await git(clone, ["config", "user.email", "verify@sig.local"]);
+    await git(clone, ["config", "user.name", "Sig Verify"]);
 
     // 2. Seed main, then the worker branch with one commit — the state a settled write task leaves.
     writeFileSync(join(clone, "README.md"), `# ${repoName}\n`);
@@ -60,7 +60,7 @@ describe.skipIf(!LIVE)("pr_worker against a real repo (issue #21 AC5)", () => {
     await exec("git", ["commit", "-m", "init"], { cwd: clone });
     await exec("git", ["branch", "-M", "main"], { cwd: clone });
     await exec("git", ["push", "-u", "origin", "main"], { cwd: clone });
-    const branch = "shepherd/live-verify-1";
+    const branch = "sig/live-verify-1";
     await exec("git", ["checkout", "-b", branch], { cwd: clone });
     writeFileSync(join(clone, "VERIFY.md"), `# consent gate live verification\n\n${new Date().toISOString()}\n`);
     await exec("git", ["add", "."], { cwd: clone });
@@ -89,7 +89,7 @@ describe.skipIf(!LIVE)("pr_worker against a real repo (issue #21 AC5)", () => {
     const result = (await manager.handleCommand(
       "cmd-live-1",
       "pr_worker",
-      { workerId: "w-live-verify", title: "consent gate live verification", body: "Opened by shepherd's pr_worker live test (issue #21)." },
+      { workerId: "w-live-verify", title: "consent gate live verification", body: "Opened by sig's pr_worker live test (issue #21)." },
       "w-live-verify",
     )) as { url: string };
 

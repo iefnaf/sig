@@ -23,7 +23,7 @@ describe("collectGitFacts (issue #8: pointers for handoff briefs)", () => {
       await g(repo, ["commit", "-m", "secret-message-1"]);
       // Second commit on a branch off main, plus a dirty + an untracked file — the write
       // leg's end state that a handoff brief points at.
-      await g(repo, ["checkout", "-b", "shepherd/relay-1"]);
+      await g(repo, ["checkout", "-b", "sig/relay-1"]);
       writeFileSync(join(repo, "b.txt"), "b\n");
       await g(repo, ["add", "b.txt"]);
       await g(repo, ["commit", "-m", "second-commit"]);

@@ -59,8 +59,8 @@ async function runLeg1(machine: FakeConnector, prompt = "第一棒：写方案")
   // Find THIS dispatch's command (earlier dispatches in the same test may already be on the wire).
   const cmd = await waitForCmd(machine, workerId);
   machine.send({ t: "cmd_ack", re: cmd.id, status: "accepted" });
-  machine.send({ t: "cmd_result", re: cmd.id, ok: true, data: { sessionId: workerId, branch: "shepherd/leg-1-1" } });
-  await machine.emit("started", workerId, { sessionId: workerId, branch: "shepherd/leg-1-1" });
+  machine.send({ t: "cmd_result", re: cmd.id, ok: true, data: { sessionId: workerId, branch: "sig/leg-1-1" } });
+  await machine.emit("started", workerId, { sessionId: workerId, branch: "sig/leg-1-1" });
   await machine.emit("report", workerId, {
     type: "report",
     status: "done",
@@ -68,7 +68,7 @@ async function runLeg1(machine: FakeConnector, prompt = "第一棒：写方案")
     decisions: ["存储用 sqlite", "接口保持 REST"],
     leftovers: ["迁移 SQL 未生成"],
     changes: ["PLAN.md"],
-    git: GIT("shepherd/leg-1-1"),
+    git: GIT("sig/leg-1-1"),
   });
   await machine.emit("settled", workerId, {
     type: "settled",
@@ -116,7 +116,7 @@ describe("handoff.build (steward.md §2.6, from real ledger rows)", () => {
       ],
       leftovers: ["迁移 SQL 未生成"],
     });
-    expect(brief!.pointers).toMatchObject({ branch: "shepherd/leg-1-1", ahead: 2, commits: ["3e56dab13073fd2a79e04a2e36414891b2fba95f"] });
+    expect(brief!.pointers).toMatchObject({ branch: "sig/leg-1-1", ahead: 2, commits: ["3e56dab13073fd2a79e04a2e36414891b2fba95f"] });
     fake.close();
   });
 
@@ -143,7 +143,7 @@ describe("handoff.build (steward.md §2.6, from real ledger rows)", () => {
       status: "done",
       summary: "第二棒完成",
       decisions: ["存储用 sqlite", "新增决定 B"],
-      git: GIT("shepherd/leg-1-2"),
+      git: GIT("sig/leg-1-2"),
     });
     await fake.emit("settled", worker2, { type: "settled", outcome: "reported" });
     const snap = await snapshotWhere(
@@ -193,12 +193,12 @@ describe("the resume-vs-new-session decision at dispatch (spec §5.3, issue #8)"
     });
     expect(outcome).toMatchObject({
       kind: "dispatched",
-      continuation: { action: "new_session", reason: "machine_switch", parentWorker: workerId, base: "shepherd/leg-1-1", brief: true, crossMachine: true },
+      continuation: { action: "new_session", reason: "machine_switch", parentWorker: workerId, base: "sig/leg-1-1", brief: true, crossMachine: true },
     });
     const [cmd2] = await macB.waitForCmds(1);
     expect(cmd2!.kind).toBe("start_worker");
     // base = the thread's latest worker branch (spec §5.3 / spike-conclusions §2)
-    expect((cmd2!.args as Record<string, unknown>).base).toBe("shepherd/leg-1-1");
+    expect((cmd2!.args as Record<string, unknown>).base).toBe("sig/leg-1-1");
     // The brief is prefixed to the task; the task text itself comes last (§2.6).
     const prompt = String((cmd2!.args as Record<string, unknown>).prompt);
     expect(prompt.startsWith("【交接简报】")).toBe(true);
@@ -224,11 +224,11 @@ describe("the resume-vs-new-session decision at dispatch (spec §5.3, issue #8)"
       freshReview: true,
     });
     expect(outcome).toMatchObject({
-      continuation: { action: "new_session", reason: "fresh_review", parentWorker: workerId, base: "shepherd/leg-1-1", brief: true },
+      continuation: { action: "new_session", reason: "fresh_review", parentWorker: workerId, base: "sig/leg-1-1", brief: true },
     });
     const [, cmd2] = await fake.waitForCmds(2);
     expect(cmd2!.kind).toBe("start_worker");
-    expect((cmd2!.args as Record<string, unknown>).base).toBe("shepherd/leg-1-1");
+    expect((cmd2!.args as Record<string, unknown>).base).toBe("sig/leg-1-1");
     fake.close();
   });
 
@@ -245,7 +245,7 @@ describe("the resume-vs-new-session decision at dispatch (spec §5.3, issue #8)"
     // Walk the new session to idle, then a modest context resumes it.
     const w2 = String((cmdHigh!.args as Record<string, unknown>).workerId);
     fake.send({ t: "cmd_ack", re: cmdHigh!.id, status: "accepted" });
-    await fake.emit("started", w2, { sessionId: w2, branch: "shepherd/leg-1-2" });
+    await fake.emit("started", w2, { sessionId: w2, branch: "sig/leg-1-2" });
     await fake.emit("settled", w2, { type: "settled", outcome: "reported", usage: { contextUsage: { tokens: 10_000, contextWindow: 200_000 } } });
     await snapshotWhere((s) => s.threads[0]?.workers[1]?.state === "idle", "second leg idle");
     const snap = await snapshot();
@@ -266,10 +266,10 @@ describe("the resume-vs-new-session decision at dispatch (spec §5.3, issue #8)"
       threadId,
       mode: "readonly",
     });
-    expect(outcome).toMatchObject({ continuation: { action: "new_session", reason: "mode_switch", base: "shepherd/leg-1-1" } });
+    expect(outcome).toMatchObject({ continuation: { action: "new_session", reason: "mode_switch", base: "sig/leg-1-1" } });
     const [, cmd2] = await fake.waitForCmds(2);
     expect(cmd2!.kind).toBe("start_worker");
-    expect(cmd2!.args).toMatchObject({ mode: "readonly", base: "shepherd/leg-1-1" }); // base goes on the wire for readonly too
+    expect(cmd2!.args).toMatchObject({ mode: "readonly", base: "sig/leg-1-1" }); // base goes on the wire for readonly too
     fake.close();
   });
 
@@ -280,7 +280,7 @@ describe("the resume-vs-new-session decision at dispatch (spec §5.3, issue #8)"
     if (outcome1.kind !== "dispatched") throw new Error("dispatch failed");
     const [cmd] = await fake.waitForCmds(1);
     const workerId = String((cmd!.args as Record<string, unknown>).workerId);
-    await fake.emit("started", workerId, { sessionId: workerId, branch: "shepherd/pao-1" });
+    await fake.emit("started", workerId, { sessionId: workerId, branch: "sig/pao-1" });
     // issue #10: error:auth lands `broken`; error:context lands `idle` ("suggest a new
     // session") — both are unresumable, the latter precisely because the connector said
     // the session cannot go on (the merge of #10 × #8).
@@ -289,7 +289,7 @@ describe("the resume-vs-new-session decision at dispatch (spec §5.3, issue #8)"
 
     const afterContext = await ownerStub().dispatchForTest({ prompt: "接着来（上下文溢出后）", repoRef: "repo-a", threadId: outcome1.threadId });
     expect(afterContext).toMatchObject({
-      continuation: { action: "new_session", reason: "session_unusable", base: "shepherd/pao-1", brief: true },
+      continuation: { action: "new_session", reason: "session_unusable", base: "sig/pao-1", brief: true },
     });
 
     // And the terminally broken shape (error:auth) behaves the same — note the middle leg
@@ -298,7 +298,7 @@ describe("the resume-vs-new-session decision at dispatch (spec §5.3, issue #8)"
     await ownerStub().setWorkerStateForTest(workerId, "broken", "error:auth");
     const outcome2 = await ownerStub().dispatchForTest({ prompt: "换个新会话接着来", repoRef: "repo-a", threadId: outcome1.threadId });
     expect(outcome2).toMatchObject({
-      continuation: { action: "new_session", reason: "session_unusable", base: "shepherd/pao-1", brief: false },
+      continuation: { action: "new_session", reason: "session_unusable", base: "sig/pao-1", brief: false },
     });
     fake.close();
   }, 15_000);
@@ -417,7 +417,7 @@ describe("PR #54 review findings", () => {
 
     // A readonly review leg on the same machine: mode switch → new session, base relayed.
     const review = await ownerStub().dispatchForTest({ prompt: "只读评审", repoRef: "repo-a", threadId, mode: "readonly" });
-    expect(review).toMatchObject({ continuation: { action: "new_session", reason: "mode_switch", base: "shepherd/leg-1-1" } });
+    expect(review).toMatchObject({ continuation: { action: "new_session", reason: "mode_switch", base: "sig/leg-1-1" } });
     const cmd2 = await waitForCmd(fake, (review as { workerId: string }).workerId);
     fake.send({ t: "cmd_ack", re: cmd2.id, status: "accepted" });
     const roWorker = (review as { workerId: string }).workerId;
@@ -430,7 +430,7 @@ describe("PR #54 review findings", () => {
     // the pointers still name the write leg's branch and its facts — not null (finding 4).
     const brief = await ownerStub().handoffForTest(threadId);
     expect(brief).toMatchObject({ fromWorkerId: roWorker });
-    expect(brief!.pointers).toMatchObject({ workerId: expect.any(String), branch: "shepherd/leg-1-1", ahead: 2 });
+    expect(brief!.pointers).toMatchObject({ workerId: expect.any(String), branch: "sig/leg-1-1", ahead: 2 });
     expect(brief!.pointers!.changedFiles).toContain("PLAN.md");
     fake.close();
   });
@@ -442,7 +442,7 @@ describe("PR #54 review findings", () => {
     if (outcome1.kind !== "dispatched") throw new Error("dispatch failed");
     const cmd1 = await waitForCmd(fake, outcome1.workerId);
     fake.send({ t: "cmd_ack", re: cmd1.id, status: "accepted" });
-    await fake.emit("started", outcome1.workerId, { sessionId: outcome1.workerId, branch: "shepherd/leg-1-1" });
+    await fake.emit("started", outcome1.workerId, { sessionId: outcome1.workerId, branch: "sig/leg-1-1" });
     await snapshotWhere((s) => s.threads.some((t) => t.workers.some((w) => w.workerId === outcome1.workerId && w.state === "running")), "leg 1 running");
 
     // A continuation while running → resume with intent after; the send FAILS at the connector.

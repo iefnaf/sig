@@ -32,13 +32,13 @@ import { appendCapped } from "./logger.ts";
 import { redactText } from "./redact.ts";
 
 /** Claude Code requires a UUID session id (§4.2's workerId shape does not qualify). */
-const SHEPHERD_NAMESPACE = "e5f0a7c1-3b9d-4e8a-9f2b-6c4d1a7e8b3f";
+const SIG_NAMESPACE = "e5f0a7c1-3b9d-4e8a-9f2b-6c4d1a7e8b3f";
 
 /** Deterministic UUID (RFC 4122 shape, v5-style construction) for a workerId: the session id
  *  is a pure function of the worker, so relaunches — in this process or after a connector
  *  restart — always land on the same Claude Code session without extra state. */
 export function claudeSessionId(workerId: string): string {
-  const namespace = SHEPHERD_NAMESPACE.replace(/-/g, "");
+  const namespace = SIG_NAMESPACE.replace(/-/g, "");
   const hash = createHash("sha1");
   for (let i = 0; i < 16; i += 1) {
     hash.update(Buffer.from([Number.parseInt(namespace.slice(i * 2, i * 2 + 2), 16)]));
@@ -71,7 +71,7 @@ export function mapStopReason(stopReason: unknown): string | undefined {
   }
 }
 
-/** MCP tool calls arrive namespaced (`mcp__shepherd__report`): never match the bare name
+/** MCP tool calls arrive namespaced (`mcp__sig__report`): never match the bare name
  *  `report` — suffix-match instead (spike-conclusions §2). */
 export function isReportTool(name: string): boolean {
   return name.endsWith("__report");
@@ -100,7 +100,7 @@ export interface ClaudeAdapterOptions {
   stateDir: string;
   /** argv prefix for the claude binary; default ["claude"]. Tests point this at fake-claude. */
   command?: string[];
-  /** Extra env for the child (tests). SHEPHERD_* is always stripped (issue #27). */
+  /** Extra env for the child (tests). SIG_* is always stripped (issue #27). */
   env?: Record<string, string | undefined>;
   /** Per-worker stderr tails (§12); default <stateDir>/logs. Pass null to disable. */
   workerLogsDir?: string | null;
@@ -206,7 +206,7 @@ export class ClaudeAdapter implements AgentAdapter {
       configPath,
       JSON.stringify({
         mcpServers: {
-          shepherd: { type: "stdio", command: process.execPath, args: [serverPath, reportFile], env: {} },
+          sig: { type: "stdio", command: process.execPath, args: [serverPath, reportFile], env: {} },
         },
       }),
     );
@@ -254,7 +254,7 @@ export class ClaudeAdapter implements AgentAdapter {
 
     try {
       // §4.4 step 4 analog: system/init must arrive within the window, echo our session id,
-      // and show the shepherd MCP server connected (§15 item 1's startup self-check).
+      // and show the sig MCP server connected (§15 item 1's startup self-check).
       const init = await proc.waitForInit(this.options.initTimeoutMs ?? 30_000);
       const seen = typeof init.session_id === "string" ? init.session_id : "";
       if (!UUID_RE.test(sessionId) || (seen !== "" && seen !== sessionId)) {
@@ -264,12 +264,12 @@ export class ClaudeAdapter implements AgentAdapter {
         );
       }
       const mcp = Array.isArray(init.mcp_servers)
-        ? (init.mcp_servers as Array<Record<string, unknown>>).find((s) => s.name === "shepherd")
+        ? (init.mcp_servers as Array<Record<string, unknown>>).find((s) => s.name === "sig")
         : undefined;
       if (mcp && typeof mcp.status === "string" && mcp.status !== "connected") {
         throw new AdapterError(
           "startup_failed",
-          `shepherd MCP server status '${mcp.status}': the report tool is not available; refusing to run unreported`,
+          `sig MCP server status '${mcp.status}': the report tool is not available; refusing to run unreported`,
         );
       }
       const handle: WorkerHandle = { workerId: spec.workerId, sessionId, cwd: spec.cwd };
@@ -656,7 +656,7 @@ export class ClaudeProcess {
         record = JSON.parse(line) as Record<string, unknown>;
       } catch {
         // §9.4: an unparseable line is logged and dropped; do not terminate.
-        this.stderrTail += `\n[shepherd] unparseable stdout line: ${line.slice(0, 200)}\n`;
+        this.stderrTail += `\n[sig] unparseable stdout line: ${line.slice(0, 200)}\n`;
         continue;
       }
       if (record.type === "system" && record.subtype === "init" && this.initWaiter) {
@@ -680,7 +680,7 @@ export class ClaudeProcess {
   private handleExit(code: number | null, signal: NodeJS.Signals | null, error?: Error): void {
     if (this.exited) return;
     this.exited = true;
-    if (error) this.appendStderr(Buffer.from(`\n[shepherd] spawn error: ${error.message}\n`));
+    if (error) this.appendStderr(Buffer.from(`\n[sig] spawn error: ${error.message}\n`));
     if (this.initWaiter) {
       const waiter = this.initWaiter;
       this.initWaiter = null;

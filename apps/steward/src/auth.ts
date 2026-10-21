@@ -1,4 +1,4 @@
-import { serverKey, type ServerKey } from "@shepherd/protocol";
+import { serverKey, type ServerKey } from "@nightboats/protocol";
 
 export function bearer(request: Request): string | null {
   return request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ?? null;

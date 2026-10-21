@@ -38,7 +38,7 @@ let eventLog: EventLog;
 const apps: ConnectorApp[] = [];
 
 beforeEach(async () => {
-  dir = tmpDir("shepherd-session-watch");
+  dir = tmpDir("sig-session-watch");
   stateDir = join(dir, "state");
   sessionsDir = join(dir, "sessions");
   repo = await makeGitRepo(dir);
@@ -74,7 +74,7 @@ function assistantEntry(id: string, parentId: string | null, content: unknown, s
 
 /** A marker entry exactly as the injected extension writes it (ADR-0001). */
 function markerEntry(commandId: string): Record<string, unknown> {
-  return entry(`m-${commandId}`, { type: "custom", customType: "shepherd.command", data: { commandId, at: Date.now() } });
+  return entry(`m-${commandId}`, { type: "custom", customType: "sig.command", data: { commandId, at: Date.now() } });
 }
 
 /** Writes a session file whose entries chain like real pi's (each parents the next). */
@@ -125,7 +125,7 @@ describe("session observation (§6.3 evidence and §10 baselines)", () => {
     expect(inspectCommandDelivery(file, "cmd-9")).toBe("not_delivered");
     // A torn final write (crash mid-append) keeps the verdict honest: ambiguous.
     const torn = writeChainedSession("w-obs-3", [userEntry("u0", null, "x")]);
-    fsSync.writeFileSync(torn, fsSync.readFileSync(torn, "utf8") + '{"type":"custom","customType":"shepherd.co');
+    fsSync.writeFileSync(torn, fsSync.readFileSync(torn, "utf8") + '{"type":"custom","customType":"sig.co');
     expect(inspectCommandDelivery(torn, "cmd-1")).toBe("ambiguous");
   });
 });

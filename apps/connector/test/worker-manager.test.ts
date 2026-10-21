@@ -35,7 +35,7 @@ let manager: WorkerManager;
 const workerIds = new Set<string>();
 
 beforeEach(async () => {
-  dir = tmpDir("shepherd-worker-test");
+  dir = tmpDir("sig-worker-test");
   stateDir = join(dir, "state");
   repo = await makeGitRepo(dir);
   store = new LocalStore(join(stateDir, "connector.sqlite"));
@@ -104,7 +104,7 @@ describe("WorkerManager over fake-pi (connector-pi.md §4–§8, §11)", () => {
 
     // start_worker resolves once running (§6.3), with the worktree facts.
     expect(result.sessionId).toBe("w-test-worker-1");
-    expect(result.branch).toBe("shepherd/fix-the-login-bug-1");
+    expect(result.branch).toBe("sig/fix-the-login-bug-1");
     expect(result.cwd).toMatch(/state\/worktrees\/repo-a-[0-9a-f]{8}\/fix-the-login-bug-1$/);
     expect(result.worktree).toBe(result.cwd);
     expect(existsSync(join(result.cwd!, "fix.txt"))).toBe(true);
@@ -120,7 +120,7 @@ describe("WorkerManager over fake-pi (connector-pi.md §4–§8, §11)", () => {
       status: "done",
       summary: "Fixed the login bug",
       changes: ["src/auth/login.ts"],
-      git: { branch: "shepherd/fix-the-login-bug-1", ahead: 1, dirty: 0, filesChanged: 1, pushed: false },
+      git: { branch: "sig/fix-the-login-bug-1", ahead: 1, dirty: 0, filesChanged: 1, pushed: false },
     });
 
     expect(settled()).toMatchObject({
@@ -320,7 +320,7 @@ describe("WorkerManager over fake-pi (connector-pi.md §4–§8, §11)", () => {
     expect(reportEvent()).not.toHaveProperty("git");
   }, 30_000);
 
-  it("delivers the prompt through the /shepherd commandId wrapper (ADR-0001)", async () => {
+  it("delivers the prompt through the /sig commandId wrapper (ADR-0001)", async () => {
     const logPath = join(dir, "prompts.log");
     const scenario = writeScenario(dir, "scenario", [reportRun({ status: "done", summary: "s" })]);
     const { PiAdapter } = await import("../src/pi-adapter.ts");
@@ -357,16 +357,16 @@ describe("WorkerManager over fake-pi (connector-pi.md §4–§8, §11)", () => {
     ]);
   }, 30_000);
 
-  it("writes the shepherd extension into the state dir, not referencing the repo (§4.2)", async () => {
+  it("writes the sig extension into the state dir, not referencing the repo (§4.2)", async () => {
     setup([reportRun({ status: "done", summary: "s" })]);
     store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
     await manager.startWorker("cmd-assets-1", args());
     await waitFor(() => settled(), 15_000, "settled event");
-    const ext = join(stateDir, "ext", `shepherd-pi-${VERSION}.ts`);
+    const ext = join(stateDir, "ext", `sig-pi-${VERSION}.ts`);
     const prompt = join(stateDir, "prompts", `worker-${VERSION}.md`);
     expect(existsSync(ext)).toBe(true);
     expect(existsSync(prompt)).toBe(true);
-    expect(readFileSync(ext, "utf8")).toContain("shepherd.report-reminder");
+    expect(readFileSync(ext, "utf8")).toContain("sig.report-reminder");
     expect(readFileSync(prompt, "utf8")).toContain("report");
   }, 30_000);
 

@@ -6,7 +6,7 @@
 // 1. The stdin prompt is only processed on EOF: nothing happens until stdin ends — a
 //    connector that writes the prompt and forgets stdin.end() hangs forever here too.
 // 2. Stream events are LF-delimited JSON: system/init first, assistant messages with
-//    content blocks (tool_use names arrive MCP-namespaced, e.g. mcp__shepherd__report),
+//    content blocks (tool_use names arrive MCP-namespaced, e.g. mcp__sig__report),
 //    and a final `result` event that ends the run and the process.
 //
 // Env:
@@ -104,7 +104,7 @@ async function main() {
     type: "system",
     subtype: "init",
     session_id: sessionId,
-    mcp_servers: [{ name: "shepherd", status: startup.mcpStatus ?? "connected" }],
+    mcp_servers: [{ name: "sig", status: startup.mcpStatus ?? "connected" }],
   });
   const run = scenario.runs?.[nextRunIndex()] ?? [];
   await playRun(run);

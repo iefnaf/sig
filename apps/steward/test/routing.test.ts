@@ -52,7 +52,7 @@ async function oneIdleThread(title: string): Promise<{ fake: FakeConnector; thre
   // A realistic leg: started (the session exists on the connector) → report → settled.
   // Without the started event the worker has no sessionId and a follow-up correctly
   // opens a NEW session instead of resuming (issue #8 / PR #54 review finding 1).
-  await fake.emit("started", workerId, { sessionId: workerId, branch: `shepherd/${title}-1` });
+  await fake.emit("started", workerId, { sessionId: workerId, branch: `sig/${title}-1` });
   await fake.emit("report", workerId, { type: "report", status: "done", summary: `${title}完成` });
   await fake.emit("settled", workerId, { type: "settled", outcome: "reported" });
   await waitRunsSettled();

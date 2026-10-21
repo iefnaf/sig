@@ -1,0 +1,13 @@
+# Drop the Shepherd compatibility layer
+
+Status: accepted and implemented. Supersedes the keep-stable list of [ADR-0002](0002-sig-brand-and-compatibility.md); ADR-0002's branding decisions (the name Sig, the ∑ mark, the `sig` command) stand unchanged.
+
+ADR-0002 kept every Shepherd-era identifier — the `~/.shepherd` state directory, `SHEPHERD_*` environment aliases, the `dev.shepherd.connector` service label, the `shepherd_session` cookie, the `shepherd-steward` Worker name, `@shepherd/*` package names, the `shepherd:keyid:v1` / `shepherd:channel-secret:v1` derivation strings, the `shepherd/` worker branch prefix, and the `/shepherd` extension command with its `shepherd.command` / `shepherd.report-reminder` entry types — so existing deployments, credentials and resumable sessions would keep working. The product has since had no external release and no users beyond the owner's own machines, so nothing in the wild depends on those names, while the mixed vocabulary was a standing source of confusion (user-facing copy still told the owner to run `shepherd upgrade` / `shepherd repo-config`, commands no fresh install ships). Everything ADR-0002 pinned is now renamed in one break:
+
+- State directory `~/.sig` (`SIG_HOME`); no `SHEPHERD_HOME` / `SHEPHERD_MACHINE_NAME` fallbacks, and the child env strips the `SIG_*` namespace only.
+- Service label `dev.sig.connector`, unit entry `bin/sig.js`; the `bin/shepherd.js` forwarding wrapper is deleted.
+- Session cookie `sig_session`; Worker name `sig-steward`; workspace packages `@nightboats/protocol` / `@nightboats/steward` (public scope per [ADR-0008](0008-nightboats-npm-scope.md)).
+- Derivation strings `sig:keyid:v1` / `sig:channel-secret:v1`; worker branches `sig/<threadSlug>-<n>`.
+- Extension command `/sig` with `sig.command` / `sig.report-reminder` entry types and the `[sig:command <id>]` steer marker; installed assets `sig-pi-<version>.ts` / `sig-report-<version>.mjs`; Claude's MCP server key `sig` (tool `mcp__sig__report`); the steward extension and its `sig-situation` / `sig-notes` / `sig-role` prompt sections.
+
+Consequences, all accepted pre-release: a machine that ran a pre-rename build re-pairs (`sig connect`) because its credentials live under the old `~/.shepherd`; any previously deployed `shepherd-steward` Worker is torn down with `wrangler delete` rather than upgraded in place; open worker sessions from before the rename do not resume across the identifier change. Historical records (earlier ADRs, research notes, spike conclusions, recorded eval output) keep their original names, per the convention ADR-0002 set.

@@ -68,7 +68,7 @@ describe("a machine drops mid-task (spec §9: lost contact, not failed)", () => 
     const [cmd] = await fake.waitForCmds(1);
     const workerId = String((cmd!.args as Record<string, unknown>).workerId);
     fake.send({ t: "cmd_ack", re: cmd!.id, status: "accepted" });
-    await fake.emit("started", workerId, { sessionId: workerId, branch: "shepherd/x-1" });
+    await fake.emit("started", workerId, { sessionId: workerId, branch: "sig/x-1" });
     await snapshotWhere((s) => s.threads[0]?.workers[0]?.state === "running", "worker running");
 
     fake.close(); // the connection dies
@@ -94,7 +94,7 @@ describe("a machine drops mid-task (spec §9: lost contact, not failed)", () => 
     const [cmd] = await fake.waitForCmds(1);
     const workerId = String((cmd!.args as Record<string, unknown>).workerId);
     fake.send({ t: "cmd_ack", re: cmd!.id, status: "accepted" });
-    await fake.emit("started", workerId, { sessionId: workerId, branch: "shepherd/x-1" });
+    await fake.emit("started", workerId, { sessionId: workerId, branch: "sig/x-1" });
     await snapshotWhere((s) => s.threads[0]?.workers[0]?.state === "running", "worker running");
 
     fake.close();
@@ -128,7 +128,7 @@ describe("a machine drops mid-task (spec §9: lost contact, not failed)", () => 
     const [cmd] = await fake.waitForCmds(1);
     const workerId = String((cmd!.args as Record<string, unknown>).workerId);
     fake.send({ t: "cmd_ack", re: cmd!.id, status: "accepted" });
-    await fake.emit("started", workerId, { sessionId: workerId, branch: "shepherd/x-1" });
+    await fake.emit("started", workerId, { sessionId: workerId, branch: "sig/x-1" });
     await snapshotWhere((s) => s.threads[0]?.workers[0]?.state === "running", "worker running");
 
     fake.close();
@@ -149,7 +149,7 @@ describe("a machine drops mid-task (spec §9: lost contact, not failed)", () => 
     const [cmd] = await fake.waitForCmds(1);
     const workerId = String((cmd!.args as Record<string, unknown>).workerId);
     fake.send({ t: "cmd_ack", re: cmd!.id, status: "accepted" });
-    await fake.emit("started", workerId, { sessionId: workerId, branch: "shepherd/x-1" });
+    await fake.emit("started", workerId, { sessionId: workerId, branch: "sig/x-1" });
     await snapshotWhere((s) => s.threads[0]?.workers[0]?.state === "running", "worker running");
 
     // Outage 1: long enough to be announced, then recovered.
@@ -197,7 +197,7 @@ describe("one notice per affected worker, not per machine (finding 5)", () => {
     for (const cmd of cmds) {
       const workerId = String((cmd!.args as Record<string, unknown>).workerId);
       fake.send({ t: "cmd_ack", re: cmd!.id, status: "accepted" });
-      await fake.emit("started", workerId, { sessionId: workerId, branch: "shepherd/x-1" });
+      await fake.emit("started", workerId, { sessionId: workerId, branch: "sig/x-1" });
     }
     await snapshotWhere((s) => s.threads.length === 2 && s.threads.every((t) => t.workers[0]?.state === "running"), "both running");
 

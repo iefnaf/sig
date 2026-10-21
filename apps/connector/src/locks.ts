@@ -1,6 +1,6 @@
 // One-file-one-process invariant, docs/design/connector-pi.md §4.3. pi has no session-file
 // lock, so the connector guarantees: only one pi process per workerId at any moment, doubly
-// enforced by ~/.shepherd/locks/<workerId>.lock (pid + start time) plus in-memory state.
+// enforced by ~/.sig/locks/<workerId>.lock (pid + start time) plus in-memory state.
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";

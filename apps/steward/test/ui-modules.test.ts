@@ -249,7 +249,7 @@ describe("times and money", () => {
 describe("what the page derives from a snapshot", () => {
   const thread = (id: string, over: Record<string, unknown> = {}) => ({
     id, title: `Thread ${id}`, goal: null, summary: null, state: "idle", unread: false, machine: "mac-studio", repos: ["repo-a"],
-    workers: [{ agent: "pi", machine: "mac-studio", branch: `shepherd/${id}`, state: "idle" }], timeline: [], ...over,
+    workers: [{ agent: "pi", machine: "mac-studio", branch: `sig/${id}`, state: "idle" }], timeline: [], ...over,
   });
 
   it("groups threads by who is waiting on whom, and searches every field that identifies one", () => {
@@ -257,7 +257,7 @@ describe("what the page derives from a snapshot", () => {
     expect(groupThreads(threads, "").map((group) => [group.state, group.threads.map((entry: { id: string }) => entry.id)])).toEqual([["waiting_you", ["c"]], ["running", ["b"]], ["idle", ["a", "d"]]]);
     expect(groupThreads(threads, "billing").flatMap((group) => group.threads.map((entry: { id: string }) => entry.id))).toEqual(["c"]);
     expect(groupThreads(threads, "CLAUDE").flatMap((group) => group.threads.map((entry: { id: string }) => entry.id))).toEqual(["d"]);
-    expect(threadMatches(threads[0], "shepherd/a")).toBe(true); // by branch
+    expect(threadMatches(threads[0], "sig/a")).toBe(true); // by branch
     expect(groupThreads(threads, "nothing like this")).toEqual([]);
   });
 

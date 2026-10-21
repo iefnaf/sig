@@ -22,7 +22,7 @@ import { handleWorkspaceApi, type WorkspaceApiDeps } from "./workspace-api.ts";
 
 export const LINK_TTL_MS = 15 * 60_000;
 export const SESSION_TTL_MS = 7 * 24 * 60 * 60_000;
-export const SESSION_COOKIE = "shepherd_session";
+export const SESSION_COOKIE = "sig_session";
 
 const enc = new TextEncoder();
 

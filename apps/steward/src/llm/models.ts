@@ -83,9 +83,9 @@ export interface FauxRequestRecord {
   at: number;
   /** The last user message's text — the exact input the model received. */
   userText: string;
-  /** The `shepherd-situation` section of the outgoing system prompt, if the hook injected one. */
+  /** The `sig-situation` section of the outgoing system prompt, if the hook injected one. */
   brief: string | null;
-  /** The `shepherd-notes` section (resident-layer memory, issue #18), when present. */
+  /** The `sig-notes` section (resident-layer memory, issue #18), when present. */
   notes: string | null;
   lastToolResult: string;
 }
@@ -150,7 +150,7 @@ export function buildStewardModels(config: StewardModelConfig, apiKey: string | 
       const lastUser = [...messages].reverse().find((m) => m.role === "user");
       const lastToolResult = [...messages].reverse().find((m) => m.role === "toolResult");
       // Replay the sections the way the provider will (transcript.js): every system message
-      // patches by name, null removes. A delta-appended section (shepherd-notes) must be
+      // patches by name, null removes. A delta-appended section (sig-notes) must be
       // visible here exactly as the model receives it after the collapse into one prompt.
       const sections = new Map<string, string>();
       for (const message of messages) {
@@ -163,8 +163,8 @@ export function buildStewardModels(config: StewardModelConfig, apiKey: string | 
       requests.push({
         at: Date.now(),
         userText: textOf((lastUser as { content?: unknown } | undefined)?.content),
-        brief: sections.get("shepherd-situation") ?? null,
-        notes: sections.get("shepherd-notes") ?? null,
+        brief: sections.get("sig-situation") ?? null,
+        notes: sections.get("sig-notes") ?? null,
         lastToolResult: textOf((lastToolResult as { content?: unknown } | undefined)?.content),
       });
       if (requests.length > 50) requests.shift();

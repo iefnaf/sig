@@ -1,4 +1,4 @@
-// The log contract (issue #26): ~/.shepherd/logs contains no keys and no session content.
+// The log contract (issue #26): ~/.sig/logs contains no keys and no session content.
 // redactText is the backstop; the Logger writes JSONL, caps growth, and tails for `logs`.
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -10,7 +10,7 @@ import { redactText } from "../src/redact.ts";
 let dir: string;
 
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "shepherd-logger-test-"));
+  dir = mkdtempSync(join(tmpdir(), "sig-logger-test-"));
 });
 
 afterEach(() => {

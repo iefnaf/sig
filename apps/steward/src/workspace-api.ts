@@ -145,7 +145,7 @@ export async function handleWorkspaceApi(request: Request, url: URL, session: Ap
     if (url.pathname === "/app/api/logout") {
       deps.endSession(session.sid);
       const secure = url.protocol === "https:" && url.hostname !== "localhost" && url.hostname !== "127.0.0.1";
-      const cookie = ["shepherd_session=", "Path=/", "HttpOnly", "SameSite=Lax", "Max-Age=0", ...(secure ? ["Secure"] : [])].join("; ");
+      const cookie = ["sig_session=", "Path=/", "HttpOnly", "SameSite=Lax", "Max-Age=0", ...(secure ? ["Secure"] : [])].join("; ");
       return json({ ok: true }, 200, { "set-cookie": cookie });
     }
     const read = /^\/app\/api\/threads\/([\w-]{1,128})\/read$/.exec(url.pathname);

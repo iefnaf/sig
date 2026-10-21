@@ -20,7 +20,7 @@ import { ProgressThrottle } from "./progress.ts";
 import { inspectSessionTail, type SessionTail } from "./session-tail.ts";
 import { readSessionHistory } from "./session-history.ts";
 import { readFullSessionHistory, claudeSessionPath } from "./full-session-history.ts";
-import type { HistoryPage } from "@shepherd/protocol";
+import type { HistoryPage } from "@nightboats/protocol";
 import type { LocalStore, RegisteredRepo, WorkerRow } from "./store.ts";
 import { StallWatchdog, stallContinueNote, type StallWatchdogOptions, type WatchdogCandidate } from "./watchdog.ts";
 import { WorktreeManager, createReadonlyWorktree } from "./worktree.ts";
@@ -302,7 +302,7 @@ export class WorkerManager {
       adapter.on("worker-event", (event) => {
         void this.onAdapterEvent(event).catch((err) => {
           // Event handling must never take the connector down (e.g. store closed at shutdown).
-          console.error(`[shepherd] worker-event handling failed for ${event.workerId}:`, err);
+          console.error(`[sig] worker-event handling failed for ${event.workerId}:`, err);
         });
       });
     }
@@ -665,7 +665,7 @@ export class WorkerManager {
     if (!created.worktree) return;
     if (!processRan) {
       await this.worktrees.cleanup(repo.path, created.worktree, { force: true }).catch((err) => {
-        console.error(`[shepherd] could not undo the allocated worktree ${created.worktree}:`, err);
+        console.error(`[sig] could not undo the allocated worktree ${created.worktree}:`, err);
       });
       return;
     }
@@ -782,7 +782,7 @@ export class WorkerManager {
         }
       }
     } catch (err) {
-      console.error("[shepherd] serial queue pump failed:", err);
+      console.error("[sig] serial queue pump failed:", err);
     }
   }
 
@@ -917,7 +917,7 @@ export class WorkerManager {
     // at most one pr_worker per worker is ever in flight, and redeliveries dedupe on cmdId
     // (§6.3) before reaching this method.
     //
-    // `gh pr create` deliberately gets no `--base`: relay legs are cut from shepherd/*
+    // `gh pr create` deliberately gets no `--base`: relay legs are cut from sig/*
     // branches that are typically unpushed (the whole point of this gate), so targeting one
     // would fail with "base branch not found". The repo's default branch shows the thread's
     // whole stacked work — the PR the user expects to review.
@@ -1427,7 +1427,7 @@ export class WorkerManager {
         await this.deliverSend(worker, send.commandId, { text: send.text, intent: "auto", images: send.images });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        console.error(`[shepherd] deferred send failed for ${workerId}: ${message}`);
+        console.error(`[sig] deferred send failed for ${workerId}: ${message}`);
         await this.emitEvent(workerId, "queue_returned", { texts: [send.text], reason: "undeliverable" });
       }
     }
@@ -1483,7 +1483,7 @@ export class WorkerManager {
     if (!worker || worker.state !== "idle") return;
     if (!(this.adapterOfWorkerOrNull(worker)?.isRunning?.(workerId) ?? false)) return;
     await this.stopProcess(workerId).catch((err) => {
-      console.error(`[shepherd] idle reclaim failed for ${workerId}:`, err);
+      console.error(`[sig] idle reclaim failed for ${workerId}:`, err);
     });
   }
 
@@ -1549,7 +1549,7 @@ export class WorkerManager {
       try {
         await this.reconcileWorkerTail(worker);
       } catch (err) {
-        console.error(`[shepherd] session-tail reconciliation failed for ${worker.workerId}:`, err);
+        console.error(`[sig] session-tail reconciliation failed for ${worker.workerId}:`, err);
       }
     }
     // Queued write workers whose runner settled or broke over the restart can start now.
@@ -2247,13 +2247,13 @@ function commandWorkerId(args: Record<string, unknown>, envelopeWorkerId: string
 
 /** §8.2/§13 (issue #16): local-only settings arriving inside a command are rejected before
  * anything runs — even a fully authenticated steward must not flip approveProject or the
- * workspace mode from afar; the owner sets them with `shepherd repo-config` on the machine. */
+ * workspace mode from afar; the owner sets them with `sig repo-config` on the machine. */
 function rejectLocalOnlyArgs(args: Record<string, unknown>): void {
   for (const key of LOCAL_ONLY_ARGS) {
     if (key in args) {
       throw new CommandError(
         "local_only_setting",
-        `'${key}' is a connector-local setting; set it on the machine with 'shepherd repo-config' (§13)`,
+        `'${key}' is a connector-local setting; set it on the machine with 'sig repo-config' (§13)`,
       );
     }
   }

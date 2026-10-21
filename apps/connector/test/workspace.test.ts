@@ -40,7 +40,7 @@ let manager: WorkerManager;
 const workerIds = new Set<string>();
 
 beforeEach(async () => {
-  dir = tmpDir("shepherd-workspace-test");
+  dir = tmpDir("sig-workspace-test");
   stateDir = join(dir, "state");
   repo = await makeGitRepo(dir);
   store = new LocalStore(join(stateDir, "connector.sqlite"));
@@ -194,7 +194,7 @@ describe("per-repo workspace modes (spec §11, connector-pi.md §8.2)", () => {
     expect(startedOf("w-ser-2")).toBeUndefined();
 
     await waitFor(() => startedOf("w-ser-2"), 25_000, "queued worker started after the first settled");
-    expect(startedOf("w-ser-2")).toMatchObject({ branch: "shepherd/second-thread-1" });
+    expect(startedOf("w-ser-2")).toMatchObject({ branch: "sig/second-thread-1" });
     await waitFor(() => settledOf("w-ser-2"), 15_000, "second worker settled");
 
     // The queue row is gone once launched.
@@ -449,8 +449,8 @@ describe("readonly relay legs continue from the previous branch (issue #8, spec 
   it("a readonly start_worker with base runs on a detached-HEAD worktree at that branch", async () => {
     setup([reportRun({ status: "done", summary: "reviewed" })]);
     registerRepo();
-    // The write leg's branch: one commit with a plan file, on shepherd/write-1.
-    await git(repo, ["checkout", "-b", "shepherd/write-1"]);
+    // The write leg's branch: one commit with a plan file, on sig/write-1.
+    await git(repo, ["checkout", "-b", "sig/write-1"]);
     const planPath = join(repo, "PLAN.md");
     writeFileSync(planPath, "# plan from leg 1\n");
     await git(repo, ["add", "PLAN.md"]);
@@ -460,7 +460,7 @@ describe("readonly relay legs continue from the previous branch (issue #8, spec 
 
     const workerId = "w-review-leg";
     workerIds.add(workerId);
-    const result = await manager.startWorker("cmd-ro", args({ workerId, mode: "readonly", base: "shepherd/write-1" }));
+    const result = await manager.startWorker("cmd-ro", args({ workerId, mode: "readonly", base: "sig/write-1" }));
     expect(result.branch).toBeUndefined(); // detached: no branch is created or moved
     expect(result.worktree).toBeTruthy();
     // The detached worktree sees leg 1's plan file; the owner's checkout stays on main.
@@ -477,18 +477,18 @@ describe("readonly relay legs continue from the previous branch (issue #8, spec 
   it("a second readonly leg on the same thread+repo gets its own worktree (finding 2)", async () => {
     setup([reportRun({ status: "done", summary: "r1" }), reportRun({ status: "done", summary: "r2" })]);
     registerRepo();
-    await git(repo, ["checkout", "-b", "shepherd/write-1"]);
+    await git(repo, ["checkout", "-b", "sig/write-1"]);
     writeFileSync(join(repo, "PLAN.md"), "# plan\n");
     await git(repo, ["add", "PLAN.md"]);
     await git(repo, ["commit", "-m", "plan"]);
     await git(repo, ["checkout", "main"]);
 
-    const first = await manager.startWorker("cmd-ro-a", args({ workerId: "w-ro-1", threadId: "relay-thread", mode: "readonly", base: "shepherd/write-1" }));
+    const first = await manager.startWorker("cmd-ro-a", args({ workerId: "w-ro-1", threadId: "relay-thread", mode: "readonly", base: "sig/write-1" }));
     await waitFor(() => settledOf("w-ro-1"), 15_000, "first readonly leg settled");
     // The leg went idle-hot (process alive, directory in use) — the second leg must not
     // reuse or delete that directory; it gets its own, and git's "missing but already
     // registered" never fires (PR #54 review finding 2).
-    const second = await manager.startWorker("cmd-ro-b", args({ workerId: "w-ro-2", threadId: "relay-thread", mode: "readonly", base: "shepherd/write-1" }));
+    const second = await manager.startWorker("cmd-ro-b", args({ workerId: "w-ro-2", threadId: "relay-thread", mode: "readonly", base: "sig/write-1" }));
     expect(second.worktree).toBeTruthy();
     expect(second.worktree).not.toBe(first.worktree);
     expect(existsSync(join(second.worktree!, "PLAN.md"))).toBe(true);
@@ -502,7 +502,7 @@ describe("readonly relay legs continue from the previous branch (issue #8, spec 
     const workerId = "w-review-missing";
     workerIds.add(workerId);
     await expect(
-      manager.startWorker("cmd-ro-2", args({ workerId, mode: "readonly", base: "shepherd/never-pushed" })),
+      manager.startWorker("cmd-ro-2", args({ workerId, mode: "readonly", base: "sig/never-pushed" })),
     ).rejects.toMatchObject({ code: "worktree_failed" });
   }, 30_000);
 });
@@ -528,7 +528,7 @@ describe("LocalStore per-repo config and the queue tables (issue #16)", () => {
     store.deleteQueuedStart("w-q");
     expect(store.getQueuedStart("w-q")).toBeNull();
 
-    store.upsertWorker({ workerId: "w-w", threadId: "t", repoId: repo, mode: "write", state: "idle", worktree: "/tmp/w", branch: "shepherd/t-1", base: "main" });
+    store.upsertWorker({ workerId: "w-w", threadId: "t", repoId: repo, mode: "write", state: "idle", worktree: "/tmp/w", branch: "sig/t-1", base: "main" });
     store.clearWorkerWorktree("w-w");
     expect(store.getWorker("w-w")).toMatchObject({ worktree: null, branch: null, base: null });
   });

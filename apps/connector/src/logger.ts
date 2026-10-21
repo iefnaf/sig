@@ -1,4 +1,4 @@
-// The connector's on-disk logger (connector-pi.md §12): JSONL under ~/.shepherd/logs/,
+// The connector's on-disk logger (connector-pi.md §12): JSONL under ~/.sig/logs/,
 // capped, with secrets redacted before anything is written. Session content never reaches
 // this logger by construction — callers log ids, codes and event types only.
 import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
@@ -58,7 +58,7 @@ export class Logger {
       // A logger must never take the daemon down (disk full, state dir removed at shutdown);
       // stderr still reaches launchd/journal for post-mortem.
       try {
-        process.stderr.write(`[shepherd] log write failed: ${line}\n`);
+        process.stderr.write(`[sig] log write failed: ${line}\n`);
       } catch {
         // nothing left to try
       }

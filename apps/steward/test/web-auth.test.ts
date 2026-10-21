@@ -100,7 +100,7 @@ describe("the worker-layer gate: invalid links never reach the DO", () => {
 describe("/网页 → one-time link → session cookie → /app", () => {
   it("replies with a one-time URL that logs in and redirects to /app", async () => {
     const { cookie } = await loginViaChat();
-    expect(cookie).toMatch(/^shepherd_session=ws1\.[0-9a-f]{64}\.[0-9a-f]{64}$/);
+    expect(cookie).toMatch(/^sig_session=ws1\.[0-9a-f]{64}\.[0-9a-f]{64}$/);
 
     const res = await SELF.fetch("https://example.com/app", { headers: { cookie } });
     expect(res.status).toBe(200);
@@ -135,12 +135,12 @@ describe("/网页 → one-time link → session cookie → /app", () => {
     expect(await res.text()).toContain("先登录");
     // A syntactically valid but unknown session id passes the worker HMAC gate only if
     // signed; a bare random sid is rejected right there.
-    const res2 = await SELF.fetch("https://example.com/app", { headers: { cookie: "shepherd_session=ws1.deadbeef.notamac" } });
+    const res2 = await SELF.fetch("https://example.com/app", { headers: { cookie: "sig_session=ws1.deadbeef.notamac" } });
     expect(res2.status).toBe(401);  });
 
   it("a well-formed but unknown session sid is rejected by the DO", async () => {
     const fakeSid = "ab".repeat(32);
-    const cookie = `shepherd_session=${await sessionCookieValue("test-server-key-not-a-secret", fakeSid)}`;
+    const cookie = `sig_session=${await sessionCookieValue("test-server-key-not-a-secret", fakeSid)}`;
     expect(await parseSessionCookie(["test-server-key-not-a-secret"], cookie.split("=")[1]!)).toBe(fakeSid);
     const res = await SELF.fetch("https://example.com/app", { headers: { cookie } });
     expect(res.status).toBe(401);

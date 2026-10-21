@@ -101,15 +101,15 @@ describe("the happy loop: natural language → tool dispatch → done card → e
 
     // --- the worker runs and reports: a deterministic green three-part card comes back -------
     fake.send({ t: "cmd_ack", re: cmd1!.id, status: "accepted" });
-    fake.send({ t: "cmd_result", re: cmd1!.id, ok: true, data: { sessionId: workerId, branch: "shepherd/login-1" } });
-    await fake.emit("started", workerId, { sessionId: workerId, branch: "shepherd/login-1" });
+    fake.send({ t: "cmd_result", re: cmd1!.id, ok: true, data: { sessionId: workerId, branch: "sig/login-1" } });
+    await fake.emit("started", workerId, { sessionId: workerId, branch: "sig/login-1" });
     await fake.emit("report", workerId, {
       type: "report",
       status: "done",
       summary: "登录 bug 修好，测试通过",
       changes: ["auth/session.ts 补上过期刷新"],
       tests: { ran: true, passed: true },
-      git: { branch: "shepherd/login-1", base: "main", ahead: 1, dirty: 0, filesChanged: 1, insertions: 5, deletions: 1, pushed: false },
+      git: { branch: "sig/login-1", base: "main", ahead: 1, dirty: 0, filesChanged: 1, insertions: 5, deletions: 1, pushed: false },
     });
     const doneSnap = await snapshotWhere(
       (s) => s.threads[0]?.workers[0]?.state === "running" && s.threads[0]?.unread === true,
@@ -125,7 +125,7 @@ describe("the happy loop: natural language → tool dispatch → done card → e
 
     // --- the event wake: the model does bookkeeping; its plain text never reaches the user ---
     await scriptModel(
-      fauxAssistantMessage([fauxToolCall("update_thread", { threadId, summary: "登录 bug 已修复：session 过期刷新补齐，测试通过，分支 shepherd/login-1" })], { stopReason: "toolUse" }),
+      fauxAssistantMessage([fauxToolCall("update_thread", { threadId, summary: "登录 bug 已修复：session 过期刷新补齐，测试通过，分支 sig/login-1" })], { stopReason: "toolUse" }),
       fauxAssistantMessage([fauxText("记账完成。（这行文字不应该发给用户）")]),
     );
     await waitRunsSettled(); // the wake fired after the 3s merge window and settled
@@ -187,13 +187,13 @@ describe("the happy loop: natural language → tool dispatch → done card → e
       status: "done",
       summary: "单元测试补齐",
       changes: ["session.test.ts 新增 3 例"],
-      git: { branch: "shepherd/login-1", base: "main", ahead: 2, dirty: 0, filesChanged: 2, insertions: 8, deletions: 0, pushed: false },
+      git: { branch: "sig/login-1", base: "main", ahead: 2, dirty: 0, filesChanged: 2, insertions: 8, deletions: 0, pushed: false },
     });
     const after = await snapshotWhere(
       (s) => s.threads[0]?.workers[0]?.state === "running" && s.threads[0]?.workers[0]?.lastOutcome === "reported:done",
       "resumed run reported",
     );
-    expect(after.threads[0]!.workers[0]!.branch).toBe("shepherd/login-1"); // branch survived the branchless started
+    expect(after.threads[0]!.workers[0]!.branch).toBe("sig/login-1"); // branch survived the branchless started
     await waitWhileOutboundPending();
     const cards = await sentCards(2);
     expect(cards).toHaveLength(2);
@@ -205,7 +205,7 @@ describe("the happy loop: natural language → tool dispatch → done card → e
 
 describe("offline machines (spike bug 4 → protocol §7.3): the Thread remembers its machine; the command waits for the owner", () => {
   it("a quote-reply continuation while offline parks a held resume; wait delivers it at the next hello", async () => {
-    const fake = await pairFakeConnector("mac-studio", { run: { status: "done", summary: "第一段完成", branch: "shepherd/leg-1" } });
+    const fake = await pairFakeConnector("mac-studio", { run: { status: "done", summary: "第一段完成", branch: "sig/leg-1" } });
     await fake.connect();
 
     await scriptModel(
@@ -263,7 +263,7 @@ describe("offline machines (spike bug 4 → protocol §7.3): the Thread remember
     const workerId = heldSnap.threads[0]!.workers[0]!.workerId;
     fake.send({ t: "cmd_ack", re: cmd2!.id, status: "accepted" });
     fake.send({ t: "cmd_result", re: cmd2!.id, ok: true, data: { delivery: "prompt", relaunched: true } });
-    await fake.emit("started", workerId, { sessionId: workerId, branch: "shepherd/leg-1" });
+    await fake.emit("started", workerId, { sessionId: workerId, branch: "sig/leg-1" });
     await fake.emit("report", workerId, { type: "report", status: "done", summary: "第二段接力完成" });
     await fake.emit("settled", workerId, { type: "settled", outcome: "reported" });
     await snapshotWhere((s) => s.threads[0]?.workers[0]?.state === "idle", "second leg done after reconnect");
@@ -276,7 +276,7 @@ describe("offline machines (spike bug 4 → protocol §7.3): the Thread remember
 
 describe("the offline-ask card: buttons resolve the Thread via providerMsgId (§3.1)", () => {
   it("start_worker on an offline-only machine asks with buttons; wait_online clears the hold and it runs on return", async () => {
-    const fake = await pairFakeConnector("mac-studio", { run: { status: "done", summary: "排队后完成", branch: "shepherd/queued-1" } });
+    const fake = await pairFakeConnector("mac-studio", { run: { status: "done", summary: "排队后完成", branch: "sig/queued-1" } });
     await fake.connect();
     await snapshotWhere((s) => s.machines.some((m) => m.online), "machine checked in");
     fake.close();

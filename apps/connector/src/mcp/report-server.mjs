@@ -11,14 +11,14 @@
 // so this server stays a dumb acknowledge-and-persist endpoint: argv[2] receives the last
 // report's args as JSON (best-effort audit trail; nothing reads it in anger).
 //
-// Like every agent child it gets no SHEPHERD_* env and no connector credentials, and it
+// Like every agent child it gets no SIG_* env and no connector credentials, and it
 // touches nothing on disk except argv[2].
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 const AUDIT_FILE = process.argv[2] ?? null;
 const PROTOCOL_VERSION = "2024-11-05";
-const SERVER_INFO = { name: "shepherd-report", version: "1.0.0" };
+const SERVER_INFO = { name: "sig-report", version: "1.0.0" };
 
 /** §7.2 (v1) — the same fields the pi extension's `report` tool takes. */
 const REPORT_TOOL = {

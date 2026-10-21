@@ -9,9 +9,9 @@
 //   status                 service state, pairing, workers, installed assets
 //   proxy [<url>|--clear]  show / set / clear the stored proxy (loopback never proxied)
 //   doctor                 pairing, service, proxy, and reachability diagnosis
-//   logs [-n N] [name]     tail ~/.shepherd/logs/<name> (default connector.log)
+//   logs [-n N] [name]     tail ~/.sig/logs/<name> (default connector.log)
 //   start | stop | restart control the background service (stop also disables start-at-login)
-//   uninstall              stop the service and remove its unit (keeps ~/.shepherd data)
+//   uninstall              stop the service and remove its unit (keeps ~/.sig data)
 //   upgrade [--version V]  npm-install @nightboats/sig (default @latest) and restart the
 //                          service; the fresh daemon rewrites the versioned pi assets
 //   add-repo <path>        register a repository so start_worker may run in it (§8.1)
@@ -39,7 +39,7 @@ import {
   resolveProxyConfig,
   type ProxyConfig,
 } from "./proxy.ts";
-import { getServiceInstaller, SHEPHERD_LABEL, type ServiceInstaller, type ServiceSpec } from "./service.ts";
+import { getServiceInstaller, SIG_LABEL, type ServiceInstaller, type ServiceSpec } from "./service.ts";
 import { isWorkspaceMode, LocalStore, WORKSPACE_MODES } from "./store.ts";
 import { defaultBranch, repoTopLevel } from "./worktree.ts";
 import { runUpgrade } from "./upgrade.ts";
@@ -50,8 +50,7 @@ const exec = promisify(execFile);
 const DEFAULT_PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
 function stateDir(): string {
-  // Keep the existing store by default: rebranding must not lose paired machines.
-  return process.env.SIG_HOME ?? process.env.SHEPHERD_HOME ?? join(homedir(), ".shepherd");
+  return process.env.SIG_HOME ?? join(homedir(), ".sig");
 }
 
 /** The bin wrapper this package ships; both src/cli.ts (dev) and dist/cli.js sit one
@@ -72,9 +71,9 @@ usage:
                                           show / set / clear the stored proxy (no_proxy
                                           bypasses hosts; loopback always bypassed)
   sig doctor                                 pairing, service, proxy, and reachability check
-  sig logs [-n <lines>] [name]               tail ~/.shepherd/logs (default connector.log)
+  sig logs [-n <lines>] [name]               tail ~/.sig/logs (default connector.log)
   sig start | stop | restart                 control the background service
-  sig uninstall                              remove the service (keeps ~/.shepherd data)
+  sig uninstall                              remove the service (keeps ~/.sig data)
   sig upgrade [--version <version>]          replace the package and restart the service
   sig add-repo <path>                        register a repository for start_worker
   sig repo-config <path> [options]           per-repo local settings (workspace mode,
@@ -82,10 +81,9 @@ usage:
   sig daemon                                 internal: run the connector daemon
 
 environment:
-  SIG_HOME         state directory (default ~/.shepherd, preserved across the rename)
+  SIG_HOME         state directory (default ~/.sig)
   SIG_MACHINE_NAME machine name reported to the steward
-  HTTPS_PROXY      captured into the stored proxy by 'sig connect' when no --proxy is given
-  SHEPHERD_HOME / SHEPHERD_MACHINE_NAME remain supported as fallback aliases`;
+  HTTPS_PROXY      captured into the stored proxy by 'sig connect' when no --proxy is given`;
 
 function usage(code = 2): never {
   console.error(USAGE);
@@ -122,10 +120,10 @@ function requireInstaller(): ServiceInstaller {
 function serviceSpec(entryPath: string): ServiceSpec {
   const dir = stateDir();
   const env: Record<string, string> = { PATH: process.env.PATH ?? DEFAULT_PATH, SIG_HOME: dir };
-  const machineName = process.env.SIG_MACHINE_NAME ?? process.env.SHEPHERD_MACHINE_NAME;
+  const machineName = process.env.SIG_MACHINE_NAME;
   if (machineName) env.SIG_MACHINE_NAME = machineName;
   return {
-    label: SHEPHERD_LABEL,
+    label: SIG_LABEL,
     nodePath: process.execPath,
     entryPath,
     args: ["daemon"],
@@ -185,12 +183,12 @@ async function connectCommand(argv: string[]): Promise<void> {
   // A non-default state directory must stop before anything else: the launchd/systemd unit
   // is shared machine state (fixed label), so installing from a private state directory
   // would silently repoint the machine's own connector at it.
-  if ((process.env.SIG_HOME ?? process.env.SHEPHERD_HOME) && !foreground) {
+  if (process.env.SIG_HOME && !foreground) {
     fail(
-      "SIG_HOME (or SHEPHERD_HOME) is set to a private state directory; installing the shared background service would repoint this machine's connector. Use --foreground, or unset it.",
+      "SIG_HOME is set to a private state directory; installing the shared background service would repoint this machine's connector. Use --foreground, or unset it.",
     );
   }
-  const machineName = process.env.SIG_MACHINE_NAME ?? process.env.SHEPHERD_MACHINE_NAME ?? hostname();
+  const machineName = process.env.SIG_MACHINE_NAME ?? hostname();
 
   // 1. Proxy (issue #68), resolved before pairing so the /pair fetch itself goes through
   //    it. An explicit --proxy wins; a stored config is kept; otherwise the shell's
@@ -427,7 +425,7 @@ async function statusCommand(): Promise<void> {
     const status = await installer.status();
     const pid = status.pid ? ` pid ${status.pid}` : "";
     console.log(
-      `service:  ${installer.kind} ${SHEPHERD_LABEL} — ${status.installed ? (status.running ? `running${pid} (${status.detail})` : `not running (${status.detail})`) : "not installed"}`,
+      `service:  ${installer.kind} ${SIG_LABEL} — ${status.installed ? (status.running ? `running${pid} (${status.detail})` : `not running (${status.detail})`) : "not installed"}`,
     );
   } else {
     console.log(`service:  not supported on ${process.platform}`);
@@ -501,7 +499,7 @@ async function serviceCommand(action: "start" | "stop" | "restart"): Promise<voi
   }
   const status = await installer.status();
   console.log(
-    `${SHEPHERD_LABEL}: ${status.running ? `running${status.pid ? ` (pid ${status.pid})` : ""}` : `not running (${status.detail})`}`,
+    `${SIG_LABEL}: ${status.running ? `running${status.pid ? ` (pid ${status.pid})` : ""}` : `not running (${status.detail})`}`,
   );
 }
 
@@ -539,7 +537,7 @@ async function daemonCommand(): Promise<void> {
   const dir = stateDir();
   let handle;
   try {
-    handle = await runDaemon({ stateDir: dir, machineName: process.env.SIG_MACHINE_NAME ?? process.env.SHEPHERD_MACHINE_NAME ?? hostname() });
+    handle = await runDaemon({ stateDir: dir, machineName: process.env.SIG_MACHINE_NAME ?? hostname() });
   } catch (err) {
     fail(err instanceof Error ? err.message : String(err));
   }

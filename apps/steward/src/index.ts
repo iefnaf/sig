@@ -1,5 +1,5 @@
 import { getAgentByName, routeAgentRequest } from "agents";
-import { parseToken } from "@shepherd/protocol";
+import { parseToken } from "@nightboats/protocol";
 import { bearer, resolveServerKeys } from "./auth.ts";
 import { AVATAR_PATH, LOGO_PATH, BRAND_HEAD, BRAND_LOCKUP, BRAND_STYLE } from "./brand.ts";
 import { Steward } from "./steward.ts";
@@ -23,8 +23,8 @@ const LINK_HINT = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"
 function sessionCookie(request: Request): string | null {
   return (request.headers.get("cookie") ?? "")
     .split(/;\s*/)
-    .find((part) => part.startsWith("shepherd_session="))
-    ?.slice("shepherd_session=".length) ?? null;
+    .find((part) => part.startsWith("sig_session="))
+    ?.slice("sig_session=".length) ?? null;
 }
 
 // Length-independent comparison so the API gate never leaks the key byte-by-byte.

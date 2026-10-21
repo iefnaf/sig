@@ -38,7 +38,7 @@ Connector B ──wss──▶                                     ├─ connec
 ### 3.1 Connection
 
 ```
-wss://<worker-host>/agents/shepherd/owner?role=connector&proto=1
+wss://<worker-host>/agents/sig/owner?role=connector&proto=1
 Authorization: Bearer <device token>
 ```
 
@@ -142,7 +142,7 @@ The token is issued by the DO at pairing time, in the format:
 ```
 st1.<keyId>.<deviceId>.<epoch>.<issuedAt>.<mac>
 mac   = HMAC-SHA256(key.secret, "st1." + keyId + "." + deviceId + "." + epoch + "." + issuedAt)
-keyId = first 8 hex chars of SHA-256("shepherd:keyid:v1:" + key.secret)
+keyId = first 8 hex chars of SHA-256("sig:keyid:v1:" + key.secret)
 ```
 
 - `SERVER_KEY` is a random value generated at deploy time and stored as a Worker secret. The optional `SERVER_KEY_PREVIOUS` secret holds the preceding key during a rotation window (below); the verifier accepts tokens signed by either — tokens minted before the `keyId` segment existed (`st1.<deviceId>.<epoch>.<issuedAt>.<mac>`) are tried against every configured key.
@@ -213,7 +213,7 @@ A connector connection sending browser-type messages, or a browser connection se
   "connector": { "version": "0.1.0", "os": "darwin", "arch": "arm64", "node": "22.13.0" },
   "machine": { "name": "mac-studio", "memTotalMB": 65536, "memFreeMB": 31000 },
   "agents": [ { "kind": "pi", "version": "1.2.0", "capabilities": { "steer": true, "followUp": true, "interrupt": true, "resume": true, "history": true, "images": true, "structuredReport": true, "readonly": true } } ],
-  "repos": [ { "repoId": "…", "name": "shepherd", "path": "/Users/x/code/shepherd", "defaultBranch": "main", "remote": "git@github.com:…" } ],
+  "repos": [ { "repoId": "…", "name": "sig", "path": "/Users/x/code/sig", "defaultBranch": "main", "remote": "git@github.com:…" } ],
   "limits": { "maxWorkers": 4, "running": 1 },
   "workers": [ { "workerId": "w…", "agent": "pi", "state": "idle", "lastSeq": 128, "sessionId": "…", "lastOutcome": "reported:done" } ],
   "pendingAcks": [ { "cmdId": "…", "state": "done" } ]
@@ -270,7 +270,7 @@ Images ride base64-encoded in `images` and must fit, together with the whole com
 { "t": "cmd_ack", "re": "<cmdId>", "status": "accepted" }
 { "t": "cmd_ack", "re": "<cmdId>", "status": "duplicate", "result": { "ok": true, "data": { } } }
 { "t": "cmd_ack", "re": "<cmdId>", "status": "rejected", "code": "not_registered_repo" }
-{ "t": "cmd_result", "re": "<cmdId>", "ok": true, "data": { "sessionId": "…", "branch": "shepherd/login-1", "effect": "after_current_tools" } }
+{ "t": "cmd_result", "re": "<cmdId>", "ok": true, "data": { "sessionId": "…", "branch": "sig/login-1", "effect": "after_current_tools" } }
 { "t": "cmd_result", "re": "<cmdId>", "ok": false, "error": { "code": "lock_held", "message": "…", "retriable": false } }
 ```
 
@@ -281,7 +281,7 @@ The `cmd_result` for `start_worker` is sent once the worker enters `running` (it
 ```json
 { "t": "events", "id": "…", "batch": [
   { "workerId": "w…", "seq": 129, "ts": 1791965700000, "type": "progress", "phase": "tool", "tool": "edit", "target": "auth/session.ts", "turn": 3 },
-  { "workerId": "w…", "seq": 130, "ts": 1791965712000, "type": "report", "status": "done", "summary": "…", "changes": ["…"], "git": { "branch": "shepherd/login-1", "ahead": 2, "dirty": 0, "pushed": false } },
+  { "workerId": "w…", "seq": 130, "ts": 1791965712000, "type": "report", "status": "done", "summary": "…", "changes": ["…"], "git": { "branch": "sig/login-1", "ahead": 2, "dirty": 0, "pushed": false } },
   { "workerId": "w…", "seq": 131, "ts": 1791965712500, "type": "settled", "outcome": "reported", "usage": { "tokens": { "input": 2317, "output": 101 }, "cost": 0.004 } }
 ] }
 ```

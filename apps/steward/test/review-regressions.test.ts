@@ -112,8 +112,8 @@ describe("review #4: event-triggered runs need a verifiable provenanceRef to dis
     const [cmd] = await fake.waitForCmds(1);
     const workerId = String((cmd!.args as Record<string, unknown>).workerId);
     fake.send({ t: "cmd_ack", re: cmd!.id, status: "accepted" });
-    fake.send({ t: "cmd_result", re: cmd!.id, ok: true, data: { sessionId: workerId, branch: "shepherd/p-1" } });
-    await fake.emit("started", workerId, { sessionId: workerId, branch: "shepherd/p-1" });
+    fake.send({ t: "cmd_result", re: cmd!.id, ok: true, data: { sessionId: workerId, branch: "sig/p-1" } });
+    await fake.emit("started", workerId, { sessionId: workerId, branch: "sig/p-1" });
     await waitRunsSettled();
 
     // The event wake: the model tries to dispatch with no ref (blocked), a bogus ref
@@ -240,8 +240,8 @@ describe("review #7: a routed reply closes the thread's open question", () => {
     const [cmd] = await fake.waitForCmds(1);
     const workerId = String((cmd!.args as Record<string, unknown>).workerId);
     fake.send({ t: "cmd_ack", re: cmd!.id, status: "accepted" });
-    fake.send({ t: "cmd_result", re: cmd!.id, ok: true, data: { sessionId: workerId, branch: "shepherd/q-1" } });
-    await fake.emit("started", workerId, { sessionId: workerId, branch: "shepherd/q-1" });
+    fake.send({ t: "cmd_result", re: cmd!.id, ok: true, data: { sessionId: workerId, branch: "sig/q-1" } });
+    await fake.emit("started", workerId, { sessionId: workerId, branch: "sig/q-1" });
     await fake.emit("settled", workerId, { type: "settled", outcome: "reported" });
     await waitRunsSettled();
     await waitWhileOutboundPending();
@@ -320,8 +320,8 @@ describe("review (other): the true submit-succeeded/markSubmitted-lost crash win
     const [cmd] = await fake.waitForCmds(1);
     const workerId = String((cmd!.args as Record<string, unknown>).workerId);
     fake.send({ t: "cmd_ack", re: cmd!.id, status: "accepted" });
-    fake.send({ t: "cmd_result", re: cmd!.id, ok: true, data: { sessionId: workerId, branch: "shepherd/w-1" } });
-    await fake.emit("started", workerId, { sessionId: workerId, branch: "shepherd/w-1" });
+    fake.send({ t: "cmd_result", re: cmd!.id, ok: true, data: { sessionId: workerId, branch: "sig/w-1" } });
+    await fake.emit("started", workerId, { sessionId: workerId, branch: "sig/w-1" });
     await scriptModel(fauxAssistantMessage([fauxText("记账。")]));
     await fake.emit("report", workerId, { type: "report", status: "done", summary: "修好了" });
 

@@ -35,7 +35,7 @@ let mock: MockSteward;
 const apps: ConnectorApp[] = [];
 
 beforeEach(async () => {
-  dir = tmpDir("shepherd-e2e-restart");
+  dir = tmpDir("sig-e2e-restart");
   stateDir = join(dir, "state");
   sessionsDir = join(dir, "sessions");
   repo = await makeGitRepo(dir);

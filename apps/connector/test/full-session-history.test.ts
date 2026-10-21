@@ -5,7 +5,7 @@
 import { appendFileSync, mkdirSync, renameSync, rmSync, truncateSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { HistoryPage } from "@shepherd/protocol";
+import type { HistoryPage } from "@nightboats/protocol";
 import { claudeSessionPath, readFullSessionHistory } from "../src/full-session-history.ts";
 import { tmpDir } from "./helpers.ts";
 
@@ -13,7 +13,7 @@ let dir: string;
 let file: string;
 
 beforeEach(() => {
-  dir = tmpDir("shepherd-full-history");
+  dir = tmpDir("sig-full-history");
   file = join(dir, "session.jsonl");
 });
 

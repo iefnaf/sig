@@ -6,7 +6,7 @@
 // links — security-sensitive, and they must work without the model. Card button callbacks
 // stay deterministic too (steward.md §3.1 signal 1): the Thread is resolved from the card's
 // providerMsgId, never from data stuffed into the button.
-import { ulid } from "@shepherd/protocol";
+import { ulid } from "@nightboats/protocol";
 import { isSpendQuery } from "./budget.ts";
 import { decideContinuation, renderHandoffBrief, type NewSessionReason } from "./handoff.ts";
 import type { Ledger, OfflineDispatchRow, ThreadRow, WorkerRow } from "./ledger.ts";

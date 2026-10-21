@@ -8,7 +8,7 @@
 // keyIds existed — is tried against every configured key. Callers are encouraged to re-seal
 // under the primary key after a non-primary open (the steward does this lazily on read), so
 // ciphertexts converge onto the current key and the window can close.
-import { deriveKeyId, type ServerKey } from "@shepherd/protocol";
+import { deriveKeyId, type ServerKey } from "@nightboats/protocol";
 
 const enc = new TextEncoder();
 
@@ -72,7 +72,7 @@ function deriveKey(serverKeySecret: string): Promise<CryptoKey> {
     .importKey("raw", enc.encode(serverKeySecret), "HKDF", false, ["deriveKey"])
     .then((hkdf) =>
       crypto.subtle.deriveKey(
-        { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(0), info: enc.encode("shepherd:channel-secret:v1") },
+        { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(0), info: enc.encode("sig:channel-secret:v1") },
         hkdf,
         { name: "AES-GCM", length: 256 },
         false,

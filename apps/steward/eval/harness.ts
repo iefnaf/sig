@@ -9,7 +9,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { createLedger, type Ledger, type LedgerSql } from "../src/ledger.ts";
 import { MIGRATIONS, runMigrations, type SqlExecutor } from "../src/schema.ts";
-import type { WorkerEvent } from "@shepherd/protocol";
+import type { WorkerEvent } from "@nightboats/protocol";
 import { CASES, THREADS, type Case } from "./dataset.ts";
 import { buildSituationBrief } from "../src/llm/brief.ts";
 import type { StewardExtensionContext } from "../src/llm/extension.ts";
@@ -47,14 +47,14 @@ export function seedWorld(seeded: SeededLedger, now: number): void {
   // One repo the machine reported: the brief shows it, so the model has a repoRef for
   // dispatches without asking (the spike's world had none and its dispatch took no repo).
   sql`INSERT OR REPLACE INTO sh_repo (repoId, deviceId, name, path, defaultBranch, remote, updatedAt)
-      VALUES ('repo-eval', 'dev_eval', 'shepherd-demo', '/srv/shepherd-demo', 'main', 'git@github.com:example/shepherd-demo.git', ${now})`;
+      VALUES ('repo-eval', 'dev_eval', 'sig-demo', '/srv/sig-demo', 'main', 'git@github.com:example/sig-demo.git', ${now})`;
   for (const t of THREADS) {
     ledger.threads.create({ threadId: t.id, title: t.title, goal: t.goal, createdFromMsg: "seed" });
     const workerId = `w_${t.id.slice(2)}`;
     ledger.workers.register({ workerId, threadId: t.id, deviceId: "dev_eval", agent: "pi", mode: "write" });
     const at = now - Math.round(t.ageH * 3_600_000);
     const events: WorkerEvent[] = [
-      { workerId, seq: 1, ts: at - 600_000, type: "started", branch: "shepherd/seed" } as WorkerEvent,
+      { workerId, seq: 1, ts: at - 600_000, type: "started", branch: "sig/seed" } as WorkerEvent,
     ];
     if (t.state === "idle_clean" || t.state === "idle_unread") {
       events.push({

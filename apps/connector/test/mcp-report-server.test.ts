@@ -40,7 +40,7 @@ function lines(stdout: string): Array<Record<string, unknown>> {
     .map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 
-describe("shepherd MCP report server (issue #17, spike §2: ~40 lines of JSON-RPC)", () => {
+describe("sig MCP report server (issue #17, spike §2: ~40 lines of JSON-RPC)", () => {
   it("initializes, lists the report tool, and answers ping", () => {
     const { stdout } = drive([
       { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {} } },
@@ -60,7 +60,7 @@ describe("shepherd MCP report server (issue #17, spike §2: ~40 lines of JSON-RP
   });
 
   it("accepts a valid report call and persists it to the audit file", () => {
-    workDir = mkdtempSync(join(tmpdir(), "shepherd-mcp-"));
+    workDir = mkdtempSync(join(tmpdir(), "sig-mcp-"));
     const audit = join(workDir, "w-1.json");
     const { stdout } = drive(
       [
@@ -95,7 +95,7 @@ describe("shepherd MCP report server (issue #17, spike §2: ~40 lines of JSON-RP
 
   it("is installed by installClaudeAssets under the state dir", async () => {
     const { installClaudeAssets } = await import("../src/install.ts");
-    workDir = mkdtempSync(join(tmpdir(), "shepherd-mcp-"));
+    workDir = mkdtempSync(join(tmpdir(), "sig-mcp-"));
     const { serverPath } = installClaudeAssets(workDir, "test-version");
     expect(serverPath).toContain("mcp");
     expect(existsSync(serverPath)).toBe(true);

@@ -24,14 +24,14 @@ if (nameFlag !== -1) {
     args.splice(nameFlag, 1);
   }
   if (!overrideName) {
-    console.error("shepherd: --name needs a value");
+    console.error("sig: --name needs a value");
     process.exit(1);
   }
 }
 const dryRun = args.includes("--dry-run");
 execFileSync("npx", ["-y", "wrangler", "deploy", ...(overrideName ? ["--name", overrideName] : []), ...args], { stdio: "inherit" });
 if (dryRun) {
-  console.log("\nshepherd: dry run — next-step hints skipped.");
+  console.log("\nsig: dry run — next-step hints skipped.");
   process.exit(0);
 }
 

@@ -481,8 +481,8 @@ describe("follow-ups: set_followup with sourceRef; due ones submit ⟦followup F
     const workerId = String((cmd!.args as Record<string, unknown>).workerId);
     const threadId = String((cmd!.args as Record<string, unknown>).threadId);
     fake.send({ t: "cmd_ack", re: cmd!.id, status: "accepted" });
-    fake.send({ t: "cmd_result", re: cmd!.id, ok: true, data: { sessionId: workerId, branch: "shepherd/x-1" } });
-    await fake.emit("started", workerId, { sessionId: workerId, branch: "shepherd/x-1" });
+    fake.send({ t: "cmd_result", re: cmd!.id, ok: true, data: { sessionId: workerId, branch: "sig/x-1" } });
+    await fake.emit("started", workerId, { sessionId: workerId, branch: "sig/x-1" });
     await waitRunsSettled();
 
     // The report wake's run: first a bogus sourceRef (refused), then none at all — which

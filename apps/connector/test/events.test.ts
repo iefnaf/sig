@@ -14,7 +14,7 @@ let mock: MockSteward;
 let port: number;
 
 beforeEach(async () => {
-  dir = mkdtempSync(join(tmpdir(), "shepherd-connector-events-"));
+  dir = mkdtempSync(join(tmpdir(), "sig-connector-events-"));
   dbPath = join(dir, "connector.sqlite");
   store = new LocalStore(dbPath);
   mock = startMockSteward();

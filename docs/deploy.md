@@ -82,7 +82,7 @@ curl -X POST https://sig.example.com/api/pairing -H "Authorization: Bearer $SERV
 # → { "code": "AB12CD34", "command": "npx @nightboats/sig connect https://sig.example.com AB12CD34" }
 ```
 
-Run that command on the machine (macOS or Linux, Node ≥ 22.18). It pairs (redeeming the one-time code), installs a background service — launchd agent (`dev.shepherd.connector`) on macOS, systemd user unit on Linux — and starts it now and at login. `connect --foreground` runs attached instead (containers, dev boxes). On filtered networks append `--proxy http://127.0.0.1:7890` (issue #68): both channels, `git`, and worker children follow it, and it is stored so the service needs no inherited environment. Day-to-day:
+Run that command on the machine (macOS or Linux, Node ≥ 22.18). It pairs (redeeming the one-time code), installs a background service — launchd agent (`dev.sig.connector`) on macOS, systemd user unit on Linux — and starts it now and at login. `connect --foreground` runs attached instead (containers, dev boxes). On filtered networks append `--proxy http://127.0.0.1:7890` (issue #68): both channels, `git`, and worker children follow it, and it is stored so the service needs no inherited environment. Day-to-day:
 
 ```sh
 sig add-repo ~/code/myproject   # allow-list a repo for start_worker (machine-local by design)
@@ -91,13 +91,13 @@ sig repo-config ~/code/myproject --approve            # trust the repo's local p
 sig status                       # service, pairing, workers, installed assets
 sig proxy [url]                  # show/set the stored proxy; --clear removes it (issue #68)
 sig doctor                       # pairing, service, proxy, reachability diagnosis (issue #68)
-sig logs                         # tail ~/.shepherd/logs/connector.log (no keys, no session content)
+sig logs                         # tail ~/.sig/logs/connector.log (no keys, no session content)
 sig stop | start | restart       # control the service
 sig upgrade                      # npm-install the latest package and restart the service
-sig uninstall                    # remove the service (keeps ~/.shepherd data)
+sig uninstall                    # remove the service (keeps ~/.sig data)
 ```
 
-State lives under `~/.shepherd/` (`SIG_HOME` to move it; `SHEPHERD_HOME` remains a fallback alias). Prerequisites: the coding agent you intend to use (pi first, Claude Code next) already installed and logged in — Sig never touches the agent's own credentials. Revoke a machine any time from the workspace (机器 → 撤销): its token dies immediately (close code 4403).
+State lives under `~/.sig/` (`SIG_HOME` to move it). Prerequisites: the coding agent you intend to use (pi first, Claude Code next) already installed and logged in — Sig never touches the agent's own credentials. Revoke a machine any time from the workspace (机器 → 撤销): its token dies immediately (close code 4403).
 
 ## Costs
 

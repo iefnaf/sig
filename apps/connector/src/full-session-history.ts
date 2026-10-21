@@ -8,7 +8,7 @@ import { stat } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { HistoryEntry, HistoryPage } from "@shepherd/protocol";
+import type { HistoryEntry, HistoryPage } from "@nightboats/protocol";
 
 /** Characters of one record per wire entry; keeps an entry far below the 256 KiB chunk cap. */
 const FRAGMENT_CHARS = 24 * 1024;
