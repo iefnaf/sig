@@ -1,5 +1,5 @@
 // End-to-end relay across agent types (issue #17 AC, spec §5.3): leg 1 is a pi worker that
-// commits a plan on its shepherd branch; leg 2 is a CLAUDE CODE worker started with
+// commits a plan on its sig branch; leg 2 is a CLAUDE CODE worker started with
 // base = that branch — the acceptance is that the Claude Code leg's worktree is cut from
 // the pi leg's branch, the plan file is on disk for it, and its report carries git facts
 // from the same shared adjudication path. Real git, real worktrees, fake-pi AND
@@ -30,7 +30,7 @@ let mock: ReturnType<typeof startMockSteward>;
 let app: ConnectorApp;
 
 beforeEach(async () => {
-  dir = tmpDir("shepherd-e2e-relay-claude");
+  dir = tmpDir("sig-e2e-relay-claude");
   stateDir = join(dir, "state");
   repo = await makeGitRepo(dir);
   store = new LocalStore(join(stateDir, "connector.sqlite"));
@@ -103,7 +103,7 @@ describe("a relay hands a branch from a pi worker to a Claude Code worker (issue
         prompt: "Produce the implementation plan and commit it",
       });
       const res1 = await waitFor(() => mock.resultsFor(cmd1), 15_000, "leg 1 cmd_result");
-      expect(res1).toMatchObject({ ok: true, data: { branch: "shepherd/cross-agent-relay-1" } });
+      expect(res1).toMatchObject({ ok: true, data: { branch: "sig/cross-agent-relay-1" } });
       await waitFor(
         () => mock.events().find((e) => e.type === "report" && e.workerId === "w-relay-pi-1"),
         20_000,
@@ -112,7 +112,7 @@ describe("a relay hands a branch from a pi worker to a Claude Code worker (issue
       const leg1Report = mock.events().find((e) => e.type === "report" && e.workerId === "w-relay-pi-1") as {
         git: { branch: string; ahead: number };
       };
-      expect(leg1Report.git.branch).toBe("shepherd/cross-agent-relay-1");
+      expect(leg1Report.git.branch).toBe("sig/cross-agent-relay-1");
       expect(leg1Report.git.ahead).toBe(1);
       expect(readFileSync(join(worktreeOf("cross-agent-relay-1"), "PLAN.md"), "utf8")).toBe(PLAN);
 
@@ -127,7 +127,7 @@ describe("a relay hands a branch from a pi worker to a Claude Code worker (issue
         prompt: "Implement per the plan committed by the previous leg",
       });
       const res2 = await waitFor(() => mock.resultsFor(cmd2), 15_000, "leg 2 cmd_result");
-      expect(res2).toMatchObject({ ok: true, data: { branch: "shepherd/cross-agent-relay-2" } });
+      expect(res2).toMatchObject({ ok: true, data: { branch: "sig/cross-agent-relay-2" } });
 
       // The report rides the SAME event path (report merged with git facts, then settled).
       await waitFor(
@@ -140,7 +140,7 @@ describe("a relay hands a branch from a pi worker to a Claude Code worker (issue
         git: { branch: string; ahead: number };
       };
       expect(leg2Report.summary).toBe("claude leg finished");
-      expect(leg2Report.git.branch).toBe("shepherd/cross-agent-relay-2");
+      expect(leg2Report.git.branch).toBe("sig/cross-agent-relay-2");
       expect(leg2Report.git.ahead).toBe(0); // the inherited plan rides on the pi leg's commit
       await waitFor(
         () => mock.events().some((e) => e.type === "settled" && e.workerId === "w-relay-claude-2" && e.outcome === "reported"),
@@ -152,7 +152,7 @@ describe("a relay hands a branch from a pi worker to a Claude Code worker (issue
       const leg2Dir = worktreeOf("cross-agent-relay-2");
       expect(readFileSync(join(leg2Dir, "PLAN.md"), "utf8")).toBe(PLAN); // inherited via base
       expect(readFileSync(join(leg2Dir, ".plan-read.txt"), "utf8")).toBe(PLAN); // claude actually read it
-      expect(readFileSync(join(leg2Dir, ".branch.txt"), "utf8").trim()).toBe("shepherd/cross-agent-relay-2");
+      expect(readFileSync(join(leg2Dir, ".branch.txt"), "utf8").trim()).toBe("sig/cross-agent-relay-2");
       expect(readFileSync(join(leg2Dir, ".log.txt"), "utf8")).toContain("pi leg: plan");
       expect(existsSync(join(leg2Dir, ".no-plan.txt"))).toBe(false);
       expect(existsSync(join(repo, "PLAN.md"))).toBe(false); // the owner's checkout is untouched

@@ -132,8 +132,8 @@ describe("push vs quiet: what buzzes the phone (spec §7.6)", () => {
     if (dispatched.kind !== "dispatched") throw new Error(`dispatch failed: ${JSON.stringify(dispatched)}`);
     const [cmd] = await fake.waitForCmds(1);
     fake.send({ t: "cmd_ack", re: cmd!.id, status: "accepted" });
-    fake.send({ t: "cmd_result", re: cmd!.id, ok: true, data: { sessionId: dispatched.workerId, branch: "shepherd/t-1" } });
-    await fake.emit("started", dispatched.workerId, { sessionId: dispatched.workerId, branch: "shepherd/t-1" });
+    fake.send({ t: "cmd_result", re: cmd!.id, ok: true, data: { sessionId: dispatched.workerId, branch: "sig/t-1" } });
+    await fake.emit("started", dispatched.workerId, { sessionId: dispatched.workerId, branch: "sig/t-1" });
     // A blocked report opens a question; settled with nothing running, the Thread is
     // waiting_you — the exact state whose notifications must never sit in a merge window.
     await fake.emit("report", dispatched.workerId, { type: "report", status: "blocked", summary: "被挡住了", question: "用哪个分支？" });
@@ -232,7 +232,7 @@ describe("quiet merging: one window, one message (steward.md §6.4)", () => {
       summary: "登录 bug 修好，测试通过",
       changes: ["auth/session.ts 补上 token 刷新"],
       tests: { ran: true, passed: true },
-      branch: "shepherd/login-1",
+      branch: "sig/login-1",
       pushed: true,
     };
     const runB: FakeWorkerRun = {
@@ -240,7 +240,7 @@ describe("quiet merging: one window, one message (steward.md §6.4)", () => {
       summary: "退款幂等补齐，回归通过",
       changes: ["payment/refund.ts 加幂等键"],
       tests: { ran: true, passed: true },
-      branch: "shepherd/refund-1",
+      branch: "sig/refund-1",
       next: "跑一遍全量回归",
       pushed: true,
     };

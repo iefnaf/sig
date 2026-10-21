@@ -4,7 +4,7 @@
 // connector's window. Offline machines answer machine_offline directly (spec §7.4 / §11.4),
 // an unanswered relay dies with the 60 s TTL, and role crossing is refused (protocol §5.3).
 import { SELF, runInDurableObject } from "cloudflare:test";
-import { CloseCode } from "@shepherd/protocol";
+import { CloseCode } from "@nightboats/protocol";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { Steward } from "../src/steward.ts";
 import { sessionCookieValue } from "../src/web.ts";
@@ -290,11 +290,11 @@ describe("role fence (protocol §5.3)", () => {
 
   it("refuses a web-role upgrade without a valid session cookie (Worker-layer pre-check)", async () => {
     // The HMAC check in the Worker's onBeforeConnect rejects before the DO is ever woken.
-    await expect(connectWeb("shepherd_session=ws1.garbage.deadbeef")).rejects.toThrow(/web role connect failed: 401/);
+    await expect(connectWeb("sig_session=ws1.garbage.deadbeef")).rejects.toThrow(/web role connect failed: 401/);
   });
 
   it("closes a web-role upgrade whose session no longer exists (DO-layer liveness)", async () => {
-    const dead = `shepherd_session=${await sessionCookieValue("test-server-key-not-a-secret", "ab".repeat(32))}`;
+    const dead = `sig_session=${await sessionCookieValue("test-server-key-not-a-secret", "ab".repeat(32))}`;
     const res = await SELF.fetch("https://example.com/agents/steward/owner?role=web", {
       headers: { Upgrade: "websocket", cookie: dead },
     });

@@ -16,7 +16,7 @@ let mock: MockSteward;
 let port: number;
 
 beforeEach(async () => {
-  dir = mkdtempSync(join(tmpdir(), "shepherd-connector-heartbeat-"));
+  dir = mkdtempSync(join(tmpdir(), "sig-connector-heartbeat-"));
   store = new LocalStore(join(dir, "connector.sqlite"));
   mock = startMockSteward();
   port = await mock.listen();

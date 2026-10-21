@@ -20,7 +20,7 @@ importers:
       '@earendil-works/pi-coding-agent':
         specifier: 1.2.0
         version: 1.2.0(@aws-sdk/credential-provider-node@3.972.86)(@modelcontextprotocol/sdk@1.32.1(@cfworker/json-schema@4.1.1)(zod@4.6.7))(@smithy/signature-v4@5.7.4)(ws@8.22.0)(zod@4.6.7)
-      '@shepherd/protocol':
+      '@nightboats/protocol':
         specifier: workspace:*
         version: link:../../packages/protocol
       '@types/node':
@@ -59,7 +59,7 @@ importers:
       '@earendil-works/pi-durable':
         specifier: 1.3.0
         version: 1.3.0(@aws-sdk/credential-provider-node@3.972.86)(@modelcontextprotocol/sdk@1.32.1(@cfworker/json-schema@4.1.1)(zod@4.6.7))(@smithy/signature-v4@5.7.4)(undici@8.12.3)(ws@8.22.0)(zod@4.6.7)
-      '@shepherd/protocol':
+      '@nightboats/protocol':
         specifier: workspace:*
         version: link:../../packages/protocol
       agents:

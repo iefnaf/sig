@@ -7,7 +7,7 @@
 // "Proactive behavior must have provenance" (spec §8.3) is enforced in the data layer:
 // createdFromMsg / sourceRef are NOT NULL and verified against sh_inbound / sh_routine at
 // creation time. Suggestions (§8.5) send a button card only; the tap is what creates.
-import { ulid } from "@shepherd/protocol";
+import { ulid } from "@nightboats/protocol";
 import type { FollowupRow, Ledger, RoutineKind, RoutineRow, RoutineSpecStored } from "./ledger.ts";
 import { digestCard, digestIsEmpty, digestSection, routineOfferCard, type DigestData, type QuietSection } from "./report-template.ts";
 import { followupWakeText, routineWakeText } from "./wake-text.ts";

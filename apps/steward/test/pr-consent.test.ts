@@ -99,15 +99,15 @@ async function doneReport(overrides: { git?: Record<string, unknown> } = {}): Pr
   await waitWhileOutboundPending();
 
   fake.send({ t: "cmd_ack", re: startCmd!.id, status: "accepted" });
-  fake.send({ t: "cmd_result", re: startCmd!.id, ok: true, data: { sessionId: workerId, branch: "shepherd/login-1" } });
-  await fake.emit("started", workerId, { sessionId: workerId, branch: "shepherd/login-1" });
+  fake.send({ t: "cmd_result", re: startCmd!.id, ok: true, data: { sessionId: workerId, branch: "sig/login-1" } });
+  await fake.emit("started", workerId, { sessionId: workerId, branch: "sig/login-1" });
   await fake.emit("report", workerId, {
     type: "report",
     status: "done",
     summary: "登录 bug 修好，测试通过",
     changes: ["auth/session.ts 补上过期刷新"],
     tests: { ran: true, passed: true },
-    git: { branch: "shepherd/login-1", base: "main", ahead: 2, dirty: 0, filesChanged: 1, insertions: 5, deletions: 1, pushed: false, ...overrides.git },
+    git: { branch: "sig/login-1", base: "main", ahead: 2, dirty: 0, filesChanged: 1, insertions: 5, deletions: 1, pushed: false, ...overrides.git },
   });
   await fake.emit("settled", workerId, { type: "settled", outcome: "reported" });
   // The done-bookkeeping wake (§5.3): script it so the run settles quietly.
@@ -133,7 +133,7 @@ describe("done cards carry the consent buttons (AC1)", () => {
       { label: "同意", action: "pr_approve", primary: true },
       { label: "先不要", action: "pr_decline" },
     ]);
-    expect(card.payload).toContain("shepherd/login-1");
+    expect(card.payload).toContain("sig/login-1");
     expect(card.payload).toContain("还没推送");
   });
 
@@ -168,7 +168,7 @@ describe("[同意] → pr_worker → PR URL back in the chat (AC2)", () => {
     expect(fake.cmds.length - before).toBe(1);
     await waitWhileOutboundPending();
     const texts = await sentTexts();
-    expect(texts.some((t) => t.includes("正在推送") && t.includes("shepherd/login-1"))).toBe(true);
+    expect(texts.some((t) => t.includes("正在推送") && t.includes("sig/login-1"))).toBe(true);
 
     // The consent row records the decision.
     const snap = await waitFor(
@@ -185,7 +185,7 @@ describe("[同意] → pr_worker → PR URL back in the chat (AC2)", () => {
       type: "pr_created",
       cmdId: prCmd.id,
       url: "https://github.com/example/repo-a/pull/7",
-      branch: "shepherd/login-1",
+      branch: "sig/login-1",
     });
     await waitWhileOutboundPending();
     const prCard = await waitFor(
@@ -247,7 +247,7 @@ describe("failures come back as a three-part failure report (AC4)", () => {
   it.each([
     ["gh_missing", "the GitHub CLI (`gh`) is not installed on this machine", "没有安装 GitHub CLI"],
     ["auth", "gh is not authenticated", "gh auth login"],
-    ["push", "! [remote rejected] shepherd/login-1 (pre-receive hook declined)", "推送分支被拒绝"],
+    ["push", "! [remote rejected] sig/login-1 (pre-receive hook declined)", "推送分支被拒绝"],
   ])("%s → red failure card whose needs-you names the fix and the retry", async (stage, message, needle) => {
     const { fake, workerId, threadId, card } = await doneReport();
     await postEvent(cardActionEvent(card.providerMsgId!, "pr_approve"));
@@ -431,7 +431,7 @@ describe("review round 1 findings", () => {
     const prCmd = await waitFor(() => fake.cmds.find((c) => c.kind === "pr_worker"), (c) => c !== undefined, "cmd sent")!;
     // The connector's emit raced a shutdown: only the command result carries the URL.
     fake.send({ t: "cmd_ack", re: prCmd!.id, status: "accepted" });
-    fake.send({ t: "cmd_result", re: prCmd!.id, ok: true, data: { url: "https://github.com/example/repo-a/pull/9", branch: "shepherd/login-1" } });
+    fake.send({ t: "cmd_result", re: prCmd!.id, ok: true, data: { url: "https://github.com/example/repo-a/pull/9", branch: "sig/login-1" } });
     const urlCards = await waitFor(
       () => sentCards().then((all) => all.filter((c) => JSON.stringify(c.payload).includes("pull/9"))),
       (c) => c.length === 1,
@@ -443,7 +443,7 @@ describe("review round 1 findings", () => {
       type: "pr_created",
       cmdId: prCmd!.id,
       url: "https://github.com/example/repo-a/pull/9",
-      branch: "shepherd/login-1",
+      branch: "sig/login-1",
     });
     await waitWhileOutboundPending();
     await new Promise((resolve) => setTimeout(resolve, 300));
@@ -465,7 +465,7 @@ describe("review round 1 findings", () => {
       status: "done",
       summary: "第二轮也完成",
       changes: ["又改了一处"],
-      git: { branch: "shepherd/login-1", base: "main", ahead: 3, dirty: 0, filesChanged: 2, insertions: 8, deletions: 1, pushed: false },
+      git: { branch: "sig/login-1", base: "main", ahead: 3, dirty: 0, filesChanged: 2, insertions: 8, deletions: 1, pushed: false },
     });
     await fake.emit("settled", workerId, { type: "settled", outcome: "reported" });
     await scriptModel(
@@ -484,7 +484,7 @@ describe("review round 1 findings", () => {
     // Approve card 1 → PR created; approve card 2 → the honest cross-card answer, no race.
     await postEvent(cardActionEvent(card1.providerMsgId!, "pr_approve"));
     const prCmd = await waitFor(() => fake.cmds.find((c) => c.kind === "pr_worker"), (c) => c !== undefined, "cmd sent")!;
-    await fake.emit("pr_created", workerId, { type: "pr_created", cmdId: prCmd!.id, url: "https://github.com/example/repo-a/pull/11", branch: "shepherd/login-1" });
+    await fake.emit("pr_created", workerId, { type: "pr_created", cmdId: prCmd!.id, url: "https://github.com/example/repo-a/pull/11", branch: "sig/login-1" });
     await waitFor(() => sentCards(), (cs) => cs.some((c) => JSON.stringify(c.payload).includes("pull/11")), "first PR card");
     await postEvent(cardActionEvent(card2.providerMsgId!, "pr_approve"));
     await waitWhileOutboundPending();

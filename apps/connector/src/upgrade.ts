@@ -4,7 +4,7 @@
 // an npx-launched `connect` becomes a durable global install on first upgrade. The process
 // running `upgrade` is by definition the OLD code — it cannot write the new version's assets.
 // The restarted daemon runs the new package and calls installAssets() at boot, which writes
-// the new versioned extension/prompt files under ~/.shepherd/ (old versions stay on disk for
+// the new versioned extension/prompt files under ~/.sig/ (old versions stay on disk for
 // sessions still referencing them).
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";

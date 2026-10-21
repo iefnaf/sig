@@ -1,4 +1,4 @@
-// End-to-end relay (issue #8, spec §5.3): leg 1 commits a plan file on its shepherd branch;
+// End-to-end relay (issue #8, spec §5.3): leg 1 commits a plan file on its sig branch;
 // leg 2 starts with base = that branch and SEES the plan file in its own worktree — the
 // acceptance test that the plan document is actually on disk for the next leg, not just a
 // branch name in a message. Real git, real worktrees, fake-pi playing the model.
@@ -18,7 +18,7 @@ let mock: ReturnType<typeof startMockSteward>;
 let app: ConnectorApp;
 
 beforeEach(async () => {
-  dir = tmpDir("shepherd-e2e-relay");
+  dir = tmpDir("sig-e2e-relay");
   stateDir = join(dir, "state");
   repo = await makeGitRepo(dir);
   store = new LocalStore(join(stateDir, "connector.sqlite"));
@@ -80,13 +80,13 @@ describe("a relay across two write legs (issue #8, spec §5.3)", () => {
         prompt: "Produce the implementation plan and commit it",
       });
       const res1 = await waitFor(() => mock.resultsFor(cmd1), 15_000, "leg 1 cmd_result");
-      expect(res1).toMatchObject({ ok: true, data: { branch: "shepherd/e2e-relay-1" } });
+      expect(res1).toMatchObject({ ok: true, data: { branch: "sig/e2e-relay-1" } });
       await waitFor(() => mock.events().some((e) => e.type === "report" && e.workerId === "w-relay-1"), 20_000, "leg 1 report");
 
       const leg1Report = mock.events().find((e) => e.type === "report" && e.workerId === "w-relay-1") as {
         git: { branch: string; ahead: number };
       };
-      expect(leg1Report.git.branch).toBe("shepherd/e2e-relay-1");
+      expect(leg1Report.git.branch).toBe("sig/e2e-relay-1");
       expect(leg1Report.git.ahead).toBe(1);
       const leg1Dir = worktreeOf("e2e-relay-1");
       expect(readFileSync(join(leg1Dir, "PLAN.md"), "utf8")).toBe(PLAN);
@@ -102,7 +102,7 @@ describe("a relay across two write legs (issue #8, spec §5.3)", () => {
         prompt: "Implement per the plan committed by the previous leg",
       });
       const res2 = await waitFor(() => mock.resultsFor(cmd2), 15_000, "leg 2 cmd_result");
-      expect(res2).toMatchObject({ ok: true, data: { branch: "shepherd/e2e-relay-2" } });
+      expect(res2).toMatchObject({ ok: true, data: { branch: "sig/e2e-relay-2" } });
       await waitFor(() => mock.events().some((e) => e.type === "settled" && e.workerId === "w-relay-2"), 20_000, "leg 2 settled");
 
       // The acceptance: leg 2's worktree is cut from leg 1's branch — the plan file is ON
@@ -110,14 +110,14 @@ describe("a relay across two write legs (issue #8, spec §5.3)", () => {
       const leg2Dir = worktreeOf("e2e-relay-2");
       expect(readFileSync(join(leg2Dir, "PLAN.md"), "utf8")).toBe(PLAN); // inherited from leg 1
       expect(readFileSync(join(leg2Dir, ".plan-read.txt"), "utf8")).toBe(PLAN); // leg 2 actually read it
-      expect(readFileSync(join(leg2Dir, ".branch.txt"), "utf8").trim()).toBe("shepherd/e2e-relay-2");
+      expect(readFileSync(join(leg2Dir, ".branch.txt"), "utf8").trim()).toBe("sig/e2e-relay-2");
       // The lineage: leg 2's log contains leg 1's plan commit (inherited via base).
       expect(readFileSync(join(leg2Dir, ".log.txt"), "utf8")).toContain("leg 1: plan");
 
       const leg2Report = mock.events().find((e) => e.type === "report" && e.workerId === "w-relay-2") as {
         git: { branch: string; ahead: number };
       };
-      expect(leg2Report.git.branch).toBe("shepherd/e2e-relay-2");
+      expect(leg2Report.git.branch).toBe("sig/e2e-relay-2");
       expect(leg2Report.git.ahead).toBe(0); // leg 2 committed nothing itself — the inherited plan rides on leg 1's commit
     },
     60_000,
@@ -134,7 +134,7 @@ describe("a relay across two write legs (issue #8, spec §5.3)", () => {
         threadId: "e2e-relay",
         repoId: repo,
         mode: "write",
-        base: "shepherd/never-pushed",
+        base: "sig/never-pushed",
         prompt: "continue",
       });
       const res = await waitFor(() => mock.resultsFor(cmd), 15_000, "cmd_result");

@@ -7,7 +7,7 @@ import { tmpDir } from "./helpers.ts";
 let dir: string;
 
 beforeEach(() => {
-  dir = tmpDir("shepherd-locks-test");
+  dir = tmpDir("sig-locks-test");
 });
 
 afterEach(() => {

@@ -97,7 +97,7 @@ describe("the reducer: derived state, unread, notification intents (steward.md �
     let snap = await snapshotWhere((s) => s.threads.some((t) => t.state === "running"), "running after dispatch");
     expect(snap.threads[0]!.workers[0]).toMatchObject({ workerId, state: "starting" });
 
-    await sendEvents(ws, [event(workerId, 1, { type: "started", sessionId: workerId, branch: "shepherd/t-1" })]);
+    await sendEvents(ws, [event(workerId, 1, { type: "started", sessionId: workerId, branch: "sig/t-1" })]);
     snap = await snapshotWhere((s) => s.threads[0]?.workers[0]?.state === "running", "worker running");
     expect(snap.threads[0]!.state).toBe("running");
     expect(snap.threads[0]!.timeline.some((e) => e.kind === "started")).toBe(true);
@@ -110,7 +110,7 @@ describe("the reducer: derived state, unread, notification intents (steward.md �
         summary: "登录 bug 修好",
         changes: ["auth/session.ts 补上刷新"],
         tests: { ran: true, passed: true },
-        git: { branch: "shepherd/t-1", base: "main", ahead: 2, dirty: 0, filesChanged: 1, insertions: 5, deletions: 1, pushed: false },
+        git: { branch: "sig/t-1", base: "main", ahead: 2, dirty: 0, filesChanged: 1, insertions: 5, deletions: 1, pushed: false },
       }),
     ]);
     snap = await snapshotWhere(
@@ -126,7 +126,7 @@ describe("the reducer: derived state, unread, notification intents (steward.md �
     const card = JSON.stringify(cards[0]);
     expect(card).toContain("登录 bug 修好");
     expect(card).toContain("auth/session.ts 补上刷新");
-    expect(card).toContain("shepherd/t-1");
+    expect(card).toContain("sig/t-1");
     expect(card).toContain("✅"); // tone by nature: done is a success
 
     await sendEvents(ws, [event(workerId, 4, { type: "settled", outcome: "reported" })]);
@@ -246,7 +246,7 @@ describe("the reducer: derived state, unread, notification intents (steward.md �
     expect(snap.threads[0]!.timeline.some((e) => e.kind === "note" && JSON.stringify(e).includes("排队"))).toBe(true);
 
     // And it resolves like any start: the later `started` event flips it to running.
-    await sendEvents(ws, [event(workerId, 2, { type: "started", sessionId: workerId, branch: "shepherd/q-1" })]);
+    await sendEvents(ws, [event(workerId, 2, { type: "started", sessionId: workerId, branch: "sig/q-1" })]);
     await snapshotWhere((s) => s.threads[0]?.workers[0]?.state === "running", "worker running after queue");
   });
 

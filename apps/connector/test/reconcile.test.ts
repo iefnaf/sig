@@ -46,7 +46,7 @@ let eventLog: EventLog;
 let events: EmittedEvent[];
 
 beforeEach(async () => {
-  dir = tmpDir("shepherd-reconcile-test");
+  dir = tmpDir("sig-reconcile-test");
   stateDir = join(dir, "state");
   sessionsDir = join(dir, "sessions");
   repo = await makeGitRepo(dir);
@@ -162,7 +162,7 @@ describe("session-tail inspection (connector-pi.md §9.1 step 3)", () => {
     const path = writeSessionFile(sessionsDir, "w-tail-6", [
       sessionUserMessage("do it"),
       sessionAssistantMessage([textBlock("I think I'm done")], { stopReason: "stop" }),
-      { type: "custom_message", customType: "shepherd.report-reminder", content: "call report", display: false },
+      { type: "custom_message", customType: "sig.report-reminder", content: "call report", display: false },
     ]);
     expect(inspectSessionTail(path)).toEqual({ kind: "lost" });
   });

@@ -1,8 +1,8 @@
-// Log redaction (issue #26): everything under ~/.shepherd/logs must stay free of keys and
+// Log redaction (issue #26): everything under ~/.sig/logs must stay free of keys and
 // session content. Callers never log secrets in the first place — this is defense in depth
 // for the cases nobody thought of (error messages quoting headers, pi diagnostics, crashes).
 
-/** Secret-shaped token patterns scrubbed from anything destined for ~/.shepherd/logs. */
+/** Secret-shaped token patterns scrubbed from anything destined for ~/.sig/logs. */
 const KEY_PATTERNS: Array<{ re: RegExp; replacement: string }> = [
   // OpenAI-style keys (sk-…, sk-proj-…)
   { re: /\bsk-(?:proj-)?[A-Za-z0-9_-]{8,}\b/g, replacement: "[redacted]" },

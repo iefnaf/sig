@@ -33,7 +33,7 @@ function report(overrides: Partial<ReportRow> = {}): ReportRow {
     tests: { ran: true, passed: true },
     question: null,
     next: null,
-    git: { branch: "shepherd/login-1", base: "main", ahead: 2, dirty: 0, filesChanged: 2, insertions: 30, deletions: 4, pushed: false },
+    git: { branch: "sig/login-1", base: "main", ahead: 2, dirty: 0, filesChanged: 2, insertions: 30, deletions: 4, pushed: false },
     ...overrides,
   };
 }
@@ -47,7 +47,7 @@ const worker: WorkerRow = {
   mode: "write",
   state: "idle",
   sessionId: "w_test",
-  branch: "shepherd/login-1",
+  branch: "sig/login-1",
   cmdId: "cmd_1",
   parentWorker: null,
   lastOutcome: "reported:done",
@@ -62,7 +62,7 @@ describe("renderReportCard: the fixed three parts (spec §7.5)", () => {
     const card = renderReportCard({
       tone: "success",
       conclusion: "登录 bug 修好，测试通过",
-      did: ["修复 auth/session.ts", "分支 shepherd/login-1"],
+      did: ["修复 auth/session.ts", "分支 sig/login-1"],
       needsYou: "要推送并开 PR 吗？",
       threadTitle: "修复登录 bug",
       footer: "Thread「修复登录 bug」 · pi @ mac-studio",
@@ -119,7 +119,7 @@ describe("didBullets / needsYouOf: data in, text out", () => {
     expect(bullets).toEqual([
       "auth/session.ts 里补上了 token 过期后的刷新",
       "测试通过",
-      "分支 shepherd/login-1，2 个提交，未推送",
+      "分支 sig/login-1，2 个提交，未推送",
     ]);
   });
 
@@ -203,7 +203,7 @@ describe("the PR consent gate's templates (issue #21)", () => {
   });
 
   it("prCreatedCard is success-badged, carries the URL as text and as an open-PR button", () => {
-    const card = prCreatedCard({ url: "https://github.com/example/repo-a/pull/7", branch: "shepherd/login-1", threadTitle: "登录 bug", footer: "f" });
+    const card = prCreatedCard({ url: "https://github.com/example/repo-a/pull/7", branch: "sig/login-1", threadTitle: "登录 bug", footer: "f" });
     expect(card.text).toContain("✅ PR 已创建");
     expect(card.text).toContain("https://github.com/example/repo-a/pull/7");
     expect(card.text).toContain("已推送到远端");
@@ -219,14 +219,14 @@ describe("the PR consent gate's templates (issue #21)", () => {
   });
 
   it("prCommandArgs builds the title/body from the report — data only, no LLM", () => {
-    const { title, body } = prCommandArgs({ report: report(), threadTitle: "登录 bug", branch: "shepherd/login-1" });
+    const { title, body } = prCommandArgs({ report: report(), threadTitle: "登录 bug", branch: "sig/login-1" });
     expect(title).toBe("登录 bug 修好，测试通过");
     expect(body).toContain("auth/session.ts 里补上了 token 过期后的刷新");
     expect(body).toContain("测试：通过");
-    expect(body).toContain("shepherd/login-1");
+    expect(body).toContain("sig/login-1");
     // No report (it was pruned): the thread title stands in, the body still names the branch.
-    const fallback = prCommandArgs({ report: null, threadTitle: "登录 bug", branch: "shepherd/login-1" });
+    const fallback = prCommandArgs({ report: null, threadTitle: "登录 bug", branch: "sig/login-1" });
     expect(fallback.title).toBe("登录 bug");
-    expect(fallback.body).toContain("shepherd/login-1");
+    expect(fallback.body).toContain("sig/login-1");
   });
 });

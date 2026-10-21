@@ -200,15 +200,15 @@ async function handle(command) {
     }
     case "prompt": {
       let text = command.message ?? "";
-      // Simulate the shepherd extension's /shepherd command (ADR-0001 marker): unwrap
-      // `/shepherd <commandId>\n<text>` and record the marker as a custom session entry,
+      // Simulate the sig extension's /sig command (ADR-0001 marker): unwrap
+      // `/sig <commandId>\n<text>` and record the marker as a custom session entry,
       // then send the clean text as the user message.
       let commandId = null;
-      if (typeof text === "string" && text.startsWith("/shepherd ")) {
+      if (typeof text === "string" && text.startsWith("/sig ")) {
         const nl = text.indexOf("\n");
-        commandId = text.slice("/shepherd ".length, nl);
+        commandId = text.slice("/sig ".length, nl);
         text = text.slice(nl + 1);
-        appendSessionEntry({ type: "custom", customType: "shepherd.command", data: { commandId, at: Date.now() } });
+        appendSessionEntry({ type: "custom", customType: "sig.command", data: { commandId, at: Date.now() } });
         appendSessionEntry({ type: "message", message: { role: "user", content: text, timestamp: Date.now() } });
       }
       logPrompt({ commandId, text, cwd: process.cwd(), sessionId, pid: process.pid, at: Date.now() });
@@ -226,16 +226,16 @@ async function handle(command) {
     case "steer":
     case "follow_up": {
       const text = messageText();
-      // The shepherd extension's input handler (§6.3 marker for queued deliveries): strip
-      // the `[shepherd:command <id>]` preamble and persist it as the same custom entry at
+      // The sig extension's input handler (§6.3 marker for queued deliveries): strip
+      // the `[sig:command <id>]` preamble and persist it as the same custom entry at
       // the moment the message enters pi's queue — like real pi, the entry is appended when
       // the message is delivered, so the session tail answers "was it delivered?".
       let delivered = text;
-      const marker = /^\[shepherd:command ([^\]\r\n]+)\]\n?/;
+      const marker = /^\[sig:command ([^\]\r\n]+)\]\n?/;
       if (typeof delivered === "string" && marker.test(delivered)) {
         const commandId = delivered.match(marker)[1];
         delivered = delivered.replace(marker, "");
-        appendSessionEntry({ type: "custom", customType: "shepherd.command", data: { commandId, at: Date.now() } });
+        appendSessionEntry({ type: "custom", customType: "sig.command", data: { commandId, at: Date.now() } });
         appendSessionEntry({ type: "message", message: { role: "user", content: delivered, timestamp: Date.now() } });
         (command.type === "steer" ? steeringQueue : followUpQueue).push(delivered);
         logPrompt({ type: command.type, text: delivered, at: Date.now() });

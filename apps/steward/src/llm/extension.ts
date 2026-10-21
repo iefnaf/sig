@@ -1,4 +1,4 @@
-// The `shepherd-steward` pi-durable extension (issue #6, steward.md §4): system-prompt
+// The `sig-steward` pi-durable extension (issue #6, steward.md §4): system-prompt
 // sections, the steward's tools, and its hooks. The extension is built inside the Durable
 // Object over a StewardExtensionContext — everything the tools reach is the DO's ledger,
 // dispatch service, and outbound queue; the extension itself holds no state that matters.
@@ -92,9 +92,9 @@ export interface StewardExtensionContext {
   recordProactiveOutcome(operationId: string, outcome: string): void;
 }
 
-const SITUATION_SECTION = "shepherd-situation";
+const SITUATION_SECTION = "sig-situation";
 /** §4.1: resident-layer notes render as one system-prompt section (delta-appended on change). */
-const NOTES_SECTION = "shepherd-notes";
+const NOTES_SECTION = "sig-notes";
 
 /** §3.3: attaching to a thread idle this long is "the earlier matter" — the reply must say
  *  so (spec §5.2). The tool result reminds the model; the prompt carries the rule. */
@@ -1247,7 +1247,7 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
   });
 
   return defineExtension({
-    name: "shepherd-steward",
+    name: "sig-steward",
     tools: [
       situation, findThreads, getThread, updateThread, startWorker, sendToWorker, interruptWorker,
       notifyUser, askUser, answerWorker, noAction,
@@ -1256,7 +1256,7 @@ export function buildStewardExtension(ctx: StewardExtensionContext): Extension {
     ],
     hooks: [guard, briefHook],
     sections: [
-      section("shepherd-role", () => ROLE_PROMPT, { tag: false }),
+      section("sig-role", () => ROLE_PROMPT, { tag: false }),
       // §4.1: resident notes are one system-prompt section — rendered from the ledger at
       // every generation, so a change appends only the delta (pi's section planner) and the
       // conversation never re-reads the whole layer. Empty layer ⇒ section omitted.
@@ -1286,7 +1286,7 @@ const ROLE_PROMPT = `你是 Sig 的总管（steward）：替用户调度他机�
    - 给已有 Thread 追加后续要求（「跑完让它把迁移 SQL 也生成」「做完把截图发我」）同样是接续：用 start_worker 挂到那个 Thread（新 worker 会接续前一棒的分支），不要只在回复里答应记着。
    - 挂靠的依据是**同一件事的延续**，不是「领域相近」：新功能、新需求即使和现有 Thread 话题相关也是新事件，该新建就新建。
    - 挂靠已沉寂多日（工具结果会提醒）的 Thread 时，回复里要说明是接续早前的那件事（「已挂到之前那个 xx 上」）。
-3. 每次行动前先看态势简报（系统提示里的 shepherd-situation 段落）；需要细节再 get_thread。状态/进度类问题（「修好了吗」「方案出来了吗」）不派发，直接根据汇报与状态回答。
+3. 每次行动前先看态势简报（系统提示里的 sig-situation 段落）；需要细节再 get_thread。状态/进度类问题（「修好了吗」「方案出来了吗」）不派发，直接根据汇报与状态回答。
 4. worker 汇报到达（⟦event⟧）后做记账：用 update_thread 重写该 Thread 的摘要；若工具结果或唤醒文本提示「整十版」，这次必须按 get_thread 的时间线与汇报【从头重写】，不要在旧摘要上缝补。除非卡片之外还有用户必须知道的新信息（风险、需要拍板、明确失败），否则不要再通知用户——通知卡片已经发过了。⟦verify⟧ 输入意味着上一条回复声称派发过但没有：要么现在真调 start_worker，要么用 notify_user 向用户更正。
 5. 给用户的回复要短：先结论，再要点，几行以内。严禁声称派发过而实际没有调用工具；只有看到 dispatched 结果才算派发过。
 6. 派发的依据（basis）：用户明说要干什么用 user_explicit；回复某条汇报用 user_reply_to；来自例行任务用 routine。凭空的推断禁止派发，改用 ask_user。

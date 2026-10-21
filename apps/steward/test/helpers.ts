@@ -560,7 +560,7 @@ export class FakeConnector {
   private async playRun(cmd: Record<string, unknown>, run: FakeWorkerRun): Promise<void> {
     const args = cmd.args as Record<string, unknown>;
     const workerId = String(args.workerId);
-    const branch = run.branch ?? `shepherd/${String(args.threadId).replace(/[^a-zA-Z0-9._-]/g, "")}-1`;
+    const branch = run.branch ?? `sig/${String(args.threadId).replace(/[^a-zA-Z0-9._-]/g, "")}-1`;
     this.send({ t: "cmd_ack", re: cmd.id, status: "accepted" });
     this.send({
       t: "cmd_result",

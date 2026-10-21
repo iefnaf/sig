@@ -3,7 +3,7 @@
 // and starts at login. Windows is out of scope (ADR-0001); getServiceInstaller returns null
 // there and the CLI falls back to `--foreground`.
 //
-// The unit runs `<node> <bin>/shepherd.js daemon`; credentials stay in the LocalStore
+// The unit runs `<node> <bin>/sig.js daemon`; credentials stay in the LocalStore
 // (never in the unit file), and the log directory is under the state dir.
 import { execFile } from "node:child_process";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
@@ -31,20 +31,20 @@ export const defaultExec: Exec = async (file, args) => {
   }
 };
 
-export const SHEPHERD_LABEL = "dev.shepherd.connector";
+export const SIG_LABEL = "dev.sig.connector";
 
 export interface ServiceSpec {
   /** Reverse-DNS label (launchd) and unit basename (systemd). */
   label: string;
   /** Absolute path of the node binary to run (process.execPath at install time). */
   nodePath: string;
-  /** Absolute path of the shepherd bin wrapper the service should run. */
+  /** Absolute path of the sig bin wrapper the service should run. */
   entryPath: string;
   /** Extra argv after the entry (["daemon"]). */
   args?: string[];
-  /** Environment for the daemon: PATH (to find `pi`/`git`) and optionally SHEPHERD_HOME. */
+  /** Environment for the daemon: PATH (to find `pi`/`git`) and optionally SIG_HOME. */
   env: Record<string, string>;
-  /** ~/.shepherd (or $SHEPHERD_HOME) — where logs and the store live. */
+  /** ~/.sig (or $SIG_HOME) — where logs and the store live. */
   stateDir: string;
   logDir: string;
 }
@@ -71,7 +71,7 @@ export interface ServiceInstaller {
   /** Stops now and disables start-at-login (until `start`/`install` again). */
   stop(): Promise<void>;
   restart(): Promise<void>;
-  /** Stops and removes the unit. Does not touch ~/.shepherd data. */
+  /** Stops and removes the unit. Does not touch ~/.sig data. */
   uninstall(): Promise<void>;
   status(): Promise<ServiceStatus>;
   /** Absolute path of the unit/plist file (for `status` output). */

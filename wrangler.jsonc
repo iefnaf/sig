@@ -25,7 +25,7 @@
 // unknown provider/model fails visibly (`sh_run` settles `unanswered`), never with a
 // silently different model.
 {
-  "name": "shepherd-steward",
+  "name": "sig-steward",
   "main": "apps/steward/src/index.ts",
   // Static assets, one directory (ADR-0004): the web workspace's plain HTML/CSS/JS files
   // (no frontend build) plus the two brand files under brand/ — only those two are public;

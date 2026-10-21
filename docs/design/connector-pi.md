@@ -40,7 +40,7 @@ Non-goals (MVP): parallel splitting and comparison-based collaboration; monitori
                                 │ stdin/stdout JSONL
                           pi --mode rpc (one process per worker)
                                 │ loads
-                          shepherd extension (report tool + forced re-report)
+                          sig extension (report tool + forced re-report)
 ```
 
 Division of responsibilities:
@@ -93,8 +93,8 @@ interface AgentAdapter {
 ```
 pi --mode rpc
    --session-id <workerId>
-   --extension <~/.shepherd/ext/shepherd-pi-<version>.ts>
-   --append-system-prompt <~/.shepherd/prompts/worker-<version>.md>
+   --extension <~/.sig/ext/sig-pi-<version>.ts>
+   --append-system-prompt <~/.sig/prompts/worker-<version>.md>
    --no-approve                      # only repos the user has approved use --approve
    [--tools read,grep,find,ls,report]  # read-only tasks
    [--model <provider/id>] [--thinking <level>]
@@ -103,14 +103,14 @@ cwd = worktree path (write tasks) or repository path (read-only tasks)
 
 - `workerId`: `w` plus a lowercase ULID, satisfying `--session-id`'s character restrictions (letters, digits, `.`, `_`, `-`, first and last character a letter or digit). The session id is the worker id, so there is no need to look up the file path afterwards. The connector still records `sessionFile` (returned by `get_state`) for validation and history reads.
 - **Sessions live in pi's default directory** (grouped by cwd), not a private one. Rationale: when the user returns to the computer, they can continue this very session with pi's own `--session`/`--resume` — the most natural path to "taking over". The cost is that external changes must be detected (§10).
-- The extension and system-prompt files are written into `~/.shepherd/` by the connector with each version and never reference in-repo files, so project content cannot swap them out.
-- Environment variables: inherit the user's environment; the connector's own credentials are **not** passed through — every `SHEPHERD_*` variable is stripped from the child env (issue #27), so the agent cannot find `SHEPHERD_HOME` (which points at the SQLite file holding the device token) or any other connector state in its environment.
+- The extension and system-prompt files are written into `~/.sig/` by the connector with each version and never reference in-repo files, so project content cannot swap them out.
+- Environment variables: inherit the user's environment; the connector's own credentials are **not** passed through — every `SIG_*` variable is stripped from the child env (issue #27), so the agent cannot find `SIG_HOME` (which points at the SQLite file holding the device token) or any other connector state in its environment.
 
 ### 4.3 The one-file-one-process invariant
 
 pi has no session-file lock (research §3). The connector guarantees:
 
-- Only one pi process per `workerId` at any moment, doubly enforced by `~/.shepherd/locks/<workerId>.lock` (holding pid and start time) plus in-memory state.
+- Only one pi process per `workerId` at any moment, doubly enforced by `~/.sig/locks/<workerId>.lock` (holding pid and start time) plus in-memory state.
 - Before launching, if the process named by the lock file is still alive, refuse to start and report `lock_held`; if the process no longer exists, treat the lock as stale — remove it and continue.
 
 ### 4.4 Start and stop sequences
@@ -220,7 +220,7 @@ command(commandId PK, workerId, kind, state: received|sending|sent|done|failed|a
 
 > **Implemented boundary (issue #15):** the tail check keys on the ADR-0001 `commandId` custom entry, never on text equality (repeated instructions would misadjudicate). Three outcomes, decided conservatively:
 >
-> 1. **Marker found** → `delivered`; the row settles `done` and hello's `pendingAcks` carries the recovered result to the DO. Prompt deliveries mark via the `/shepherd` wrapper; steer/follow-up deliveries cannot be extension commands, so they carry a `[shepherd:command <id>]` preamble that pi's input handler strips, appending the custom entry when pi *accepts the message into its queue* (pi persists the user message itself only when the queued turn starts — queue-acceptance is the decidability boundary for a steer).
+> 1. **Marker found** → `delivered`; the row settles `done` and hello's `pendingAcks` carries the recovered result to the DO. Prompt deliveries mark via the `/sig` wrapper; steer/follow-up deliveries cannot be extension commands, so they carry a `[sig:command <id>]` preamble that pi's input handler strips, appending the custom entry when pi *accepts the message into its queue* (pi persists the user message itself only when the queued turn starts — queue-acceptance is the decidability boundary for a steer).
 > 2. **Marker provably absent** → `failed(not_delivered)`, `retriable: true`: either the whole tail was read consistently past the write-ahead anchor entry, or the row never left `accepted` (the handler never started), or — for the write-ahead kinds `start_worker`/`send`/`resume` — the marker expectation was never armed, which by construction means *nothing was written to pi*. A torn final line, an unreadable file, or a marker-expecting delivery whose session file is unknown stays **ambiguous** — absence is evidence only when the read was complete.
 > 3. Everything else (commands with no session footprint: `interrupt`'s abort, `stop_process`, `cleanup_worktree`, `diag`, …) → honestly `ambiguous`; the DO marks the outbox row, puts a note on the Thread's timeline, and wakes the steward to `ask_user`. The connector never re-sends, and re-deliveries answer `ambiguous`/`duplicate`.
 >
@@ -233,7 +233,7 @@ command(commandId PK, workerId, kind, state: received|sending|sent|done|failed|a
 The connector ships a pi extension with each version (loaded by every process via `--extension`); it does exactly two things:
 
 1. Register the `report` tool.
-2. In `agent_before_settle`, if this run window's `outcome == "completed"`, `report` was never called, and this window has not been reminded yet, append a `custom_message` (`customType: "shepherd.report-reminder"`) with `continue: true`, forcing one more model request. At most one reminder per window, to prevent an infinite loop.
+2. In `agent_before_settle`, if this run window's `outcome == "completed"`, `report` was never called, and this window has not been reminded yet, append a `custom_message` (`customType: "sig.report-reminder"`) with `continue: true`, forcing one more model request. At most one reminder per window, to prevent an infinite loop.
 
 Measured: without forcing 5/6, with forcing 6/6, no duplicate calls (research #11).
 
@@ -273,8 +273,8 @@ The connector starts workers only in **registered repositories**. Registration h
 
 ### 8.2 Write tasks: a dedicated worktree
 
-- Location: `~/.shepherd/worktrees/<repoName>-<pathHash>/<branchSlug>`.
-- Branch: `shepherd/<threadSlug>-<n>`; the starting point is `base` (on relay, the previous worker's branch), defaulting to the local HEAD of the repository's current default branch (no network access).
+- Location: `~/.sig/worktrees/<repoName>-<pathHash>/<branchSlug>`.
+- Branch: `sig/<threadSlug>-<n>`; the starting point is `base` (on relay, the previous worker's branch), defaulting to the local HEAD of the repository's current default branch (no network access).
 - One worktree per write task, no cross-interference; per repository it is configurable as "serial" (only one write worker at a time in the same repo) or "work directly in the main directory".
 - **No automatic deletion.** `cleanup_worktree` runs only on an explicit command, and by default refuses worktrees with uncommitted changes or unpushed commits unless `force`.
 
@@ -311,7 +311,7 @@ Measured: when the connector is killed, pi exits gracefully and cleans up its ch
 
 Approach: while running, snapshot pi's descendant processes every 5 seconds (pid plus process start time) into LocalStore. Cleanup is triggered by: pi exiting unexpectedly, connector startup, or a `stop_process` timeout. When cleaning up, each pid on the list is terminated only if it is still alive and the start time matches (to avoid killing a reused pid).
 
-This is the portable approach (macOS, Linux); the alternative is tagging pi's environment with `SHEPHERD_WORKER_ID` and scanning process environments, but reading other processes' environments behaves inconsistently across platforms, so it is not the first choice.
+This is the portable approach (macOS, Linux); the alternative is tagging pi's environment with `SIG_WORKER_ID` and scanning process environments, but reading other processes' environments behaves inconsistently across platforms, so it is not the first choice.
 
 ### 9.4 Other failures
 
@@ -382,7 +382,7 @@ The `history` command backs "view raw history" in the web UI:
 - Each pi process is about 135–155 MB (measured). Default concurrency cap `clamp(floor(0.5 × 总内存 / 250 MB), 1, 8)` (总内存 = total memory), configurable; `start_worker` requests beyond the cap queue.
 - Idle reclamation: 10 minutes by default (§4.1).
 - The connector itself should keep a small resident memory footprint; all bulk data (sessions, events) stays on disk.
-- Logs: `~/.shepherd/logs/`, keeping the tail of pi's stderr per worker; logs contain no model keys or session content.
+- Logs: `~/.sig/logs/`, keeping the tail of pi's stderr per worker; logs contain no model keys or session content.
 
 ## 13. Security
 

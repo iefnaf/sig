@@ -145,7 +145,7 @@ describe("external_activity (connector-pi.md §10, steward.md §5.3)", () => {
           t: "events",
           id: "evt-1",
           batch: [
-            { workerId, seq: 1, ts: Date.now(), type: "started", sessionId: workerId, cwd: "/srv", branch: "shepherd/t-1" },
+            { workerId, seq: 1, ts: Date.now(), type: "started", sessionId: workerId, cwd: "/srv", branch: "sig/t-1" },
             {
               workerId,
               seq: 2,
@@ -382,7 +382,7 @@ describe("wake merging stays within its window class (steward.md §5.3/§5.4)", 
           t: "events",
           id: "evt-3",
           batch: [
-            { workerId, seq: 3, ts: Date.now(), type: "report", status: "done", summary: "完成", git: { branch: "shepherd/t-1", base: "main", ahead: 1, dirty: 0, filesChanged: 1, insertions: 1, deletions: 0, pushed: false } },
+            { workerId, seq: 3, ts: Date.now(), type: "report", status: "done", summary: "完成", git: { branch: "sig/t-1", base: "main", ahead: 1, dirty: 0, filesChanged: 1, insertions: 1, deletions: 0, pushed: false } },
             { workerId, seq: 4, ts: Date.now(), type: "settled", outcome: "reported" },
           ],
         }),

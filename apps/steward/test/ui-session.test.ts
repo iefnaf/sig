@@ -112,7 +112,7 @@ describe("reading pi's records", () => {
     expect(describeRecord({ type: "model_change", id: "x", parentId: "m1", provider: "openai", modelId: "gpt-4o" }).blocks).toEqual([{ t: "meta", kind: "model", title: "openai/gpt-4o", detail: "" }]);
     expect(describeRecord({ type: "compaction", id: "x", parentId: "m1", summary: "earlier work", tokensBefore: 50000 }).blocks).toEqual([{ t: "meta", kind: "compaction", title: "50000", detail: "earlier work" }]);
     expect(describeRecord({ type: "branch_summary", id: "x", parentId: "m1", fromId: "m9", summary: "tried A" }).blocks).toEqual([{ t: "meta", kind: "branch_summary", title: "m9", detail: "tried A" }]);
-    expect(describeRecord({ type: "custom", id: "x", parentId: "m1", customType: "shepherd", data: { commandId: "c1" } }).blocks).toEqual([{ t: "meta", kind: "custom", title: "shepherd", detail: pretty({ commandId: "c1" }) }]);
+    expect(describeRecord({ type: "custom", id: "x", parentId: "m1", customType: "sig", data: { commandId: "c1" } }).blocks).toEqual([{ t: "meta", kind: "custom", title: "sig", detail: pretty({ commandId: "c1" }) }]);
   });
 
   it("keeps anything it does not know as a raw block instead of dropping it", () => {

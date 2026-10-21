@@ -2,7 +2,7 @@ import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CloseCode, HelloMessageSchema } from "@shepherd/protocol";
+import { CloseCode, HelloMessageSchema } from "@nightboats/protocol";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConnectorClient } from "../src/client.ts";
 import { LocalStore } from "../src/store.ts";
@@ -57,7 +57,7 @@ let store: LocalStore;
 
 beforeEach(() => {
   FakeWebSocket.instances = [];
-  dir = mkdtempSync(join(tmpdir(), "shepherd-connector-client-test-"));
+  dir = mkdtempSync(join(tmpdir(), "sig-connector-client-test-"));
   store = new LocalStore(join(dir, "connector.sqlite"));
   store.saveCredentials({ serverUrl: "https://example.com", deviceId: "dev_abc", token: "st1.dev_abc.1.100.deadbeef" });
 });

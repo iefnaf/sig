@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import shepherdExtension, { COMMAND_ENTRY_TYPE, COMMAND_NAME, REMINDER_ENTRY_TYPE } from "../src/ext/shepherd-pi.ts";
+import sigExtension, { COMMAND_ENTRY_TYPE, COMMAND_NAME, REMINDER_ENTRY_TYPE } from "../src/ext/sig-pi.ts";
 import { wrapPrompt } from "../src/pi-adapter.ts";
 
 /** The slice of pi's ExtensionAPI the extension uses — enough to drive it deterministically. */
@@ -29,7 +29,7 @@ class FakePi {
 
 function fresh() {
   const pi = new FakePi();
-  shepherdExtension(pi as never);
+  sigExtension(pi as never);
   return pi;
 }
 
@@ -48,9 +48,9 @@ function beforeSettle(pi: FakePi, event: Partial<Record<string, unknown>> = {}) 
   }) as { entries?: unknown[]; continue?: boolean } | undefined;
 }
 
-describe("shepherd pi extension (connector-pi.md §7, ADR-0001)", () => {
+describe("sig pi extension (connector-pi.md §7, ADR-0001)", () => {
   it("the connector's prompt wrapper and the extension's command name agree", () => {
-    // wrapPrompt builds `/shepherd <commandId>\n<text>`; if the two sides drift, prompts
+    // wrapPrompt builds `/sig <commandId>\n<text>`; if the two sides drift, prompts
     // leak the wrapper to the model. Real pi verified: disposition "handled".
     expect(wrapPrompt("cmd-1", "do it")).toBe(`/${COMMAND_NAME} cmd-1\ndo it`);
   });
@@ -95,7 +95,7 @@ describe("shepherd pi extension (connector-pi.md §7, ADR-0001)", () => {
     ]);
   });
 
-  it("passes malformed /shepherd args through as plain text without a marker", async () => {
+  it("passes malformed /sig args through as plain text without a marker", async () => {
     const pi = fresh();
     await pi.commands.get(COMMAND_NAME)!.handler("just a plain prompt");
     expect(pi.appendedEntries).toEqual([]);

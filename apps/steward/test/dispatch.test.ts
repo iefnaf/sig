@@ -201,7 +201,7 @@ describe("the dispatch service (Dispatcher.startWorker)", () => {
 
   it("attaches to an existing thread on the same machine and resumes the previous session (issue #8)", async () => {
     const fake = await pairFakeConnector("mac-studio", {
-      run: { status: "done", summary: "第一段完成", branch: "shepherd/leg-1" },
+      run: { status: "done", summary: "第一段完成", branch: "sig/leg-1" },
     });
     await fake.connect();
     const first = await ownerStub().dispatchForTest({ prompt: "第一段任务", repoRef: "repo-a", newTitle: "第一段任务" });
@@ -384,7 +384,7 @@ describe("the dispatch service: agent targeting (issue #17)", () => {
 
   it("an agent switch on a Thread is a new session from the previous leg's branch (spec §5.3)", async () => {
     const fake = await pairFakeConnector("mac-studio", {
-      run: { status: "done", summary: "pi leg done", branch: "shepherd/leg-1" },
+      run: { status: "done", summary: "pi leg done", branch: "sig/leg-1" },
       autorun: false,
       agents: ["pi", "claude-code"],
     });
@@ -394,14 +394,14 @@ describe("the dispatch service: agent targeting (issue #17)", () => {
     const leg1Id = (first as { workerId: string }).workerId;
     const [cmd1] = await fake.waitForCmds(1);
     fake.send({ t: "cmd_ack", re: cmd1!.id, status: "accepted" });
-    fake.send({ t: "cmd_result", re: cmd1!.id, ok: true, data: { sessionId: leg1Id, branch: "shepherd/leg-1" } });
-    await fake.emit("started", leg1Id, { sessionId: leg1Id, branch: "shepherd/leg-1" });
+    fake.send({ t: "cmd_result", re: cmd1!.id, ok: true, data: { sessionId: leg1Id, branch: "sig/leg-1" } });
+    await fake.emit("started", leg1Id, { sessionId: leg1Id, branch: "sig/leg-1" });
     await fake.emit("report", leg1Id, {
       type: "report",
       status: "done",
       summary: "pi leg done",
       git: {
-        branch: "shepherd/leg-1",
+        branch: "sig/leg-1",
         base: "b464a0f8c355115c1212b0f019b4a65d2bb44e3",
         ahead: 1,
         dirty: 0,
@@ -432,10 +432,10 @@ describe("the dispatch service: agent targeting (issue #17)", () => {
     });
     expect(second).toMatchObject({
       kind: "dispatched",
-      continuation: { action: "new_session", reason: "agent_switch", base: "shepherd/leg-1" },
+      continuation: { action: "new_session", reason: "agent_switch", base: "sig/leg-1" },
     });
     const [, cmd2] = await fake.waitForCmds(2);
-    expect(cmd2!.args).toMatchObject({ agent: "claude-code", base: "shepherd/leg-1" });
+    expect(cmd2!.args).toMatchObject({ agent: "claude-code", base: "sig/leg-1" });
     const snap = await ownerStub().debugSnapshot();
     expect(snap.threads[0]!.workers).toHaveLength(2);
     expect(snap.threads[0]!.workers[1]!.agent).toBe("claude-code");

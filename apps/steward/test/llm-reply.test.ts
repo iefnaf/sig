@@ -75,8 +75,8 @@ async function dispatchOne(prompt = "修复登录 bug"): Promise<{ fake: FakeCon
   const workerId = String((cmd!.args as Record<string, unknown>).workerId);
   const threadId = String((cmd!.args as Record<string, unknown>).threadId);
   fake.send({ t: "cmd_ack", re: cmd!.id, status: "accepted" });
-  fake.send({ t: "cmd_result", re: cmd!.id, ok: true, data: { sessionId: workerId, branch: "shepherd/x-1" } });
-  await fake.emit("started", workerId, { sessionId: workerId, branch: "shepherd/x-1" });
+  fake.send({ t: "cmd_result", re: cmd!.id, ok: true, data: { sessionId: workerId, branch: "sig/x-1" } });
+  await fake.emit("started", workerId, { sessionId: workerId, branch: "sig/x-1" });
   await waitRunsSettled();
   return { fake, workerId, threadId };
 }
@@ -103,9 +103,9 @@ describe("input markers (steward.md §4.2, §15.2)", () => {
   it("eventWakeText carries the marker, the facts, and the bookkeeping instruction", () => {
     const text = eventWakeText({
       thread: { threadId: "t_1", title: "登录 bug", goal: null, summary: null, summaryAt: null, state: "idle", unread: true, lastMachine: null, lastActivityAt: 0, archived: false, createdFromMsg: null, createdAt: 0 },
-      worker: { workerId: "w_a", threadId: "t_1", deviceId: "dev_1", repoId: "/srv/repo-a", agent: "pi", mode: "write", state: "idle", sessionId: null, branch: "shepherd/x-1", cmdId: null, parentWorker: null, lastOutcome: "reported:done", lastEventAt: null, lastProgress: null, contextPercent: null, createdAt: 0 },
+      worker: { workerId: "w_a", threadId: "t_1", deviceId: "dev_1", repoId: "/srv/repo-a", agent: "pi", mode: "write", state: "idle", sessionId: null, branch: "sig/x-1", cmdId: null, parentWorker: null, lastOutcome: "reported:done", lastEventAt: null, lastProgress: null, contextPercent: null, createdAt: 0 },
       machine: { deviceId: "dev_1", name: "mac-studio", online: true, lastSeen: null, agents: [], maxWorkers: 4, bootId: "boot-1" },
-      report: { status: "done", summary: "修好了", changes: ["a.ts"], decisions: ["用 session 方案"], leftovers: null, tests: { ran: true, passed: true }, question: null, git: { branch: "shepherd/x-1", base: "main", ahead: 2, dirty: 0, filesChanged: 1, insertions: 5, deletions: 1, pushed: false } },
+      report: { status: "done", summary: "修好了", changes: ["a.ts"], decisions: ["用 session 方案"], leftovers: null, tests: { ran: true, passed: true }, question: null, git: { branch: "sig/x-1", base: "main", ahead: 2, dirty: 0, filesChanged: 1, insertions: 5, deletions: 1, pushed: false } },
       notified: true,
     });
     expect(text.startsWith("⟦event⟧")).toBe(true);
@@ -244,8 +244,8 @@ describe("the wake queue: merge window and replay safety (steward.md §5.1/§5.4
     const [, cmd2] = await fake.waitForCmds(2);
     const worker2 = String((cmd2!.args as Record<string, unknown>).workerId);
     fake.send({ t: "cmd_ack", re: cmd2!.id, status: "accepted" });
-    fake.send({ t: "cmd_result", re: cmd2!.id, ok: true, data: { sessionId: worker2, branch: "shepherd/x-2" } });
-    await fake.emit("started", worker2, { sessionId: worker2, branch: "shepherd/x-2" });
+    fake.send({ t: "cmd_result", re: cmd2!.id, ok: true, data: { sessionId: worker2, branch: "sig/x-2" } });
+    await fake.emit("started", worker2, { sessionId: worker2, branch: "sig/x-2" });
 
     // Two done reports land nearly simultaneously (same ms window).
     await scriptModel(fauxAssistantMessage([fauxText("记账。")]));
@@ -325,15 +325,15 @@ describe("the situation brief: per request via beforeRequest, persisted nowhere 
     expect(second.brief).not.toBe(first.brief); // freshest every turn, not a frozen prompt
     expect(second.brief).toContain("修个东西");
 
-    // Nothing of the brief persisted: no stored entry carries the shepherd-situation SECTION
+    // Nothing of the brief persisted: no stored entry carries the sig-situation SECTION
     // (the role prompt merely mentions its name) or the brief's body text.
     const state = await llmState();
     const storedSections = state.raw.flatMap((record) => {
       const messages = (record as { model?: Array<{ sections?: Record<string, unknown> }> }).model ?? [];
       return messages.flatMap((m) => Object.keys(m.sections ?? {}));
     });
-    expect(storedSections).toContain("shepherd-role"); // the static section did persist…
-    expect(storedSections).not.toContain("shepherd-situation"); // …the brief's did not
+    expect(storedSections).toContain("sig-role"); // the static section did persist…
+    expect(storedSections).not.toContain("sig-situation"); // …the brief's did not
     const everything = JSON.stringify(state.raw);
     expect(everything).not.toContain("还没有任何一件事");
     expect(everything).not.toContain("Thread 一览");

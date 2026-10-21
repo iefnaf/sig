@@ -22,9 +22,9 @@ exports[`message snapshots (issue #11) > consent-carrying done report (issue #21
 做了什么：
 - auth/session.ts 里补上了 token 过期后的刷新
 - 测试通过
-- 分支 shepherd/login-1，2 个提交，未推送
+- 分支 sig/login-1，2 个提交，未推送
 
-需要你：分支 shepherd/login-1（2 个提交）还没推送。点「同意」我会推送并创建 PR；选「先不要」就先留在机器上。
+需要你：分支 sig/login-1（2 个提交）还没推送。点「同意」我会推送并创建 PR；选「先不要」就先留在机器上。
 
 详情：https://example.com/link/wl1.t/t_test.1.0abc
 
@@ -40,14 +40,14 @@ exports[`message snapshots (issue #11) > merged done reports: one message, each 
 **✅ 「修复登录 bug」登录 bug 修好，测试通过**
 - auth/session.ts 里补上了 token 过期后的刷新
 - 测试通过
-- 分支 shepherd/login-1，2 个提交，已推送
+- 分支 sig/login-1，2 个提交，已推送
 详情：https://example.com/link/wl1.t/t_test.1.0abc
 
 **✅ 「退款接口幂等」退款接口补齐幂等，回归通过**
 - payment/refund.ts 加了幂等键
 - 补 2 个用例
 - 测试通过
-- 分支 shepherd/refund-1，1 个提交，已推送
+- 分支 sig/refund-1，1 个提交，已推送
 **需要你**：遗留：旧渠道还没覆盖
 详情：https://example.com/link/wl1.t/t_two.1.0def
 
@@ -67,7 +67,7 @@ exports[`message snapshots (issue #11) > single done report: the fixed three-par
 做了什么：
 - auth/session.ts 里补上了 token 过期后的刷新
 - 测试通过
-- 分支 shepherd/login-1，2 个提交，已推送
+- 分支 sig/login-1，2 个提交，已推送
 
 需要你：建议下一步：跑一遍全量测试
 

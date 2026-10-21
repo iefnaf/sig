@@ -27,7 +27,7 @@ const LOG = () => join(dir, "claude-prompt.log");
 const ARGV_LOG = () => join(dir, "claude-argv.log");
 
 beforeEach(() => {
-  dir = tmpDir("shepherd-claude-test");
+  dir = tmpDir("sig-claude-test");
   stateDir = join(dir, "state");
   events = [];
   logs = [];
@@ -111,7 +111,7 @@ describe("invocation contract (spike-conclusions §2)", () => {
       const config = JSON.parse(readFileSync(argv[cfgIdx + 1]!, "utf8")) as {
         mcpServers: Record<string, { command: string; args: string[] }>;
       };
-      const server = config.mcpServers.shepherd!;
+      const server = config.mcpServers.sig!;
       expect(server).toBeDefined();
       expect(existsSync(server.args[0]!)).toBe(true);
       // --append-system-prompt carries the §7.3 reporting conventions (text, not a path).
@@ -154,7 +154,7 @@ describe("stream mapping and shared adjudication (§5.2 via the pi path)", () =>
     async () => {
       setup([
         [
-          { emit: claudeToolUse("mcp__shepherd__report", { status: "done", summary: "all good", decisions: ["used sqlite"] }) },
+          { emit: claudeToolUse("mcp__sig__report", { status: "done", summary: "all good", decisions: ["used sqlite"] }) },
           { emit: claudeAssistantText("Reported.", "end_turn") },
         ],
       ]);
@@ -171,7 +171,7 @@ describe("stream mapping and shared adjudication (§5.2 via the pi path)", () =>
   );
 
   it(
-    "a tool merely NAMED report is not the shepherd report (suffix match only)",
+    "a tool merely NAMED report is not the sig report (suffix match only)",
     async () => {
       setup([
         [
@@ -198,7 +198,7 @@ describe("stream mapping and shared adjudication (§5.2 via the pi path)", () =>
       expect(mapStopReason("end_turn")).toBe("stop");
       expect(mapStopReason("tool_use")).toBe("tool_use");
       expect(mapStopReason("max_tokens")).toBe("length");
-      expect(isReportTool("mcp__shepherd__report")).toBe(true);
+      expect(isReportTool("mcp__sig__report")).toBe(true);
       expect(isReportTool("report")).toBe(false);
     },
     30_000,
@@ -242,7 +242,7 @@ describe("continuation and interruption", () => {
     async () => {
       setup([
         [{ emit: claudeAssistantText("first run done") }],
-        [{ emit: claudeToolUse("mcp__shepherd__report", { status: "done", summary: "second run" }) }],
+        [{ emit: claudeToolUse("mcp__sig__report", { status: "done", summary: "second run" }) }],
       ]);
       const handle = await adapter.start(spec());
       await waitFor(() => settledOf()[0], 10_000, "run 1 settle");

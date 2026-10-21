@@ -1,6 +1,6 @@
 // The state-dir guard: connect may not install the shared service from a private state dir
-// (SIG_HOME, or its SHEPHERD_HOME alias). The guard fires before any pairing traffic, so a
-// dummy code never reaches the network.
+// (SIG_HOME). The guard fires before any pairing traffic, so a dummy code never reaches the
+// network.
 import { describe, expect, it } from "vitest";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -18,18 +18,6 @@ describe("connect with a private state directory", () => {
     try {
       const p = run(process.execPath, [dist, "connect", "https://example.com", "DUMMY1234"], {
         env: { ...process.env, SIG_HOME: home },
-      });
-      await expect(p).rejects.toThrow(/would repoint this machine's connector/);
-    } finally {
-      rmSync(home, { recursive: true, force: true });
-    }
-  }, 30_000);
-
-  it("the SHEPHERD_HOME alias is guarded the same way", async () => {
-    const home = mkdtempSync(join(tmpdir(), "sig-guard-"));
-    try {
-      const p = run(process.execPath, [dist, "connect", "https://example.com", "DUMMY1234"], {
-        env: { ...process.env, SHEPHERD_HOME: home },
       });
       await expect(p).rejects.toThrow(/would repoint this machine's connector/);
     } finally {

@@ -64,7 +64,7 @@ async function runningWorker(title = "查一下构建为什么挂"): Promise<{ f
   const outcome = await ownerStub().dispatchForTest({ prompt: title, repoRef: "repo-a", newTitle: title });
   if (outcome.kind !== "dispatched") throw new Error(`dispatch failed: ${JSON.stringify(outcome)}`);
   fake.send({ t: "cmd_ack", re: (await fake.waitForCmds(1))[0]!.id, status: "accepted" });
-  await fake.emit("started", outcome.workerId, { sessionId: outcome.workerId, branch: "shepherd/x-1" });
+  await fake.emit("started", outcome.workerId, { sessionId: outcome.workerId, branch: "sig/x-1" });
   return { fake, workerId: outcome.workerId, threadId: outcome.threadId };
 }
 

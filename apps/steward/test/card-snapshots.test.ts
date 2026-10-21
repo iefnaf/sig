@@ -36,7 +36,7 @@ function report(overrides: Partial<ReportRow> = {}): ReportRow {
     next: null,
     // pushed: an ORDINARY completion (nothing left to ask) — issue #21 gives unpushed write
     // completions their own consent-message snapshot below.
-    git: { branch: "shepherd/login-1", base: "main", ahead: 2, dirty: 0, filesChanged: 2, insertions: 30, deletions: 4, pushed: true },
+    git: { branch: "sig/login-1", base: "main", ahead: 2, dirty: 0, filesChanged: 2, insertions: 30, deletions: 4, pushed: true },
     ...overrides,
   };
 }
@@ -50,7 +50,7 @@ const worker: WorkerRow = {
   mode: "write",
   state: "idle",
   sessionId: "w_test",
-  branch: "shepherd/login-1",
+  branch: "sig/login-1",
   cmdId: "cmd_1",
   parentWorker: null,
   lastOutcome: "reported:done",
@@ -81,7 +81,7 @@ describe("message snapshots (issue #11)", () => {
       summary: "退款接口补齐幂等，回归通过",
       changes: ["payment/refund.ts 加了幂等键", "补 2 个用例"],
       tests: { ran: true, passed: true },
-      git: { branch: "shepherd/refund-1", base: "main", ahead: 1, dirty: 0, filesChanged: 2, insertions: 18, deletions: 2, pushed: true },
+      git: { branch: "sig/refund-1", base: "main", ahead: 1, dirty: 0, filesChanged: 2, insertions: 18, deletions: 2, pushed: true },
       leftovers: ["旧渠道还没覆盖"],
     });
     const sections: QuietSection[] = [
@@ -117,7 +117,7 @@ describe("message size budget (issue #11: one merged message stays readable)", (
     kind: "report",
     tone: "success",
     conclusion: `第 ${i} 件事完成了，结论占据接近上限的长度。`.repeat(3),
-    did: [`改动第 ${i} 处：${"细节".repeat(40)}`, `验证第 ${i} 处：${"证据".repeat(40)}`, `分支 shepherd/x-${i}，3 个提交，已推送`, `4 个文件未提交`],
+    did: [`改动第 ${i} 处：${"细节".repeat(40)}`, `验证第 ${i} 处：${"证据".repeat(40)}`, `分支 sig/x-${i}，3 个提交，已推送`, `4 个文件未提交`],
     needsYou: `建议下一步：${"具体建议".repeat(20)}`,
     threadTitle: `事项标题第 ${i} 号`,
     detailsUrl: `https://example.com/link/wl1.t/t_${i}.1.${"0".repeat(40)}abcd`,

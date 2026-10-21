@@ -257,7 +257,7 @@ export const STRINGS = {
   svDisconnectedLong: ['Still can’t connect. Reload the page to sign in again.', '仍然无法连接，请刷新页面重新登录。'],
   svError: ['Couldn’t read the session: {reason}', '无法读取会话：{reason}'],
   svStuck: ['The read made no progress.', '读取没有进展。'],
-  svOutdated: ['That machine’s connector is too old to read full sessions. Run “shepherd upgrade” on it, then retry.', '那台机器上的 connector 版本太旧，读不了完整会话。在那台机器上运行「shepherd upgrade」后再重试。'],
+  svOutdated: ['That machine’s connector is too old to read full sessions. Run “sig upgrade” on it, then retry.', '那台机器上的 connector 版本太旧，读不了完整会话。在那台机器上运行「sig upgrade」后再重试。'],
   svMeta_session: ['Session', '会话'],
   svMeta_model: ['Model', '模型'],
   svMeta_thinking_level: ['Thinking level', '思考强度'],

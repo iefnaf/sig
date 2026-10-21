@@ -362,7 +362,7 @@ describe("sweepWorkers: realism anchors through the real dispatch flow", () => {
     const [cmd] = await fake.waitForCmds(1);
     fake.send({ t: "cmd_ack", re: cmd!.id, status: "accepted" });
     const { workerId } = outcome;
-    await fake.emit("started", workerId, { sessionId: workerId, cwd: "/srv/repo-a", branch: "shepherd/th-1" });
+    await fake.emit("started", workerId, { sessionId: workerId, cwd: "/srv/repo-a", branch: "sig/th-1" });
     await waitForWorkerState(workerId, "running");
 
     await backdateWorker(workerId, 21);
@@ -380,7 +380,7 @@ describe("sweepWorkers: realism anchors through the real dispatch flow", () => {
     const [cmd] = await fake.waitForCmds(1);
     fake.send({ t: "cmd_ack", re: cmd!.id, status: "accepted" });
     const { workerId } = outcome;
-    await fake.emit("started", workerId, { sessionId: workerId, cwd: "/srv/repo-a", branch: "shepherd/th-1" });
+    await fake.emit("started", workerId, { sessionId: workerId, cwd: "/srv/repo-a", branch: "sig/th-1" });
     await waitForWorkerState(workerId, "running");
 
     fake.close();

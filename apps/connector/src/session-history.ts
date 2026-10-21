@@ -17,7 +17,7 @@ import {
   HISTORY_TOOLS_MAX,
   type HistoryEntry,
   type HistoryPage,
-} from "@shepherd/protocol";
+} from "@nightboats/protocol";
 
 /** Bookkeeping entries that are not conversation content. */
 const SKIPPED_ENTRY_TYPES = new Set(["usage", "label", "session_info", "compaction", "model_change", "custom"]);

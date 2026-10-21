@@ -20,7 +20,7 @@ const worker = (overrides: Partial<WorkerRow> = {}): WorkerRow => ({
   mode: "write",
   state: "idle",
   sessionId: "w_1",
-  branch: "shepherd/login-1",
+  branch: "sig/login-1",
   cmdId: null,
   parentWorker: null,
   lastOutcome: "reported:done",
@@ -95,7 +95,7 @@ describe("decideContinuation (spec §5.3: resume vs new session)", () => {
 });
 
 const GIT = {
-  branch: "shepherd/login-1",
+  branch: "sig/login-1",
   base: "b464a0f8c355115c1212b0f019b4a65d2bb44e3",
   ahead: 2,
   dirty: 0,
@@ -153,7 +153,7 @@ describe("assembleBrief (steward.md §2.6: goal, state, deduped decisions, lefto
     expect(brief.decisions.map((d) => d.workerId)).toEqual(["w_1", "w_1", "w_2"]);
     // Latest leftovers: the newest report that named any.
     expect(brief.leftovers).toEqual(["迁移 SQL 未生成"]);
-    expect(brief.pointers).toMatchObject({ workerId: "w_1", branch: "shepherd/login-1", ahead: 2 });
+    expect(brief.pointers).toMatchObject({ workerId: "w_1", branch: "sig/login-1", ahead: 2 });
   });
 
   it("caps items keeping the LATEST decisions and reporting the older drops", () => {
@@ -185,8 +185,8 @@ describe("assembleBrief (steward.md §2.6: goal, state, deduped decisions, lefto
   });
 
   it("falls back to the thread's latest reported git facts when the from-worker reported none", () => {
-    const brief = assembleBrief(source({ fromWorker: worker({ workerId: "w_3", branch: "shepherd/login-2" }) }));
-    expect(brief.pointers).toMatchObject({ workerId: "w_3", branch: "shepherd/login-2", ahead: 2 }); // w_2's facts, w_3's branch
+    const brief = assembleBrief(source({ fromWorker: worker({ workerId: "w_3", branch: "sig/login-2" }) }));
+    expect(brief.pointers).toMatchObject({ workerId: "w_3", branch: "sig/login-2", ahead: 2 }); // w_2's facts, w_3's branch
   });
 });
 
@@ -200,7 +200,7 @@ describe("renderHandoffBrief (pointers, not content; the steward adds only the t
     expect(text).toContain("（w_1）"); // source worker on the decision line
     expect(text).toContain("遗留事项");
     expect(text).toContain("git 指针");
-    expect(text).toContain("shepherd/login-1");
+    expect(text).toContain("sig/login-1");
     expect(text).toContain("auth/session.ts");
     expect(text.trimEnd().endsWith("本次任务：")).toBe(true); // the steward appends ONLY the task
     // No content smuggled: commit shas abbreviated, no diff bodies.
@@ -241,8 +241,8 @@ describe("renderHandoffBrief (pointers, not content; the steward adds only the t
     const readonlyLeg = worker({ workerId: "w_ro", branch: null, mode: "readonly", state: "idle" });
     const brief = assembleBrief(source({ fromWorker: readonlyLeg, pointerWorker: worker() }));
     expect(brief.fromWorkerId).toBe("w_ro");
-    expect(brief.pointers).toMatchObject({ workerId: "w_1", branch: "shepherd/login-1", ahead: 2 });
-    expect(renderHandoffBrief(brief)).toContain("shepherd/login-1");
+    expect(brief.pointers).toMatchObject({ workerId: "w_1", branch: "sig/login-1", ahead: 2 });
+    expect(renderHandoffBrief(brief)).toContain("sig/login-1");
   });
 
   it("warns when the previous leg left uncommitted changes (they are NOT on the relay branch)", () => {

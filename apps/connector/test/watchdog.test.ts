@@ -47,7 +47,7 @@ let treeScript: Array<TreeCpuSample | undefined> = [];
 let errors: unknown[] = [];
 
 beforeEach(async () => {
-  dir = tmpDir("shepherd-watchdog-test");
+  dir = tmpDir("sig-watchdog-test");
   stateDir = join(dir, "state");
   repo = await makeGitRepo(dir);
   store = new LocalStore(join(stateDir, "connector.sqlite"));
@@ -545,14 +545,14 @@ describe("the production sampler under a busy tool child (fake-pi, real ps)", ()
   // the child. Marker-matched cleanup only — never a broad pkill.
   afterEach(() => {
     try {
-      execFileSync("pkill", ["-f", "shepherd-wd-busy"]);
+      execFileSync("pkill", ["-f", "sig-wd-busy"]);
     } catch {
       // none left
     }
   });
 
   it("a silent parent with a CPU-bound child is hot, never a stall", async () => {
-    const busy = `node -e "/*shepherd-wd-busy*/ const e=Date.now()+9000; while(Date.now()<e){Math.sqrt(Math.random())}"`;
+    const busy = `node -e "/*sig-wd-busy*/ const e=Date.now()+9000; while(Date.now()<e){Math.sqrt(Math.random())}"`;
     const scenario = writeScenario(dir, "scenario", [[{ shell: busy }], [{ delayMs: 60_000 }]]);
     const runsFile = join(dir, "runs-shared.txt");
     writeFileSync(runsFile, "0");

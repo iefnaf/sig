@@ -17,7 +17,7 @@ let mock: MockSteward;
 let app: ConnectorApp;
 
 beforeEach(async () => {
-  dir = tmpDir("shepherd-e2e-worker");
+  dir = tmpDir("sig-e2e-worker");
   stateDir = join(dir, "state");
   repo = await makeGitRepo(dir);
   store = new LocalStore(join(stateDir, "connector.sqlite"));
@@ -70,7 +70,7 @@ describe("start_worker over the real transport (issue #3 + #30)", () => {
       t: "cmd_result",
       re: cmdId,
       ok: true,
-      data: { sessionId: "w-e2e-1", branch: "shepherd/fix-the-login-bug-1" },
+      data: { sessionId: "w-e2e-1", branch: "sig/fix-the-login-bug-1" },
     });
 
     await waitFor(() => mock.events().some((e) => e.type === "settled"), 20_000, "settled event on the wire");
@@ -84,7 +84,7 @@ describe("start_worker over the real transport (issue #3 + #30)", () => {
 
     const report = events.find((e) => e.type === "report")!;
     expect(report.status).toBe("done");
-    expect(report.git).toMatchObject({ branch: "shepherd/fix-the-login-bug-1", ahead: 1, dirty: 0 });
+    expect(report.git).toMatchObject({ branch: "sig/fix-the-login-bug-1", ahead: 1, dirty: 0 });
     expect(events.find((e) => e.type === "settled")).toMatchObject({ outcome: "reported" });
 
     // Redelivery of the same cmdId: `duplicate`, and no second run (events do not grow).

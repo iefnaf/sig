@@ -9,7 +9,7 @@ let dir: string;
 let processes: PiProcess[];
 
 beforeEach(() => {
-  dir = tmpDir("shepherd-pi-process-test");
+  dir = tmpDir("sig-pi-process-test");
   processes = [];
 });
 
@@ -163,7 +163,7 @@ describe("PiProcess (rpc.md framing + spike-conclusions §2)", () => {
     expect(proc.getStderrTail().length).toBeLessThanOrEqual(64 * 1024 + 100);
   });
 
-  it("writes a redacted, capped stderr file per worker (§12: tails under ~/.shepherd/logs)", async () => {
+  it("writes a redacted, capped stderr file per worker (§12: tails under ~/.sig/logs)", async () => {
     const stderrFile = join(dir, "pi-w-test.log");
     const proc = new PiProcess({
       command: [

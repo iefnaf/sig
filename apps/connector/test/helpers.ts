@@ -25,8 +25,8 @@ export async function makeGitRepo(parent: string, name = "repo-a"): Promise<stri
   const repo = join(parent, name);
   mkdirSync(repo);
   await git(repo, ["init", "-b", "main"]);
-  await git(repo, ["config", "user.email", "test@shepherd.local"]);
-  await git(repo, ["config", "user.name", "Shepherd Test"]);
+  await git(repo, ["config", "user.email", "test@sig.local"]);
+  await git(repo, ["config", "user.name", "Sig Test"]);
   writeFileSync(join(repo, "README.md"), `# ${basename(repo)}\n`);
   await git(repo, ["add", "."]);
   await git(repo, ["commit", "-m", "init"]);
@@ -246,7 +246,7 @@ export function claudeAssistantText(text: string, stopReason = "end_turn"): Reco
 }
 
 /** One assistant message with a tool_use block — MCP tools arrive NAMESPACED
- *  (mcp__shepherd__report); the connector must suffix-match, never bare-match. */
+ *  (mcp__sig__report); the connector must suffix-match, never bare-match. */
 export function claudeToolUse(name: string, input: Record<string, unknown>): Record<string, unknown> {
   return {
     type: "assistant",
@@ -263,7 +263,7 @@ export function claudeReportRun(
   return [
     ...(opts.shellBefore ? [{ shell: opts.shellBefore }] : []),
     ...(opts.tool ? [{ emit: claudeToolUse(opts.tool.name, opts.tool.input) }] : []),
-    { emit: claudeToolUse("mcp__shepherd__report", report) },
+    { emit: claudeToolUse("mcp__sig__report", report) },
     { emit: claudeAssistantText("Reported.", "end_turn") },
   ];
 }

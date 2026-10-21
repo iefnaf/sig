@@ -67,7 +67,7 @@ function seedWorker(workerId: string, overrides: Record<string, unknown> = {}): 
     repoId: repo,
     mode: "write",
     state: "idle",
-    branch: "shepherd/fix-the-login-bug-1",
+    branch: "sig/fix-the-login-bug-1",
     worktree: join(dir, "worktree-login"),
     base: "main",
     ...overrides,
@@ -75,7 +75,7 @@ function seedWorker(workerId: string, overrides: Record<string, unknown> = {}): 
 }
 
 beforeEach(async () => {
-  dir = tmpDir("shepherd-pr");
+  dir = tmpDir("sig-pr");
   stateDir = join(dir, "state");
   mkdirSync(stateDir, { recursive: true });
   repo = await makeGitRepo(dir);
@@ -96,13 +96,13 @@ describe("openPr (issue #21)", () => {
       calls.push(`${file} ${args.join(" ")} @${options.cwd}`);
       return scriptedExec(HAPPY)(file, args, options);
     };
-    const result = await openPr({ worktree: "/wt", branch: "shepherd/x-1", title: "修好登录", body: "body", exec });
+    const result = await openPr({ worktree: "/wt", branch: "sig/x-1", title: "修好登录", body: "body", exec });
     expect(result.url).toBe("https://github.com/example/repo-a/pull/7");
     expect(calls).toEqual([
       "gh --version @/wt",
       "gh auth status @/wt",
-      "git push -u origin shepherd/x-1 @/wt",
-      "gh pr create --head shepherd/x-1 --title 修好登录 --body body @/wt",
+      "git push -u origin sig/x-1 @/wt",
+      "gh pr create --head sig/x-1 --title 修好登录 --body body @/wt",
     ]);
   });
 
@@ -155,14 +155,14 @@ describe("pr_worker command (issue #21 AC2/AC4)", () => {
     manager = newManager(scriptedExec(HAPPY));
     seedWorker("w-pr-1");
     const result = await manager.handleCommand("cmd-pr-1", "pr_worker", { workerId: "w-pr-1", title: "修好登录", body: "- 改了 auth" }, "w-pr-1");
-    expect(result).toEqual({ url: "https://github.com/example/repo-a/pull/7", branch: "shepherd/fix-the-login-bug-1" });
+    expect(result).toEqual({ url: "https://github.com/example/repo-a/pull/7", branch: "sig/fix-the-login-bug-1" });
     expect(events).toEqual([
       {
         workerId: "w-pr-1",
         type: "pr_created",
         cmdId: "cmd-pr-1",
         url: "https://github.com/example/repo-a/pull/7",
-        branch: "shepherd/fix-the-login-bug-1",
+        branch: "sig/fix-the-login-bug-1",
       },
     ]);
   });
@@ -198,7 +198,7 @@ describe("pr_worker command (issue #21 AC2/AC4)", () => {
     manager = newManager(
       scriptedExec({
         ...HAPPY,
-        "git push": { exit: 1, stderr: "! [remote rejected] shepherd/x-1 (pre-receive hook declined)" },
+        "git push": { exit: 1, stderr: "! [remote rejected] sig/x-1 (pre-receive hook declined)" },
       }),
     );
     seedWorker("w-pr-4");
@@ -259,7 +259,7 @@ describe("pr_worker command (issue #21 AC2/AC4)", () => {
     await exec("git", ["remote", "add", "origin", origin], { cwd: repo });
     await exec("git", ["push", "-u", "origin", "main"], { cwd: repo });
     const worktree = join(dir, "wt-real");
-    await exec("git", ["worktree", "add", "-b", "shepherd/real-1", worktree], { cwd: repo });
+    await exec("git", ["worktree", "add", "-b", "sig/real-1", worktree], { cwd: repo });
     await exec("git", ["commit", "--allow-empty", "-m", "work"], { cwd: worktree });
 
     const ghOnly: PrExec = async (file, args, options) => {
@@ -275,7 +275,7 @@ describe("pr_worker command (issue #21 AC2/AC4)", () => {
       repoId: repo,
       mode: "write",
       state: "idle",
-      branch: "shepherd/real-1",
+      branch: "sig/real-1",
       worktree,
       base: "main",
     });
@@ -283,7 +283,7 @@ describe("pr_worker command (issue #21 AC2/AC4)", () => {
     expect(result).toMatchObject({ url: "https://github.com/example/repo-a/pull/7" });
     // The branch genuinely landed on the remote.
     const { stdout } = await exec("git", ["ls-remote", "--heads", "origin"], { cwd: repo });
-    expect(stdout).toContain("shepherd/real-1");
+    expect(stdout).toContain("sig/real-1");
   });
 });
 

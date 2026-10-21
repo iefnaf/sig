@@ -17,7 +17,7 @@ let store: LocalStore;
 let handle: DaemonHandle | null = null;
 
 beforeEach(async () => {
-  dir = tmpDir("shepherd-daemon-test");
+  dir = tmpDir("sig-daemon-test");
   stateDir = join(dir, "state");
   mock = startMockSteward();
   const port = await mock.listen();
@@ -49,7 +49,7 @@ describe("runDaemon", () => {
     expect(hello.machine).toMatchObject({ name: "test-machine" });
 
     // Every boot rewrites the versioned assets (upgrade path, issue #26).
-    expect(existsSync(join(stateDir, "ext", `shepherd-pi-${VERSION}.ts`))).toBe(true);
+    expect(existsSync(join(stateDir, "ext", `sig-pi-${VERSION}.ts`))).toBe(true);
     expect(existsSync(join(stateDir, "prompts", `worker-${VERSION}.md`))).toBe(true);
 
     const logPath = join(stateDir, "logs", "connector.log");
@@ -67,7 +67,7 @@ describe("runDaemon", () => {
     const log = readFileSync(logPath, "utf8");
     expect(log).toContain("daemon_start");
     expect(log).toContain("welcomed");
-    expect(log).not.toContain(mock.token); // no keys in ~/.shepherd/logs
+    expect(log).not.toContain(mock.token); // no keys in ~/.sig/logs
   }, 20_000);
 
   it("activates a stored proxy at boot and still bypasses loopback for the connection (issue #68)", async () => {

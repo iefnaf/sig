@@ -21,10 +21,10 @@ import { installAssets, type InstalledAssets } from "./install.ts";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { PiProcess } from "./pi-process.ts";
-import type { HistoryPage } from "@shepherd/protocol";
+import type { HistoryPage } from "@nightboats/protocol";
 
-/** Must match COMMAND_NAME in ./ext/shepherd-pi.ts (locked together by a test). */
-const SHEPHERD_COMMAND = "shepherd";
+/** Must match COMMAND_NAME in ./ext/sig-pi.ts (locked together by a test). */
+const SIG_COMMAND = "sig";
 
 export interface PiAdapterOptions {
   stateDir: string;
@@ -40,15 +40,15 @@ export interface PiAdapterOptions {
 
 /** Env for the agent child (§4.2: "inherit the user's environment; the connector's own
  * credentials are not passed through", issue #27). The connector's state lives under
- * SIG_* and legacy SHEPHERD_* variables (the home setting locates the device-token store),
- * so the whole namespace is stripped; the device token itself never was an env var. */
+ * SIG_* variables (the home setting locates the device-token store), so the whole
+ * namespace is stripped; the device token itself never was an env var. */
 export function childEnv(
   source: Record<string, string | undefined> = process.env,
   extra?: Record<string, string | undefined>,
 ): Record<string, string | undefined> {
   const env: Record<string, string | undefined> = {};
   for (const [key, value] of Object.entries(source)) {
-    if (key.startsWith("SIG_") || key.startsWith("SHEPHERD_")) continue;
+    if (key.startsWith("SIG_")) continue;
     env[key] = value;
   }
   if (extra) Object.assign(env, extra);
@@ -207,7 +207,7 @@ export class PiAdapter implements AgentAdapter {
       };
 
       // §4.4 step 5: send the prompt, wrapped for the extension's commandId marker
-      // (ADR-0001). The `/shepherd` extension command consumes it, so the response's
+      // (ADR-0001). The `/sig` extension command consumes it, so the response's
       // disposition must be "handled".
       const message = wrapPrompt(spec.commandId, spec.prompt);
       const response = await proc.rpc(
@@ -218,8 +218,8 @@ export class PiAdapter implements AgentAdapter {
       if (disposition !== "handled") {
         throw new AdapterError(
           "startup_failed",
-          `shepherd extension did not consume the prompt (disposition: ${disposition || "missing"}); ` +
-            `is ~/.shepherd/ext loadable?`,
+          `sig extension did not consume the prompt (disposition: ${disposition || "missing"}); ` +
+            `is ~/.sig/ext loadable?`,
         );
       }
       this.pendingResumeSpecs.set(spec.workerId, spec);
@@ -245,13 +245,13 @@ export class PiAdapter implements AgentAdapter {
     const runtime = this.require(id);
     const images = input.images?.map((i) => ({ type: "image", data: i.data, mimeType: i.mimeType }));
     if (how === "prompt") {
-      // A prompt-path send goes through the same `/shepherd` wrapper as the initial prompt,
+      // A prompt-path send goes through the same `/sig` wrapper as the initial prompt,
       // so the commandId marker lands in the session (ADR-0001: ambiguous-command detection).
       const message = input.commandId ? wrapPrompt(input.commandId, input.text) : input.text;
       await runtime.process.rpc({ type: "prompt", message, images });
       return {};
     }
-    // §6.3: a queued steer/follow_up cannot carry the `/shepherd` wrapper (pi forbids
+    // §6.3: a queued steer/follow_up cannot carry the `/sig` wrapper (pi forbids
     // extension commands there), so the commandId travels as an input preamble. pi's input
     // handler runs before queueing: it strips the preamble and appends the custom entry, so
     // the marker is on disk from the moment pi ACCEPTS the message into its queue.
@@ -486,16 +486,16 @@ export class PiAdapter implements AgentAdapter {
   }
 }
 
-/** `/shepherd <commandId>\n<text>` — the extension unwraps it and writes the marker (ADR-0001). */
+/** `/sig <commandId>\n<text>` — the extension unwraps it and writes the marker (ADR-0001). */
 export function wrapPrompt(commandId: string, text: string): string {
-  return `/${SHEPHERD_COMMAND} ${commandId}\n${text}`;
+  return `/${SIG_COMMAND} ${commandId}\n${text}`;
 }
 
 /** The §6.3 marker for deliveries pi will not accept extension commands on (steer/
  *  follow_up): a one-line preamble that is part of the message itself, so pi persists it
  *  together with the user message exactly when the message is delivered. */
 export function markerPreamble(commandId: string, text: string): string {
-  return `[shepherd:command ${commandId}]\n${text}`;
+  return `[sig:command ${commandId}]\n${text}`;
 }
 
 /** Validates and normalizes `report` tool args into the §7.2 payload; null when invalid. */

@@ -57,7 +57,7 @@ async function dispatchRunningWorker(prompt: string): Promise<{ fake: FakeConnec
   const [cmd] = await fake.waitForCmds(1);
   fake.send({ t: "cmd_ack", re: cmd!.id, status: "accepted" });
   const { workerId, threadId } = outcome;
-  await fake.emit("started", workerId, { sessionId: workerId, cwd: "/srv/repo-a", branch: `shepherd/${threadId}-1` });
+  await fake.emit("started", workerId, { sessionId: workerId, cwd: "/srv/repo-a", branch: `sig/${threadId}-1` });
   // The frame is only queued when emit resolves — wait until the reducer has applied it,
   // or a later backdate races the event's own lastEventAt write.
   await waitForWorkerState(workerId, "running");

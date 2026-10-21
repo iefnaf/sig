@@ -11,7 +11,7 @@
 //    leftovers, and git pointers. Pointers, not content: the new worker reads the code and
 //    diffs itself. `handoff.build` (ledger.ts) gathers the rows; this module stays pure so
 //    it is testable without a database.
-import type { GitFacts } from "@shepherd/protocol";
+import type { GitFacts } from "@nightboats/protocol";
 import type { ReportRow, WorkerRow } from "./ledger.ts";
 
 /** Context usage at or above this share forces a new session instead of a resume

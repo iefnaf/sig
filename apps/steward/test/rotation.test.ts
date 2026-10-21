@@ -3,7 +3,7 @@
 // survive the window and converge onto the new primary key.
 import { env, runInDurableObject } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
-import { mintToken, parseToken, serverKey, type ServerKey } from "@shepherd/protocol";
+import { mintToken, parseToken, serverKey, type ServerKey } from "@nightboats/protocol";
 import { openSecret } from "../src/secretbox.ts";
 import type { Steward } from "../src/steward.ts";
 import {

@@ -66,7 +66,7 @@ sig upgrade                # install the latest package and restart
 sig uninstall              # remove the service, preserve local state
 ```
 
-State remains in `~/.shepherd/` for compatibility with earlier Shepherd releases. You can revoke a machine from the Sig workspace at any time.
+State remains in `~/.sig/`. You can revoke a machine from the Sig workspace at any time.
 
 ## License
 
@@ -144,7 +144,7 @@ sig upgrade                # 安装最新包并重启
 sig uninstall              # 移除服务，保留本地状态
 ```
 
-为了兼容早期 Shepherd 版本，状态仍保存在 `~/.shepherd/`。你可以随时在 Sig 工作台撤销一台电脑。
+状态保存在 `~/.sig/`。你可以随时在 Sig 工作台撤销一台电脑。
 
 ## 许可证
 

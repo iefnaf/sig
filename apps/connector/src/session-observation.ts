@@ -1,12 +1,12 @@
 // Bounded, conservative session observations for crash recovery and pre-launch comparison
 // (connector-pi.md §6.3/§10). Absence is evidence only when the entire relevant tail was read.
-// COMMAND_ENTRY_TYPE must match ext/shepherd-pi.ts (the extension writes the marker; this
+// COMMAND_ENTRY_TYPE must match ext/sig-pi.ts (the extension writes the marker; this
 // reader looks for it — the string literal is duplicated because the extension file is
-// shipped standalone into ~/.shepherd/ext and must not import connector sources).
+// shipped standalone into ~/.sig/ext and must not import connector sources).
 import { closeSync, fstatSync, openSync, readSync } from "node:fs";
 import { redactText } from "./redact.ts";
 
-export const COMMAND_ENTRY_TYPE = "shepherd.command";
+export const COMMAND_ENTRY_TYPE = "sig.command";
 const TAIL_BYTES = 256 * 1024;
 type Entry = Record<string, unknown> & { id?: string; type: string };
 

@@ -1,6 +1,6 @@
 // Build for the published npm package (issue #26): bundle the CLI into a single plain-JS
 // ESM file so `npx @nightboats/sig` needs no TypeScript stripping and no workspace deps
-// (@shepherd/protocol and ws are bundled in; node: builtins stay external). The pi
+// (@nightboats/protocol and ws are bundled in; node: builtins stay external). The pi
 // extension is NOT bundled — pi loads it as a file — so it is copied verbatim to
 // dist/ext/, where install.ts resolves it via import.meta.url.
 import { copyFileSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
@@ -26,7 +26,7 @@ await build({
   logLevel: "info",
 });
 
-copyFileSync("src/ext/shepherd-pi.ts", "dist/ext/shepherd-pi.ts");
+copyFileSync("src/ext/sig-pi.ts", "dist/ext/sig-pi.ts");
 // The MCP report server is likewise loaded as a FILE (Claude Code spawns it per its
 // mcp-config), so it ships verbatim next to the extension (issue #17).
 copyFileSync("src/mcp/report-server.mjs", "dist/mcp/report-server.mjs");

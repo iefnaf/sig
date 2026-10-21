@@ -7,7 +7,7 @@
 import os from "node:os";
 import { ConnectorClient, type ClientOptions } from "./client.ts";
 import { CommandLog, type CommandResult } from "./commands.ts";
-import type { CmdMessage } from "@shepherd/protocol";
+import type { CmdMessage } from "@nightboats/protocol";
 import { EventLog } from "./events.ts";
 import type { LocalStore } from "./store.ts";
 import type { StallWatchdogOptions } from "./watchdog.ts";

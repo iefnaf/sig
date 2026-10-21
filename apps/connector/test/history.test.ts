@@ -21,7 +21,7 @@ let mock: MockSteward;
 let app: ConnectorApp;
 
 beforeEach(async () => {
-  dir = tmpDir("shepherd-history-e2e");
+  dir = tmpDir("sig-history-e2e");
   stateDir = join(dir, "state");
   repo = await makeGitRepo(dir);
   store = new LocalStore(join(stateDir, "connector.sqlite"));

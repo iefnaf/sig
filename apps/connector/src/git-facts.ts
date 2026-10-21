@@ -4,9 +4,9 @@
 // files are pointers (issue #8): bare shas/paths, never content.
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import type { GitFacts } from "@shepherd/protocol";
+import type { GitFacts } from "@nightboats/protocol";
 
-export type { GitFacts } from "@shepherd/protocol";
+export type { GitFacts } from "@nightboats/protocol";
 
 const exec = promisify(execFile);
 

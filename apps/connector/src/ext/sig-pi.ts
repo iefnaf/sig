@@ -1,33 +1,33 @@
 // Sig's injected pi extension, docs/design/connector-pi.md §7.1 and ADR-0001.
 //
-// The connector writes this file into ~/.shepherd/ext/ with each version and loads it via
+// The connector writes this file into ~/.sig/ext/ with each version and loads it via
 // `--extension`; it never references in-repo files, so project content cannot swap it out.
 // It does exactly three things:
 //
 // 1. Register the `report` tool (§7.2 fields).
 // 2. In `agent_before_settle`, when this run window completed without any `report` call and
-//    has not been reminded yet, append a `shepherd.report-reminder` custom message with
+//    has not been reminded yet, append a `sig.report-reminder` custom message with
 //    `continue: true`, forcing one more model request. At most one reminder per window.
 //    (Measured: 5/6 → 6/6 report call rate, no duplicate calls — research #11.)
 // 3. Write the steward `commandId` into a `custom` session entry (ADR-0001), replacing the
 //    old "last user message text matches" ambiguity heuristic (connector-pi.md §15.2).
-//    The connector delivers prompts as `/shepherd <commandId>\n<text>`; this command records
+//    The connector delivers prompts as `/sig <commandId>\n<text>`; this command records
 //    the marker and re-sends the clean text as a normal user message. Steer/follow_up
-//    deliveries cannot be extension commands, so they carry a `[shepherd:command <id>]`
+//    deliveries cannot be extension commands, so they carry a `[sig:command <id>]`
 //    preamble that the input handler below strips and persists as the same custom entry.
 
 import { Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 /** `custom` entry customType for the command marker (ADR-0001). */
-export const COMMAND_ENTRY_TYPE = "shepherd.command";
+export const COMMAND_ENTRY_TYPE = "sig.command";
 /** `custom_message` customType for the forced re-report reminder (§7.1). */
-export const REMINDER_ENTRY_TYPE = "shepherd.report-reminder";
+export const REMINDER_ENTRY_TYPE = "sig.report-reminder";
 /** Extension command name; prompts are delivered as `/<name> <commandId>\n<text>`. */
-export const COMMAND_NAME = "shepherd";
+export const COMMAND_NAME = "sig";
 
-/** §6.3 steer/follow_up marker preamble: `[shepherd:command <commandId>]\n<text>`. */
-export const MARKER_PREAMBLE = "[shepherd:command ";
+/** §6.3 steer/follow_up marker preamble: `[sig:command <commandId>]\n<text>`. */
+export const MARKER_PREAMBLE = "[sig:command ";
 
 function appendCommandEntry(pi: ExtensionAPI, commandId: string): void {
   pi.appendEntry(COMMAND_ENTRY_TYPE, { commandId, at: Date.now() });
@@ -65,7 +65,7 @@ interface WindowState {
   reminded: boolean;
 }
 
-export default function shepherdExtension(pi: ExtensionAPI): void {
+export default function sigExtension(pi: ExtensionAPI): void {
   // In-memory run-window state. A new user prompt opens a new window; the reminder's forced
   // continuation deliberately does not (it is part of the same window, so `reportCalled` and
   // `reminded` persist across it — that is what makes the reminder fire at most once).

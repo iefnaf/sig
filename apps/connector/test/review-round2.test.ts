@@ -107,7 +107,7 @@ let adapter: ScriptedAdapter;
 let manager: WorkerManager;
 
 beforeEach(() => {
-  dir = tmpDir("shepherd-review-round2-test");
+  dir = tmpDir("sig-review-round2-test");
   const stateDir = join(dir, "state");
   const repoDir = join(dir, "repo-a");
   mkdirSync(repoDir, { recursive: true });
