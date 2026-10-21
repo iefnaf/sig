@@ -39,9 +39,7 @@
     "esbuild": "0.28.2",
     "typescript": "7.0.2",
     "vitest": "4.1.12",
-    "ws": "8.22.0"
-  },
-  "dependencies": {
+    "ws": "8.22.0",
     "http-proxy-agent": "^9.1.0",
     "https-proxy-agent": "^9.1.0",
     "undici": "^8.12.3"

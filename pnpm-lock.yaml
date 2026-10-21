@@ -13,16 +13,6 @@ importers:
         version: 7.0.2
 
   apps/connector:
-    dependencies:
-      http-proxy-agent:
-        specifier: ^9.1.0
-        version: 9.1.0
-      https-proxy-agent:
-        specifier: ^9.1.0
-        version: 9.1.0
-      undici:
-        specifier: ^8.12.3
-        version: 8.12.3
     devDependencies:
       '@earendil-works/pi-ai':
         specifier: 1.2.0
@@ -42,9 +32,18 @@ importers:
       esbuild:
         specifier: 0.28.2
         version: 0.28.2
+      http-proxy-agent:
+        specifier: ^9.1.0
+        version: 9.1.0
+      https-proxy-agent:
+        specifier: ^9.1.0
+        version: 9.1.0
       typescript:
         specifier: 7.0.2
         version: 7.0.2
+      undici:
+        specifier: ^8.12.3
+        version: 8.12.3
       vitest:
         specifier: 4.1.12
         version: 4.1.12(@types/node@26.6.5)(vite@8.3.4(@types/node@26.6.5)(esbuild@0.28.2)(jiti@2.7.0)(yaml@2.9.1))
