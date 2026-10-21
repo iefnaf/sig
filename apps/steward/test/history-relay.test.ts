@@ -203,8 +203,17 @@ describe("the §6.6 relay: browser ↔ DO ↔ connector", () => {
     const cookie = await webLogin();
     const { ws, reader } = await connectWeb(cookie);
     await openStream(ws, workerId);
-    const reqId = await relayReqId();
-    expect(reqId).toBeTruthy();
+    // The relay row appears when the DO digests the fire-and-forget history_open — poll for
+    // it instead of asserting instantly (same race the TTL test below documents: on a loaded
+    // runner the ws frame can trail this RPC by seconds; a zero-tolerance assert failed CI
+    // twice under the reshuffled test grouping).
+    const reqDeadline = Date.now() + 8000;
+    let reqId = await relayReqId();
+    while (reqId === null) {
+      if (Date.now() > reqDeadline) throw new Error("relay row never appeared after history_open");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      reqId = await relayReqId();
+    }
 
     // B guesses/knows the reqId and tries to inject content into A's relay: dropped, the
     // relay row survives (A may still answer), the browser hears nothing.
@@ -215,14 +224,15 @@ describe("the §6.6 relay: browser ↔ DO ↔ connector", () => {
     await expect(reader.nextWhere((m) => m.t === "history_chunk", 300)).rejects.toThrow();
     await expect(relayRowCount()).resolves.toBe(1);
     ws.close();
-  }, 15_000);
+  }, 20_000);
 
   it("an unanswered relay is swept by the TTL alarm", async () => {
     await runInDurableObject(ownerStub(), (instance: Steward) => {
-      // 2s, not sub-second: the sanity assert below must land before the ceil(TTL)-granularity
+      // 10s, not 2s: the sanity assert below must land before the ceil(TTL)-granularity
       // sweep alarm can fire — under a loaded runner (parallel test processes) the assert's
-      // RPC can queue behind >1s of DO work and a 700ms TTL gets the row swept first.
-      (instance as unknown as { historyRelayTtlMs: number }).historyRelayTtlMs = 2000;
+      // RPC can queue behind seconds of DO work, and a 2s TTL got the row swept (or the poll
+      // deadline hit) before the first observation on CI's 4-vCPU runners.
+      (instance as unknown as { historyRelayTtlMs: number }).historyRelayTtlMs = 10_000;
     });
     const fake = await pairFakeConnector("mac-studio");
     fake.historySilent = true; // the machine never answers
@@ -236,14 +246,14 @@ describe("the §6.6 relay: browser ↔ DO ↔ connector", () => {
     // it instead of asserting instantly (the ws frame and this RPC are different input
     // channels; under load creation can trail the send, and the ceil(TTL)-granularity sweep
     // must never race this first observation either).
-    const rowDeadline = Date.now() + 1500;
+    const rowDeadline = Date.now() + 8000;
     for (;;) {
       if ((await relayRowCount()) === 1) break;
       if (Date.now() > rowDeadline) throw new Error("relay row never appeared after history_open");
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
 
-    const deadline = Date.now() + 8000;
+    const deadline = Date.now() + 25_000;
     while (Date.now() < deadline) {
       if ((await relayRowCount()) === 0) break;
       await new Promise((resolve) => setTimeout(resolve, 100));
@@ -253,7 +263,7 @@ describe("the §6.6 relay: browser ↔ DO ↔ connector", () => {
     // ends the view; the page no longer parks on 连接中… forever).
     await expect(reader.nextWhere(() => true, 300)).rejects.toThrow();
     ws.close();
-  }, 15_000);
+  }, 45_000);
 });
 
 describe("role fence (protocol §5.3)", () => {
