@@ -20,8 +20,34 @@ export interface StewardModelConfig {
   /** Overrides the provider's catalog base URL (self-hosted / proxy endpoints). */
   baseUrl?: string;
   /** True when the deploy config actually named a provider/model — the sealed sh_model row's
-   *  provider only wins when this is false (see llmModelsAsync in steward.ts). */
+   *  provider only wins when this is false, UNLESS the row itself carries an explicit
+   *  modelId (a runtime switch, issue #70), which wins unconditionally (see
+   *  mergeModelSelection). */
   explicit: boolean;
+}
+
+/** The sealed sh_model row, as steward.ts's modelConfig() reads it back. */
+export interface SealedModelSelection {
+  provider: string;
+  /** Set only by an owner-driven runtime switch (issue #70's Settings page); null for the
+   *  legacy MODEL_KEY seed or a pre-#70 provider-only setModelConfig call. */
+  modelId: string | null;
+  baseUrl: string | null;
+  apiKey: string;
+}
+
+/**
+ * The precedence rule for the effective model selection (steward.ts ensureRootModel and
+ * llmSelection share this): a runtime switch's own modelId (issue #70) wins over
+ * vars.STEWARD_MODEL entirely — that is the point of letting the owner switch at runtime
+ * without a redeploy. Short of that, a legacy sealed row (provider only, no modelId) picks
+ * the provider when vars are unset; the deploy config alone otherwise.
+ */
+export function mergeModelSelection(sealed: SealedModelSelection | null, vars: StewardModelConfig): StewardModelConfig {
+  if (sealed?.modelId) {
+    return { provider: sealed.provider, modelId: sealed.modelId, explicit: true, ...(sealed.baseUrl ? { baseUrl: sealed.baseUrl } : {}) };
+  }
+  return sealed && !vars.explicit ? { ...vars, provider: sealed.provider } : vars;
 }
 
 /** ADR-0001 decision 11: the eval baseline. Changing it requires re-running the routing eval. */

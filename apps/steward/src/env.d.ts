@@ -10,10 +10,12 @@
 // The steward model selection (issue #6, ADR-0001 decision 11): `STEWARD_MODEL` is deploy
 // config (the root wrangler.jsonc `vars`, JSON: {provider, modelId, baseUrl?}; default
 // deepseek/deepseek-flash when unset) and picks provider + model id. The API key never comes
-// from an env var: it is the sealed sh_model row (seeded from MODEL_KEY at deploy or set via
-// setModelConfig), read through Steward.modelConfig() — the provider it names wins over the
-// vars default. Tests bind STEWARD_MODEL = {provider: "faux", modelId: "faux-1"} for the
-// scripted provider.
+// from an env var: it is the sealed sh_model row (seeded from MODEL_KEY at deploy, or set via
+// setModelConfig/the Settings page's runtime switch), read through Steward.modelConfig(). A
+// runtime switch (issue #70) carries its own modelId and wins over vars.STEWARD_MODEL
+// entirely; a legacy provider-only seal (MODEL_KEY, or setModelConfig with no modelId) only
+// picks the provider, and only when vars are unset (llm/models.ts mergeModelSelection). Tests
+// bind STEWARD_MODEL = {provider: "faux", modelId: "faux-1"} for the scripted provider.
 interface Env {
   SERVER_KEY: string;
   SERVER_KEY_PREVIOUS?: string;

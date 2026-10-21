@@ -144,13 +144,13 @@ describe("SERVER_KEY rotation: sealed secrets (issue #27)", () => {
     expect(row.apiKeyEnc).toMatch(/^v2\./);
     expect(row.apiKeyEnc).not.toContain("sk-model-secret-123");
 
-    expect(await ownerStub().modelConfig()).toEqual({ provider: "deepseek", apiKey: "sk-model-secret-123" });
+    expect(await ownerStub().modelConfig()).toEqual({ provider: "deepseek", modelId: null, baseUrl: null, apiKey: "sk-model-secret-123" });
 
     // Rotate: the sealed key still opens during the window (old primary demoted).
     const freshPrimary = await serverKey("rotated-fresh-server-key-2");
     const oldPrimary = await serverKey(PRIMARY_SECRET);
     await overrideKeys([freshPrimary, oldPrimary]);
-    expect(await ownerStub().modelConfig()).toEqual({ provider: "deepseek", apiKey: "sk-model-secret-123" });
+    expect(await ownerStub().modelConfig()).toEqual({ provider: "deepseek", modelId: null, baseUrl: null, apiKey: "sk-model-secret-123" });
     // Window closed (key dropped entirely): reads report unconfigured, not garbage.
     await overrideKeys([freshPrimary]);
     expect(await ownerStub().modelConfig()).toBeNull();

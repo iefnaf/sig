@@ -27,7 +27,7 @@ The owner is whoever holds `SERVER_KEY` (ADR-0003): no owner row, no messaging i
 
 ## Owner workflow without Feishu
 
-- **Settings** (`/app/api/settings`, `/app/api/settings/model`): the model selection (`apiKey` is a boolean — the key is never returned). Saving re-seals the key under `SERVER_KEY`.
+- **Settings** (`/app/api/settings`, `/app/api/settings/model`): the model selection (`apiKey` is a boolean — the key is never returned). Issue #70: saving takes `{provider, modelId, apiKey, baseUrl?}` together — a runtime switch, not just a key replacement — and re-seals all of it under `SERVER_KEY`; from then on it wins over `vars.STEWARD_MODEL` entirely (steward.ts `mergeModelSelection`).
 - **Pairing** (`/app/api/pairing`): mints a one-time code (10 minutes) keyed by the client's request id, so a retry gets the same code, and returns the full `npx @nightboats/sig connect <origin> <code>` command. It is shown only in the machines panel, never in the conversation feed (`private: true` on the outbound row).
 - **Revoke** (`/app/api/machines/revoke`): bumps the device epoch and closes the connection with `4403`.
 - **First run**: the page asks for settings (a model key) and then a machine, one notice at a time.

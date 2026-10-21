@@ -869,4 +869,17 @@ export const MIGRATIONS: readonly Migration[] = [
       sql`CREATE TABLE IF NOT EXISTS sh_web_pairing (id TEXT PRIMARY KEY, code TEXT NOT NULL, expiresAt INTEGER NOT NULL)`;
     },
   },
+  {
+    // Runtime model switching (issue #70): the Settings page picks provider + modelId (and
+    // optionally baseUrl) without a redeploy. Both columns are nullable — a row seeded only
+    // from MODEL_KEY or an older setModelConfig(provider, apiKey) call keeps modelId/baseUrl
+    // NULL, and the deploy-config vars.STEWARD_MODEL still supplies them (legacy precedence,
+    // steward.ts ensureRootModel). An explicit switch fills both, and from then on wins over
+    // vars entirely — that's the whole point of a runtime switch.
+    id: "021_model_switch",
+    up: (sql) => {
+      ignoringDuplicateColumn(() => { sql`ALTER TABLE sh_model ADD COLUMN modelId TEXT`; });
+      ignoringDuplicateColumn(() => { sql`ALTER TABLE sh_model ADD COLUMN baseUrl TEXT`; });
+    },
+  },
 ];
