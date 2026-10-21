@@ -14,7 +14,7 @@
 import type { Agent } from "node:http";
 import { HttpProxyAgent } from "http-proxy-agent";
 import { HttpsProxyAgent } from "https-proxy-agent";
-import { EnvHttpProxyAgent, setGlobalDispatcher } from "undici";
+import { EnvHttpProxyAgent, fetch as undiciFetch, setGlobalDispatcher, type Dispatcher } from "undici";
 
 /** The stored proxy choice. `noProxy` is a comma-separated no_proxy list; loopback is
  *  excluded regardless, so `noProxy` only widens the bypass set. */
@@ -151,8 +151,16 @@ export function proxyLogFields(config: ProxyConfig): { proxy: string; noProxy: s
 
 export interface ProxyApplication {
   readonly config: ProxyConfig;
+  /** The EnvHttpProxyAgent every proxied fetch goes through. */
+  readonly dispatcher: Dispatcher;
   /** The `ws` agent for a target URL, or undefined when the target is bypassed. */
   wsAgentFor(targetUrl: string): Agent | undefined;
+  /** A fetch bound to `dispatcher`. Node's built-in fetch and a bundled undici dispatcher
+   *  can mismatch request-handler protocols across Node versions (undici 8 rejects the
+   *  internal handler on Node 22, and undici 7's ProxyAgent hangs on Node 26), so the
+   *  connector's proxied calls (pairing, doctor) go through undici's own fetch with the
+   *  dispatcher passed explicitly — same package on every Node. */
+  fetch: typeof fetch;
 }
 
 /** Activates a stored config in this process: env for children (git, pi workers — childEnv
@@ -160,11 +168,15 @@ export interface ProxyApplication {
  *  per-target agent factory for the WebSocket. Idempotent per process. */
 export function applyProxy(config: ProxyConfig): ProxyApplication {
   Object.assign(process.env, proxyEnvFor(config));
-  setGlobalDispatcher(new EnvHttpProxyAgent());
+  const dispatcher = new EnvHttpProxyAgent();
+  // Belt for anything reading the global dispatcher symbol; the connector's own calls go
+  // through `fetch` below instead (see the note on ProxyApplication.fetch).
+  setGlobalDispatcher(dispatcher);
   const httpsAgent = new HttpsProxyAgent(config.url);
   const httpAgent = new HttpProxyAgent(config.url);
   return {
     config,
+    dispatcher,
     wsAgentFor(targetUrl: string): Agent | undefined {
       if (!shouldProxy(targetUrl, config)) return undefined;
       try {
@@ -172,6 +184,14 @@ export function applyProxy(config: ProxyConfig): ProxyApplication {
       } catch {
         return undefined;
       }
+    },
+    fetch(input, init) {
+      // Only string/URL inputs ever reach here; the cast absorbs the structural drift
+      // between @types/node's globals and undici's own Request/Response types.
+      return undiciFetch(input as string | URL, {
+        ...init,
+        dispatcher,
+      } as Parameters<typeof undiciFetch>[1]) as unknown as Promise<Response>;
     },
   };
 }

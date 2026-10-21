@@ -3,7 +3,7 @@
 // the fetch channel (the wiring `sig doctor` and the daemon rely on).
 import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { getGlobalDispatcher, setGlobalDispatcher, EnvHttpProxyAgent, type Dispatcher } from "undici";
+import { getGlobalDispatcher, setGlobalDispatcher, EnvHttpProxyAgent, fetch as undiciFetch, type Dispatcher } from "undici";
 import {
   DEFAULT_NO_PROXY,
   applyProxy,
@@ -208,7 +208,10 @@ describe("fetch through EnvHttpProxyAgent (the daemon's fetch channel)", () => {
       httpsProxy: `http://127.0.0.1:${address.port}`,
       noProxy: "", // test target is loopback; the real default bypasses it
     });
-    const res = await fetch("http://127.0.0.1:64444/app", { dispatcher } as RequestInit & { dispatcher?: unknown });
+    // undici's own fetch, not the built-in one: the connector's proxied calls pass the
+    // dispatcher to the same package's fetch, which can't mismatch handler protocols
+    // across Node versions the way built-in fetch + a bundled dispatcher can.
+    const res = await undiciFetch("http://127.0.0.1:64444/app", { dispatcher });
     expect(await res.text()).toBe("via-proxy");
     expect(seenUrls).toEqual(["http://127.0.0.1:64444/app"]);
   });

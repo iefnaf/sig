@@ -26,7 +26,7 @@ import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { Agent, EnvHttpProxyAgent } from "undici";
+import { Agent, EnvHttpProxyAgent, fetch as undiciFetch, type Dispatcher } from "undici";
 import { runDaemon } from "./daemon.ts";
 import { installAssets } from "./install.ts";
 import { tailFile } from "./logger.ts";
@@ -198,8 +198,12 @@ async function connectCommand(argv: string[]): Promise<void> {
   //    inherited environment. Git children and pi workers follow via process.env.
   const store = new LocalStore(join(dir, "connector.sqlite"));
   const resolvedProxy = resolveProxyConfig({ flag: proxyFlag, stored: store.getProxyConfig(), env: process.env });
+  let proxiedFetch: typeof fetch | undefined;
   if (resolvedProxy.config) {
-    applyProxy(resolvedProxy.config);
+    // The pairing fetch below goes through the proxy via undici's own fetch — the built-in
+    // fetch and a bundled dispatcher can mismatch handler protocols across Node versions.
+    const application = applyProxy(resolvedProxy.config);
+    proxiedFetch = application.fetch;
     store.setProxyConfig(resolvedProxy.config);
     const fields = proxyLogFields(resolvedProxy.config);
     console.log(
@@ -210,7 +214,7 @@ async function connectCommand(argv: string[]): Promise<void> {
   // 2. Pair (protocol §5.2): redeem the code once, persist credentials in the LocalStore.
   let deviceId: string;
   try {
-    ({ deviceId } = await connect(url, code, machineName, { store }));
+    ({ deviceId } = await connect(url, code, machineName, { store, fetchImpl: proxiedFetch }));
   } catch (err) {
     store.close();
     fail(err instanceof Error ? err.message : String(err));
@@ -373,13 +377,15 @@ async function doctorCommand(): Promise<void> {
   }
 
   if (serverUrl) {
-    // Any HTTP response proves the path (401 is the expected unauthenticated gate).
-    const probe = async (dispatcher: unknown): Promise<{ ok: boolean; detail: string }> => {
+    // Any HTTP response proves the path (401 is the expected unauthenticated gate). The
+    // probes go through undici's own fetch — same package as the dispatchers, so the
+    // request-handler protocol can't mismatch Node's built-in fetch across versions.
+    const probe = async (dispatcher: Dispatcher): Promise<{ ok: boolean; detail: string }> => {
       try {
-        const res = await fetch(`${serverUrl}/app`, {
+        const res = await undiciFetch(`${serverUrl}/app`, {
           dispatcher,
           signal: AbortSignal.timeout(8000),
-        } as RequestInit & { dispatcher?: unknown });
+        });
         return { ok: true, detail: `HTTP ${res.status}` };
       } catch (err) {
         const cause = (err as { cause?: { code?: string } })?.cause?.code;
