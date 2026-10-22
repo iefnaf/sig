@@ -35,8 +35,9 @@ const state = {
   skew: 0, // server clock minus this browser's clock, so relative times agree with the server's timestamps
   session: null, // within the selected thread: the worker whose recorded session fills the main pane
   viewer: null, // { workerId, handle } while that pane is mounted
-  settings: null, // { claimed, model } from /app/api/settings
+  settings: null, // { model, passkeys } from /app/api/settings
   keyDraft: '', // the model key being typed; kept out of the dialog's redraw signature
+  passkeyLabelDraft: '', // ditto, for the new-passkey label field
 };
 
 // ---- small pieces ---------------------------------------------------------------------------------
@@ -547,6 +548,44 @@ function pairingSection() {
       h('button', { type: 'button', class: 'button', dataset: { action: 'create-pairing', focus: 'create-pairing' }, disabled: pairing === 'creating' ? true : null }, t('pairingCreate'))));
 }
 
+/** One row in the Security section. Mirrors machineCard()'s confirm-then-commit shape. */
+function passkeyRow(passkey) {
+  const confirming = state.dialog.confirm === passkey.credentialId;
+  return h('div', { class: 'passkey-row' },
+    h('div', null, h('strong', null, passkey.label),
+      h('p', { class: 'dialog-hint' }, t('passkeyMeta', {
+        created: ago(passkey.createdAt),
+        lastUsed: passkey.lastUsedAt ? ago(passkey.lastUsedAt) : t('passkeyNeverUsed'),
+      }))),
+    confirming
+      ? h('div', { class: 'revoke-confirm' },
+        h('p', null, t('passkeyRemoveConfirm', { name: passkey.label })),
+        h('div', { class: 'dialog-actions' },
+          h('button', { type: 'button', class: 'button danger', dataset: { action: 'passkey-remove-yes', passkey: passkey.credentialId } }, t('passkeyRemoveConfirmAction')),
+          h('button', { type: 'button', class: 'button', dataset: { action: 'passkey-remove-no' } }, t('actionCancel'))))
+      : h('div', { class: 'dialog-actions' },
+        h('button', { type: 'button', class: 'button danger', dataset: { action: 'passkey-remove', passkey: passkey.credentialId } }, t('passkeyRemove'))));
+}
+
+/** Rendered inside accountSection(), below the existing model-settings block. */
+function securitySection() {
+  const passkeys = state.settings?.passkeys ?? null;
+  return h('section', { class: 'security-settings' },
+    h('h3', null, t('securityTitle')),
+    passkeys === null ? h('p', { class: 'dialog-copy' }, t('settingsLoading'))
+      : [
+        passkeys.map(passkeyRow),
+        !passkeys.length ? h('p', { class: 'dialog-copy' }, t('passkeysEmpty')) : null,
+        state.dialog.passkeyAdd === 'unsupported' ? h('p', { class: 'dialog-error' }, t('passkeyUnsupported')) : null,
+        state.dialog.passkeyAdd === 'failed' ? h('p', { class: 'dialog-error' }, t('passkeyAddFailed')) : null,
+        h('form', { id: 'passkey-form', class: 'model-form' },
+          h('label', { class: 'sr-only', for: 'passkey-label' }, t('passkeyLabelLabel')),
+          h('input', { id: 'passkey-label', autocomplete: 'off', placeholder: t('passkeyLabelPlaceholder'), value: state.passkeyLabelDraft }),
+          h('button', { type: 'submit', class: 'button primary', disabled: state.dialog.passkeyAdd === 'creating' ? true : null },
+            state.dialog.passkeyAdd === 'creating' ? t('passkeyAdding') : t('passkeyAdd'))),
+      ]);
+}
+
 function accountSection() {
   const settings = state.settings;
   const model = settings?.model;
@@ -560,6 +599,7 @@ function accountSection() {
         h('input', { id: 'model-key', type: 'password', autocomplete: 'off', spellcheck: 'false', placeholder: t('modelKeyPlaceholder'), value: state.keyDraft }),
         h('button', { type: 'submit', class: 'button primary' }, t('modelSave'))),
       h('p', { class: 'dialog-hint' }, t('modelHelp'))) : null,
+    securitySection(),
     h('div', { class: 'dialog-actions' }, h('button', { type: 'button', class: 'button danger', dataset: { action: 'sign-out' } }, t('signOut'))),
   ];
 }
@@ -598,7 +638,7 @@ function renderDialog() {
   const signature = [type, rev, getLocale(), pairing, confirm,
     type === 'machines' ? [snapshot.machines, snapshot.threads.map((entry) => [entry.id, entry.state, entry.workers.map((worker) => [worker.state, worker.machine])]), minuteBucket()] : null,
     type === 'scope' ? [state.selected, snapshot.threads.map((entry) => [entry.id, entry.title, entry.state, entry.repos])] : null,
-    type === 'account' ? state.settings : null];
+    type === 'account' ? [state.settings, state.dialog.passkeyAdd] : null];
   redraw('dialog', signature, () => {
     const { title, body } = dialogContent();
     $('#dialog-title').textContent = title;
@@ -615,7 +655,7 @@ function bumpDialog() {
 }
 
 function openDialog(type) {
-  state.dialog = { type, rev: 0, pairing: null, confirm: null };
+  state.dialog = { type, rev: 0, pairing: null, confirm: null, passkeyAdd: null };
   drawn.delete('dialog');
   if (type === 'account') void loadSettings();
   renderDialog();
@@ -978,6 +1018,95 @@ async function revokeMachine(deviceId) {
   bumpDialog();
 }
 
+// ---- passkeys --------------------------------------------------------------------------------------------
+
+function b64urlToBuffer(value) {
+  const base64 = value.replace(/-/g, '+').replace(/_/g, '/');
+  const binary = atob(base64 + '='.repeat((4 - (base64.length % 4)) % 4));
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
+
+function bufferToB64url(buffer) {
+  let binary = '';
+  for (const byte of new Uint8Array(buffer)) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+/** A UA-sniffed fallback when the owner leaves the label field blank — a guess at the device's
+ *  name, not interface copy, so it is not routed through t(). */
+function defaultPasskeyLabel() {
+  const ua = navigator.userAgent ?? '';
+  if (/iPhone/.test(ua)) return 'iPhone';
+  if (/iPad/.test(ua)) return 'iPad';
+  if (/Macintosh/.test(ua)) return 'Mac';
+  if (/Android/.test(ua)) return 'Android';
+  if (/Windows/.test(ua)) return 'Windows PC';
+  return 'Passkey';
+}
+
+/** addPasskey(): see candidate-2 design §Usage 1 for the full call sequence. */
+async function addPasskey() {
+  if (!window.PublicKeyCredential) {
+    state.dialog.passkeyAdd = 'unsupported';
+    return bumpDialog();
+  }
+  const label = state.passkeyLabelDraft.trim() || defaultPasskeyLabel();
+  state.dialog.passkeyAdd = 'creating';
+  bumpDialog();
+  try {
+    const { status, data } = await request('/app/api/settings/webauthn/register/options', {});
+    if (status !== 200 || !data) throw new Error('options_failed');
+    let credential;
+    try {
+      credential = await navigator.credentials.create({
+        publicKey: {
+          challenge: b64urlToBuffer(data.challenge),
+          rp: { id: data.rpId, name: 'Sig' },
+          user: { id: b64urlToBuffer(data.userId), name: 'owner', displayName: 'Sig' },
+          pubKeyCredParams: [{ alg: -7, type: 'public-key' }, { alg: -257, type: 'public-key' }],
+          authenticatorSelection: { residentKey: 'required', userVerification: 'preferred' },
+          excludeCredentials: data.excludeCredentials.map((entry) => ({ id: b64urlToBuffer(entry.id), type: 'public-key', transports: entry.transports })),
+          attestation: 'none',
+        },
+      });
+    } catch {
+      // The user cancelled the platform prompt, or no compatible authenticator answered —
+      // not a failure worth a toast, just back to the idle add-a-passkey state.
+      state.dialog.passkeyAdd = null;
+      return bumpDialog();
+    }
+    const { status: verifyStatus } = await request('/app/api/settings/webauthn/register/verify', {
+      challengeToken: data.challengeToken,
+      clientDataJSON: bufferToB64url(credential.response.clientDataJSON),
+      attestationObject: bufferToB64url(credential.response.attestationObject),
+      label,
+    });
+    if (verifyStatus !== 200) throw new Error('verify_failed');
+    state.passkeyLabelDraft = '';
+    state.dialog.passkeyAdd = null;
+    toast(t('passkeyAdded'));
+    await loadSettings();
+  } catch {
+    state.dialog.passkeyAdd = 'failed';
+    bumpDialog();
+  }
+}
+
+/** removePasskey(credentialId): see candidate-2 design §Usage 3. */
+async function removePasskey(credentialId) {
+  try {
+    const { status } = await request('/app/api/settings/webauthn/remove', { credentialId });
+    if (status !== 200 && status !== 401) toast(t('passkeyRemoveFailed'));
+  } catch {
+    toast(t('passkeyRemoveFailed'));
+  }
+  if (state.dialog) state.dialog.confirm = null;
+  await loadSettings();
+  bumpDialog();
+}
+
 // ---- navigation ------------------------------------------------------------------------------------------
 
 const scopeKey = () => state.selected ?? 'all';
@@ -1183,17 +1312,31 @@ document.addEventListener('click', (event) => {
       state.dialog.confirm = null;
       return bumpDialog();
     case 'revoke-yes': return void revokeMachine(dataset.machine);
+    case 'passkey-remove':
+      state.dialog.confirm = dataset.passkey;
+      return bumpDialog();
+    case 'passkey-remove-no':
+      state.dialog.confirm = null;
+      return bumpDialog();
+    case 'passkey-remove-yes': return void removePasskey(dataset.passkey);
   }
 });
 
-// The model key is typed in the settings dialog, which is not redrawn while it is being typed.
+// The model key and passkey label are typed in the settings dialog, which is not redrawn
+// while either is being typed.
 $('#dialog').addEventListener('input', (event) => {
   if (event.target.id === 'model-key') state.keyDraft = event.target.value;
+  if (event.target.id === 'passkey-label') state.passkeyLabelDraft = event.target.value;
 });
 $('#dialog').addEventListener('submit', (event) => {
-  if (event.target.id !== 'model-form') return;
-  event.preventDefault();
-  void saveModelKey();
+  if (event.target.id === 'model-form') {
+    event.preventDefault();
+    return void saveModelKey();
+  }
+  if (event.target.id === 'passkey-form') {
+    event.preventDefault();
+    return void addPasskey();
+  }
 });
 
 // ---- start ----------------------------------------------------------------------------------------------------

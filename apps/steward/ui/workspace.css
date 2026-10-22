@@ -506,7 +506,7 @@ a.button { text-decoration: none; }
 
 /* settings and pairing dialogs */
 .pairing { margin-top: 18px; border-top: 1px solid var(--line); padding-top: 14px; }
-.pairing h3, .model-settings h3 { font-size: 12px; font-weight: 550; margin: 0 0 6px; }
+.pairing h3, .model-settings h3, .security-settings h3 { font-size: 12px; font-weight: 550; margin: 0 0 6px; }
 .pairing-command { display: block; margin: 8px 0; padding: 10px 12px; font: 11px/1.6 ui-monospace, "SFMono-Regular", Menlo, monospace; background: #f3f5ee; border: 1px solid #e3e8dc; border-radius: 6px; color: #3f5230; user-select: all; overflow-wrap: anywhere; }
 .dialog-hint { font-size: 10px; color: #8b967d; margin: 6px 0 0; }
 .dialog-actions .dialog-hint { margin: 0; align-self: center; }
@@ -517,6 +517,11 @@ a.button { text-decoration: none; }
 .revoke-confirm { margin-top: 10px; padding: 10px 12px; background: #fbf1eb; border: 1px solid #dfc7ba; border-radius: 6px; font-size: 11px; color: #7b4a35; }
 .revoke-confirm p { margin: 0 0 8px; }
 .machine-card > .dialog-actions { margin-top: 12px; }
+.security-settings { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 14px; }
+.passkey-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.passkey-row:last-of-type { border-bottom: none; }
+.passkey-row > div:first-child { min-width: 0; }
+.passkey-row .dialog-hint { margin-top: 2px; }
 
 @media (max-width: 1180px) {
   .view-tabs, .session-toolbar { padding-left: 24px; padding-right: 24px; }
