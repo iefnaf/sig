@@ -18,11 +18,22 @@
 import type { Ledger } from "./ledger.ts";
 import type { SqlExecutor } from "./schema.ts";
 import { BRAND_HEAD, BRAND_LOCKUP, BRAND_STYLE } from "./brand.ts";
+import { verifyAssertionResponse, verifyRegistrationResponse, WebauthnVerifyError } from "./webauthn.ts";
 import { handleWorkspaceApi, type WorkspaceApiDeps } from "./workspace-api.ts";
+import { WorkspaceError } from "./workspace.ts";
 
 export const LINK_TTL_MS = 15 * 60_000;
 export const SESSION_TTL_MS = 7 * 24 * 60 * 60_000;
 export const SESSION_COOKIE = "sig_session";
+/**
+ * One ceremony, one round trip (candidate-2 design): short enough that a stolen challenge is
+ * useless within seconds of being issued. 60s is a guess, not a measurement — the `agents` SDK's
+ * own docs (docs/lifecycle.md) confirm a Durable Object's JS heap does not survive an eviction
+ * between requests (which is exactly why this is a DB row and not an in-memory Map/alarm), but
+ * neither it nor anything else in the package states how long an idle instance is typically kept
+ * warm, so there's no real number to calibrate against.
+ */
+export const WEBAUTHN_CHALLENGE_TTL_MS = 60_000;
 
 const enc = new TextEncoder();
 
@@ -41,6 +52,16 @@ function fromHex(hex: string): Uint8Array {
     out[i] = parseInt(pair, 16);
   });
   return out;
+}
+
+/** The byte encoding WebAuthn's `challenge` field wants on the wire. Not the W3C `base64url` of
+ *  anything WebAuthn-specific — just a generic bytes-to-string encoding, which is why this lives
+ *  here rather than in webauthn.ts (graft 1's module boundary is about wire-format *shapes*, not
+ *  about who is allowed to base64url-encode a buffer). */
+function toBase64Url(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
 async function mac(secret: string, payload: string): Promise<string> {
@@ -109,6 +130,67 @@ export async function verifyLinkToken(secrets: readonly string[], token: string 
   return null;
 }
 
+// ---- WebAuthn challenge tokens --------------------------------------------------------------------
+
+export interface WebauthnChallenge {
+  /** Opaque; echoed back by the client as `challengeToken` and re-verified at that point. */
+  token: string;
+  /** base64url bytes for `navigator.credentials.create()/.get()`'s `challenge` field. */
+  challenge: string;
+  expiresAt: number;
+}
+
+/**
+ * Same idiom as mintLinkToken: `wc1.<purpose>.<sid|->.<expiresAt>.<nonce>.<mac>`, HMAC'd under
+ * secrets[0]. `challenge` is base64url(UTF-8 bytes of `token`) — there is no separate
+ * random-bytes-plus-lookup step; the WebAuthn "challenge" the browser signs IS this token, just
+ * re-encoded into the byte format the browser API wants. Pure function: no DB access, callable
+ * from the Worker layer (login) without waking the DO.
+ */
+export async function mintWebauthnChallenge(
+  secret: string,
+  purpose: "register" | "authenticate",
+  sid: string,
+  now = Date.now(),
+  ttlMs = WEBAUTHN_CHALLENGE_TTL_MS,
+): Promise<WebauthnChallenge> {
+  const expiresAt = now + ttlMs;
+  const nonce = randomHex(16);
+  const base = `wc1.${purpose}.${sid}.${expiresAt}.${nonce}`;
+  const token = `${base}.${await mac(secret, base)}`;
+  return { token, challenge: toBase64Url(enc.encode(token)), expiresAt };
+}
+
+export interface VerifiedWebauthnChallenge {
+  purpose: "register" | "authenticate";
+  sid: string;
+  nonce: string;
+}
+
+/**
+ * Stateless HMAC + expiry check only — mirrors verifyLinkToken exactly, including being safe to
+ * call before the DO wakes. Does NOT enforce single-use (see WebApp#consumeWebauthnNonce): a
+ * verified-but-unconsumed token proves "the Worker minted this and it hasn't expired," not "this
+ * hasn't been used" — that can only be established by the one DB write, atomically with
+ * whatever the token authorizes.
+ */
+export async function verifyWebauthnChallenge(secrets: readonly string[], token: string | null): Promise<VerifiedWebauthnChallenge | null> {
+  if (!token) return null;
+  const parts = token.split(".");
+  if (parts.length !== 6 || parts[0] !== "wc1" || !/^[0-9a-f]{64}$/.test(parts[5]!)) return null;
+  const [prefix, purpose, sid, expiresRaw, nonce, macHex] = parts as [string, string, string, string, string, string];
+  if ((purpose !== "register" && purpose !== "authenticate") || !/^[\w-]+$/.test(sid) || !/^\d+$/.test(expiresRaw) || !/^[0-9a-f]{32}$/.test(nonce)) {
+    return null;
+  }
+  const expiresAt = Number(expiresRaw);
+  if (!Number.isFinite(expiresAt) || expiresAt < Date.now()) return null;
+  const payload = `${prefix}.${purpose}.${sid}.${expiresRaw}.${nonce}`;
+  for (const secret of secrets) {
+    if (await macOk(secret, payload, macHex)) return { purpose, sid, nonce };
+  }
+  return null;
+}
+
 // ---- session cookie -----------------------------------------------------------------------------
 
 export async function sessionCookieValue(secret: string, sid: string): Promise<string> {
@@ -124,6 +206,14 @@ export async function parseSessionCookie(secrets: readonly string[], value: stri
     if (await macOk(secret, `ws1.${parts[1]}`, parts[2]!)) return parts[1]!;
   }
   return null;
+}
+
+export interface PasskeyView {
+  credentialId: string;
+  label: string;
+  transports: string[];
+  createdAt: number;
+  lastUsedAt: number | null;
 }
 
 // ---- views (rendered shapes — the data comes from ledger.views, steward.md §10) -----------------
@@ -152,7 +242,19 @@ export interface WebDeps {
   machineConnected(deviceId: string): boolean;
   audit(reason: string, detail: string): void;
   /** The owner mutations behind the workspace API (steward.ts owns the conversation). */
-  workspace: Pick<WorkspaceApiDeps, "budget" | "submitMessage" | "submitAction" | "settings" | "saveModel" | "pairing" | "revoke">;
+  workspace: Pick<
+    WorkspaceApiDeps,
+    | "budget"
+    | "submitMessage"
+    | "submitAction"
+    | "settings"
+    | "saveModel"
+    | "pairing"
+    | "revoke"
+    | "webauthnRegisterOptions"
+    | "webauthnRegisterVerify"
+    | "webauthnRemove"
+  >;
   sessionEnded?(sid: string): void;
   /** The workspace page: a static asset fetched through the Worker's assets binding. */
   shell(): Promise<Response>;
@@ -168,20 +270,44 @@ function esc(text: string): string {
   return text.replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch] ?? ch);
 }
 
+/** Served as a new unauthenticated static asset, next to how index.ts already handles
+ *  LOGO_PATH/AVATAR_PATH — the sign-in page has no session, so it cannot reach anything under
+ *  the session-gated /app/assets/* tree (including i18n.js), and carries its own tiny inline
+ *  string table instead. */
+export const LOGIN_SCRIPT_PATH = "/login.js";
+
 function loginPromptPage(message: string, status: number): Response {
   const html = `<!doctype html>
 <html lang="zh-CN">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex">
 <title>Sig</title>
 ${BRAND_HEAD}
-<style>${BRAND_STYLE}body{font:15px/1.7 -apple-system,"PingFang SC",sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:0 16px}main{max-width:480px}</style>
+<style>${BRAND_STYLE}body{font:15px/1.7 -apple-system,"PingFang SC",sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:0 16px}main{max-width:480px}button{font:inherit;margin-top:12px;padding:8px 16px;border-radius:8px;border:1px solid #1c3656;background:#1c3656;color:#fff;cursor:pointer}button:disabled{opacity:.6;cursor:default}.hint{opacity:.75;font-size:13px}#passkey-status{color:#b3261e}</style>
 </head>
 <body><main>
 ${BRAND_LOCKUP}
 <p>${esc(message)}</p>
+<p><button id="passkey-signin" type="button" hidden>使用通行密钥登录</button></p>
+<p id="passkey-status" hidden></p>
 <p class="hint">新的登录链接用 <code>POST /api/login-link</code> 签发（15 分钟内有效，只能打开一次）。</p>
+<script type="module" src="${LOGIN_SCRIPT_PATH}"></script>
 </main></body></html>`;
-  return new Response(html, { status, headers: { "content-type": "text/html; charset=utf-8" } });
+  return new Response(html, {
+    status,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "content-security-policy": [
+        "default-src 'none'",
+        "script-src 'self'",
+        "style-src 'self' 'unsafe-inline'",
+        "img-src 'self' data:",
+        "connect-src 'self'",
+        "base-uri 'none'",
+        "form-action 'none'",
+        "frame-ancestors 'none'",
+      ].join("; "),
+    },
+  });
 }
 
 export class WebApp {
@@ -252,6 +378,131 @@ export class WebApp {
   #purgeExpiredWebRows(now: number): void {
     this.#sql`DELETE FROM sh_web_link WHERE expiresAt < ${now - 24 * 3600_000}`;
     this.#sql`DELETE FROM sh_web_session WHERE expiresAt < ${now}`;
+    // Nonce rows are already spent the moment they exist (#consumeWebauthnNonce inserts them
+    // only once, at verify time) — this is housekeeping, not a correctness window like the two
+    // DELETEs above.
+    this.#sql`DELETE FROM sh_web_webauthn_nonce WHERE usedAt < ${now - 24 * 3600_000}`;
+  }
+
+  /** INSERT OR IGNORE INTO sh_web_webauthn_nonce: true the first time a nonce is seen, false on
+   *  replay. mintWebauthnChallenge never touches the DB, so this insert is the only state a
+   *  WebAuthn challenge ever has — there is nothing to pre-register before the attempt. */
+  #consumeWebauthnNonce(nonce: string): boolean {
+    this.#sql`INSERT OR IGNORE INTO sh_web_webauthn_nonce (nonce, usedAt) VALUES (${nonce}, ${this.#now()})`;
+    return this.#sql<{ changes: number }>`SELECT changes() AS changes`[0]!.changes > 0;
+  }
+
+  /** Discoverable-credential registration options (Usage §1): no username to collect (ADR-0003,
+   *  single owner), so userId is a fixed constant and excludeCredentials is every passkey this
+   *  deployment already has, so the platform authenticator does not offer to re-register one. */
+  async webauthnRegisterOptions(
+    sid: string,
+    rpId: string,
+  ): Promise<{ challenge: string; challengeToken: string; rpId: string; userId: string; excludeCredentials: { id: string; transports: string[] }[] }> {
+    const { token, challenge } = await mintWebauthnChallenge(this.#deps.secrets[0]!, "register", sid, this.#now());
+    return {
+      challenge,
+      challengeToken: token,
+      rpId,
+      userId: toBase64Url(enc.encode("owner")),
+      excludeCredentials: this.listPasskeys().map((passkey) => ({ id: passkey.credentialId, transports: passkey.transports })),
+    };
+  }
+
+  /**
+   * Verifies a registration ceremony and stores the new credential. `attestation` is `unknown`
+   * on purpose (synthesis graft 1): only webauthn.ts's verifyRegistrationResponse is allowed to
+   * assert its shape.
+   */
+  async webauthnRegisterVerify(sid: string, rpId: string, origin: string, label: string, attestation: unknown): Promise<void> {
+    const wire = attestation !== null && typeof attestation === "object" ? (attestation as Record<string, unknown>) : {};
+    const challengeToken = typeof wire.challengeToken === "string" ? wire.challengeToken : null;
+    const verified = await verifyWebauthnChallenge(this.#deps.secrets, challengeToken);
+    // Defense in depth alongside CSRF: a challenge minted for a different session than the one
+    // redeeming it is treated the same as a bad/expired token.
+    if (!verified || verified.purpose !== "register" || verified.sid !== sid) throw new WorkspaceError("bad_request", 400);
+    if (!this.#consumeWebauthnNonce(verified.nonce)) {
+      this.#deps.audit("webauthn_register_failed", "replay");
+      throw new WorkspaceError("replay", 409);
+    }
+    let result;
+    try {
+      result = await verifyRegistrationResponse(wire, { rpId, origin, expectedChallenge: toBase64Url(enc.encode(challengeToken!)) });
+    } catch (err) {
+      this.#deps.audit("webauthn_register_failed", err instanceof WebauthnVerifyError ? err.reason : (err instanceof Error ? err.message : String(err)));
+      throw new WorkspaceError("attestation_invalid", 400);
+    }
+    const now = this.#now();
+    this.#sql`
+      INSERT INTO sh_web_credential (credentialId, publicKeyCose, signCount, label, transports, rpId, createdAt, lastUsedAt)
+      VALUES (${result.credentialId}, ${result.publicKeyCose}, ${result.signCount}, ${label.trim().slice(0, 80)}, ${JSON.stringify(result.transports)}, ${rpId}, ${now}, ${null})
+    `;
+    this.#deps.audit("webauthn_register_verified", result.credentialId);
+  }
+
+  /**
+   * Verifies a login assertion and, on success, opens the exact same session openLink does —
+   * the one reuse point. `assertion` is `unknown` on purpose (synthesis graft 1): only
+   * webauthn.ts's verifyAssertionResponse is allowed to assert its shape.
+   */
+  async webauthnLoginVerify(rpId: string, origin: string, secure: boolean, assertion: unknown): Promise<Response> {
+    const wire = assertion !== null && typeof assertion === "object" ? (assertion as Record<string, unknown>) : {};
+    const challengeToken = typeof wire.challengeToken === "string" ? wire.challengeToken : null;
+    const credentialId = typeof wire.credentialId === "string" ? wire.credentialId : null;
+    const verified = await verifyWebauthnChallenge(this.#deps.secrets, challengeToken);
+    if (!verified || verified.purpose !== "authenticate" || !credentialId) return loginPromptPage("登录已过期，请重试。", 410);
+    if (!this.#consumeWebauthnNonce(verified.nonce)) {
+      this.#deps.audit("webauthn_login_failed", "replay");
+      return loginPromptPage("此登录请求已被使用。", 409);
+    }
+    const row = this.#sql<{ publicKeyCose: string; signCount: number }>`
+      SELECT publicKeyCose, signCount FROM sh_web_credential WHERE credentialId = ${credentialId}
+    `[0];
+    if (!row) {
+      this.#deps.audit("webauthn_login_failed", "unknown_credential");
+      return loginPromptPage("未找到匹配的通行密钥。", 401);
+    }
+    let result;
+    try {
+      result = await verifyAssertionResponse(wire, {
+        rpId,
+        origin,
+        expectedChallenge: toBase64Url(enc.encode(challengeToken!)),
+        storedPublicKeyCose: row.publicKeyCose,
+        storedSignCount: row.signCount,
+      });
+    } catch (err) {
+      this.#deps.audit("webauthn_login_failed", err instanceof WebauthnVerifyError ? err.reason : (err instanceof Error ? err.message : String(err)));
+      return loginPromptPage("通行密钥验证失败。", 401);
+    }
+    const now = this.#now();
+    this.#sql`UPDATE sh_web_credential SET signCount = ${result.newSignCount}, lastUsedAt = ${now} WHERE credentialId = ${credentialId}`;
+    this.#deps.audit("webauthn_login_verified", credentialId);
+    const { cookie } = await this.openSession(secure);
+    return new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { "content-type": "application/json", "set-cookie": cookie, "cache-control": "no-store" },
+    });
+  }
+
+  /** Settings → Security's list (ADR-0005): projects rows, drops publicKeyCose/signCount. */
+  listPasskeys(): PasskeyView[] {
+    return this.#sql<{ credentialId: string; label: string; transports: string | null; createdAt: number; lastUsedAt: number | null }>`
+      SELECT credentialId, label, transports, createdAt, lastUsedAt FROM sh_web_credential ORDER BY createdAt
+    `.map((row) => ({
+      credentialId: row.credentialId,
+      label: row.label,
+      transports: row.transports ? (JSON.parse(row.transports) as string[]) : [],
+      createdAt: row.createdAt,
+      lastUsedAt: row.lastUsedAt,
+    }));
+  }
+
+  /** No "last passkey" guard, deliberately: the link flow is always available regardless of
+   *  passkey count (ADR-0003/0005), so removing one — even the only one — never locks the
+   *  owner out. */
+  removePasskey(credentialId: string): void {
+    this.#sql`DELETE FROM sh_web_credential WHERE credentialId = ${credentialId}`;
   }
 
   /** Session liveness for browser WebSocket upgrades (the Worker layer only checks the MAC). */
