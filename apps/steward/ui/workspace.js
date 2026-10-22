@@ -36,7 +36,7 @@ const state = {
   session: null, // within the selected thread: the worker whose recorded session fills the main pane
   viewer: null, // { workerId, handle } while that pane is mounted
   settings: null, // { claimed, model } from /app/api/settings
-  keyDraft: '', // the model key being typed; kept out of the dialog's redraw signature
+  modelDraft: null, // { provider, modelId, baseUrl, apiKey } being typed; kept out of the dialog's redraw signature
 };
 
 // ---- small pieces ---------------------------------------------------------------------------------
@@ -550,14 +550,21 @@ function pairingSection() {
 function accountSection() {
   const settings = state.settings;
   const model = settings?.model;
+  const draft = state.modelDraft;
   return [
     h('p', { class: 'dialog-copy' }, settings ? t('accountBody') : t('settingsLoading')),
-    model ? h('section', { class: 'model-settings' },
+    model && draft ? h('section', { class: 'model-settings' },
       h('h3', null, t('modelTitle')),
       h('p', { class: 'dialog-copy' }, t(model.apiKey ? 'modelReady' : 'modelNoKey', { provider: model.provider, model: model.modelId })),
       h('form', { id: 'model-form', class: 'model-form' },
+        h('label', { class: 'sr-only', for: 'model-provider' }, t('modelProviderLabel')),
+        h('input', { id: 'model-provider', type: 'text', autocomplete: 'off', spellcheck: 'false', placeholder: t('modelProviderPlaceholder'), value: draft.provider }),
+        h('label', { class: 'sr-only', for: 'model-id' }, t('modelIdLabel')),
+        h('input', { id: 'model-id', type: 'text', autocomplete: 'off', spellcheck: 'false', placeholder: t('modelIdPlaceholder'), value: draft.modelId }),
+        h('label', { class: 'sr-only', for: 'model-base-url' }, t('modelBaseUrlLabel')),
+        h('input', { id: 'model-base-url', type: 'text', autocomplete: 'off', spellcheck: 'false', placeholder: t('modelBaseUrlPlaceholder'), value: draft.baseUrl }),
         h('label', { class: 'sr-only', for: 'model-key' }, t('modelKeyLabel')),
-        h('input', { id: 'model-key', type: 'password', autocomplete: 'off', spellcheck: 'false', placeholder: t('modelKeyPlaceholder'), value: state.keyDraft }),
+        h('input', { id: 'model-key', type: 'password', autocomplete: 'off', spellcheck: 'false', placeholder: t('modelKeyPlaceholder'), value: draft.apiKey }),
         h('button', { type: 'submit', class: 'button primary' }, t('modelSave'))),
       h('p', { class: 'dialog-hint' }, t('modelHelp'))) : null,
     h('div', { class: 'dialog-actions' }, h('button', { type: 'button', class: 'button danger', dataset: { action: 'sign-out' } }, t('signOut'))),
@@ -916,6 +923,9 @@ async function loadSettings() {
     const { status, data } = await request('/app/api/settings');
     if (status !== 200 || !data) return;
     state.settings = data;
+    state.modelDraft = data.model
+      ? { provider: data.model.provider, modelId: data.model.modelId, baseUrl: data.model.baseUrl ?? '', apiKey: '' }
+      : null;
     renderSetup();
     if (state.dialog?.type === 'account') bumpDialog();
   } catch {
@@ -923,13 +933,20 @@ async function loadSettings() {
   }
 }
 
-async function saveModelKey() {
-  const apiKey = state.keyDraft.trim();
-  if (!apiKey) return;
+/** Issue #70: provider + modelId (+ optional baseUrl) and the matching API key, switched
+ *  without a redeploy — the same request/toast/reload flow the key-only form used. */
+async function saveModel() {
+  const draft = state.modelDraft;
+  if (!draft) return;
+  const provider = draft.provider.trim();
+  const modelId = draft.modelId.trim();
+  const baseUrl = draft.baseUrl.trim();
+  const apiKey = draft.apiKey.trim();
+  if (!provider || !modelId || !apiKey) return;
   try {
-    const { status } = await request('/app/api/settings/model', { apiKey });
+    const { status } = await request('/app/api/settings/model', { provider, modelId, apiKey, ...(baseUrl ? { baseUrl } : {}) });
     if (status === 200) {
-      state.keyDraft = '';
+      draft.apiKey = '';
       toast(t('modelSaved'));
       await loadSettings();
       await refresh();
@@ -1186,14 +1203,16 @@ document.addEventListener('click', (event) => {
   }
 });
 
-// The model key is typed in the settings dialog, which is not redrawn while it is being typed.
+// The model form is typed in the settings dialog, which is not redrawn while it is being typed.
+const MODEL_DRAFT_FIELDS = { 'model-provider': 'provider', 'model-id': 'modelId', 'model-base-url': 'baseUrl', 'model-key': 'apiKey' };
 $('#dialog').addEventListener('input', (event) => {
-  if (event.target.id === 'model-key') state.keyDraft = event.target.value;
+  const field = MODEL_DRAFT_FIELDS[event.target.id];
+  if (field && state.modelDraft) state.modelDraft[field] = event.target.value;
 });
 $('#dialog').addEventListener('submit', (event) => {
   if (event.target.id !== 'model-form') return;
   event.preventDefault();
-  void saveModelKey();
+  void saveModel();
 });
 
 // ---- start ----------------------------------------------------------------------------------------------------

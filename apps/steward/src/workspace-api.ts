@@ -24,7 +24,11 @@ export interface WorkspaceApiDeps {
   audit(reason: string, detail: string): void;
   requireOrigin?: boolean;
   settings?(): Promise<unknown>;
-  saveModel?(apiKey: string): Promise<void>;
+  /** Issue #70: the Settings page's runtime model switch — provider + modelId (+ optional
+   *  baseUrl) and the matching API key, all required together (switching provider always
+   *  needs a new key; re-submitting the same provider/modelId still reseals the key, which
+   *  keeps the "fix a rejected key" flow the same single form). */
+  saveModel?(input: { provider: string; modelId: string; apiKey: string; baseUrl?: string }): Promise<void>;
   pairing?(id: string): Promise<{ code: string; expiresAt: number }>;
   revoke?(deviceId: string): void;
 }
@@ -96,6 +100,23 @@ function parseAction(body: Record<string, unknown>): WorkspaceActionInput {
   return { id, cardId, action };
 }
 
+/** Issue #70: provider + modelId (+ optional baseUrl) and the matching API key, all required
+ *  together — switching provider always needs a new key, and re-submitting the same
+ *  provider/modelId still reseals the key (the "fix a rejected key" flow is this same form). */
+function parseModelSwitch(body: Record<string, unknown>): { provider: string; modelId: string; apiKey: string; baseUrl?: string } {
+  const { provider, modelId, apiKey, baseUrl } = body;
+  if (typeof provider !== "string" || !provider.trim() || provider.length > 128) throw new WorkspaceError("bad_request");
+  if (typeof modelId !== "string" || !modelId.trim() || modelId.length > 256) throw new WorkspaceError("bad_request");
+  if (typeof apiKey !== "string" || !apiKey.trim() || apiKey.length > 8192) throw new WorkspaceError("bad_request");
+  if (baseUrl !== undefined && (typeof baseUrl !== "string" || baseUrl.length > 2048)) throw new WorkspaceError("bad_request");
+  return {
+    provider: provider.trim(),
+    modelId: modelId.trim(),
+    apiKey: apiKey.trim(),
+    ...(typeof baseUrl === "string" && baseUrl.trim() ? { baseUrl: baseUrl.trim() } : {}),
+  };
+}
+
 export async function handleWorkspaceApi(request: Request, url: URL, session: ApiSession, deps: WorkspaceApiDeps): Promise<Response> {
   if (url.pathname === "/app/api/workspace") {
     if (request.method !== "GET") return json({ error: "method_not_allowed" }, 405);
@@ -121,9 +142,7 @@ export async function handleWorkspaceApi(request: Request, url: URL, session: Ap
       return json({ ...pair, command: `npx @nightboats/sig connect ${url.origin} ${pair.code}` });
     }
     if (url.pathname === "/app/api/settings/model" && deps.saveModel) {
-      const { apiKey } = await readJson(request);
-      if (typeof apiKey !== "string" || !apiKey.trim() || apiKey.length > 8192) return json({ error: "bad_request" }, 400);
-      await deps.saveModel(apiKey.trim());
+      await deps.saveModel(parseModelSwitch(await readJson(request)));
       return json({ ok: true });
     }
     if (url.pathname === "/app/api/machines/revoke" && deps.revoke) {

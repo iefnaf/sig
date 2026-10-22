@@ -71,6 +71,7 @@ import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import {
   buildStewardModels,
   installModel,
+  mergeModelSelection,
   resolveModelConfig,
   type FauxRequestRecord,
   type StewardModels,
@@ -452,18 +453,16 @@ export class Steward extends Agent<Env> {
   });
 
   /**
-   * Applies the merged model selection to the live collection and the root session, before
-   * the first submit of an isolate (and after any setModelConfig). The deploy config
-   * (vars.STEWARD_MODEL) picks provider + model id; when it is unset, the sealed sh_model
-   * row's provider (set via setModelConfig or seeded from MODEL_KEY, issue #25/#27) is the
-   * user's choice. The API key is always the sealed row's (never an env var, spike bug 7),
+   * Applies the merged model selection (mergeModelSelection, issue #70) to the live
+   * collection and the root session, before the first submit of an isolate (and after any
+   * setModelConfig). The API key is always the sealed row's (never an env var, spike bug 7),
    * and only when its provider matches the selection — a key sealed for another provider is
    * not silently sent elsewhere.
    */
   private async ensureRootModel(): Promise<void> {
     const sealed = await this.modelConfig();
     const vars = this.modelVarsConfig;
-    const config = sealed && !vars.explicit ? { ...vars, provider: sealed.provider } : vars;
+    const config = mergeModelSelection(sealed, vars);
     const apiKey = sealed && sealed.provider === config.provider ? sealed.apiKey : undefined;
     installModel(this.llmModels.models, config, apiKey);
     // Review #10: a provider/model combination the catalog does not know (e.g. a sealed
@@ -692,7 +691,7 @@ export class Steward extends Agent<Env> {
         submitMessage: (input) => this.submitWorkspaceMessage(input),
         submitAction: (input) => this.submitWorkspaceAction(input),
         settings: async () => ({ model: await this.llmSelection() }),
-        saveModel: async (key: string) => { const selected = await this.llmSelection(); await this.setModelConfig(selected.provider, key); },
+        saveModel: async (input) => { await this.setModelConfig(input.provider, input.apiKey, input.modelId, input.baseUrl); },
         pairing: (id: string) => this.webPairing(id),
         revoke: (id: string) => { this.logChannel("web_machine_revoked", id); void this.revoke(id); },
       },
@@ -2607,13 +2606,24 @@ export class Steward extends Agent<Env> {
   // itself is deepseek-flash); M2's setup/chat step can reconfigure via setModelConfig.
   static readonly DEFAULT_MODEL_PROVIDER = "deepseek";
 
-  async setModelConfig(provider: string, apiKey: string): Promise<void> {
+  /**
+   * `modelId`/`baseUrl` are present for an owner-driven runtime switch (issue #70, the
+   * Settings page): once set, they win over vars.STEWARD_MODEL entirely (ensureRootModel),
+   * not just the provider. Omitting them (the MODEL_KEY seed path, and the pre-#70
+   * provider-only form) keeps the legacy behavior — vars still supply modelId/baseUrl.
+   */
+  async setModelConfig(provider: string, apiKey: string, modelId?: string, baseUrl?: string): Promise<void> {
     if (!provider.trim() || !apiKey.trim()) throw new Error("provider and apiKey are required");
     const [primary] = await this.serverKeys();
     const apiKeyEnc = await sealSecret(primary!, apiKey);
+    const modelIdValue = modelId?.trim() || null;
+    const baseUrlValue = baseUrl?.trim() || null;
     this.sql`
-      INSERT INTO sh_model (id, provider, apiKeyEnc, updatedAt) VALUES (0, ${provider}, ${apiKeyEnc}, ${Date.now()})
-      ON CONFLICT(id) DO UPDATE SET provider = excluded.provider, apiKeyEnc = excluded.apiKeyEnc, updatedAt = excluded.updatedAt
+      INSERT INTO sh_model (id, provider, apiKeyEnc, modelId, baseUrl, updatedAt)
+      VALUES (0, ${provider}, ${apiKeyEnc}, ${modelIdValue}, ${baseUrlValue}, ${Date.now()})
+      ON CONFLICT(id) DO UPDATE SET
+        provider = excluded.provider, apiKeyEnc = excluded.apiKeyEnc,
+        modelId = excluded.modelId, baseUrl = excluded.baseUrl, updatedAt = excluded.updatedAt
     `;
     // The LLM wiring (issue #6) installs the sealed selection lazily (ensureRootModel, before
     // the next submit) — resetting the memo is enough; the models collection handed to pi at
@@ -2622,21 +2632,24 @@ export class Steward extends Agent<Env> {
     this.appliedRootModel = undefined;
   }
 
-  async modelConfig(): Promise<{ provider: string; apiKey: string } | null> {
+  async modelConfig(): Promise<{ provider: string; modelId: string | null; baseUrl: string | null; apiKey: string } | null> {
     // One-click-deploy glue (issue #25, spec §12.1 step 1): MODEL_KEY — the secret the
     // Deploy-to-Cloudflare form collects — seeds the sealed config on first read, so the key
     // never lives anywhere outside the user's own account. Seeding only fills an empty
-    // sh_model: an explicit setModelConfig (M2's setup/chat step) always wins, and the env
-    // secret is dead weight once the sealed row exists (delete it if you like).
+    // sh_model: an explicit setModelConfig (M2's setup/chat step, or the Settings switch)
+    // always wins, and the env secret is dead weight once the sealed row exists (delete it if
+    // you like).
     if (this.sql`SELECT 1 AS one FROM sh_model WHERE id = 0`.length === 0 && this.env.MODEL_KEY?.trim()) {
       await this.setModelConfig(Steward.DEFAULT_MODEL_PROVIDER, this.env.MODEL_KEY.trim());
     }
-    const row = this.sql<{ provider: string; apiKeyEnc: string }>`SELECT provider, apiKeyEnc FROM sh_model WHERE id = 0`[0];
+    const row = this.sql<{ provider: string; apiKeyEnc: string; modelId: string | null; baseUrl: string | null }>`
+      SELECT provider, apiKeyEnc, modelId, baseUrl FROM sh_model WHERE id = 0
+    `[0];
     if (!row) return null;
     const opened = await openSecret(await this.serverKeys(), row.apiKeyEnc);
     // Sealed under a dropped key: report unconfigured rather than failing calls forever.
     if (!opened) return null;
-    return { provider: row.provider, apiKey: opened.text };
+    return { provider: row.provider, modelId: row.modelId, baseUrl: row.baseUrl, apiKey: opened.text };
   }
 
   /**
@@ -2659,7 +2672,7 @@ export class Steward extends Agent<Env> {
     const sealed = await this.modelConfig();
     // `varsRaw: null` models an unset deploy config; `undefined` (the production call) reads env.
     const vars = resolveModelConfig(varsRaw === undefined ? this.env.STEWARD_MODEL : varsRaw);
-    const config = sealed && !vars.explicit ? { ...vars, provider: sealed.provider } : vars;
+    const config = mergeModelSelection(sealed, vars);
     return {
       provider: config.provider,
       modelId: config.modelId,
