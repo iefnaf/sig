@@ -11,7 +11,7 @@ import { dayKey, formatClock, formatDay, formatRelative, formatUsd, trimOpenMark
 import { markup } from './markup.js';
 import { mountSessionViewer } from './session.js';
 import {
-  ACTION_KEYS, FATAL_COPY, KNOWN_TITLES, attentionFor, groupByDay, groupThreads, isActiveWorker, messagesFor, previewOf, summarize, withPending, workOn,
+  ACTION_KEYS, FATAL_COPY, KNOWN_TITLES, attentionFor, groupByDay, groupThreads, isActiveWorker, messagesFor, modelAfterProviderChange, previewOf, summarize, withPending, workOn,
 } from './model.js';
 
 const $ = (selector) => document.querySelector(selector);
@@ -591,6 +591,8 @@ function accountSection() {
   const settings = state.settings;
   const model = settings?.model;
   const draft = state.modelDraft;
+  const catalog = settings?.providers ?? [];
+  const keyed = (settings?.keyedProviders ?? []).includes(draft?.provider);
   return [
     h('p', { class: 'dialog-copy' }, settings ? t('accountBody') : t('settingsLoading')),
     model && draft ? h('section', { class: 'model-settings' },
@@ -598,13 +600,18 @@ function accountSection() {
       h('p', { class: 'dialog-copy' }, t(model.apiKey ? 'modelReady' : 'modelNoKey', { provider: model.provider, model: model.modelId })),
       h('form', { id: 'model-form', class: 'model-form' },
         h('label', { class: 'sr-only', for: 'model-provider' }, t('modelProviderLabel')),
-        h('input', { id: 'model-provider', type: 'text', autocomplete: 'off', spellcheck: 'false', placeholder: t('modelProviderPlaceholder'), value: draft.provider }),
+        h('input', { id: 'model-provider', type: 'text', list: 'model-provider-options', autocomplete: 'off', spellcheck: 'false', placeholder: t('modelProviderPlaceholder'), value: draft.provider, dataset: { focus: 'model-provider' } }),
+        h('datalist', { id: 'model-provider-options' },
+          catalog.map((provider) => h('option', { value: provider.id, label: provider.name }))),
         h('label', { class: 'sr-only', for: 'model-id' }, t('modelIdLabel')),
-        h('input', { id: 'model-id', type: 'text', autocomplete: 'off', spellcheck: 'false', placeholder: t('modelIdPlaceholder'), value: draft.modelId }),
+        h('input', { id: 'model-id', type: 'text', list: 'model-model-options', autocomplete: 'off', spellcheck: 'false', placeholder: t('modelIdPlaceholder'), value: draft.modelId, dataset: { focus: 'model-id' } }),
+        h('datalist', { id: 'model-model-options' },
+          (catalog.find((provider) => provider.id === draft.provider)?.models ?? [])
+            .map((entry) => h('option', { value: entry.id, label: entry.name }))),
         h('label', { class: 'sr-only', for: 'model-base-url' }, t('modelBaseUrlLabel')),
-        h('input', { id: 'model-base-url', type: 'text', autocomplete: 'off', spellcheck: 'false', placeholder: t('modelBaseUrlPlaceholder'), value: draft.baseUrl }),
+        h('input', { id: 'model-base-url', type: 'text', autocomplete: 'off', spellcheck: 'false', placeholder: t('modelBaseUrlPlaceholder'), value: draft.baseUrl, dataset: { focus: 'model-base-url' } }),
         h('label', { class: 'sr-only', for: 'model-key' }, t('modelKeyLabel')),
-        h('input', { id: 'model-key', type: 'password', autocomplete: 'off', spellcheck: 'false', placeholder: t('modelKeyPlaceholder'), value: draft.apiKey }),
+        h('input', { id: 'model-key', type: 'password', autocomplete: 'off', spellcheck: 'false', placeholder: t(keyed ? 'modelKeyKeep' : 'modelKeyPlaceholder'), value: draft.apiKey, dataset: { focus: 'model-key' } }),
         h('button', { type: 'submit', class: 'button primary' }, t('modelSave'))),
       h('p', { class: 'dialog-hint' }, t('modelHelp'))) : null,
     securitySection(),
@@ -974,8 +981,9 @@ async function loadSettings() {
   }
 }
 
-/** Issue #70: provider + modelId (+ optional baseUrl) and the matching API key, switched
- *  without a redeploy — the same request/toast/reload flow the key-only form used. */
+/** Issues #70/#74: provider + modelId (+ optional baseUrl) switched without a redeploy.
+ *  The API key is optional once the provider has a sealed one — switching back to a keyed
+ *  provider is the whole point — and a pasted key reseals it. */
 async function saveModel() {
   const draft = state.modelDraft;
   if (!draft) return;
@@ -983,9 +991,13 @@ async function saveModel() {
   const modelId = draft.modelId.trim();
   const baseUrl = draft.baseUrl.trim();
   const apiKey = draft.apiKey.trim();
-  if (!provider || !modelId || !apiKey) return;
+  if (!provider || !modelId) return;
+  if (!apiKey && !(state.settings?.keyedProviders ?? []).includes(provider)) {
+    toast(t('modelKeyMissing'));
+    return;
+  }
   try {
-    const { status } = await request('/app/api/settings/model', { provider, modelId, apiKey, ...(baseUrl ? { baseUrl } : {}) });
+    const { status } = await request('/app/api/settings/model', { provider, modelId, ...(apiKey ? { apiKey } : {}), ...(baseUrl ? { baseUrl } : {}) });
     if (status === 200) {
       draft.apiKey = '';
       toast(t('modelSaved'));
@@ -1341,11 +1353,19 @@ document.addEventListener('click', (event) => {
 });
 
 // The model form and the passkey label are typed in the settings dialog, which is not
-// redrawn while either is being typed.
+// redrawn while either is being typed. Picking another provider redraws once (issue #74):
+// the model list, the key placeholder, and the preselected model all follow the provider.
 const MODEL_DRAFT_FIELDS = { 'model-provider': 'provider', 'model-id': 'modelId', 'model-base-url': 'baseUrl', 'model-key': 'apiKey' };
 $('#dialog').addEventListener('input', (event) => {
   const field = MODEL_DRAFT_FIELDS[event.target.id];
-  if (field && state.modelDraft) state.modelDraft[field] = event.target.value;
+  if (field && state.modelDraft) {
+    state.modelDraft[field] = event.target.value;
+    if (field === 'provider') {
+      const next = modelAfterProviderChange(state.settings?.providers, event.target.value, state.modelDraft.modelId);
+      if (next !== null) state.modelDraft.modelId = next;
+      bumpDialog();
+    }
+  }
   if (event.target.id === 'passkey-label') state.passkeyLabelDraft = event.target.value;
 });
 $('#dialog').addEventListener('submit', (event) => {

@@ -7,7 +7,7 @@ import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { STRINGS, getLocale, setLocale, t, tOr } from "../ui/i18n.js";
 import { dayKey, formatClock, formatDay, formatRelative, formatUsd, parseInline, parseMarkup, plainText, safeUrl, trimOpenMarkup } from "../ui/format.js";
-import { ACTION_KEYS, FATAL_COPY, KNOWN_TITLES, groupByDay, groupThreads, messagesFor, previewOf, summarize, threadMatches, withPending, workOn } from "../ui/model.js";
+import { ACTION_KEYS, FATAL_COPY, KNOWN_TITLES, groupByDay, groupThreads, messagesFor, modelAfterProviderChange, previewOf, summarize, threadMatches, withPending, workOn } from "../ui/model.js";
 import { cardView } from "../src/workspace.ts";
 import { askUserCard, noteDecisionCard, offlineAskCard, routineOfferCard, workerQuestionCard } from "../src/report-template.ts";
 
@@ -102,6 +102,24 @@ describe("shipped files", () => {
       }
     }
     expect(checked).toBeGreaterThan(40);
+  });
+});
+
+describe("the settings draft's provider switch (issue #74)", () => {
+  const catalog = [
+    { id: "deepseek", name: "DeepSeek", models: [{ id: "deepseek-flash", name: "DeepSeek Flash" }, { id: "deepseek-v4-pro", name: "DeepSeek V4 Pro" }] },
+    { id: "empty", name: "Empty", models: [] },
+  ];
+
+  it("keeps a modelId the new provider also has, else preselects its first model", () => {
+    expect(modelAfterProviderChange(catalog, "deepseek", "deepseek-flash")).toBe("deepseek-flash");
+    expect(modelAfterProviderChange(catalog, "deepseek", "gpt-4o")).toBe("deepseek-flash");
+  });
+
+  it("leaves the field alone for a catalog-unknown provider or a provider with no models", () => {
+    expect(modelAfterProviderChange(catalog, "my-proxy", "gpt-4o")).toBeNull();
+    expect(modelAfterProviderChange(catalog, "empty", "anything")).toBeNull();
+    expect(modelAfterProviderChange(undefined, "deepseek", "deepseek-flash")).toBeNull();
   });
 });
 
