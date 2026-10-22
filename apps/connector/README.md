@@ -45,6 +45,16 @@ sig connect https://sig.example.com <pairing-code>
 
 The pairing code is single-use and expires after 10 minutes. `connect` saves the device credential, installs a launchd service on macOS or a systemd user service on Linux, and starts the connector. On a machine without a supported service manager, add `--foreground` and keep the terminal open.
 
+### Networks that block the deployment
+
+`*.workers.dev` and similar hosts are unreachable from some networks (notably mainland China without a proxy). Pass a proxy so both the pairing request and the long-lived connection can get through:
+
+```sh
+sig connect https://sig.example.com <pairing-code> --proxy http://127.0.0.1:7890
+```
+
+With no `--proxy`, `connect` captures `HTTPS_PROXY` from the environment and stores it; the background service, git, and agent workers all inherit it. Check reachability any time with `sig doctor`, and inspect or change the stored proxy with `sig proxy`.
+
 After pairing, register each repository that Sig may use:
 
 ```sh
@@ -122,6 +132,16 @@ sig connect https://sig.example.com <pairing-code>
 ```
 
 配对码只能使用一次，10 分钟后过期。`connect` 会保存设备凭证，在 macOS 安装 launchd 服务、在 Linux 安装 systemd 用户服务，并启动 connector。没有受支持服务管理器的机器可以加 `--foreground`，并保持终端打开。
+
+### 无法直连部署地址的网络
+
+部分网络（典型如未开代理的中国大陆）无法访问 `*.workers.dev` 等域名。请传入代理，让配对请求和长连接都能通过：
+
+```sh
+sig connect https://sig.example.com <pairing-code> --proxy http://127.0.0.1:7890
+```
+
+不传 `--proxy` 时，`connect` 会捕获环境变量 `HTTPS_PROXY` 并持久化；后台服务、git 和 agent worker 都会继承该代理。可随时用 `sig doctor` 检查连通性，用 `sig proxy` 查看或修改已存储的代理。
 
 配对后，逐个登记允许 Sig 使用的仓库：
 
