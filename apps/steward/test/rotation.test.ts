@@ -151,9 +151,11 @@ describe("SERVER_KEY rotation: sealed secrets (issue #27)", () => {
     const oldPrimary = await serverKey(PRIMARY_SECRET);
     await overrideKeys([freshPrimary, oldPrimary]);
     expect(await ownerStub().modelConfig()).toEqual({ provider: "deepseek", modelId: null, baseUrl: null, apiKey: "sk-model-secret-123" });
-    // Window closed (key dropped entirely): reads report unconfigured, not garbage.
+    // Window closed (key dropped entirely): the key is unreadable, but the selection itself
+    // is plain columns — it survives as a keyless row the Settings page can re-key, instead
+    // of masquerading as "no selection" (issue #74 split the two storages).
     await overrideKeys([freshPrimary]);
-    expect(await ownerStub().modelConfig()).toBeNull();
+    expect(await ownerStub().modelConfig()).toEqual({ provider: "deepseek", modelId: null, baseUrl: null, apiKey: "" });
   });
 });
 

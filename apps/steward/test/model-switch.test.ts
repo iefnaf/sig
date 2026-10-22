@@ -19,12 +19,13 @@ async function clearModelRow(): Promise<void> {
   await ownerStub().channelLogEntries(1);
   await runInDurableObject(ownerStub(), (instance: Steward) => {
     (instance as unknown as { sql: Sql }).sql.bind(instance)`DELETE FROM sh_model`;
+    (instance as unknown as { sql: Sql }).sql.bind(instance)`DELETE FROM sh_provider_key`;
   });
 }
 
-// sh_model survives between test files (the DO's SQLite is never rolled back) and, once a
-// switch sets an explicit modelId, it wins over every other test's vars.STEWARD_MODEL = faux
-// binding. Clear it on both sides so nothing here leaks into a later file.
+// sh_model/sh_provider_key survive between test files (the DO's SQLite is never rolled back) and, once
+// a switch sets an explicit modelId, it wins over every other test's vars.STEWARD_MODEL = faux
+// binding. Clear both on both sides so nothing here leaks into a later file.
 beforeEach(clearModelRow);
 afterEach(clearModelRow);
 
@@ -66,6 +67,35 @@ describe("mergeModelSelection via setModelConfig/llmSelection (RPC level)", () =
   });
 });
 
+describe("per-provider keys (issue #74)", () => {
+  it("keeps each provider's key when switching between them, and switching back needs no re-entry", async () => {
+    await ownerStub().setModelConfig("anthropic", "sk-ant-a", "claude-a");
+    await ownerStub().setModelConfig("openai", "sk-openai-b", "gpt-b");
+    expect(await ownerStub().keyedProviders()).toEqual(["anthropic", "openai"]);
+
+    // No apiKey given: the selection moves back to anthropic and picks up its sealed key.
+    await ownerStub().setModelConfig("anthropic", undefined, "claude-a2");
+    expect(await ownerStub().modelConfig()).toMatchObject({ provider: "anthropic", modelId: "claude-a2", apiKey: "sk-ant-a" });
+  });
+
+  it("a keyless switch resolves with an empty key and reports apiKey: false", async () => {
+    await ownerStub().setModelConfig("deepseek", undefined, "deepseek-flash");
+    expect(await ownerStub().modelConfig()).toMatchObject({ provider: "deepseek", modelId: "deepseek-flash", apiKey: "" });
+    expect(await ownerStub().llmSelection()).toMatchObject({ provider: "deepseek", modelId: "deepseek-flash", apiKey: false });
+  });
+
+  it("mirrors the selected provider's key in sh_model, so a pre-#74 reader stays consistent", async () => {
+    await ownerStub().setModelConfig("anthropic", "sk-ant-mirror", "claude-m");
+    await ownerStub().setModelConfig("openai", "sk-openai-mirror", "gpt-m");
+    const rows = await runInDurableObject(ownerStub(), (instance: Steward) =>
+      (instance as unknown as { sql: Sql }).sql.bind(instance)`SELECT provider, apiKeyEnc FROM sh_model WHERE id = 0` as unknown as { provider: string; apiKeyEnc: string }[],
+    );
+    expect(rows[0]).toMatchObject({ provider: "openai" });
+    expect(rows[0]!.apiKeyEnc.length).toBeGreaterThan(0);
+    expect(rows[0]!.apiKeyEnc).not.toContain("sk-openai-mirror");
+  });
+});
+
 describe("the Settings page's model switch (HTTP level, ADR-0004)", () => {
   async function browser() {
     const cookie = await webLogin();
@@ -80,12 +110,25 @@ describe("the Settings page's model switch (HTTP level, ADR-0004)", () => {
     return { post, settings };
   }
 
-  it("GET /app/api/settings reports the merged selection", async () => {
-    const { settings } = await browser();
+  it("GET /app/api/settings reports the merged selection, the provider catalog, and which providers have keys (issue #74)", async () => {
+    const { settings, post } = await browser();
     const res = await settings();
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { model: { provider: string; modelId: string; baseUrl: string | null; apiKey: boolean } };
+    const body = (await res.json()) as {
+      model: { provider: string; modelId: string; baseUrl: string | null; apiKey: boolean };
+      providers: Array<{ id: string; name: string; models: Array<{ id: string; name: string }> }>;
+      keyedProviders: string[];
+    };
     expect(body.model).toMatchObject({ provider: "faux", modelId: "faux-1" });
+    const deepseek = body.providers.find((provider) => provider.id === "deepseek");
+    expect(deepseek?.name).toBe("DeepSeek");
+    expect(deepseek?.models.some((model) => model.id === "deepseek-flash")).toBe(true);
+    // The test env binds MODEL_KEY, so this first read seeds the default provider's key.
+    expect(body.keyedProviders).toEqual(["deepseek"]);
+
+    await post("settings/model", { provider: "anthropic", modelId: "claude-sonnet-x", apiKey: "sk-ant-web" });
+    const after = (await (await settings()).json()) as { keyedProviders: string[] };
+    expect(after.keyedProviders).toEqual(["anthropic", "deepseek"]);
   });
 
   it("POST /app/api/settings/model switches provider + modelId, overriding vars, and the owner sees it reflected back", async () => {
@@ -105,11 +148,24 @@ describe("the Settings page's model switch (HTTP level, ADR-0004)", () => {
     expect(after.model.baseUrl).toBe("https://proxy.example/v1");
   });
 
-  it("rejects a switch missing provider, modelId, or apiKey", async () => {
+  it("a switch without apiKey keeps the provider's sealed key (issue #74)", async () => {
+    const { post, settings } = await browser();
+    await post("settings/model", { provider: "anthropic", modelId: "claude-sonnet-x", apiKey: "sk-ant-web" });
+    await post("settings/model", { provider: "openai", modelId: "gpt-o", apiKey: "sk-openai-web" });
+
+    const back = await post("settings/model", { provider: "anthropic", modelId: "claude-sonnet-y" });
+    expect(back.status).toBe(200);
+    const after = (await (await settings()).json()) as { model: { provider: string; modelId: string; apiKey: boolean }; keyedProviders: string[] };
+    expect(after.model).toMatchObject({ provider: "anthropic", modelId: "claude-sonnet-y", apiKey: true });
+    // No settings read happened first, so MODEL_KEY never seeded: only the saved keys.
+    expect(after.keyedProviders).toEqual(["anthropic", "openai"]);
+  });
+
+  it("rejects a switch missing provider or modelId, or with a malformed apiKey", async () => {
     const { post } = await browser();
     expect((await post("settings/model", { modelId: "claude-x", apiKey: "sk-1" })).status).toBe(400);
     expect((await post("settings/model", { provider: "anthropic", apiKey: "sk-1" })).status).toBe(400);
-    expect((await post("settings/model", { provider: "anthropic", modelId: "claude-x" })).status).toBe(400);
     expect((await post("settings/model", { provider: "", modelId: "claude-x", apiKey: "sk-1" })).status).toBe(400);
+    expect((await post("settings/model", { provider: "anthropic", modelId: "claude-x", apiKey: 5 })).status).toBe(400);
   });
 });

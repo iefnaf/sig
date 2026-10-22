@@ -24,11 +24,11 @@ export interface WorkspaceApiDeps {
   audit(reason: string, detail: string): void;
   requireOrigin?: boolean;
   settings?(): Promise<unknown>;
-  /** Issue #70: the Settings page's runtime model switch — provider + modelId (+ optional
-   *  baseUrl) and the matching API key, all required together (switching provider always
-   *  needs a new key; re-submitting the same provider/modelId still reseals the key, which
-   *  keeps the "fix a rejected key" flow the same single form). */
-  saveModel?(input: { provider: string; modelId: string; apiKey: string; baseUrl?: string }): Promise<void>;
+  /** Issues #70/#74: the Settings page's runtime model switch — provider + modelId (+
+   *  optional baseUrl), with `apiKey` optional once the provider has a sealed key: switching
+   * to a previously keyed provider needs no re-entry, while giving a key reseals it (the
+   * "fix a rejected key" flow stays the same single form). */
+  saveModel?(input: { provider: string; modelId: string; apiKey?: string; baseUrl?: string }): Promise<void>;
   pairing?(id: string): Promise<{ code: string; expiresAt: number }>;
   revoke?(deviceId: string): void;
   /** `attestation`/the WebAuthn wire fields stay `unknown` here on purpose (synthesis graft 1):
@@ -116,16 +116,16 @@ function parseAction(body: Record<string, unknown>): WorkspaceActionInput {
 /** Issue #70: provider + modelId (+ optional baseUrl) and the matching API key, all required
  *  together — switching provider always needs a new key, and re-submitting the same
  *  provider/modelId still reseals the key (the "fix a rejected key" flow is this same form). */
-function parseModelSwitch(body: Record<string, unknown>): { provider: string; modelId: string; apiKey: string; baseUrl?: string } {
+function parseModelSwitch(body: Record<string, unknown>): { provider: string; modelId: string; apiKey?: string; baseUrl?: string } {
   const { provider, modelId, apiKey, baseUrl } = body;
   if (typeof provider !== "string" || !provider.trim() || provider.length > 128) throw new WorkspaceError("bad_request");
   if (typeof modelId !== "string" || !modelId.trim() || modelId.length > 256) throw new WorkspaceError("bad_request");
-  if (typeof apiKey !== "string" || !apiKey.trim() || apiKey.length > 8192) throw new WorkspaceError("bad_request");
+  if (apiKey !== undefined && (typeof apiKey !== "string" || apiKey.length > 8192)) throw new WorkspaceError("bad_request");
   if (baseUrl !== undefined && (typeof baseUrl !== "string" || baseUrl.length > 2048)) throw new WorkspaceError("bad_request");
   return {
     provider: provider.trim(),
     modelId: modelId.trim(),
-    apiKey: apiKey.trim(),
+    ...(typeof apiKey === "string" && apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
     ...(typeof baseUrl === "string" && baseUrl.trim() ? { baseUrl: baseUrl.trim() } : {}),
   };
 }

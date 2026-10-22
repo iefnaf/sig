@@ -911,4 +911,21 @@ export const MIGRATIONS: readonly Migration[] = [
       ignoringDuplicateColumn(() => { sql`ALTER TABLE sh_model ADD COLUMN baseUrl TEXT`; });
     },
   },
+  {
+    // Per-provider keys (issue #74): the credential registry lives in sh_provider_key, one
+    // sealed row per provider, so switching back to a provider never re-asks for its key.
+    // sh_model id=0 stays the active selection and keeps mirroring the selected provider's
+    // key in apiKeyEnc — a reader on pre-074 code (rollback to an older worker) still sees a
+    // consistent provider+key pair. An existing install's key moves over on migration.
+    id: "022_provider_keys",
+    up: (sql) => {
+      sql`CREATE TABLE IF NOT EXISTS sh_provider_key (
+        provider TEXT PRIMARY KEY,
+        apiKeyEnc TEXT NOT NULL,
+        updatedAt INTEGER NOT NULL
+      )`;
+      sql`INSERT OR IGNORE INTO sh_provider_key (provider, apiKeyEnc, updatedAt)
+        SELECT provider, apiKeyEnc, updatedAt FROM sh_model WHERE id = 0`;
+    },
+  },
 ];

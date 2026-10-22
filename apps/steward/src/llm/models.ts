@@ -53,6 +53,29 @@ export function mergeModelSelection(sealed: SealedModelSelection | null, vars: S
 /** ADR-0001 decision 11: the eval baseline. Changing it requires re-running the routing eval. */
 export const DEFAULT_MODEL_CONFIG: StewardModelConfig = { provider: "deepseek", modelId: "deepseek-flash", explicit: false };
 
+/** One catalog provider as the Settings page sees it (issue #74): pickable models included. */
+export interface ProviderCatalogEntry {
+  id: string;
+  name: string;
+  models: Array<{ id: string; name: string }>;
+}
+
+let catalogMemo: ProviderCatalogEntry[] | undefined;
+
+/** The builtin provider catalog (id, display name, chat models) — the list the Settings
+ *  dialog picks from. Static per deployment, so memoized; the shape is intentionally flat
+ *  and JSON-friendly (it rides /app/api/settings). */
+export function providerCatalog(): ProviderCatalogEntry[] {
+  if (!catalogMemo) {
+    catalogMemo = builtinProviders().map((provider) => ({
+      id: provider.id,
+      name: provider.name,
+      models: provider.getModels().map((model) => ({ id: model.id, name: model.name })),
+    }));
+  }
+  return catalogMemo;
+}
+
 /** Parses `vars.STEWARD_MODEL`; anything malformed falls back to the default. */
 export function resolveModelConfig(raw: unknown): StewardModelConfig {
   let parsed: unknown = raw;

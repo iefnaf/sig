@@ -72,6 +72,7 @@ import {
   buildStewardModels,
   installModel,
   mergeModelSelection,
+  providerCatalog,
   resolveModelConfig,
   type FauxRequestRecord,
   type StewardModels,
@@ -690,7 +691,12 @@ export class Steward extends Agent<Env> {
         budget: () => this.budgetState(),
         submitMessage: (input) => this.submitWorkspaceMessage(input),
         submitAction: (input) => this.submitWorkspaceAction(input),
-        settings: async () => ({ model: await this.llmSelection(), passkeys: this.web.listPasskeys() }),
+        settings: async () => ({
+          model: await this.llmSelection(),
+          passkeys: this.web.listPasskeys(),
+          providers: providerCatalog(),
+          keyedProviders: await this.keyedProviders(),
+        }),
         saveModel: async (input) => { await this.setModelConfig(input.provider, input.apiKey, input.modelId, input.baseUrl); },
         pairing: (id: string) => this.webPairing(id),
         revoke: (id: string) => { this.logChannel("web_machine_revoked", id); void this.revoke(id); },
@@ -2608,31 +2614,47 @@ export class Steward extends Agent<Env> {
   // row itself, this keeps the *wire* quiet too.
   private deliveryChain: Promise<void> = Promise.resolve();
 
-  // ---- Model credentials (spec §12.2  // ---- Model credentials (spec §12.2 "model keys stored encrypted", issue #27) ---------------
-  // The provider API key is AES-GCM sealed under SERVER_KEY exactly like the Feishu secrets
-  // (sh_model.apiKeyEnc); the plaintext exists only in transit and in memory. The LLM wiring
-  // (M2) reads it back through modelConfig(). Not reachable over HTTP — RPC on the stub only,
-  // which the routes-audit test pins down.
+  // ---- Model credentials (spec §12.2 "model keys stored encrypted", issues #27/#74) ---------------
+  // Provider API keys are AES-GCM sealed under SERVER_KEY exactly like the Feishu secrets
+  // (sh_provider_key.apiKeyEnc, one row per provider); the plaintext exists only in transit
+  // and in memory. sh_model id=0 is the active selection and mirrors the selected provider's
+  // key for pre-#74 readers. Not reachable over HTTP — RPC on the stub only, which the
+  // routes-audit test pins down.
 
   // ADR-0001 decision 11: the default provider for keys collected at deploy time (the model
   // itself is deepseek-flash); M2's setup/chat step can reconfigure via setModelConfig.
   static readonly DEFAULT_MODEL_PROVIDER = "deepseek";
 
   /**
-   * `modelId`/`baseUrl` are present for an owner-driven runtime switch (issue #70, the
-   * Settings page): once set, they win over vars.STEWARD_MODEL entirely (ensureRootModel),
-   * not just the provider. Omitting them (the MODEL_KEY seed path, and the pre-#70
-   * provider-only form) keeps the legacy behavior — vars still supply modelId/baseUrl.
+   * `apiKey` omitted (issue #74) means "keep the key already sealed for this provider" —
+   * switching provider or model no longer re-asks for a saved key. `modelId`/`baseUrl` are
+   * present for an owner-driven runtime switch (issue #70, the Settings page): once set,
+   * they win over vars.STEWARD_MODEL entirely (ensureRootModel). Omitting them (the
+   * MODEL_KEY seed path, and the pre-#70 provider-only form) keeps the legacy behavior —
+   * vars still supply modelId/baseUrl.
    */
-  async setModelConfig(provider: string, apiKey: string, modelId?: string, baseUrl?: string): Promise<void> {
-    if (!provider.trim() || !apiKey.trim()) throw new Error("provider and apiKey are required");
+  async setModelConfig(provider: string, apiKey?: string, modelId?: string, baseUrl?: string): Promise<void> {
+    if (!provider.trim()) throw new Error("provider is required");
+    const providerId = provider.trim();
     const [primary] = await this.serverKeys();
-    const apiKeyEnc = await sealSecret(primary!, apiKey);
+    const key = apiKey?.trim() || "";
+    // No key given: the selection moves to a provider whose key was sealed earlier, so mirror
+    // that stored key — a pre-#74 reader of sh_model keeps seeing a matching provider+key.
+    const sealedKey = key || (await this.sealedKeyFor(providerId)) || "";
+    const apiKeyEnc = sealedKey ? await sealSecret(primary!, sealedKey) : "";
+    if (key) {
+      this.sql`
+        INSERT INTO sh_provider_key (provider, apiKeyEnc, updatedAt)
+        VALUES (${providerId}, ${await sealSecret(primary!, key)}, ${Date.now()})
+        ON CONFLICT(provider) DO UPDATE SET
+          apiKeyEnc = excluded.apiKeyEnc, updatedAt = excluded.updatedAt
+      `;
+    }
     const modelIdValue = modelId?.trim() || null;
     const baseUrlValue = baseUrl?.trim() || null;
     this.sql`
       INSERT INTO sh_model (id, provider, apiKeyEnc, modelId, baseUrl, updatedAt)
-      VALUES (0, ${provider}, ${apiKeyEnc}, ${modelIdValue}, ${baseUrlValue}, ${Date.now()})
+      VALUES (0, ${providerId}, ${apiKeyEnc}, ${modelIdValue}, ${baseUrlValue}, ${Date.now()})
       ON CONFLICT(id) DO UPDATE SET
         provider = excluded.provider, apiKeyEnc = excluded.apiKeyEnc,
         modelId = excluded.modelId, baseUrl = excluded.baseUrl, updatedAt = excluded.updatedAt
@@ -2644,24 +2666,38 @@ export class Steward extends Agent<Env> {
     this.appliedRootModel = undefined;
   }
 
+  private async sealedKeyFor(provider: string): Promise<string | null> {
+    const row = this.sql<{ apiKeyEnc: string }>`SELECT apiKeyEnc FROM sh_provider_key WHERE provider = ${provider}`[0];
+    if (!row) return null;
+    const opened = await openSecret(await this.serverKeys(), row.apiKeyEnc);
+    return opened?.text ?? null;
+  }
+
   async modelConfig(): Promise<{ provider: string; modelId: string | null; baseUrl: string | null; apiKey: string } | null> {
     // One-click-deploy glue (issue #25, spec §12.1 step 1): MODEL_KEY — the secret the
     // Deploy-to-Cloudflare form collects — seeds the sealed config on first read, so the key
-    // never lives anywhere outside the user's own account. Seeding only fills an empty
-    // sh_model: an explicit setModelConfig (M2's setup/chat step, or the Settings switch)
-    // always wins, and the env secret is dead weight once the sealed row exists (delete it if
-    // you like).
-    if (this.sql`SELECT 1 AS one FROM sh_model WHERE id = 0`.length === 0 && this.env.MODEL_KEY?.trim()) {
+    // never lives anywhere outside the user's own account. Seeding fills an empty deployment
+    // only: an explicit setModelConfig (any provider's saved key counts, issue #74) always
+    // wins, and the env secret is dead weight once a sealed row exists (delete it if you like).
+    if (
+      this.env.MODEL_KEY?.trim() &&
+      this.sql`SELECT 1 AS one FROM sh_model WHERE id = 0`.length === 0 &&
+      !this.sql`SELECT 1 AS one FROM sh_provider_key WHERE provider = ${Steward.DEFAULT_MODEL_PROVIDER}`.length
+    ) {
       await this.setModelConfig(Steward.DEFAULT_MODEL_PROVIDER, this.env.MODEL_KEY.trim());
     }
-    const row = this.sql<{ provider: string; apiKeyEnc: string; modelId: string | null; baseUrl: string | null }>`
-      SELECT provider, apiKeyEnc, modelId, baseUrl FROM sh_model WHERE id = 0
+    const row = this.sql<{ provider: string; modelId: string | null; baseUrl: string | null }>`
+      SELECT provider, modelId, baseUrl FROM sh_model WHERE id = 0
     `[0];
     if (!row) return null;
-    const opened = await openSecret(await this.serverKeys(), row.apiKeyEnc);
-    // Sealed under a dropped key: report unconfigured rather than failing calls forever.
-    if (!opened) return null;
-    return { provider: row.provider, modelId: row.modelId, baseUrl: row.baseUrl, apiKey: opened.text };
+    // The key lives with the provider now (issue #74): a selection whose provider has no
+    // sealed key still resolves, keyless — apiKey: "" — and fails visibly at run time.
+    return { provider: row.provider, modelId: row.modelId, baseUrl: row.baseUrl, apiKey: (await this.sealedKeyFor(row.provider)) ?? "" };
+  }
+
+  /** Providers with a sealed key (issue #74): what the Settings page marks as ready to switch to. */
+  async keyedProviders(): Promise<string[]> {
+    return this.sql<{ provider: string }>`SELECT provider FROM sh_provider_key ORDER BY provider`.map((row) => row.provider);
   }
 
   /**
@@ -2691,7 +2727,7 @@ export class Steward extends Agent<Env> {
       baseUrl: config.baseUrl ?? null,
       explicitVars: vars.explicit,
       sealedProvider: sealed?.provider ?? null,
-      apiKey: Boolean(sealed && sealed.provider === config.provider),
+      apiKey: Boolean(sealed && sealed.provider === config.provider && sealed.apiKey),
       modelKnown: config.provider === "faux" || builtinProviders().some((p) => p.id === config.provider && p.getModels().some((m) => m.id === config.modelId)),
     };
   }
