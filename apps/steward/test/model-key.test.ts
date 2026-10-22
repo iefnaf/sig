@@ -21,7 +21,7 @@ beforeEach(async () => {
 describe("modelConfig: MODEL_KEY seeding", () => {
   it("seals the deploy-form key into sh_model on first read, under the default provider", async () => {
     const cfg = await ownerStub().modelConfig();
-    expect(cfg).toEqual({ provider: "deepseek", apiKey: env.MODEL_KEY });
+    expect(cfg).toEqual({ provider: "deepseek", modelId: null, baseUrl: null, apiKey: env.MODEL_KEY });
 
     // Sealed at rest (spec §12.2): the stored row never contains the plaintext key.
     const rows = await runInDurableObject(ownerStub(), (instance: Steward) =>
@@ -38,6 +38,6 @@ describe("modelConfig: MODEL_KEY seeding", () => {
   it("never overwrites an explicit config: setModelConfig beats the env seed", async () => {
     await ownerStub().setModelConfig("openai", "sk-explicit-setting");
     // A later read (what a fresh isolate's first modelConfig() would do) must keep it.
-    expect(await ownerStub().modelConfig()).toEqual({ provider: "openai", apiKey: "sk-explicit-setting" });
+    expect(await ownerStub().modelConfig()).toEqual({ provider: "openai", modelId: null, baseUrl: null, apiKey: "sk-explicit-setting" });
   });
 });
