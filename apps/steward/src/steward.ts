@@ -690,10 +690,14 @@ export class Steward extends Agent<Env> {
         budget: () => this.budgetState(),
         submitMessage: (input) => this.submitWorkspaceMessage(input),
         submitAction: (input) => this.submitWorkspaceAction(input),
-        settings: async () => ({ model: await this.llmSelection() }),
+        settings: async () => ({ model: await this.llmSelection(), passkeys: this.web.listPasskeys() }),
         saveModel: async (input) => { await this.setModelConfig(input.provider, input.apiKey, input.modelId, input.baseUrl); },
         pairing: (id: string) => this.webPairing(id),
         revoke: (id: string) => { this.logChannel("web_machine_revoked", id); void this.revoke(id); },
+        webauthnRegisterOptions: (sid: string, rpId: string) => this.web.webauthnRegisterOptions(sid, rpId),
+        webauthnRegisterVerify: (sid: string, rpId: string, origin: string, label: string, attestation: unknown) =>
+          this.web.webauthnRegisterVerify(sid, rpId, origin, label, attestation),
+        webauthnRemove: (credentialId: string) => this.web.removePasskey(credentialId),
       },
       sessionEnded: (sid) => this.closeWebSession({ sid }),
       shell: () => this.env.ASSETS.fetch(new Request("https://assets.invalid/workspace.html")),
@@ -1071,6 +1075,14 @@ export class Steward extends Agent<Env> {
       // index.ts verified the HMAC and expiry before forwarding; single-use is decided here.
       const secure = url.protocol === "https:" && url.hostname !== "localhost" && url.hostname !== "127.0.0.1";
       return this.web.openLink(url.pathname.slice("/link/".length), secure);
+    }
+    if (url.pathname === "/webauthn/login/verify" && request.method === "POST") {
+      // index.ts shape-checked the body (non-empty strings on the expected keys) and forwarded
+      // it unconditionally — the assertion's validity depends on a public key that only exists
+      // in this DO's SQLite, so there is no stateless pre-check available at the Worker layer.
+      const secure = url.protocol === "https:" && url.hostname !== "localhost" && url.hostname !== "127.0.0.1";
+      const body: unknown = await request.json();
+      return this.web.webauthnLoginVerify(url.hostname, url.origin, secure, body);
     }
     if ((url.pathname === "/app" || url.pathname.startsWith("/app/")) && (request.method === "GET" || request.method === "POST")) {
       return this.web.handle(request);

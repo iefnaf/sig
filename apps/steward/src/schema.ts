@@ -870,6 +870,35 @@ export const MIGRATIONS: readonly Migration[] = [
     },
   },
   {
+    // WebAuthn/passkey login (a second proof of the same owner, ADR-0003 — not multi-user):
+    // registered credentials, and the single-use nonce for the WebAuthn challenge token's own
+    // HMAC (mintWebauthnChallenge/verifyWebauthnChallenge, web.ts). Unlike sh_web_link, the
+    // nonce row is written once, at verify time — the challenge token is fully self-describing
+    // (purpose/sid/expiry/nonce, all HMAC'd), so nothing needs a pre-registered row to be
+    // meaningful, only to be spent exactly once (web.ts's #consumeWebauthnNonce). `rpId` is
+    // recorded per credential (not just trusted from the live request at verify time) purely
+    // as a diagnostic: WebAuthn ties a credential to the RP ID it was registered under, so if
+    // the deployment's effective hostname ever changes, every passkey stops working, and this
+    // column is what tells the owner why.
+    id: "021_webauthn",
+    up: (sql) => {
+      sql`CREATE TABLE IF NOT EXISTS sh_web_credential (
+        credentialId TEXT PRIMARY KEY,
+        publicKeyCose TEXT NOT NULL,
+        signCount INTEGER NOT NULL DEFAULT 0,
+        label TEXT NOT NULL,
+        transports TEXT,
+        rpId TEXT NOT NULL,
+        createdAt INTEGER NOT NULL,
+        lastUsedAt INTEGER
+      )`;
+      sql`CREATE TABLE IF NOT EXISTS sh_web_webauthn_nonce (
+        nonce TEXT PRIMARY KEY,
+        usedAt INTEGER NOT NULL
+      )`;
+    },
+  },
+  {
     // Runtime model switching (issue #70): the Settings page picks provider + modelId (and
     // optionally baseUrl) without a redeploy. Both columns are nullable — a row seeded only
     // from MODEL_KEY or an older setModelConfig(provider, apiKey) call keeps modelId/baseUrl

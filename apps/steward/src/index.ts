@@ -3,7 +3,7 @@ import { parseToken } from "@nightboats/protocol";
 import { bearer, resolveServerKeys } from "./auth.ts";
 import { AVATAR_PATH, LOGO_PATH, BRAND_HEAD, BRAND_LOCKUP, BRAND_STYLE } from "./brand.ts";
 import { Steward } from "./steward.ts";
-import { parseSessionCookie, verifyLinkToken } from "./web.ts";
+import { LOGIN_SCRIPT_PATH, mintWebauthnChallenge, parseSessionCookie, verifyLinkToken } from "./web.ts";
 
 export { Steward };
 
@@ -54,11 +54,41 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    // Brand assets are public and do not wake the Durable Object. Everything else
-    // continues through the existing authentication gates, including unknown assets.
+    // Brand assets and the pre-session passkey sign-in script are public and do not wake the
+    // Durable Object. Everything else continues through the existing authentication gates,
+    // including unknown assets.
     if ((request.method === "GET" || request.method === "HEAD") &&
-        (url.pathname === LOGO_PATH || url.pathname === AVATAR_PATH)) {
+        (url.pathname === LOGO_PATH || url.pathname === AVATAR_PATH || url.pathname === LOGIN_SCRIPT_PATH)) {
       return env.ASSETS.fetch(request);
+    }
+
+    // The WebAuthn login ceremony's two legs (candidate-2 design): minting a challenge needs no
+    // credential at all, so it is answered entirely by the Worker, with no DO wake — unlike
+    // /pair, there is nothing to rate-limit here because nobody has proven anything yet.
+    if (url.pathname === "/webauthn/login/options" && request.method === "POST") {
+      const { challenge, token, expiresAt } = await mintWebauthnChallenge(webVerifyKeys(env)[0]!, "authenticate", "-");
+      return json({ challenge, challengeToken: token, rpId: url.hostname, expiresAt });
+    }
+    // Verifying an assertion needs the stored public key, which only exists in DO SQLite —
+    // there is no stateless pre-check available (the /pair shape, not the /link shape). The
+    // body is shape-checked (strings present, non-empty) but not crypto-pre-checked; a bad
+    // assertion still wakes the DO once and fails fast there. `request.clone()` lets the body
+    // be read here for the shape check AND forwarded intact afterward — reading `request`
+    // itself would consume the stream `stub.fetch(request)` needs.
+    if (url.pathname === "/webauthn/login/verify" && request.method === "POST") {
+      let body: unknown;
+      try {
+        body = await request.clone().json();
+      } catch {
+        return json({ error: "bad_request" }, 400);
+      }
+      const a = (body ?? {}) as Record<string, unknown>;
+      const keys = ["challengeToken", "credentialId", "clientDataJSON", "authenticatorData", "signature"];
+      if (!keys.every((k) => typeof a[k] === "string" && (a[k] as string).length > 0)) {
+        return json({ error: "bad_request" }, 400);
+      }
+      const stub = await getAgentByName(env.Steward, "owner");
+      return stub.fetch(request);
     }
 
     if (url.pathname === "/pair" && request.method === "POST") {

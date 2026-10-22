@@ -31,6 +31,19 @@ export interface WorkspaceApiDeps {
   saveModel?(input: { provider: string; modelId: string; apiKey: string; baseUrl?: string }): Promise<void>;
   pairing?(id: string): Promise<{ code: string; expiresAt: number }>;
   revoke?(deviceId: string): void;
+  /** `attestation`/the WebAuthn wire fields stay `unknown` here on purpose (synthesis graft 1):
+   *  only webauthn.ts's verifyRegistrationResponse/verifyAssertionResponse ever assert their
+   *  shape — this layer validates only that the JSON body is an object with the right keys
+   *  present as non-empty strings, same depth as every other branch below. */
+  webauthnRegisterOptions?(sid: string, rpId: string): Promise<{
+    challenge: string;
+    challengeToken: string;
+    rpId: string;
+    userId: string;
+    excludeCredentials: { id: string; transports: string[] }[];
+  }>;
+  webauthnRegisterVerify?(sid: string, rpId: string, origin: string, label: string, attestation: unknown): Promise<void>;
+  webauthnRemove?(credentialId: string): void;
 }
 
 export interface ApiSession {
@@ -149,6 +162,24 @@ export async function handleWorkspaceApi(request: Request, url: URL, session: Ap
       const { deviceId } = await readJson(request);
       if (typeof deviceId !== "string" || !deps.devices().some(d => d.deviceId === deviceId)) return json({ error: "not_found" }, 404);
       deps.revoke(deviceId);
+      return json({ ok: true });
+    }
+    if (url.pathname === "/app/api/settings/webauthn/register/options" && deps.webauthnRegisterOptions) {
+      return json(await deps.webauthnRegisterOptions(session.sid, url.hostname));
+    }
+    if (url.pathname === "/app/api/settings/webauthn/register/verify" && deps.webauthnRegisterVerify) {
+      const { challengeToken, clientDataJSON, attestationObject, label } = await readJson(request);
+      if (typeof challengeToken !== "string" || typeof clientDataJSON !== "string" || typeof attestationObject !== "string") {
+        return json({ error: "bad_request" }, 400);
+      }
+      if (typeof label !== "string" || !label.trim() || label.length > 80) return json({ error: "bad_request" }, 400);
+      await deps.webauthnRegisterVerify(session.sid, url.hostname, url.origin, label.trim(), { challengeToken, clientDataJSON, attestationObject });
+      return json({ ok: true });
+    }
+    if (url.pathname === "/app/api/settings/webauthn/remove" && deps.webauthnRemove) {
+      const { credentialId } = await readJson(request);
+      if (typeof credentialId !== "string" || !credentialId) return json({ error: "bad_request" }, 400);
+      deps.webauthnRemove(credentialId);
       return json({ ok: true });
     }
     if (url.pathname === "/app/api/messages") {

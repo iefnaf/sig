@@ -19,7 +19,12 @@ async function fetchAsset(name: string): Promise<Response> {
 
 const asset = async (name: string): Promise<string> => (await fetchAsset(name)).text();
 
-const SCRIPTS = ["workspace.js", "dom.js", "format.js", "model.js", "i18n.js", "markup.js", "session.js", "session-model.js"];
+// login.js is the pre-session sign-in script: it ships as its own public asset (not under the
+// session-gated /app/assets/* tree) and deliberately does not import i18n.js (candidate-2
+// design §6) — it is included here for the sink scan and the import-export check (it has no
+// imports, so that check is a no-op for it) but NOT in the i18n-completeness scan below, whose
+// own file list is separate and intentionally does not reach it.
+const SCRIPTS = ["workspace.js", "dom.js", "format.js", "model.js", "i18n.js", "markup.js", "session.js", "session-model.js", "login.js"];
 
 /** The text between the parentheses of every call to `fn(…)` (not `x.fn(…)`, not `prefixfn(…)`). */
 function callArguments(source: string, fn: string): string[] {
