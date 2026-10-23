@@ -1,5 +1,14 @@
 import { Agent } from "agents";
-import { buildHello, scriptForStartWorker, workerEvent, type MachinePhase, type StoredCredentials, type WorkerSnapshot } from "./protocol.ts";
+import {
+  browseDirectory,
+  buildHello,
+  registerRepository,
+  scriptForStartWorker,
+  workerEvent,
+  type MachinePhase,
+  type StoredCredentials,
+  type WorkerSnapshot,
+} from "./protocol.ts";
 
 interface PairResponse {
   deviceId?: unknown;
@@ -213,6 +222,15 @@ export class PreviewMachine extends Agent<Env> {
       this.setPhase("welcomed", undefined, null);
       return;
     }
+    if (message.t === "directory_list") {
+      if (typeof message.id !== "string") return;
+      this.send({
+        t: "directory_listing",
+        re: message.id,
+        ...browseDirectory({ path: message.path, showHidden: message.showHidden }),
+      });
+      return;
+    }
     if (message.t === "cmd" && typeof message.id === "string" && typeof message.kind === "string") {
       await this.handleCommand(socket, message.id, message.kind, (message.args ?? {}) as Record<string, unknown>);
     }
@@ -233,6 +251,21 @@ export class PreviewMachine extends Agent<Env> {
       INSERT INTO command_result (cmdId, state, result) VALUES (${cmdId}, 'accepted', NULL)
     `;
     this.send({ t: "cmd_ack", re: cmdId, status: "accepted" });
+
+    if (kind === "register_repo") {
+      const registration = registerRepository(args.path);
+      if (!registration.ok) {
+        const error = { code: registration.code };
+        this.finishCommand(cmdId, false, error);
+        this.send({ t: "cmd_ack", re: cmdId, status: "rejected", code: registration.code });
+        this.send({ t: "cmd_result", re: cmdId, ok: false, error });
+        return;
+      }
+      const data = { repo: registration.repo };
+      this.finishCommand(cmdId, true, data);
+      this.send({ t: "cmd_result", re: cmdId, ok: true, data });
+      return;
+    }
 
     if (kind === "start_worker") {
       const script = scriptForStartWorker(args);
