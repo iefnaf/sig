@@ -75,12 +75,33 @@ jobs:
           output_file="$RUNNER_TEMP/wrangler-preview.json"
           json_file="$RUNNER_TEMP/wrangler-preview-payload.json"
           login_body_file="$RUNNER_TEMP/login-link-response.json"
+          preview_name="pr-${{ github.event.pull_request.number }}"
+          preview_delete_body_file="$RUNNER_TEMP/preview-delete-response.json"
+          preview_delete_status="$(curl --silent --show-error --output "$preview_delete_body_file" \
+            --write-out '%{http_code}' \
+            --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/workers/sig-steward/previews/$preview_name")"
+          case "$preview_delete_status" in
+            200)
+              pnpm --filter @nightboats/steward exec wrangler preview delete \
+                --config ../../wrangler.preview.jsonc \
+                --name "$preview_name" \
+                --skip-confirmation
+              ;;
+            404)
+              echo "Preview $preview_name is absent; creating a fresh deployment."
+              ;;
+            *)
+              cat "$preview_delete_body_file" >&2
+              exit 1
+              ;;
+          esac
           printf 'SERVER_KEY=%s\n' "$preview_key" > "$secrets_file"
           trap 'rm -f "$secrets_file"' EXIT
 
           pnpm --filter @nightboats/steward exec wrangler preview \
             --config ../../wrangler.preview.jsonc \
-            --name "pr-${{ github.event.pull_request.number }}" \
+            --name "$preview_name" \
             --secrets-file "$secrets_file" \
             --json > "$output_file"
 
