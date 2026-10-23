@@ -111,11 +111,15 @@ jobs:
           printf 'SERVER_KEY=%s\n' "$preview_key" > "$secrets_file"
           trap 'rm -f "$secrets_file"' EXIT
 
-          pnpm --filter @nightboats/steward exec wrangler preview \
+          if ! pnpm --filter @nightboats/steward exec wrangler preview \
             --config ../../wrangler.preview.jsonc \
             --name "$preview_name" \
             --secrets-file "$secrets_file" \
-            --json > "$output_file"
+            --json > "$output_file"; then
+            echo "Steward preview deployment failed; Wrangler payload:"
+            cat "$output_file" >&2
+            exit 1
+          fi
 
           node - "$output_file" "$json_file" <<'NODE'
           const fs = require("node:fs");
@@ -169,11 +173,15 @@ jobs:
           printf 'PREVIEW_MACHINE_KEY=%s\n' "$machine_key" > "$machine_secrets_file"
           trap 'rm -f "$secrets_file" "$machine_secrets_file"' EXIT
 
-          pnpm --filter @nightboats/steward exec wrangler preview \
+          if ! pnpm --filter @nightboats/steward exec wrangler preview \
             --config ../../wrangler.machine-preview.jsonc \
             --name "$machine_name" \
             --secrets-file "$machine_secrets_file" \
-            --json > "$machine_output_file"
+            --json > "$machine_output_file"; then
+            echo "Simulated machine preview deployment failed; Wrangler payload:"
+            cat "$machine_output_file" >&2
+            exit 1
+          fi
 
           node - "$machine_output_file" "$machine_json_file" <<'NODE'
           const fs = require("node:fs");
