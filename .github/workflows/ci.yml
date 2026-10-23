@@ -193,7 +193,7 @@ jobs:
           if (start === -1 || end <= start) throw new Error("Wrangler preview output has no JSON payload");
           fs.writeFileSync(output, text.slice(start, end + 1));
           NODE
-          machine_url="$(jq -er '.preview.urls[] | select(endswith(".previews.iefnaf.cc"))' "$machine_json_file")"
+          machine_url="$(jq -er '.preview.urls[0]' "$machine_json_file")"
 
           last_machine_status=000
           for attempt in $(seq 1 45); do
