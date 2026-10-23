@@ -117,7 +117,7 @@ import { ambiguousWakeText, commandAttentionWakeText, escapeMarkers, verifyWakeT
 import { WorkspaceError, cardOpen, cardView, type WorkspaceActionInput, type WorkspaceInput } from "./workspace.ts";
 import type { MachineDirectoryInput, MachineDirectoryResult } from "./workspace-api.ts";
 import { WorkspaceStream } from "./workspace-stream.ts";
-import { WebApp, linkTargetForThread, parseSessionCookie } from "./web.ts";
+import { WebApp, linkTargetForThread, loginLinkPolicyFromEnv, parseSessionCookie } from "./web.ts";
 
 /** Messages the workspace will queue before telling the owner to wait for the steward to catch up. */
 const MAX_OPEN_USER_RUNS = 10;
@@ -688,6 +688,7 @@ export class Steward extends Agent<Env> {
     return (this.web_ ??= new WebApp({
       sql: this.sql.bind(this) as unknown as import("./schema.ts").SqlExecutor,
       secrets: [this.env.SERVER_KEY, this.env.SERVER_KEY_PREVIOUS].filter((k): k is string => typeof k === "string" && k.length > 0),
+      loginLinkPolicy: loginLinkPolicyFromEnv(this.env.LOGIN_LINK_TTL_MS, this.env.LOGIN_LINK_REUSABLE),
       ledger: this.ledger,
       listDevices: () =>
         this.sql<{ deviceId: string; name: string | null; revoked: number }>`

@@ -94,23 +94,38 @@ jobs:
           fs.writeFileSync(output, text.slice(start, end + 1));
           NODE
           preview_url="$(jq -er '.preview.urls[] | select(endswith(".previews.iefnaf.cc"))' "$json_file")"
-          login_status=000
+          login_url=""
+          last_login_status=000
+          last_first_open=000
+          last_second_open=000
           for attempt in $(seq 1 45); do
             login_status="$(curl --silent --show-error --request POST "$preview_url/api/login-link" \
               --header "Authorization: Bearer $preview_key" \
               --header 'content-type: application/json' \
               --data '{}' --output "$login_body_file" --write-out '%{http_code}')" || login_status=000
+            last_login_status="$login_status"
             if [ "$login_status" -ge 200 ] && [ "$login_status" -lt 300 ]; then
-              break
+              candidate_url="$(jq -er '.url' "$login_body_file")"
+              first_open="$(curl --silent --show-error --request GET "$candidate_url" \
+                --output /dev/null --write-out '%{http_code}')" || first_open=000
+              last_first_open="$first_open"
+              if [ "$first_open" -eq 303 ]; then
+                second_open="$(curl --silent --show-error --request GET "$candidate_url" \
+                  --output /dev/null --write-out '%{http_code}')" || second_open=000
+                last_second_open="$second_open"
+                if [ "$second_open" -eq 303 ]; then
+                  login_url="$candidate_url"
+                  break
+                fi
+              fi
             fi
             sleep 2
           done
-          if [ "$login_status" -lt 200 ] || [ "$login_status" -ge 300 ]; then
-            echo "Login-link request did not become available; last HTTP status was $login_status:"
+          if [ -z "$login_url" ]; then
+            echo "Reusable login link did not become available; last statuses were login=$last_login_status first_open=$last_first_open second_open=$last_second_open:"
             cat "$login_body_file" >&2
             exit 1
           fi
-          login_url="$(jq -er '.url' "$login_body_file")"
 
           printf 'preview_url=%s\n' "$preview_url" >> "$GITHUB_OUTPUT"
           printf 'login_url=%s\n' "$login_url" >> "$GITHUB_OUTPUT"
@@ -122,8 +137,8 @@ jobs:
           {
             printf '%s\n' '### Cloudflare Preview'
             printf '%s\n' "Preview URL: ${{ steps.preview.outputs.preview_url }}"
-            printf '%s\n' "One-time sign-in (15 minutes, one use): ${{ steps.preview.outputs.login_url }}"
-            printf '%s\n' 'The preview uses the zero-cost faux model. Each push rotates the preview key, so use the latest sign-in link.'
+            printf '%s\n' "Sign-in (24 hours, reusable): ${{ steps.preview.outputs.login_url }}"
+            printf '%s\n' 'The preview uses the zero-cost faux model. Each push rotates the preview key, so use the latest sign-in link. Closing the pull request deletes the preview.'
           } > "$body_file"
           gh pr comment "${{ github.event.pull_request.number }}" \
             --edit-last --create-if-none --body-file "$body_file"

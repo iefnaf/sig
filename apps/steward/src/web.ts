@@ -1,13 +1,13 @@
 // The signed-link web (issue #22, spec §7.3–7.4 / §12.2, steward.md §10; ADR-0001 decisions
-// 7 and 12, superseded by ADR-0005): the only door into the web app is a one-time link —
+// 7 and 12, superseded by ADR-0005): the only door into the web app is a signed login link
 // minted by `POST /api/login-link` (the SERVER_KEY holder, ADR-0003) or a card's 查看详情
-// button. Opening it exchanges the single-use, short-expiry token for a session cookie bound
-// to the owner; the session opens the web workspace (workspace.ts / workspace-api.ts: a
-// static page that talks to a small JSON API), plus the server-rendered machine and
-// raw-process pages.
+// button. Production links are single-use and short-expiry; Preview deployments can make
+// them reusable. Opening one exchanges the token for a session cookie bound to the owner;
+// the session opens the web workspace (workspace.ts / workspace-api.ts: a static page that
+// talks to a small JSON API), plus the server-rendered machine and raw-process pages.
 //
 // Token formats (SERVER_KEY-signed, rotatable like every other MAC in the deployment):
-//   link    wl1.<target>.<expiresAt>.<nonce>.<mac>   one use, ≤15 min
+//   link    wl1.<target>.<expiresAt>.<nonce>.<mac>   production: one use, ≤15 min
 //   session ws1.<sid>.<mac>                           random sid, DB-backed, 7 days
 // The Worker layer verifies the HMACs statelessly (index.ts) so blind probes never wake the
 // Durable Object; single-use and session liveness are DB facts, checked here.
@@ -36,6 +36,26 @@ export const SESSION_COOKIE = "sig_session";
 export const WEBAUTHN_CHALLENGE_TTL_MS = 60_000;
 
 const enc = new TextEncoder();
+
+export interface LoginLinkPolicy {
+  ttlMs: number;
+  singleUse: boolean;
+}
+
+export const DEFAULT_LOGIN_LINK_POLICY: LoginLinkPolicy = { ttlMs: LINK_TTL_MS, singleUse: true };
+
+function positiveDurationMs(value: string | number | undefined, fallback: number): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+export function loginLinkPolicyFromEnv(
+  ttlMs: string | number | undefined,
+  reusableLink: string | boolean | undefined,
+): LoginLinkPolicy {
+  const reusable = reusableLink === true || reusableLink === "true";
+  return { ttlMs: positiveDurationMs(ttlMs, LINK_TTL_MS), singleUse: !reusable };
+}
 
 async function hmacKey(secret: string, usage: KeyUsage[]): Promise<CryptoKey> {
   return crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, usage);
@@ -259,6 +279,7 @@ export interface WebDeps {
     | "webauthnRemove"
   >;
   sessionEnded?(sid: string): void;
+  loginLinkPolicy?: LoginLinkPolicy;
   now?(): number;
 }
 
@@ -277,7 +298,7 @@ function esc(text: string): string {
  *  string table instead. */
 export const LOGIN_SCRIPT_PATH = "/login.js";
 
-function loginPromptPage(message: string, status: number): Response {
+function loginPromptPage(message: string, status: number, policy: LoginLinkPolicy = DEFAULT_LOGIN_LINK_POLICY): Response {
   const html = `<!doctype html>
 <html lang="zh-CN">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex">
@@ -290,7 +311,7 @@ ${BRAND_LOCKUP}
 <p>${esc(message)}</p>
 <p><button id="passkey-signin" type="button" hidden>使用通行密钥登录</button></p>
 <p id="passkey-status" hidden></p>
-<p class="hint">新的登录链接用 <code>POST /api/login-link</code> 签发（15 分钟内有效，只能打开一次）。</p>
+<p class="hint">新的登录链接用 <code>POST /api/login-link</code> 签发（${policy.singleUse ? "只能打开一次" : "在有效期内可重复打开"}，${Math.floor(policy.ttlMs / 60_000)} 分钟内有效）。</p>
 <script type="module" src="${LOGIN_SCRIPT_PATH}"></script>
 </main></body></html>`;
   return new Response(html, {
@@ -314,6 +335,10 @@ ${BRAND_LOCKUP}
 export class WebApp {
   readonly #deps: WebDeps;
   constructor(deps: WebDeps) {
+    const policy = deps.loginLinkPolicy;
+    if (policy && (!Number.isSafeInteger(policy.ttlMs) || policy.ttlMs < 1)) {
+      throw new RangeError("login link TTL must be positive");
+    }
     this.#deps = deps;
   }
 
@@ -342,11 +367,12 @@ export class WebApp {
     return (this.#sql<{ origin: string }>`SELECT origin FROM sh_deploy WHERE id = 1`[0]?.origin ?? null);
   }
 
-  /** Absolute one-time URL for a message card's 查看详情 button, or null before any origin is known. */
+  /** Absolute login URL for a message card's 查看详情 button, or null before any origin is known. */
   async linkUrl(target: string): Promise<string | null> {
     const origin = this.origin();
     if (!origin) return null;
-    const { token, expiresAt } = await mintLinkToken(this.#deps.secrets[0]!, target, this.#now());
+    const policy = this.#deps.loginLinkPolicy ?? DEFAULT_LOGIN_LINK_POLICY;
+    const { token, expiresAt } = await mintLinkToken(this.#deps.secrets[0]!, target, this.#now(), policy.ttlMs);
     this.#sql`
       INSERT INTO sh_web_link (tokenHash, target, expiresAt, createdAt)
       VALUES (${await sha256Hex(token)}, ${target}, ${expiresAt}, ${this.#now()})
@@ -356,21 +382,25 @@ export class WebApp {
 
   // ---- the link → session exchange ----------------------------------------------------------------
 
-  /** Consumes a verified link token: single-use, short expiry; mints the owner session. */
+  /** Consumes a verified link token and mints the owner session. */
   async openLink(token: string, secure: boolean): Promise<Response> {
     const hash = await sha256Hex(token);
-    // Conditional consume (spike bug 1's pattern): exactly one concurrent open can flip
-    // usedAt from NULL — the loser sees changes() == 0 and is told the link is spent.
-    this.#sql`
-      UPDATE sh_web_link SET usedAt = ${this.#now()}
-      WHERE tokenHash = ${hash} AND usedAt IS NULL AND expiresAt > ${this.#now()}
-    `;
-    const consumed = this.#sql<{ changes: number }>`SELECT changes() AS changes`[0]!.changes > 0;
     const row = this.#sql<{ target: string; usedAt: number | null; expiresAt: number }>`
       SELECT target, usedAt, expiresAt FROM sh_web_link WHERE tokenHash = ${hash}
     `[0];
-    if (!row) return loginPromptPage("链接无效。", 403);
-    if (!consumed) return loginPromptPage(row.expiresAt <= this.#now() ? "链接已过期。" : "链接已使用过，只能打开一次。", 410);
+    const policy = this.#deps.loginLinkPolicy ?? DEFAULT_LOGIN_LINK_POLICY;
+    if (!row) return loginPromptPage("链接无效。", 403, policy);
+    if (row.expiresAt <= this.#now()) return loginPromptPage("链接已过期。", 410, policy);
+    if (policy.singleUse) {
+      // Conditional consume (spike bug 1's pattern): exactly one concurrent open can flip
+      // usedAt from NULL — the loser sees changes() == 0 and is told the link is spent.
+      this.#sql`
+        UPDATE sh_web_link SET usedAt = ${this.#now()}
+        WHERE tokenHash = ${hash} AND usedAt IS NULL AND expiresAt > ${this.#now()}
+      `;
+      const consumed = this.#sql<{ changes: number }>`SELECT changes() AS changes`[0]!.changes > 0;
+      if (!consumed) return loginPromptPage("链接已使用过，只能打开一次。", 410, policy);
+    }
     const location = row.target === "home" ? "/app" : `/app/threads/${row.target.replace(/^t\//, "")}`;
     const { cookie } = await this.openSession(secure);
     return new Response(null, { status: 303, headers: { location, "set-cookie": cookie } });

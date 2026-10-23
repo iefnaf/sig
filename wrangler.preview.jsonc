@@ -20,7 +20,9 @@
   "previews": {
     "observability": { "enabled": true },
     "vars": {
-      "STEWARD_MODEL": "{\"provider\":\"faux\",\"modelId\":\"faux-1\"}"
+      "STEWARD_MODEL": "{\"provider\":\"faux\",\"modelId\":\"faux-1\"}",
+      "LOGIN_LINK_TTL_MS": "86400000",
+      "LOGIN_LINK_REUSABLE": "true"
     },
     "durable_objects": {
       "bindings": [{ "name": "Steward", "class_name": "Steward" }]
