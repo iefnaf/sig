@@ -73,6 +73,7 @@ jobs:
           preview_key="$(openssl rand -hex 32)"
           secrets_file="$RUNNER_TEMP/preview-secrets.env"
           output_file="$RUNNER_TEMP/wrangler-preview.json"
+          json_file="$RUNNER_TEMP/wrangler-preview-payload.json"
           printf 'SERVER_KEY=%s\n' "$preview_key" > "$secrets_file"
           trap 'rm -f "$secrets_file"' EXIT
 
@@ -82,7 +83,16 @@ jobs:
             --secrets-file "$secrets_file" \
             --json > "$output_file"
 
-          preview_url="$(jq -er '.preview.urls[0]' "$output_file")"
+          node - "$output_file" "$json_file" <<'NODE'
+          const fs = require("node:fs");
+          const [input, output] = process.argv.slice(2);
+          const text = fs.readFileSync(input, "utf8");
+          const start = text.indexOf("{");
+          const end = text.lastIndexOf("}");
+          if (start === -1 || end <= start) throw new Error("Wrangler preview output has no JSON payload");
+          fs.writeFileSync(output, text.slice(start, end + 1));
+          NODE
+          preview_url="$(jq -er '.preview.urls[0]' "$json_file")"
           login_url="$(curl --fail --silent --show-error --request POST "$preview_url/api/login-link" \
             --header "Authorization: Bearer $preview_key" \
             --header 'content-type: application/json' \
