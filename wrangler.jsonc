@@ -39,6 +39,7 @@
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Steward"] }],
   "previews": {
+    "observability": { "enabled": true },
     "vars": {
       "STEWARD_MODEL": "{\"provider\":\"faux\",\"modelId\":\"faux-1\"}"
     },
