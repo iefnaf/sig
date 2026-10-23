@@ -39,7 +39,7 @@ function constantTimeEquals(got: string, want: string): boolean {
 
 function websocketUrl(serverUrl: string): string {
   const url = new URL(serverUrl);
-  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  url.protocol = url.protocol === "https:" ? "https:" : "http:";
   url.pathname = "/agents/steward/owner";
   url.search = "?role=connector&proto=1";
   return url.toString();
