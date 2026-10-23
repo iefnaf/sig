@@ -253,6 +253,7 @@ export interface WebDeps {
     | "testModel"
     | "pairing"
     | "revoke"
+    | "addDirectory"
     | "webauthnRegisterOptions"
     | "webauthnRegisterVerify"
     | "webauthnRemove"

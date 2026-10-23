@@ -1,5 +1,15 @@
 // Commands (DO -> connector) and their acks/results, docs/design/connector-do-protocol.md §4.2, §6.2-6.3.
 import { z } from "zod";
+import { RepoSchema } from "./messages.ts";
+
+export const RegisterRepoArgsSchema = z.strictObject({
+  path: z.string().min(1).max(4096).regex(/^[^\0]+$/),
+});
+
+export const RegisterRepoResultSchema = z.object({
+  repo: RepoSchema.refine((repo) => repo.repoId !== "" && repo.name !== "" && repo.path !== ""),
+});
+export type RegisterRepoResult = z.infer<typeof RegisterRepoResultSchema>;
 
 export const CmdMessageSchema = z.object({
   t: z.literal("cmd"),

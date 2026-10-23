@@ -251,6 +251,16 @@ dialog::backdrop { background: #29382438; backdrop-filter: blur(2px); }
 .machine-card dl > div { display: grid; grid-template-columns: 85px 1fr; gap: 8px; padding: 4px 0; }
 .machine-card dt { color: #91a17e; }
 .machine-card dd { margin: 0; color: #677f55; overflow-wrap: anywhere; }
+.machine-card .directory-help { margin-top: 10px; line-height: 1.7; font-size: 11px; }
+.directory-form { margin-top: 14px; }
+.directory-form label { display: block; font-size: 12px; color: #647653; }
+.directory-form input { box-sizing: border-box; width: 100%; margin: 8px 0; padding: 9px 10px; border: 1px solid #dce4d2; border-radius: 5px; font: inherit; font-size: 12px; color: var(--ink); background: #fff; }
+.directory-form input:focus { outline: 2px solid #a7ba8f; outline-offset: 1px; }
+.directory-form .dialog-actions { margin-top: 8px; }
+.machine-card .directory-error { color: #a34238; font-size: 11px; line-height: 1.7; }
+.machine-card .directory-message, .machine-card .directory-result p { font-size: 11px; line-height: 1.7; }
+.directory-result { margin-top: 12px; }
+.directory-result code { display: block; overflow-wrap: anywhere; font-size: 11px; color: #677f55; margin-top: 5px; }
 .machine-help { margin: 18px 0 0; }
 .raw-entry { padding: 14px 0; border-top: 1px solid #e3e9db; }
 .raw-entry strong { font-size: 10px; color: #869e6d; font-weight: 500; }

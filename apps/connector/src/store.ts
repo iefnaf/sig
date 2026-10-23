@@ -214,9 +214,6 @@ export class LocalStore {
   }
 
   // --- Repositories (connector-pi.md §8.1) ---------------------------------------------
-  // The connector starts workers only in registered repositories, so even a compromised
-  // steward cannot make it start an agent in an arbitrary directory.
-
   addRepo(repo: {
     repoId: string;
     name: string;

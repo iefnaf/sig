@@ -12,7 +12,7 @@ const AgentCapabilitySchema = z.object({
   capabilities: z.record(z.string(), z.boolean()),
 });
 
-const RepoSchema = z.object({
+export const RepoSchema = z.object({
   repoId: z.string(),
   name: z.string(),
   path: z.string(),

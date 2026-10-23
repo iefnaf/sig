@@ -5,9 +5,11 @@
 // On boot the §9.1 reconciliation runs BEFORE the first hello, so the hello.workers snapshot
 // the DO reconciles against already reflects the crash (issue #12).
 import os from "node:os";
+import { isAbsolute, join } from "node:path";
 import { ConnectorClient, type ClientOptions } from "./client.ts";
 import { CommandLog, type CommandResult } from "./commands.ts";
-import type { CmdMessage } from "@nightboats/protocol";
+import { RegisterRepoArgsSchema, type CmdMessage } from "@nightboats/protocol";
+import { registerRepository } from "./repository.ts";
 import { EventLog } from "./events.ts";
 import type { LocalStore } from "./store.ts";
 import type { StallWatchdogOptions } from "./watchdog.ts";
@@ -149,6 +151,13 @@ export class ConnectorApp {
       if (cmd.kind === "reconcile") {
         // protocol §6.2: a fresh hello.workers snapshot on demand.
         data = { workers: this.workersSnapshot() };
+      } else if (cmd.kind === "register_repo") {
+        const parsed = RegisterRepoArgsSchema.safeParse(cmd.args);
+        if (!parsed.success) throw new CommandError("invalid_directory", "Choose an existing Git directory on this machine.");
+        const requested = parsed.data.path;
+        const path = requested === "~" ? os.homedir() : requested.startsWith("~/") ? join(os.homedir(), requested.slice(2)) : requested;
+        if (!isAbsolute(path)) throw new CommandError("invalid_directory", "Use an absolute path or ~/path on this machine.");
+        data = { repo: await registerRepository({ store: this.store, path }) };
       } else {
         data = await this.manager.handleCommand(cmd.id, cmd.kind, cmd.args ?? {}, cmd.workerId);
       }

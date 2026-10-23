@@ -40,11 +40,13 @@ import {
   HistoryOpenMessageSchema,
   PingMessageSchema,
   PROTOCOL_VERSION,
+  RegisterRepoResultSchema,
   generatePairingCode,
   mintToken,
   parseToken,
   ulid,
   type CmdMessage,
+  type CmdResult,
   type ErrorMessage,
   type EventsAckMessage,
   type HistoryReqMessage,
@@ -113,6 +115,7 @@ import { MIGRATIONS, runMigrations } from "./schema.ts";
 import { openSecret, sealSecret } from "./secretbox.ts";
 import { ambiguousWakeText, commandAttentionWakeText, escapeMarkers, verifyWakeText } from "./wake-text.ts";
 import { WorkspaceError, cardOpen, cardView, type WorkspaceActionInput, type WorkspaceInput } from "./workspace.ts";
+import type { MachineDirectoryInput, MachineDirectoryResult } from "./workspace-api.ts";
 import { WorkspaceStream } from "./workspace-stream.ts";
 import { WebApp, linkTargetForThread, parseSessionCookie } from "./web.ts";
 
@@ -717,6 +720,7 @@ export class Steward extends Agent<Env> {
         selectModel: (input) => this.selectComposerModel(input),
         pairing: (id: string) => this.webPairing(id),
         revoke: (id: string) => { this.logChannel("web_machine_revoked", id); void this.revoke(id); },
+        addDirectory: (input) => this.addMachineDirectory(input),
         webauthnRegisterOptions: (sid: string, rpId: string) => this.web.webauthnRegisterOptions(sid, rpId),
         webauthnRegisterVerify: (sid: string, rpId: string, origin: string, label: string, attestation: unknown) =>
           this.web.webauthnRegisterVerify(sid, rpId, origin, label, attestation),
@@ -1265,10 +1269,10 @@ export class Steward extends Agent<Env> {
         this.handlePing(connection, message);
         return;
       case "cmd_ack":
-        this.handleCmdAck(message);
+        this.handleCmdAck(state?.deviceId, message);
         return;
       case "cmd_result":
-        this.handleCmdResult(message);
+        this.handleCmdResult(state?.deviceId, message);
         return;
       case "events":
         this.handleEvents(connection, message);
@@ -1480,6 +1484,8 @@ export class Steward extends Agent<Env> {
     // settled (e.g. `ambiguous` after a crash mid-sending). Settle the matching outbox rows;
     // ambiguous rows are never re-delivered (§4.2) — the steward is woken to ask (issue #15).
     for (const pending of hello.pendingAcks) {
+      const command = this.sql<{ deviceId: string }>`SELECT deviceId FROM outbox WHERE cmdId = ${pending.cmdId}`[0];
+      if (command?.deviceId !== auth.deviceId) continue;
       if (pending.state === "ambiguous") {
         // pr_worker rows route to the consent gate's own deterministic answer inside
         // (issue #21); every other kind gets #15's wake-to-ask.
@@ -1561,14 +1567,17 @@ export class Steward extends Agent<Env> {
     void this.drainNotifications();
   }
 
-  private handleCmdAck(raw: unknown): void {
+  private handleCmdAck(deviceId: string | undefined, raw: unknown): void {
     const parsed = CmdAckMessageSchema.safeParse(raw);
     if (!parsed.success) return;
     const ack = parsed.data;
+    const row = this.sql<OutboxRow>`SELECT * FROM outbox WHERE cmdId = ${ack.re}`[0];
+    if (!row || row.deviceId !== deviceId) return;
     if (ack.status === "accepted") {
       this.sql`UPDATE outbox SET state = 'accepted' WHERE cmdId = ${ack.re} AND state IN ('sent', 'queued')`;
     } else if (ack.status === "duplicate") {
       if (ack.result) {
+        if (row.kind === "register_repo") return this.settleDirectoryRegistration(row, ack.result);
         this.sql`
           UPDATE outbox SET state = ${ack.result.ok ? "done" : "failed"}, result = ${JSON.stringify(ack.result)}
           WHERE cmdId = ${ack.re}
@@ -1577,6 +1586,7 @@ export class Steward extends Agent<Env> {
         this.sql`UPDATE outbox SET state = 'accepted' WHERE cmdId = ${ack.re} AND state IN ('sent', 'queued')`;
       }
     } else if (ack.status === "rejected") {
+      if (row.kind === "register_repo") return this.settleDirectoryRegistration(row, { ok: false, error: { code: ack.code ?? "registration_failed" } });
       this.sql`
         UPDATE outbox SET state = 'failed', failReason = 'rejected', result = ${JSON.stringify({ code: ack.code ?? null })}
         WHERE cmdId = ${ack.re}
@@ -1590,10 +1600,13 @@ export class Steward extends Agent<Env> {
     }
   }
 
-  private handleCmdResult(raw: unknown): void {
+  private handleCmdResult(deviceId: string | undefined, raw: unknown): void {
     const parsed = CmdResultMessageSchema.safeParse(raw);
     if (!parsed.success) return;
     const result = parsed.data;
+    const command = this.sql<OutboxRow>`SELECT * FROM outbox WHERE cmdId = ${result.re}`[0];
+    if (!command || command.deviceId !== deviceId) return;
+    if (command.kind === "register_repo") return this.settleDirectoryRegistration(command, result);
     const wasFailed = this.sql<{ state: string }>`SELECT state FROM outbox WHERE cmdId = ${result.re}`[0]?.state === "failed";
     this.sql`
       UPDATE outbox SET state = ${result.ok ? "done" : "failed"}, result = ${JSON.stringify(result.ok ? result.data ?? null : result.error ?? null)}
@@ -1629,6 +1642,19 @@ export class Steward extends Agent<Env> {
       if (code === "session_in_use" || code === "not_delivered") {
         this.noteCommandAttention(result.re, code, typeof error.message === "string" ? error.message : "");
       }
+    }
+  }
+
+  private settleDirectoryRegistration(row: OutboxRow, result: CmdResult): void {
+    if (row.state === "done" || row.state === "expired" || row.state === "ambiguous" || (row.state === "failed" && row.failReason !== "ack_timeout")) return;
+    const parsed = RegisterRepoResultSchema.safeParse(result.data);
+    if (result.ok && parsed.success) {
+      this.ledger.repos.recordRegistration(row.deviceId, parsed.data.repo);
+      this.sql`UPDATE outbox SET state = 'done', result = ${JSON.stringify(parsed.data)}, failReason = NULL WHERE cmdId = ${row.cmdId}`;
+    } else {
+      const error = result.error;
+      const code = error !== null && typeof error === "object" && "code" in error && typeof error.code === "string" ? error.code : "registration_failed";
+      this.sql`UPDATE outbox SET state = 'failed', result = ${JSON.stringify({ code })}, failReason = 'registration_failed' WHERE cmdId = ${row.cmdId}`;
     }
   }
 
@@ -2189,6 +2215,37 @@ export class Steward extends Agent<Env> {
     for (const connection of this.getConnections<ConnState>(`dev:${deviceId}`)) {
       connection.close(CloseCode.REVOKED, "revoked");
     }
+  }
+
+  private async addMachineDirectory(input: MachineDirectoryInput): Promise<MachineDirectoryResult> {
+    const cmdId = `web-directory:${input.id}`;
+    const payload = JSON.stringify({ path: input.path });
+    const previous = this.sql<OutboxRow>`SELECT * FROM outbox WHERE cmdId = ${cmdId}`[0];
+    if (previous && (previous.deviceId !== input.deviceId || previous.kind !== "register_repo" || previous.payload !== payload)) {
+      throw new WorkspaceError("id_conflict", 409);
+    }
+    const device = this.sql<{ revoked: number }>`SELECT revoked FROM device WHERE deviceId = ${input.deviceId}`[0];
+    if (!device || device.revoked) throw new WorkspaceError("not_found", 404);
+    if (!previous) {
+      if (!this.connFor(input.deviceId)) throw new WorkspaceError("machine_offline", 409);
+      await this.enqueue(input.deviceId, "register_repo", { path: input.path }, { cmdId, notAfter: Date.now() + 120_000 });
+      this.logChannel("web_directory_requested", input.deviceId);
+    }
+    const row = this.sql<OutboxRow>`SELECT * FROM outbox WHERE cmdId = ${cmdId}`[0]!;
+    const stored: unknown = row.result ? JSON.parse(row.result) : null;
+    if (row.state === "done") {
+      const parsed = RegisterRepoResultSchema.safeParse(stored);
+      return parsed.success ? { state: "done", id: input.id, repo: parsed.data.repo } : { state: "failed", id: input.id, code: "registration_failed" };
+    }
+    if (row.failReason === "not_after") return { state: "failed", id: input.id, code: "outcome_unknown" };
+    if (row.state === "failed" && row.failReason !== "ack_timeout") {
+      const code = stored !== null && typeof stored === "object" && "code" in stored && typeof stored.code === "string" ? stored.code : "registration_failed";
+      return { state: "failed", id: input.id, code };
+    }
+    if (row.state === "ambiguous" || row.state === "expired" || (row.notAfter !== null && row.notAfter <= Date.now())) {
+      return { state: "failed", id: input.id, code: "outcome_unknown" };
+    }
+    return { state: "pending", id: input.id };
   }
 
   // Enqueues a command for a device's outbox and attempts immediate delivery (protocol §4.2).
