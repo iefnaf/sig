@@ -113,7 +113,7 @@ jobs:
           trap 'rm -f "$secrets_file"' EXIT
 
           if ! "$wrangler_bin" preview \
-            --config ../../wrangler.preview.jsonc \
+            --config ./wrangler.preview.jsonc \
             --name "$preview_name" \
             --secrets-file "$secrets_file" \
             --json > "$output_file"; then
@@ -175,7 +175,7 @@ jobs:
           trap 'rm -f "$secrets_file" "$machine_secrets_file"' EXIT
 
           if ! "$wrangler_bin" preview \
-            --config ../../wrangler.machine-preview.jsonc \
+            --config ./wrangler.machine-preview.jsonc \
             --name "$machine_name" \
             --secrets-file "$machine_secrets_file" \
             --json > "$machine_output_file"; then
