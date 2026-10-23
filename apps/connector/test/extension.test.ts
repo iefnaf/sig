@@ -68,6 +68,7 @@ describe("sig pi extension (connector-pi.md §7, ADR-0001)", () => {
       "tests",
       "question",
       "next",
+      "answer",
     ]);
   });
 

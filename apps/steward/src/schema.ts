@@ -934,4 +934,12 @@ export const MIGRATIONS: readonly Migration[] = [
       ignoringDuplicateColumn(() => { sql`ALTER TABLE sh_model ADD COLUMN thinkingLevel TEXT`; });
     },
   },
+  {
+    id: "024_report_answer",
+    up: (sql) => {
+      ignoringDuplicateColumn(() => {
+        sql`ALTER TABLE sh_report ADD COLUMN answer TEXT`;
+      });
+    },
+  },
 ];

@@ -56,6 +56,7 @@ describe("sig MCP report server (issue #17, spike §2: ~40 lines of JSON-RPC)", 
     expect(tools.tools[0]!.name).toBe("report");
     expect(tools.tools[0]!.inputSchema.required).toContain("status");
     expect(tools.tools[0]!.inputSchema.required).toContain("summary");
+    expect(tools.tools[0]!.inputSchema.properties).toHaveProperty("answer");
     expect(replies[2]).toMatchObject({ id: 3, result: {} });
   });
 

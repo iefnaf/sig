@@ -516,6 +516,7 @@ export function normalizeReport(args: unknown): ReportPayload | null {
   if (leftovers) payload.leftovers = leftovers;
   if (typeof raw.question === "string") payload.question = raw.question;
   if (typeof raw.next === "string") payload.next = raw.next;
+  if (typeof raw.answer === "string") payload.answer = raw.answer;
   if (typeof raw.tests === "object" && raw.tests !== null) {
     const tests = raw.tests as Record<string, unknown>;
     payload.tests = {
