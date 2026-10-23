@@ -142,7 +142,10 @@ export class PreviewMachine extends Agent<Env> {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ code: pairingCode, name: "preview-machine" }),
     });
-    if (!response.ok) throw new Error(`pairing failed with HTTP ${response.status}`);
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      throw new Error(`pairing failed with HTTP ${response.status}: ${body.slice(0, 500)}`);
+    }
     const result = (await response.json()) as PairResponse;
     if (typeof result.deviceId !== "string" || typeof result.token !== "string") {
       throw new Error("pairing response is missing credentials");
