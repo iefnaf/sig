@@ -93,7 +93,7 @@ jobs:
           if (start === -1 || end <= start) throw new Error("Wrangler preview output has no JSON payload");
           fs.writeFileSync(output, text.slice(start, end + 1));
           NODE
-          preview_url="$(jq -er '.preview.urls[0]' "$json_file")"
+          preview_url="$(jq -er '.preview.urls[] | select(endswith(".previews.iefnaf.cc"))' "$json_file")"
           login_status=000
           for attempt in $(seq 1 45); do
             login_status="$(curl --silent --show-error --request POST "$preview_url/api/login-link" \
