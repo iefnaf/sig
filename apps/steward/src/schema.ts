@@ -928,4 +928,10 @@ export const MIGRATIONS: readonly Migration[] = [
         SELECT provider, apiKeyEnc, updatedAt FROM sh_model WHERE id = 0`;
     },
   },
+  {
+    id: "023_model_thinking",
+    up: (sql) => {
+      ignoringDuplicateColumn(() => { sql`ALTER TABLE sh_model ADD COLUMN thinkingLevel TEXT`; });
+    },
+  },
 ];

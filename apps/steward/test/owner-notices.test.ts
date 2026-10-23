@@ -57,8 +57,30 @@ describe("a keyed deployment whose key the provider rejects", () => {
   });
 
   it("non-auth failures keep the generic notice, and a missing key outranks the detail", () => {
-    expect(failedRunNotice({ provider: "deepseek", apiKey: true }, true, "500: upstream")).toBe(FAILED_RUN_NOTICE);
+    expect(failedRunNotice({ provider: "deepseek", apiKey: true }, true, "500: upstream")).toContain("暂时不可用");
     expect(failedRunNotice({ provider: "deepseek", apiKey: true }, true, undefined)).toBe(FAILED_RUN_NOTICE);
     expect(failedRunNotice({ provider: "deepseek", apiKey: false }, true, deepseek401)).toBe(NO_MODEL_KEY_WEB_NOTICE);
+  });
+});
+
+describe("actionable model failure messages", () => {
+  it.each([
+    ["429: rate limit exceeded", "请求过于频繁"],
+    ["402: insufficient balance", "额度不足"],
+    ["insufficient_quota", "额度不足"],
+    ["request timed out", "超时"],
+    ["404: model_not_found", "模型或端点"],
+    ["503: service unavailable", "暂时不可用"],
+  ])("explains %s without exposing the upstream payload", (detail, expected) => {
+    const notice = failedRunNotice({ provider: "deepseek", apiKey: true }, true, detail + " secret-key-should-not-leak");
+    expect(notice).toContain(expected);
+    expect(notice).not.toContain("总管");
+    expect(notice).not.toContain("secret-key-should-not-leak");
+  });
+
+  it("gives a concrete next step when the cause is unknown", () => {
+    const notice = failedRunNotice({ provider: "deepseek", apiKey: true }, true);
+    expect(notice).toContain("测试连接");
+    expect(notice).not.toContain("总管");
   });
 });

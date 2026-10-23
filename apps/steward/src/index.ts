@@ -15,6 +15,31 @@ function htmlPage(body: string, status = 200): Response {
   return new Response(body, { status, headers: { "content-type": "text/html; charset=utf-8" } });
 }
 
+/** Serve HTML and its modules through the same deployment's asset binding. */
+async function workspaceShell(env: Env, url: URL): Promise<Response> {
+  const page = await env.ASSETS.fetch(new Request(new URL("/workspace", url.origin)));
+  if (!page.ok) return new Response("workspace unavailable", { status: 503, headers: { "cache-control": "no-store" } });
+  const socket = `${url.protocol === "https:" ? "wss" : "ws"}://${url.host}`;
+  return new Response(page.body, {
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store",
+      "content-security-policy": [
+        "default-src 'none'",
+        "script-src 'self'",
+        "style-src 'self'",
+        "img-src 'self' data:",
+        `connect-src 'self' ${socket}`,
+        "base-uri 'none'",
+        "form-action 'self'",
+        "frame-ancestors 'none'",
+      ].join("; "),
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "no-referrer",
+    },
+  });
+}
+
 // The web's shared "get a fresh link" page (web.ts renders the full variant inside the DO;
 // this stateless twin answers rejected probes without waking it).
 const LINK_HINT = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex"><title>Sig</title>${BRAND_HEAD}<style>${BRAND_STYLE}body{font:15px/1.7 -apple-system,"PingFang SC",sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:0 16px}main{max-width:480px}</style></head><body><main>${BRAND_LOCKUP}<p>链接无效或已过期。</p><p style="opacity:.75;font-size:13px">新的登录链接用 <code>POST /api/login-link</code> 签发（15 分钟内有效，只能打开一次）。</p></main></body></html>`;
@@ -182,7 +207,11 @@ export default {
         return (await routeAgentRequest(new Request(url, request), env)) ?? new Response("not found", { status: 404 });
       }
       const stub = await getAgentByName(env.Steward, "owner");
-      return stub.fetch(request);
+      const response = await stub.fetch(request);
+      if (request.method === "GET" && response.status === 204 && response.headers.get("x-sig-workspace-shell") === "1") {
+        return workspaceShell(env, url);
+      }
+      return response;
     }
 
     const routed = await routeAgentRequest(request, env, {

@@ -42,6 +42,8 @@ const ICONS = {
   'chevron-right': [['path', { d: 'm9 5 7 7-7 7' }]],
   'chevron-down': [['path', { d: 'm6 9 6 6 6-6' }]],
   'arrow-up': [['path', { d: 'M12 19V5m-6 6 6-6 6 6' }]],
+  'panel-left': [['rect', { x: 3, y: 4, width: 18, height: 16, rx: 2 }], ['path', { d: 'M9 4v16' }]],
+  'chevron-left': [['path', { d: 'm15 5-7 7 7 7' }]],
   panel: [['rect', { x: 3, y: 4, width: 18, height: 16, rx: 2 }], ['path', { d: 'M15 4v16' }]],
   route: [['circle', { cx: 6, cy: 5, r: 2 }], ['circle', { cx: 18, cy: 19, r: 2 }], ['path', { d: 'M6 7v7a5 5 0 0 0 5 5h5M6 11h7a5 5 0 0 0 5-5V3m-3 3 3-3 3 3' }]],
   shield: [['path', { d: 'm12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6Z' }], ['path', { d: 'm8 12 3 3 5-6' }]],
@@ -80,4 +82,34 @@ export function icon(name) {
 /** Fills every <… data-icon="name"> placeholder in the static shell. */
 export function paintIcons(root = document) {
   for (const element of root.querySelectorAll('[data-icon]')) element.replaceChildren(icon(element.dataset.icon));
+}
+
+// Static, same-origin brand symbols. See provider-icons.LICENSE.txt for provenance.
+const PROVIDER_ICONS = {
+  'amazon-bedrock': 'bedrock-color', anthropic: 'claude-color', azure: 'azure-color',
+  baseten: 'baseten', cerebras: 'cerebras', 'cloudflare-ai-gateway': 'cloudflare-color',
+  'cloudflare-workers-ai': 'workersai-color', deepseek: 'deepseek-color', fireworks: 'fireworks-color',
+  'github-copilot': 'githubcopilot', google: 'gemini-color', 'google-vertex': 'vertexai-color',
+  groq: 'groq', huggingface: 'huggingface-color', 'kimi-coding': 'kimi', meta: 'meta-color',
+  minimax: 'minimax-color', 'minimax-cn': 'minimax-color', mistral: 'mistral-color',
+  moonshotai: 'kimi', 'moonshotai-cn': 'kimi', nvidia: 'nvidia-color', openai: 'openai',
+  'openai-codex': 'openai', opencode: 'opencode', 'opencode-go': 'opencode', openrouter: 'openrouter',
+  'qwen-token-plan': 'qwen-color', 'qwen-token-plan-cn': 'qwen-color', 'qwen-token-plan-individual': 'qwen-color',
+  together: 'together-color', 'vercel-ai-gateway': 'vercel', xai: 'xai', xiaomi: 'mimocode',
+  'xiaomi-token-plan-ams': 'mimocode', 'xiaomi-token-plan-cn': 'mimocode', 'xiaomi-token-plan-sgp': 'mimocode',
+  zai: 'zai', 'zai-api': 'zai', 'zai-api-cn': 'zhipu-color', 'zai-coding-cn': 'zhipu-color',
+};
+
+export function providerIcon(provider) {
+  const name = Object.hasOwn(PROVIDER_ICONS, provider) ? PROVIDER_ICONS[provider] : null;
+  if (!name) return icon('layers');
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('aria-hidden', 'true');
+  const use = document.createElementNS(SVG_NS, 'use');
+  use.setAttribute('width', '24');
+  use.setAttribute('height', '24');
+  use.setAttribute('href', `/app/assets/provider-icons.svg#${name}`);
+  svg.append(use);
+  return svg;
 }

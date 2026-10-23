@@ -118,3 +118,20 @@ export const FATAL_COPY = {
   logged_out: ['signedOutTitle', 'signedOut'],
   unreachable: ['loadFailedTitle', 'loadFailedBody'],
 };
+
+/** Missing model credentials block first use; passkeys are an optional first-run step. */
+export function initialSetupStep(settings, hasConversation, securitySkipped) {
+  if (!settings.model?.apiKey) return 'model';
+  if (!settings.passkeys.length && !hasConversation && !securitySkipped) return 'security';
+  return null;
+}
+
+/** Preserve a compatible choice; otherwise use the model's advertised default. */
+export function thinkingAfterModelChange(model, current = 'off') {
+  return model?.thinkingLevels?.includes(current) ? current : model?.defaultThinkingLevel ?? 'off';
+}
+
+/** Only configured providers belong in the chat's model menu. */
+export function availableChatModels(settings) {
+  return (settings?.providers ?? []).filter((provider) => settings.keyedProviders.includes(provider.id));
+}

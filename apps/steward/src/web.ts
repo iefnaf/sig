@@ -249,6 +249,8 @@ export interface WebDeps {
     | "submitAction"
     | "settings"
     | "saveModel"
+    | "selectModel"
+    | "testModel"
     | "pairing"
     | "revoke"
     | "webauthnRegisterOptions"
@@ -256,8 +258,6 @@ export interface WebDeps {
     | "webauthnRemove"
   >;
   sessionEnded?(sid: string): void;
-  /** The workspace page: a static asset fetched through the Worker's assets binding. */
-  shell(): Promise<Response>;
   now?(): number;
 }
 
@@ -575,45 +575,21 @@ export class WebApp {
     // The workspace: /app is the whole conversation; a Thread URL (the card links and the
     // session viewer's way back) opens the same page with that Thread selected; settings
     // and machines are dialogs the page opens over the same shell.
-    if (request.method === "GET" && (url.pathname === "/app" || url.pathname === "/app/settings" || url.pathname === "/app/machines")) return this.workspaceShell(url);
+    if (request.method === "GET" && (url.pathname === "/app" || url.pathname === "/app/settings" || url.pathname === "/app/machines")) return this.workspaceShell();
     const thread = /^\/app\/threads\/([\w-]+)$/.exec(url.pathname);
     if (thread && request.method === "GET") {
-      return this.#ledger.threads.get(thread[1]!) ? this.workspaceShell(url) : new Response("not found", { status: 404 });
+      return this.#ledger.threads.get(thread[1]!) ? this.workspaceShell() : new Response("not found", { status: 404 });
     }
     // The old raw-process URL (ADR-0001 decision 12) opens the workspace's session viewer.
     const rawProcess = /^\/app\/threads\/([\w-]+)\/workers\/([A-Za-z0-9._-]+)$/.exec(url.pathname);
-    if (rawProcess && request.method === "GET") return this.workspaceShell(url);
+    if (rawProcess && request.method === "GET") return this.workspaceShell();
 
     return new Response("not found", { status: 404 });
   }
 
-  /**
-   * The workspace page. Its script and styles are same-origin files, so the policy can forbid
-   * every inline script and every other origin: whatever an agent or a repository puts in the
-   * conversation can only ever be displayed, never executed.
-   */
-  private async workspaceShell(url: URL): Promise<Response> {
-    const page = await this.#deps.shell();
-    if (!page.ok) return new Response("workspace unavailable", { status: 503, headers: { "cache-control": "no-store" } });
-    const socket = `${url.protocol === "https:" ? "wss" : "ws"}://${url.host}`;
-    return new Response(page.body, {
-      headers: {
-        "content-type": "text/html; charset=utf-8",
-        "cache-control": "no-store",
-        "content-security-policy": [
-          "default-src 'none'",
-          "script-src 'self'",
-          "style-src 'self'",
-          "img-src 'self' data:",
-          `connect-src 'self' ${socket}`,
-          "base-uri 'none'",
-          "form-action 'self'",
-          "frame-ancestors 'none'",
-        ].join("; "),
-        "x-content-type-options": "nosniff",
-        "referrer-policy": "no-referrer",
-      },
-    });
+  /** The edge Worker supplies assets from the current deployment after this session gate. */
+  private workspaceShell(): Response {
+    return new Response(null, { status: 204, headers: { "x-sig-workspace-shell": "1", "cache-control": "no-store" } });
   }
 
   #deviceViews(): DeviceView[] {

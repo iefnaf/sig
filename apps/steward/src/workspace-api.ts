@@ -3,6 +3,8 @@
 // the session's CSRF token in a header, a same-origin Origin, and a JSON body — so a form
 // post or a cross-site fetch can never act for the owner. Every mutation carries a client
 // request id; the Durable Object makes retries of one id a single effect.
+import { isThinkingLevel, type ComposerModelInput, type ModelSwitchInput } from "./llm/models.ts";
+import type { ConnectionTestResult } from "./llm/connection-test.ts";
 import type { BudgetState } from "./budget.ts";
 import type { Ledger } from "./ledger.ts";
 import {
@@ -28,7 +30,9 @@ export interface WorkspaceApiDeps {
    *  optional baseUrl), with `apiKey` optional once the provider has a sealed key: switching
    * to a previously keyed provider needs no re-entry, while giving a key reseals it (the
    * "fix a rejected key" flow stays the same single form). */
-  saveModel?(input: { provider: string; modelId: string; apiKey?: string; baseUrl?: string }): Promise<void>;
+  saveModel?(input: ModelSwitchInput): Promise<void>;
+  selectModel?(input: ComposerModelInput): Promise<unknown>;
+  testModel?(input: ModelSwitchInput): Promise<ConnectionTestResult>;
   pairing?(id: string): Promise<{ code: string; expiresAt: number }>;
   revoke?(deviceId: string): void;
   /** `attestation`/the WebAuthn wire fields stay `unknown` here on purpose (synthesis graft 1):
@@ -116,14 +120,16 @@ function parseAction(body: Record<string, unknown>): WorkspaceActionInput {
 /** Issue #70: provider + modelId (+ optional baseUrl) and the matching API key, all required
  *  together — switching provider always needs a new key, and re-submitting the same
  *  provider/modelId still reseals the key (the "fix a rejected key" flow is this same form). */
-function parseModelSwitch(body: Record<string, unknown>): { provider: string; modelId: string; apiKey?: string; baseUrl?: string } {
-  const { provider, modelId, apiKey, baseUrl } = body;
+function parseModelSwitch(body: Record<string, unknown>): ModelSwitchInput {
+  const { provider, modelId, apiKey, baseUrl, thinkingLevel } = body;
+  if (thinkingLevel !== undefined && !isThinkingLevel(thinkingLevel)) throw new WorkspaceError("bad_request");
   if (typeof provider !== "string" || !provider.trim() || provider.length > 128) throw new WorkspaceError("bad_request");
   if (typeof modelId !== "string" || !modelId.trim() || modelId.length > 256) throw new WorkspaceError("bad_request");
   if (apiKey !== undefined && (typeof apiKey !== "string" || apiKey.length > 8192)) throw new WorkspaceError("bad_request");
   if (baseUrl !== undefined && (typeof baseUrl !== "string" || baseUrl.length > 2048)) throw new WorkspaceError("bad_request");
   return {
     provider: provider.trim(),
+    ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
     modelId: modelId.trim(),
     ...(typeof apiKey === "string" && apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
     ...(typeof baseUrl === "string" && baseUrl.trim() ? { baseUrl: baseUrl.trim() } : {}),
@@ -153,6 +159,14 @@ export async function handleWorkspaceApi(request: Request, url: URL, session: Ap
       if (typeof id !== "string" || !REQUEST_ID.test(id)) return json({ error: "bad_request" }, 400);
       const pair = await deps.pairing(id);
       return json({ ...pair, command: `npx @nightboats/sig connect ${url.origin} ${pair.code}` });
+    }
+    if (url.pathname === "/app/api/settings/model/selection" && deps.selectModel) {
+      const input = parseModelSwitch(await readJson(request));
+      if (input.thinkingLevel === undefined) throw new WorkspaceError("bad_request");
+      return json({ model: await deps.selectModel({ provider: input.provider, modelId: input.modelId, thinkingLevel: input.thinkingLevel }) });
+    }
+    if (url.pathname === "/app/api/settings/model/test" && deps.testModel) {
+      return json(await deps.testModel(parseModelSwitch(await readJson(request))));
     }
     if (url.pathname === "/app/api/settings/model" && deps.saveModel) {
       await deps.saveModel(parseModelSwitch(await readJson(request)));

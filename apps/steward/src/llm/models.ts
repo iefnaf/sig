@@ -5,11 +5,16 @@
 // vitest binds STEWARD_MODEL accordingly and scripts replies through Steward.fauxScript.
 import {
   createModels,
+  getSupportedThinkingLevels,
+  clampThinkingLevel,
   createProvider,
   type MutableModels,
   type Provider,
 } from "@earendil-works/pi-ai/models";
+import { providerInfo, type ProviderInfo } from "./provider-info.ts";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
+import { MODEL_THINKING_LEVELS } from "@earendil-works/pi-ai/providers/model-schema";
+import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { AssistantMessage, TranscriptContext } from "@earendil-works/pi-ai";
 import { fauxProvider, type FauxProviderHandle } from "@earendil-works/pi-ai/providers/faux";
 
@@ -19,6 +24,7 @@ export interface StewardModelConfig {
   modelId: string;
   /** Overrides the provider's catalog base URL (self-hosted / proxy endpoints). */
   baseUrl?: string;
+  thinkingLevel?: ModelThinkingLevel;
   /** True when the deploy config actually named a provider/model — the sealed sh_model row's
    *  provider only wins when this is false, UNLESS the row itself carries an explicit
    *  modelId (a runtime switch, issue #70), which wins unconditionally (see
@@ -34,6 +40,7 @@ export interface SealedModelSelection {
   modelId: string | null;
   baseUrl: string | null;
   apiKey: string;
+  thinkingLevel?: ModelThinkingLevel;
 }
 
 /**
@@ -45,7 +52,7 @@ export interface SealedModelSelection {
  */
 export function mergeModelSelection(sealed: SealedModelSelection | null, vars: StewardModelConfig): StewardModelConfig {
   if (sealed?.modelId) {
-    return { provider: sealed.provider, modelId: sealed.modelId, explicit: true, ...(sealed.baseUrl ? { baseUrl: sealed.baseUrl } : {}) };
+    return { provider: sealed.provider, modelId: sealed.modelId, explicit: true, ...(sealed.thinkingLevel ? { thinkingLevel: sealed.thinkingLevel } : {}), ...(sealed.baseUrl ? { baseUrl: sealed.baseUrl } : {}) };
   }
   return sealed && !vars.explicit ? { ...vars, provider: sealed.provider } : vars;
 }
@@ -57,7 +64,27 @@ export const DEFAULT_MODEL_CONFIG: StewardModelConfig = { provider: "deepseek", 
 export interface ProviderCatalogEntry {
   id: string;
   name: string;
-  models: Array<{ id: string; name: string }>;
+  info?: ProviderInfo;
+  models: Array<{ id: string; name: string; baseUrl: string; api: string; thinkingLevels: ModelThinkingLevel[]; defaultThinkingLevel: ModelThinkingLevel }>;
+}
+
+/** Keep legacy Coding Plan IDs stable so existing encrypted keys remain usable. */
+export function stewardProviders(): Provider[] {
+  const providers = builtinProviders();
+  const apiVariants = [
+    { source: "zai", id: "zai-api", baseUrl: "https://api.z.ai/api/paas/v4" },
+    { source: "zai-coding-cn", id: "zai-api-cn", baseUrl: "https://open.bigmodel.cn/api/paas/v4" },
+  ];
+  for (const { source, id, baseUrl } of apiVariants) {
+    const base = providers.find((provider) => provider.id === source);
+    if (!base) throw new Error(`Missing catalog provider: ${source}`);
+    providers.push(createProvider({
+      id, name: base.name, baseUrl, auth: {},
+      models: base.getModels().map((model) => ({ ...model, provider: id, baseUrl })),
+      api: { stream: base.stream.bind(base), streamSimple: base.streamSimple.bind(base) },
+    }));
+  }
+  return providers;
 }
 
 let catalogMemo: ProviderCatalogEntry[] | undefined;
@@ -67,14 +94,29 @@ let catalogMemo: ProviderCatalogEntry[] | undefined;
  *  and JSON-friendly (it rides /app/api/settings). */
 export function providerCatalog(): ProviderCatalogEntry[] {
   if (!catalogMemo) {
-    catalogMemo = builtinProviders().map((provider) => ({
+    catalogMemo = stewardProviders().filter((provider) => provider.getModels().length > 0).map((provider) => ({
       id: provider.id,
       name: provider.name,
-      models: provider.getModels().map((model) => ({ id: model.id, name: model.name })),
+      info: providerInfo(provider.id, provider.name),
+      models: provider.getModels().map((model) => ({ id: model.id, name: model.name, baseUrl: model.baseUrl, api: model.api, thinkingLevels: getSupportedThinkingLevels(model), defaultThinkingLevel: clampThinkingLevel(model, "off") })),
     }));
   }
   return catalogMemo;
 }
+
+export function isThinkingLevel(value: unknown): value is ModelThinkingLevel {
+  return MODEL_THINKING_LEVELS.some((level) => value === level);
+}
+
+export function resolveModelThinking(config: StewardModelConfig): { thinkingLevel: ModelThinkingLevel; thinkingLevels: ModelThinkingLevel[] } {
+  const model = stewardProviders().find((provider) => provider.id === config.provider)?.getModels().find((entry) => entry.id === config.modelId);
+  return model
+    ? { thinkingLevel: clampThinkingLevel(model, config.thinkingLevel ?? "off"), thinkingLevels: getSupportedThinkingLevels(model) }
+    : { thinkingLevel: "off", thinkingLevels: ["off"] };
+}
+
+export type ModelSwitchInput = Pick<StewardModelConfig, "provider" | "modelId" | "baseUrl" | "thinkingLevel"> & { apiKey?: string };
+export type ComposerModelInput = Pick<StewardModelConfig, "provider" | "modelId"> & { thinkingLevel: ModelThinkingLevel };
 
 /** Parses `vars.STEWARD_MODEL`; anything malformed falls back to the default. */
 export function resolveModelConfig(raw: unknown): StewardModelConfig {
@@ -87,7 +129,7 @@ export function resolveModelConfig(raw: unknown): StewardModelConfig {
     }
   }
   if (parsed === null || typeof parsed !== "object") return { ...DEFAULT_MODEL_CONFIG };
-  const cfg = parsed as { provider?: unknown; modelId?: unknown; baseUrl?: unknown };
+  const cfg = parsed as { provider?: unknown; modelId?: unknown; baseUrl?: unknown; thinkingLevel?: unknown };
   if (typeof cfg.provider !== "string" || typeof cfg.modelId !== "string" || !cfg.provider || !cfg.modelId) {
     return { ...DEFAULT_MODEL_CONFIG };
   }
@@ -95,6 +137,7 @@ export function resolveModelConfig(raw: unknown): StewardModelConfig {
     provider: cfg.provider,
     modelId: cfg.modelId,
     explicit: true,
+    ...(isThinkingLevel(cfg.thinkingLevel) ? { thinkingLevel: cfg.thinkingLevel } : {}),
     ...(typeof cfg.baseUrl === "string" && cfg.baseUrl.length > 0 ? { baseUrl: cfg.baseUrl } : {}),
   };
 }
@@ -114,7 +157,7 @@ export function providerWithInlineKey(base: Provider, apiKey: string | undefined
     auth: {
       apiKey: {
         name: `${base.name} API key`,
-        resolve: async () => (apiKey ? { auth: { apiKey, baseUrl: baseUrl ?? base.baseUrl }, source: "deploy config" } : undefined),
+        resolve: async () => (apiKey ? { auth: { apiKey, ...(baseUrl ? { baseUrl } : {}) }, source: "deploy config" } : undefined),
       },
     },
     models: [...base.getModels()],
@@ -165,7 +208,7 @@ export interface StewardModels {
  */
 export function installModel(models: MutableModels, config: StewardModelConfig, apiKey: string | undefined): void {
   if (config.provider === "faux") return;
-  const base = builtinProviders().find((p) => p.id === config.provider);
+  const base = stewardProviders().find((p) => p.id === config.provider);
   if (!base) return; // unknown provider: registers nothing — runs fail visibly as no_model
   models.setProvider(providerWithInlineKey(base, apiKey, config.baseUrl));
 }
@@ -272,7 +315,7 @@ export function buildStewardModels(config: StewardModelConfig, apiKey: string | 
     };
   }
 
-  const base = builtinProviders().find((p) => p.id === config.provider);
+  const base = stewardProviders().find((p) => p.id === config.provider);
   const models = createModels();
   if (!base) {
     // Unknown provider id: register nothing. The root session's model stays unresolvable and

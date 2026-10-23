@@ -216,7 +216,7 @@ describe("user runs: operationId, reply delivery, idempotency (steward.md §6.3,
     const runs = await llmRuns();
     expect(runs[0]).toMatchObject({ status: "settled", resultStatus: "unanswered", resultReason: "model_error" });
     const texts = await sentTexts();
-    expect(texts.some((t) => t.includes("没有跑成"))).toBe(true);
+    expect(texts.some((t) => t.includes("模型请求未完成"))).toBe(true);
   });
 
   it("recovers the provider's error text from the transcript tail and pins it in the channel log", async () => {

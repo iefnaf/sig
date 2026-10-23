@@ -7,7 +7,7 @@ import { env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { STRINGS, getLocale, setLocale, t, tOr } from "../ui/i18n.js";
 import { dayKey, formatClock, formatDay, formatRelative, formatUsd, parseInline, parseMarkup, plainText, safeUrl, trimOpenMarkup } from "../ui/format.js";
-import { ACTION_KEYS, FATAL_COPY, KNOWN_TITLES, groupByDay, groupThreads, messagesFor, modelAfterProviderChange, previewOf, summarize, threadMatches, withPending, workOn } from "../ui/model.js";
+import { ACTION_KEYS, FATAL_COPY, KNOWN_TITLES, groupByDay, groupThreads, messagesFor, modelAfterProviderChange, thinkingAfterModelChange, availableChatModels, initialSetupStep, previewOf, summarize, threadMatches, withPending, workOn } from "../ui/model.js";
 import { cardView } from "../src/workspace.ts";
 import { askUserCard, noteDecisionCard, offlineAskCard, routineOfferCard, workerQuestionCard } from "../src/report-template.ts";
 
@@ -24,7 +24,7 @@ const asset = async (name: string): Promise<string> => (await fetchAsset(name)).
 // design §6) — it is included here for the sink scan and the import-export check (it has no
 // imports, so that check is a no-op for it) but NOT in the i18n-completeness scan below, whose
 // own file list is separate and intentionally does not reach it.
-const SCRIPTS = ["workspace.js", "dom.js", "format.js", "model.js", "i18n.js", "markup.js", "session.js", "session-model.js", "login.js"];
+const SCRIPTS = ["workspace.js", "model-picker.js", "dom.js", "format.js", "model.js", "i18n.js", "markup.js", "session.js", "session-model.js", "login.js"];
 
 /** The text between the parentheses of every call to `fn(…)` (not `x.fn(…)`, not `prefixfn(…)`). */
 function callArguments(source: string, fn: string): string[] {
@@ -352,5 +352,35 @@ describe("cards as the workspace reads them", () => {
     expect(question.buttons).toEqual([]); // answered by replying; the detail link rides the text, not a button
     expect(question.body.join("\n")).toContain("Drop the old index?");
     expect(cardView(null)).toMatchObject({ tone: "info", title: "", body: [], buttons: [], note: null }); // junk in, nothing out
+  });
+});
+
+
+describe("first-run setup", () => {
+  const configured = { model: { apiKey: true }, passkeys: [] };
+  it("requires a model even when security was skipped or conversations exist", () => {
+    expect(initialSetupStep({ model: { apiKey: false }, passkeys: [] }, true, true)).toBe("model");
+  });
+  it("offers passkeys after a preconfigured model on a new deployment", () => {
+    expect(initialSetupStep(configured, false, false)).toBe("security");
+  });
+  it("opens the workspace for existing, secured, or explicitly skipped setups", () => {
+    expect(initialSetupStep(configured, true, false)).toBeNull();
+    expect(initialSetupStep(configured, false, true)).toBeNull();
+    expect(initialSetupStep({ ...configured, passkeys: [{ credentialId: "saved" }] }, false, false)).toBeNull();
+  });
+});
+
+
+describe("composer model choices", () => {
+  it("offers only providers with saved keys", () => {
+    expect(availableChatModels({ keyedProviders: ["ready"], providers: [{ id: "ready" }, { id: "unconfigured" }] })).toEqual([{ id: "ready" }]);
+    expect(availableChatModels(null)).toEqual([]);
+  });
+  it("preserves supported thinking, and uses the advertised default otherwise", () => {
+    const model = { thinkingLevels: ["off", "high", "max"], defaultThinkingLevel: "off" };
+    expect(thinkingAfterModelChange(model, "max")).toBe("max");
+    expect(thinkingAfterModelChange(model, "low")).toBe("off");
+    expect(thinkingAfterModelChange({ thinkingLevels: ["high"], defaultThinkingLevel: "high" }, "off")).toBe("high");
   });
 });

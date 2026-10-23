@@ -110,6 +110,30 @@ describe("the Settings page's model switch (HTTP level, ADR-0004)", () => {
     return { post, settings };
   }
 
+  it("tests saved or draft keys without saving credentials or changing the selected model", async () => {
+    const { settings, post } = await browser();
+    await post("settings/model", { provider: "deepseek", modelId: "deepseek-flash", apiKey: "saved-test-key" });
+    const before = await (await settings()).json();
+    const saved = await post("settings/model/test", { provider: "deepseek", modelId: "not-in-catalog" });
+    expect(await saved.json()).toEqual({ ok: false, error: "unknown_model" });
+    const draft = await post("settings/model/test", { provider: "openai", modelId: "not-in-catalog", apiKey: "unsaved-test-key" });
+    expect(await draft.json()).toEqual({ ok: false, error: "unknown_model" });
+    expect(await (await post("settings/model/test", { provider: "openai", modelId: "not-in-catalog" })).json()).toEqual({ ok: false, error: "missing_key" });
+    expect(await (await settings()).json()).toEqual(before);
+    expect((await ownerStub().modelConfig())?.apiKey).toBe("saved-test-key");
+  });
+
+  it("protects the connection test with CSRF and validates its request", async () => {
+    const cookie = await webLogin();
+    const forbidden = await SELF.fetch(`${BASE}/app/api/settings/model/test`, {
+      method: "POST", headers: { cookie, "content-type": "application/json" },
+      body: JSON.stringify({ provider: "deepseek", modelId: "deepseek-flash", apiKey: "test-only" }),
+    });
+    expect(forbidden.status).toBe(403);
+    const { post } = await browser();
+    expect((await post("settings/model/test", { provider: "deepseek" })).status).toBe(400);
+  });
+
   it("GET /app/api/settings reports the merged selection, the provider catalog, and which providers have keys (issue #74)", async () => {
     const { settings, post } = await browser();
     const res = await settings();
