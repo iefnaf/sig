@@ -52,14 +52,16 @@ Keep these commands in one shell session, or persist the generated key in an own
 
 `MODEL_KEY` is optional here — the owner can paste the model key into the workspace's Settings at step 5 instead, which is the preferred channel.
 
-Verify the gates (both against the printed URL; the second uses the key):
+Verify the gates (all against the printed URL; the third uses the key):
 
 ```sh
 curl -o /dev/null -sW '%{http_code}\n' https://<url>/app                                   # 401 — needs sign-in
 curl -o /dev/null -sW '%{http_code}\n' https://<url>/api/messages                          # 401 — no bearer
-curl -s -X POST https://<url>/api/messages -H "Authorization: Bearer $KEY" \
-     -H 'content-type: application/json' -d '{"text":"ping"}' | head -c 200                # 200 {"id":…}
+curl -o /dev/null -sW '%{http_code}\n' -X POST https://<url>/api/login-link \
+     -H "Authorization: Bearer $KEY"                                                       # 200 — the key checks out
 ```
+
+The third gate proves the SERVER_KEY matches (a wrong key still answers 401) with no side effects: the minted link is one-time and expires unused, so nothing lands in the workspace before the owner configures a model key — the first real message is step 6's "hi", after the key is in.
 
 Anything else (timeouts from this machine) → [Appendix A](#appendix-a--custom-domain) for a custom domain, then re-run this step against the new hostname before continuing.
 
