@@ -1,0 +1,29 @@
+{
+  "name": "sig-steward",
+  "main": "apps/steward/src/index.ts",
+  "workers_dev": true,
+  "assets": { "directory": "./apps/steward/ui", "binding": "ASSETS", "run_worker_first": true },
+  "routes": [
+    {
+      "pattern": "previews.iefnaf.cc",
+      "custom_domain": true,
+      "previews_enabled": true,
+      "enabled": false
+    }
+  ],
+  "compatibility_date": "2026-10-10",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [{ "name": "Steward", "class_name": "Steward" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Steward"] }],
+  "previews": {
+    "observability": { "enabled": true },
+    "vars": {
+      "STEWARD_MODEL": "{\"provider\":\"faux\",\"modelId\":\"faux-1\"}"
+    },
+    "durable_objects": {
+      "bindings": [{ "name": "Steward", "class_name": "Steward" }]
+    }
+  }
+}

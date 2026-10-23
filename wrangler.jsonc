@@ -33,14 +33,6 @@
   // index.ts gates every other route, so /app/assets/* sits behind the same session gate
   // as the rest of /app.
   "assets": { "directory": "./apps/steward/ui", "binding": "ASSETS", "run_worker_first": true },
-  "routes": [
-    {
-      "pattern": "previews.iefnaf.cc",
-      "custom_domain": true,
-      "previews_enabled": true,
-      "enabled": false
-    }
-  ],
   "compatibility_date": "2026-10-10",
   "compatibility_flags": ["nodejs_compat"],
   "durable_objects": {

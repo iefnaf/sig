@@ -79,7 +79,7 @@ jobs:
           trap 'rm -f "$secrets_file"' EXIT
 
           pnpm --filter @nightboats/steward exec wrangler preview \
-            --config ../../wrangler.jsonc \
+            --config ../../wrangler.preview.jsonc \
             --name "pr-${{ github.event.pull_request.number }}" \
             --secrets-file "$secrets_file" \
             --json > "$output_file"
@@ -158,7 +158,7 @@ jobs:
           case "$preview_status" in
             200)
               pnpm --filter @nightboats/steward exec wrangler preview delete \
-                --config ../../wrangler.jsonc \
+                --config ../../wrangler.preview.jsonc \
                 --name "$preview_name" \
                 --skip-confirmation
               ;;
