@@ -96,8 +96,7 @@ function stateBadge(value) {
 
 // ---- cards ----------------------------------------------------------------------------------------------
 
-const KIND_ICONS = { question: 'help', consent: 'branch', offline: 'monitor', offer: 'repeat', memory: 'memory', report: 'check', update: 'sparkle' };
-const DECISION_KINDS = ['question', 'consent', 'offline', 'offer', 'memory'];
+const KIND_ICONS = { question: 'help', consent: 'branch', offline: 'monitor', offer: 'repeat', memory: 'memory' };
 
 function buttonLabel(button) {
   const action = button.action ?? '';
@@ -113,7 +112,6 @@ const cardTitle = (card) => (KNOWN_TITLES[card.title] ? t(KNOWN_TITLES[card.titl
 const cardHeading = (card) => cardTitle(card) || card.body[0] || t(`kind${cap(card.kind)}`);
 
 function cardNode(card, cardId, open) {
-  const decisive = DECISION_KINDS.includes(card.kind);
   const busy = state.busyCards.has(cardId);
   const actions = card.buttons.map((button) => {
     const label = buttonLabel(button);
@@ -127,13 +125,13 @@ function cardNode(card, cardId, open) {
   }).filter(Boolean);
   const canAnswer = open && card.kind === 'question';
   return h('div', { class: `card${open ? ' is-open' : ''}`, dataset: { tone: card.tone, kind: card.kind } },
-    h('div', { class: 'card-kind' }, icon(KIND_ICONS[card.kind] ?? 'sparkle'), t(`kind${cap(card.kind)}`)),
+    h('div', { class: 'card-kind' }, icon(KIND_ICONS[card.kind]), t(`kind${cap(card.kind)}`)),
     cardTitle(card) ? h('h3', { class: 'card-title' }, cardTitle(card)) : null,
     card.body.length ? h('div', { class: 'card-body' }, card.body.map(markup)) : null,
     actions.length || canAnswer ? h('div', { class: 'card-actions' }, actions,
       canAnswer ? h('button', { type: 'button', class: 'button quiet', dataset: { reply: cardId, focus: `reply:${cardId}` } }, t('answer')) : null) : null,
     busy ? h('div', { class: 'card-busy' }, t('cardWorking')) : null,
-    decisive && !open ? h('div', { class: 'card-state' }, icon('check'), t('cardHandled')) : null,
+    !open ? h('div', { class: 'card-state' }, icon('check'), t('cardHandled')) : null,
     card.note ? h('p', { class: 'card-note' }, card.note) : null);
 }
 

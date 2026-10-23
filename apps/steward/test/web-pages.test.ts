@@ -97,6 +97,36 @@ describe("report cards carry the one-time 查看详情 link", () => {
     expect(thread.workers[0]!.branch).toContain("sig/login");
   });
 
+  it("in the workspace a finished report is an ordinary message, not a card; a PR ask stays a card", async () => {
+    const answer = "## 结论\n\n1. 先装依赖\n2. 再启动\n\n```sh\npnpm i\n\npnpm dev\n```";
+    for (const [pushed, kind] of [[true, "text"], [false, "card"]] as const) {
+      await resetLedgerState();
+      await configureAndBind("ou_owner");
+      const fake = await pairFakeConnector("mac-studio", { run: { status: "done", summary: "调研完成", answer, branch: "sig/research-1", pushed } });
+      await fake.connect();
+      await ownerStub().dispatchForTest({ prompt: "调研一下", repoRef: "repo-a", newTitle: "调研" });
+      await waitForWorkerIdle();
+      await waitWhileOutboundPending();
+
+      const [row] = await sentCards();
+      const cookie = await webLogin();
+      const { messages } = (await (await SELF.fetch("https://example.com/app/api/workspace", { headers: { cookie } })).json()) as {
+        messages: Array<{ id: string; text?: string; card?: { kind: string; body: string[] } }>;
+      };
+      const message = messages.find((entry) => entry.id === row!.id)!;
+      if (kind === "text") {
+        expect(message.card).toBeUndefined();
+        expect(message.text).toContain(answer);
+        expect(message.text).not.toContain("/link/wl1.");
+      } else {
+        expect(message.card).toMatchObject({ kind: "consent" });
+        expect(message.card!.body).toHaveLength(1);
+        expect(message.card!.body[0]).toContain(answer);
+      }
+      fake.close();
+    }
+  });
+
   it("a failure card links to the timeline too", async () => {
     const fake = await pairFakeConnector("mac-studio", {
       run: { status: "needs_decision", summary: "卡住了", question: "要不要删库？" },

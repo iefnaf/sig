@@ -9,7 +9,8 @@ import { STRINGS, getLocale, setLocale, t, tOr } from "../ui/i18n.js";
 import { dayKey, formatClock, formatDay, formatRelative, formatUsd, parseInline, parseMarkup, plainText, safeUrl, trimOpenMarkup } from "../ui/format.js";
 import { ACTION_KEYS, FATAL_COPY, KNOWN_TITLES, groupByDay, groupThreads, messagesFor, modelAfterProviderChange, thinkingAfterModelChange, availableChatModels, initialSetupStep, previewOf, summarize, threadMatches, withPending, workOn } from "../ui/model.js";
 import { cardView } from "../src/workspace.ts";
-import { askUserCard, noteDecisionCard, offlineAskCard, routineOfferCard, workerQuestionCard } from "../src/report-template.ts";
+import type { ReportRow, WorkerRow } from "../src/ledger.ts";
+import { askUserCard, noteDecisionCard, offlineAskCard, reportCardFor, routineOfferCard, workerQuestionCard } from "../src/report-template.ts";
 
 async function fetchAsset(name: string): Promise<Response> {
   const response = await env.ASSETS.fetch(new Request(`https://assets.invalid/${name}`));
@@ -142,7 +143,7 @@ describe("interface copy", () => {
       for (const attribute of source.matchAll(/data-i18n(?:-[a-z]+)?="([A-Za-z_:]+)"/g)) used.add(attribute[1]!);
     }
     // Keys built from data: card kinds, worker states, connection states, and the copy tables.
-    for (const kind of ["question", "consent", "offline", "offer", "memory", "report", "update"]) used.add(`kind${kind[0]!.toUpperCase()}${kind.slice(1)}`);
+    for (const kind of ["question", "consent", "offline", "offer", "memory"]) used.add(`kind${kind[0]!.toUpperCase()}${kind.slice(1)}`);
     for (const state of ["queued", "starting", "running", "recovering", "idle", "broken"]) used.add(`worker${state[0]!.toUpperCase()}${state.slice(1)}`);
     for (const state of ["connecting", "live", "reconnecting", "disconnected"]) used.add(state);
     // The session viewer labels the bookkeeping entries an agent writes by kind (session-model.js).
@@ -342,6 +343,18 @@ describe("cards as the workspace reads them", () => {
     ] });
     expect(view).toMatchObject({ tone: "success", title: "Done" });
     expect(view.buttons).toEqual([{ label: "Open PR", url: "https://github.com/acme/repo/pull/7" }, { label: "Approve", action: "pr_approve" }]);
+  });
+
+  it("keeps a report's markdown whole: blank lines, lists and code fences survive, the login link goes", () => {
+    const answer = "## 结论\n\n1. 先装依赖\n2. 再启动\n\n```sh\npnpm i\n\npnpm dev\n```";
+    const view = cardView(reportCardFor(
+      { status: "done", summary: "调研完成", answer } as ReportRow, { mode: "read", agent: "claude" } as WorkerRow, "mac-studio", "调研",
+      "https://example.com/link/wl1.t/t_1.1.a.b",
+    ));
+    expect(view.body).toHaveLength(1);
+    expect(view.body[0]).toContain(answer);
+    expect(view.body[0]).not.toContain("/link/wl1.");
+    expect(parseMarkup(view.body[0]!).map((block) => block.t)).toEqual(expect.arrayContaining(["h", "ol", "code"]));
   });
 
   it("reads the system's own messages: offline, routine offer, memory, worker question", () => {
