@@ -197,7 +197,8 @@ A connector connection sending browser-type messages, or a browser connection se
 ### 5.4 Trust in commands
 
 - The connector accepts commands only on **its own authenticated connection**.
-- Constraints such as the repository whitelist and `approveProject` being settable only on the local machine are enforced locally by the connector (connector-pi.md §8.1, §13) and are not relaxed just because a command comes from the "trusted steward". This is the last line of defense against a compromised steward side.
+- Worker commands still require a locally registered repository. Registration can be requested by the owner through the authenticated web machine page as `register_repo{path}` or through the local CLI. The connector validates the existing Git directory and persists its canonical root. The model has no registration tool.
+- Web registration trusts the steward to convey owner authorization, so it replaces the former guarantee against whitelist expansion by a compromised steward. `approveProject` and workspace mode remain settable only on the machine (connector-pi.md §8.1, §13).
 
 ## 6. Message catalog
 
@@ -252,6 +253,7 @@ Common envelope:
 
 | `kind` | `args` | Notes |
 |---|---|---|
+| `register_repo` | `path` | Authenticated owner web action. Registers an existing Git directory and returns its canonical metadata. No project approval or workspace-mode changes. |
 | `start_worker` | `threadId, repoId, mode, base?, prompt, images?, model?` | Maps to connector-pi.md §6.1; `repoId` must be in the connector's whitelist |
 | `send` | `text, images?, intent` | `intent: now \| after \| auto` |
 | `interrupt` | `then?: { text }` | Abort, optionally followed by one new instruction |
@@ -275,6 +277,10 @@ Images ride base64-encoded in `images` and must fit, together with the whole com
 ```
 
 The `cmd_result` for `start_worker` is sent once the worker enters `running` (it does not wait for the task to finish); task progress and completion travel on the event stream.
+
+A successful `register_repo` returns `{ repo: { repoId, name, path, defaultBranch, remote } }` after local persistence. The DO accepts the result only from the target machine and records that one repository before reporting success to the web. Duplicate terminal results do not re-add a directory that a newer `hello` removed. A full `hello` remains the reconciliation path for all machine repositories.
+
+The web submits `{ id, deviceId, path }` to `POST /app/api/machines/directories`. Repeating the same request reads its durable state. Reusing an id with a different machine or path returns a conflict. New requests require an online machine and expire after two minutes. An elapsed deadline with no confirmed result is an unknown outcome, so the owner can check the directory list or repeat registration safely. Old connectors return `unsupported_command`, which the web presents as an update instruction.
 
 ### 6.4 Events (connector → DO)
 

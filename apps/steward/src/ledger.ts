@@ -642,7 +642,12 @@ export function createLedger(deps: LedgerDeps) {
     createdAt: r.createdAt as number,
   });
 
-  // ---- machines / repos (hello is the source of truth, protocol §6.1) --------------------------
+  function recordRepository(deviceId: string, repo: HelloMessage["repos"][number]): void {
+    sql`
+      INSERT OR REPLACE INTO sh_repo (repoId, deviceId, name, path, defaultBranch, remote, updatedAt)
+      VALUES (${repo.repoId}, ${deviceId}, ${repo.name}, ${repo.path}, ${repo.defaultBranch}, ${repo.remote}, ${now()})
+    `;
+  }
 
   const machines = {
     /** Upserts machine facts + the full repo snapshot from a hello, and marks it online. */
@@ -663,12 +668,7 @@ export function createLedger(deps: LedgerDeps) {
       sql`UPDATE sh_machine SET otherRunning = ${Math.max(0, hello.limits.running - trackedRunning)} WHERE deviceId = ${hello.deviceId}`;
       // hello.repos is a full snapshot: replace this machine's rows so removals stick.
       sql`DELETE FROM sh_repo WHERE deviceId = ${hello.deviceId}`;
-      for (const repo of hello.repos) {
-        sql`
-          INSERT OR REPLACE INTO sh_repo (repoId, deviceId, name, path, defaultBranch, remote, updatedAt)
-          VALUES (${repo.repoId}, ${hello.deviceId}, ${repo.name}, ${repo.path}, ${repo.defaultBranch}, ${repo.remote}, ${ts})
-        `;
-      }
+      for (const repo of hello.repos) recordRepository(hello.deviceId, repo);
     },
     /** Online derives from live connections only (issue #5): onConnect marks, onClose clears. */
     setOnline(deviceId: string, online: boolean, fallbackName?: string): void {
@@ -691,6 +691,7 @@ export function createLedger(deps: LedgerDeps) {
   };
 
   const repos = {
+    recordRegistration: recordRepository,
     /** Machines that have a repo matching `ref` by name or exact repoId (routing signal 2). */
     machinesHaving(ref: string): { deviceId: string; repoId: string; repoName: string }[] {
       return sql<{ deviceId: string; repoId: string; repoName: string }>`

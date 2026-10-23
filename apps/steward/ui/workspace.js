@@ -39,6 +39,7 @@ const state = {
   settings: null, // { model, passkeys } from /app/api/settings
   modelDraft: null, // { provider, modelId, baseUrl, apiKey } being typed; kept out of the dialog's redraw signature
   passkeyLabelDraft: '', // ditto, for the new-passkey label field
+  directoryForms: new Map(),
   setupChecked: false,
   initialDialog: null,
   settingsError: false,
@@ -570,6 +571,32 @@ function renderContext() {
 
 // ---- dialogs -------------------------------------------------------------------------------------------
 
+function directoryForm(machine) {
+  const form = state.directoryForms.get(machine.id);
+  if (!form) return !machine.repos.length && !machine.revoked
+    ? h('p', { class: 'directory-help' }, t(machine.online ? 'directoryEmpty' : 'directoryOffline')) : null;
+  if (form.state === 'done') return h('div', { class: 'directory-result', role: 'status' },
+    h('p', null, t('directoryAdded')), h('code', null, form.repo.path));
+  const busy = form.state === 'pending';
+  const retry = form.state === 'retry';
+  const inputId = `directory-path-${machine.id}`;
+  const errorKey = {
+    invalid_directory: 'directoryInvalid', unsupported: 'directoryUnsupported', unsupported_command: 'directoryUnsupported',
+    machine_offline: 'directoryOffline', not_found: 'directoryUnavailable', outcome_unknown: 'directoryUnknown',
+  }[form.code] ?? 'directoryFailed';
+  return h('form', { class: 'directory-form', dataset: { directoryMachine: machine.id }, 'aria-busy': busy ? 'true' : 'false' },
+    h('label', { for: inputId }, t('directoryPath')),
+    h('p', { id: `${inputId}-help`, class: 'directory-help' }, t('directoryHelp')),
+    h('input', { id: inputId, name: 'path', type: 'text', value: form.path, required: true, maxlength: 4096,
+      placeholder: '~/projects/my-repo', autocomplete: 'off', spellcheck: 'false', disabled: busy || retry,
+      'aria-describedby': `${inputId}-help`, dataset: { directoryPath: machine.id, focus: `directory:${machine.id}` } }),
+    busy ? h('p', { class: 'directory-message', role: 'status' }, t('directoryAdding')) : null,
+    retry || form.state === 'failed' ? h('p', { class: 'directory-error', role: 'alert' }, t(retry ? 'directoryRetry' : errorKey)) : null,
+    h('div', { class: 'dialog-actions' },
+      h('button', { type: 'submit', class: 'button primary', disabled: busy || !machine.online }, t(retry ? 'directoryRetryAction' : 'addDirectory')),
+      !busy ? h('button', { type: 'button', class: 'button', dataset: { action: 'directory-close', machine: machine.id } }, t('actionCancel')) : null));
+}
+
 function machineCard(machine) {
   const work = workOn(state.snapshot, machine);
   const status = machine.revoked ? t('revoked') : machine.online ? t('online') : t('offline');
@@ -583,13 +610,17 @@ function machineCard(machine) {
       h('div', null, h('dt', null, t('agents')), h('dd', null, machine.agents.join(', ') || t('noneListed'))),
       h('div', null, h('dt', null, t('repositories')), h('dd', null, machine.repos.join(', ') || t('noneListed'))),
       work.length ? h('div', null, h('dt', null, t('running')), h('dd', null, work.map((entry) => entry.title).join(' · '))) : null),
+    machine.revoked ? null : directoryForm(machine),
     machine.revoked ? null : confirming
       ? h('div', { class: 'revoke-confirm' },
         h('p', null, t('revokeConfirm', { name: machine.name })),
         h('div', { class: 'dialog-actions' },
           h('button', { type: 'button', class: 'button danger', dataset: { action: 'revoke-yes', machine: machine.id, focus: `revoke-yes:${machine.id}` } }, t('revokeConfirmAction')),
           h('button', { type: 'button', class: 'button', dataset: { action: 'revoke-no', focus: `revoke-no:${machine.id}` } }, t('actionCancel'))))
-      : h('div', { class: 'dialog-actions' }, h('button', { type: 'button', class: 'button danger', dataset: { action: 'revoke', machine: machine.id, focus: `revoke:${machine.id}` } }, t('revokeMachine'))));
+      : h('div', { class: 'dialog-actions' },
+        !state.directoryForms.has(machine.id) || state.directoryForms.get(machine.id).state === 'done'
+          ? h('button', { type: 'button', class: 'button primary', disabled: !machine.online, dataset: { action: 'directory-open', machine: machine.id, focus: `directory-open:${machine.id}` } }, icon('plus'), t('addDirectory')) : null,
+        h('button', { type: 'button', class: 'button danger', dataset: { action: 'revoke', machine: machine.id, focus: `revoke:${machine.id}` } }, t('revokeMachine'))));
 }
 
 function pairingSection() {
@@ -924,6 +955,9 @@ function openDialog(type) {
   drawn.delete('dialog');
   if (type === 'account') void loadSettings();
   renderDialog();
+  if (type === 'machines') for (const [deviceId, form] of state.directoryForms) {
+    if (form.state === 'pending') void runDirectoryRegistration(deviceId, form);
+  }
 }
 
 function closeDialog() {
@@ -1021,6 +1055,7 @@ async function request(path, body) {
  */
 function reloadForSignIn() {
   if ($('#message-input').value.trim() || [...state.pending.values()].some((entry) => entry.status === 'sending')) return false;
+  if ([...state.directoryForms.values()].some((form) => form.path || form.state === 'pending')) return false;
   try {
     if (Date.now() - Number(sessionStorage.getItem('pip.signin-reload') ?? 0) < 60_000) return false;
     sessionStorage.setItem('pip.signin-reload', String(Date.now()));
@@ -1317,6 +1352,59 @@ async function createPairing() {
   if (state.dialog?.type !== 'machines') return;
   state.dialog.pairing = pairing;
   bumpDialog();
+}
+
+const directoryRequests = new Set();
+
+async function submitDirectory(deviceId, element) {
+  const form = state.directoryForms.get(deviceId);
+  if (!form || form.state === 'pending' || !element.reportValidity()) return;
+  const requestBody = form.state === 'retry' ? form.request : { id: uuid(), deviceId, path: form.path };
+  const pending = { state: 'pending', path: form.path, request: requestBody, startedAt: Date.now() };
+  state.directoryForms.set(deviceId, pending);
+  bumpDialog();
+  await runDirectoryRegistration(deviceId, pending);
+}
+
+async function runDirectoryRegistration(deviceId, pending) {
+  if (directoryRequests.has(deviceId)) return;
+  directoryRequests.add(deviceId);
+  try {
+    while (state.directoryForms.get(deviceId) === pending && state.dialog?.type === 'machines' && !state.fatal) {
+      let response;
+      try {
+        response = await request('/app/api/machines/directories', pending.request);
+      } catch {
+        state.directoryForms.set(deviceId, { ...pending, state: 'retry' });
+        break;
+      }
+      if (state.directoryForms.get(deviceId) !== pending) return;
+      const { status, data } = response;
+      if (status === 200 && data?.state === 'done' && typeof data.repo?.path === 'string') {
+        state.directoryForms.set(deviceId, { state: 'done', path: pending.path, repo: data.repo });
+        await refresh();
+        break;
+      }
+      if (status === 200 && data?.state === 'failed') {
+        state.directoryForms.set(deviceId, { state: 'failed', path: pending.path, code: data.code });
+        break;
+      }
+      if (status !== 202 || data?.state !== 'pending') {
+        state.directoryForms.set(deviceId, status >= 500
+          ? { ...pending, state: 'retry' }
+          : { state: 'failed', path: pending.path, code: data?.error });
+        break;
+      }
+      if (Date.now() - pending.startedAt > 125_000) {
+        state.directoryForms.set(deviceId, { state: 'failed', path: pending.path, code: 'outcome_unknown' });
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+  } finally {
+    directoryRequests.delete(deviceId);
+    bumpDialog();
+  }
 }
 
 async function copyPairing() {
@@ -1664,6 +1752,13 @@ document.addEventListener('click', (event) => {
     case 'sign-out': return void signOut();
     case 'create-pairing': return void createPairing();
     case 'copy-pairing': return void copyPairing();
+    case 'directory-open':
+      state.directoryForms.set(dataset.machine, { state: 'editing', path: '' });
+      bumpDialog();
+      return document.getElementById(`directory-path-${dataset.machine}`)?.focus();
+    case 'directory-close':
+      state.directoryForms.delete(dataset.machine);
+      return bumpDialog();
     case 'revoke':
       state.dialog.confirm = dataset.machine;
       return bumpDialog();
@@ -1685,6 +1780,8 @@ document.addEventListener('click', (event) => {
 const MODEL_CUSTOM = '__custom';
 const MODEL_DRAFT_FIELDS = { 'model-provider-custom': 'provider', 'model-id-custom': 'modelId', 'model-key': 'apiKey' };
 document.addEventListener('input', (event) => {
+  const directory = state.directoryForms.get(event.target.dataset?.directoryPath);
+  if (directory && (directory.state === 'editing' || directory.state === 'failed')) directory.path = event.target.value;
   const field = MODEL_DRAFT_FIELDS[event.target.id];
   if (field && state.modelDraft) {
     state.dialog.test = null;
@@ -1699,6 +1796,10 @@ document.addEventListener('input', (event) => {
   if (event.target.id === 'passkey-label') state.passkeyLabelDraft = event.target.value;
 });
 document.addEventListener('submit', (event) => {
+  if (event.target.dataset.directoryMachine) {
+    event.preventDefault();
+    return void submitDirectory(event.target.dataset.directoryMachine, event.target);
+  }
   if (event.target.id === 'model-form') {
     event.preventDefault();
     return void saveModel();

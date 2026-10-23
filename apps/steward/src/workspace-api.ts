@@ -6,6 +6,7 @@
 import { isThinkingLevel, type ComposerModelInput, type ModelSwitchInput } from "./llm/models.ts";
 import type { ConnectionTestResult } from "./llm/connection-test.ts";
 import type { BudgetState } from "./budget.ts";
+import { RegisterRepoArgsSchema, type RegisterRepoResult } from "@nightboats/protocol";
 import type { Ledger } from "./ledger.ts";
 import {
   WorkspaceError,
@@ -14,6 +15,17 @@ import {
   type WorkspaceDevice,
   type WorkspaceInput,
 } from "./workspace.ts";
+
+export interface MachineDirectoryInput {
+  id: string;
+  deviceId: string;
+  path: string;
+}
+
+export type MachineDirectoryResult =
+  | { state: "pending"; id: string }
+  | { state: "done"; id: string; repo: RegisterRepoResult["repo"] }
+  | { state: "failed"; id: string; code: string };
 
 export interface WorkspaceApiDeps {
   ledger: Ledger;
@@ -35,6 +47,7 @@ export interface WorkspaceApiDeps {
   testModel?(input: ModelSwitchInput): Promise<ConnectionTestResult>;
   pairing?(id: string): Promise<{ code: string; expiresAt: number }>;
   revoke?(deviceId: string): void;
+  addDirectory?(input: MachineDirectoryInput): Promise<MachineDirectoryResult>;
   /** `attestation`/the WebAuthn wire fields stay `unknown` here on purpose (synthesis graft 1):
    *  only webauthn.ts's verifyRegistrationResponse/verifyAssertionResponse ever assert their
    *  shape — this layer validates only that the JSON body is an object with the right keys
@@ -148,7 +161,8 @@ export async function handleWorkspaceApi(request: Request, url: URL, session: Ap
   if (request.method !== "POST") return json({ error: "not_found" }, 404);
 
   const origin = request.headers.get("origin");
-  if (!sameSecret(request.headers.get("x-csrf-token") ?? "", session.csrf) || (deps.requireOrigin ? origin !== url.origin : origin !== null && origin !== url.origin)) {
+  const requireOrigin = deps.requireOrigin || url.pathname === "/app/api/machines/directories";
+  if (!sameSecret(request.headers.get("x-csrf-token") ?? "", session.csrf) || (requireOrigin ? origin !== url.origin : origin !== null && origin !== url.origin)) {
     return json({ error: "forbidden" }, 403);
   }
   if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json")) return json({ error: "json_required" }, 415);
@@ -177,6 +191,16 @@ export async function handleWorkspaceApi(request: Request, url: URL, session: Ap
       if (typeof deviceId !== "string" || !deps.devices().some(d => d.deviceId === deviceId)) return json({ error: "not_found" }, 404);
       deps.revoke(deviceId);
       return json({ ok: true });
+    }
+    if (url.pathname === "/app/api/machines/directories" && deps.addDirectory) {
+      const { id, deviceId, path } = await readJson(request);
+      if (typeof id !== "string" || !REQUEST_ID.test(id) || typeof deviceId !== "string" || !/^[\w-]{1,128}$/.test(deviceId)) {
+        throw new WorkspaceError("bad_request");
+      }
+      const args = RegisterRepoArgsSchema.safeParse({ path });
+      if (!args.success) throw new WorkspaceError("bad_request");
+      const result = await deps.addDirectory({ id, deviceId, path: args.data.path });
+      return json(result, result.state === "pending" ? 202 : 200);
     }
     if (url.pathname === "/app/api/settings/webauthn/register/options" && deps.webauthnRegisterOptions) {
       return json(await deps.webauthnRegisterOptions(session.sid, url.hostname));

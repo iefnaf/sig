@@ -41,7 +41,8 @@ import {
 } from "./proxy.ts";
 import { getServiceInstaller, SIG_LABEL, type ServiceInstaller, type ServiceSpec } from "./service.ts";
 import { isWorkspaceMode, LocalStore, WORKSPACE_MODES } from "./store.ts";
-import { defaultBranch, repoTopLevel } from "./worktree.ts";
+import { repoTopLevel } from "./worktree.ts";
+import { registerRepository } from "./repository.ts";
 import { runUpgrade } from "./upgrade.ts";
 import { VERSION } from "./version.ts";
 
@@ -226,6 +227,7 @@ async function connectCommand(argv: string[]): Promise<void> {
   //    hold the connection in this terminal (dev boxes, containers, unsupported platforms).
   if (foreground) {
     console.log(`paired as ${deviceId}; running in foreground (Ctrl-C to stop)`);
+    console.log(`next: open ${new URL("/app/machines", url)} to add a Git directory`);
     const handle = await runDaemon({ stateDir: dir, machineName });
     const shutdown = () => {
       void handle.stop().finally(() => process.exit(0));
@@ -253,7 +255,7 @@ async function connectCommand(argv: string[]): Promise<void> {
   );
   for (const note of installer.notes) console.log(`note: ${note}`);
   console.log(`logs: ${join(dir, "logs", "connector.log")}`);
-  console.log("next: sig status · sig add-repo <path> · sig logs");
+  console.log(`next: open ${new URL("/app/machines", url)} to add a Git directory · sig status · sig logs`);
 }
 
 // --- status / logs ---------------------------------------------------------------------------
@@ -557,26 +559,12 @@ async function daemonCommand(): Promise<void> {
 
 // --- add-repo --------------------------------------------------------------------------------
 
-/** `sig add-repo <path>`: registers the repository (resolving subdirectories to the
- * repo root) in the local whitelist. Runs entirely on-machine (§8.1/§13): a remote
- * steward can never add entries, only see them. */
 async function addRepo(path: string | undefined): Promise<void> {
   if (!path) usage();
-  const topLevel = await repoTopLevel(path);
-  const name = basename(topLevel);
-  let remote: string | null = null;
-  try {
-    const { stdout } = await exec("git", ["config", "--get", "remote.origin.url"], { cwd: topLevel });
-    remote = stdout.trim() || null;
-  } catch {
-    // no remote — fine
-  }
-  const branch = await defaultBranch(topLevel).catch(() => null);
-
   const store = new LocalStore(join(stateDir(), "connector.sqlite"));
   try {
-    store.addRepo({ repoId: topLevel, name, path: topLevel, defaultBranch: branch, remote });
-    console.log(`registered ${name} (${topLevel})${branch ? ` default branch: ${branch}` : ""}`);
+    const repo = await registerRepository({ store, path });
+    console.log(`registered ${repo.name} (${repo.path})${repo.defaultBranch ? ` default branch: ${repo.defaultBranch}` : ""}`);
     console.log("next: sig repo-config <path> to pick the workspace mode or approve the project");
   } finally {
     store.close();
