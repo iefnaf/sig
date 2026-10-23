@@ -72,6 +72,9 @@ export interface ReportCardInput {
   rawNeedsYou?: boolean;
   /** Action buttons (issue #21: the consent gate's [同意]/[先不要], the PR link). */
   buttons?: ReportCardButton[];
+  /** The worker's full answer/finding (issue #76): present when `report.answer` carried a
+   *  conclusion for a task that produced no code change, independent of `did`. */
+  answer?: string;
 }
 
 function clip(text: string, max: number): string {
@@ -84,6 +87,9 @@ export function renderReportCard(input: ReportCardInput): LocalMessage {
   const lines: string[] = [`${TONE_BADGE[input.tone]} ${clip(input.conclusion, MAX_CONCLUSION + 2)}`];
   const did = input.did.filter((item) => item.trim().length > 0).slice(0, MAX_DID_ITEMS).map((item) => `- ${clip(item, MAX_DID_ITEM + 2)}`);
   if (did.length > 0) lines.push("", "做了什么：", ...did);
+  if (input.answer && input.answer.trim().length > 0) {
+    lines.push("", clipBytes(input.answer.trim(), MERGED_TEXT_BUDGET_BYTES));
+  }
   if (input.needsYou && input.needsYou.trim().length > 0) {
     // rawNeedsYou forwards the worker's question VERBATIM (issue #10 review finding 6) — no
     // 120-character cap, only the byte-boundary clip above.
@@ -156,6 +162,7 @@ export function reportCardFor(report: ReportRow, worker: WorkerRow, machineName:
     tone: toneOfReport(report.status),
     conclusion: report.summary,
     did: didBullets(report),
+    answer: report.answer ?? undefined,
     // The consent ask replaces the generic next-step line when it applies: the decision the
     // card exists to collect IS what the owner must do next.
     needsYou: consent

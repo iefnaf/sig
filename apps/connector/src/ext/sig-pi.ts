@@ -35,7 +35,8 @@ function appendCommandEntry(pi: ExtensionAPI, commandId: string): void {
 
 const REMINDER_TEXT =
   "[Sig] You finished without calling the `report` tool. Call `report` now as your " +
-  "final action: status (done | blocked | needs_decision), summary, changes, decisions, " +
+  "final action: status (done | blocked | needs_decision), summary, changes " +
+  "(or `answer` when nothing was modified), decisions, " +
   "leftovers, and — when blocked or needs_decision — the question for the user in `question`. " +
   "Do not answer this reminder in plain text.";
 
@@ -58,6 +59,12 @@ const reportParameters = Type.Object({
   ),
   question: Type.Optional(Type.String({ description: "Required when status is blocked or needs_decision." })),
   next: Type.Optional(Type.String({ description: "Suggested next step." })),
+  answer: Type.Optional(
+    Type.String({
+      description:
+        "The full answer or finding, when this task was informational (a question, an explanation, an investigation) rather than a code change. Use this instead of `changes` when nothing was modified.",
+    }),
+  ),
 });
 
 interface WindowState {

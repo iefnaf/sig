@@ -122,6 +122,7 @@ const report = (seq: number, workerId: string, fields: Partial<ReportRow>): Repo
   question: null,
   next: null,
   git: null,
+  answer: null,
   ...fields,
 });
 

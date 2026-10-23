@@ -114,6 +114,7 @@ export interface ReportRow {
   question: string | null;
   next: string | null;
   git: GitFacts | null;
+  answer: string | null;
 }
 
 /** Git facts merged into the report event by the connector (connector-pi.md §7.2).
@@ -510,6 +511,7 @@ const viewReport = (r: Record<string, unknown>): ReportRow => ({
   question: (r.question as string | null) ?? null,
   next: (r.next as string | null) ?? null,
   git: jsonOrNull<GitFacts>(r.git as string | null),
+  answer: (r.answer as string | null) ?? null,
 });
 
 const viewQuestion = (r: Record<string, unknown>): QuestionRow => ({
@@ -2237,14 +2239,14 @@ export function createLedger(deps: LedgerDeps) {
         }
         const status = (event.status === "blocked" || event.status === "needs_decision" ? event.status : "done") as ReportRow["status"];
         sql`
-          INSERT OR IGNORE INTO sh_report (workerId, seq, threadId, status, summary, changes, decisions, leftovers, tests, question, next, git, receivedAt)
+          INSERT OR IGNORE INTO sh_report (workerId, seq, threadId, status, summary, changes, decisions, leftovers, tests, question, next, git, answer, receivedAt)
           VALUES (${workerId}, ${seq}, ${worker.threadId}, ${status}, ${str(event.summary) ?? ""},
                   ${event.changes ? JSON.stringify(event.changes) : null},
                   ${event.decisions ? JSON.stringify(event.decisions) : null},
                   ${event.leftovers ? JSON.stringify(event.leftovers) : null},
                   ${event.tests ? JSON.stringify(event.tests) : null},
                   ${str(event.question)}, ${str(event.next)},
-                  ${event.git ? JSON.stringify(event.git) : null}, ${now()})
+                  ${event.git ? JSON.stringify(event.git) : null}, ${str(event.answer)}, ${now()})
         `;
         sql`
           UPDATE sh_worker SET lastOutcome = ${`reported:${status}`}, lastEventAt = ${ts}, updatedAt = ${now()}

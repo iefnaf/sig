@@ -46,6 +46,11 @@ const REPORT_TOOL = {
       },
       question: { type: "string", description: "Required when status is blocked or needs_decision." },
       next: { type: "string", description: "Suggested next step." },
+      answer: {
+        type: "string",
+        description:
+          "The full answer or finding, when this task was informational (a question, an explanation, an investigation) rather than a code change. Use this instead of `changes` when nothing was modified.",
+      },
     },
     required: ["status", "summary"],
   },

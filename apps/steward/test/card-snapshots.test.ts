@@ -37,6 +37,7 @@ function report(overrides: Partial<ReportRow> = {}): ReportRow {
     // pushed: an ORDINARY completion (nothing left to ask) — issue #21 gives unpushed write
     // completions their own consent-message snapshot below.
     git: { branch: "sig/login-1", base: "main", ahead: 2, dirty: 0, filesChanged: 2, insertions: 30, deletions: 4, pushed: true },
+    answer: null,
     ...overrides,
   };
 }

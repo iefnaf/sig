@@ -5,9 +5,12 @@ import { describe, expect, it } from "vitest";
 import type { ReportRow, WorkerRow } from "../src/ledger.ts";
 import {
   askUserText,
+  byteLength,
+  clipBytes,
   didBullets,
   failureCard,
   MAX_CONCLUSION,
+  MERGED_TEXT_BUDGET_BYTES,
   needsYouOf,
   notifyCard,
   offlineAskCard,
@@ -34,6 +37,7 @@ function report(overrides: Partial<ReportRow> = {}): ReportRow {
     question: null,
     next: null,
     git: { branch: "sig/login-1", base: "main", ahead: 2, dirty: 0, filesChanged: 2, insertions: 30, deletions: 4, pushed: false },
+    answer: null,
     ...overrides,
   };
 }
@@ -110,6 +114,34 @@ describe("renderReportCard: the fixed three parts (spec §7.5)", () => {
     // badge + space + conclusion; conclusion itself ≤ 80 chars + ellipsis
     expect(title.length).toBeLessThanOrEqual(2 + 1 + MAX_CONCLUSION + 2);
     expect(card.text).toContain("…");
+  });
+
+  it("renders the answer as its own section alongside did (issue #76)", () => {
+    const card = renderReportCard({
+      tone: "success",
+      conclusion: "讲解完了 pi-memory 项目",
+      did: [],
+      answer: "pi-memory 是一个……完整的调研结论。",
+      threadTitle: "讲解 pi-memory",
+      footer: "f",
+    });
+    expect(card.text).toContain("pi-memory 是一个……完整的调研结论。");
+  });
+
+  it("an answer clips at MERGED_TEXT_BUDGET_BYTES, not the write-task caps", () => {
+    const longAnswer = "这是一段很长的调研结论。".repeat(3_000); // well past 28 KB of CJK
+    const card = renderReportCard({
+      tone: "success",
+      conclusion: "调研完成",
+      did: [],
+      answer: longAnswer,
+      threadTitle: "t",
+      footer: "f",
+    });
+    expect(byteLength(card.text)).toBeLessThanOrEqual(MERGED_TEXT_BUDGET_BYTES + 512);
+    expect(card.text).toContain("…");
+    expect(clipBytes(longAnswer, MERGED_TEXT_BUDGET_BYTES).endsWith("…")).toBe(true);
+    expect(clipBytes("短结论", MERGED_TEXT_BUDGET_BYTES)).toBe("短结论"); // short text untouched
   });
 });
 
@@ -228,5 +260,26 @@ describe("the PR consent gate's templates (issue #21)", () => {
     const fallback = prCommandArgs({ report: null, threadTitle: "登录 bug", branch: "sig/login-1" });
     expect(fallback.title).toBe("登录 bug");
     expect(fallback.body).toContain("sig/login-1");
+  });
+});
+
+describe("reportCardFor: the answer section (issue #76)", () => {
+  it("an informational report (no changes) surfaces its answer, not a generic did bullet", () => {
+    // The discriminant is report.answer + empty report.changes, never worker.mode (issue #76).
+    const readonlyWorker = { ...worker, mode: "readonly" } as WorkerRow;
+    const card = reportCardFor(
+      report({ changes: null, git: null, answer: "pi-memory 是一个本地记忆服务……完整结论在这里。" }),
+      readonlyWorker,
+      "mac-studio",
+      "讲解 pi-memory",
+    );
+    expect(card.text).toContain("pi-memory 是一个本地记忆服务……完整结论在这里。");
+  });
+
+  it("a write task that both changed files and answered a question gets both sections", () => {
+    const card = reportCardFor(report({ answer: "顺带说明一下这次改动的背景。" }), worker, "mac-studio", "登录 bug");
+    expect(card.text).toContain("做了什么：");
+    expect(card.text).toContain("auth/session.ts 里补上了 token 过期后的刷新");
+    expect(card.text).toContain("顺带说明一下这次改动的背景。");
   });
 });

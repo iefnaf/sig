@@ -108,6 +108,8 @@ export interface ReportPayload {
   tests?: { ran: boolean; passed?: boolean; note?: string };
   question?: string;
   next?: string;
+  /** The full answer/finding when this task was informational (no code change) rather than a change. */
+  answer?: string;
 }
 
 export interface TokenUsage {
