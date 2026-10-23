@@ -1,31 +1,47 @@
-// The pre-session passkey sign-in script (ADR-0005). Served as its own public asset, next to
-// LOGO_PATH/AVATAR_PATH (index.ts) — the sign-in page has no session, so it cannot reach
-// anything under the session-gated /app/assets/* tree, including i18n.js. It carries its own
-// tiny inline string table instead, reading the same `pip.locale` key i18n.js uses, for a
-// consistent language choice without sharing any code with it.
 const STRINGS = {
-  signIn: ['Sign in with a passkey', '使用通行密钥登录'],
-  failed: ['Couldn’t sign in with that passkey. Try again, or use a login link.', '通行密钥登录失败，请重试，或使用登录链接。'],
-  unsupported: ['This browser doesn’t support passkeys.', '当前浏览器不支持通行密钥。'],
+  heading: ['Welcome back.', '欢迎回来。'],
+  intro: ['Sign in to your personal agent.', '登录你的个人智能体。'],
+  password: ['Deployment password', '部署密码'],
+  passwordSignIn: ['Sign in', '登录'],
+  signingIn: ['Signing in…', '正在登录…'],
+  or: ['or', '或'],
+  passkeySignIn: ['Sign in with a passkey', '使用通行密钥登录'],
+  failed: ['Couldn’t sign in with that passkey. Try again, or use your password.', '通行密钥登录失败，请重试或使用密码。'],
+  cancelled: ['Passkey sign-in was cancelled. Try again, or use your password.', '已取消通行密钥登录，可以重试或使用密码。'],
+  unsupported: ['Passkeys aren’t available in this browser. You can sign in with your password.', '当前浏览器无法使用通行密钥，你可以使用密码登录。'],
+  invalid: ['Incorrect password. Try again.', '密码错误，请重试。'],
+  unavailable: ['Password sign-in isn’t available. Use a passkey, check the deployment password policy, or retry shortly.', '密码登录暂不可用。请使用通行密钥、检查部署密码规则，或稍后重试。'],
+  network: ['Couldn’t reach Sig. Check your connection and try again.', '无法连接 Sig，请检查网络后重试。'],
+  retry: ['Too many attempts. Try again in {seconds}s, or use a passkey.', '尝试次数过多，请在 {seconds} 秒后重试，或使用通行密钥。'],
+  retryPasskey: ['Too many passkey attempts. Try again in {seconds}s, or use your password.', '通行密钥尝试次数过多，请在 {seconds} 秒后重试，或使用密码。'],
+  retryReady: ['You can try again now.', '现在可以重新尝试。'],
+  recoveryTitle: ['Forgot your password?', '忘记密码？'],
+  recovery: ['In the Cloudflare dashboard, open your Worker, then Settings > Variables and Secrets. Set LOGIN_PASSWORD to a new, unique password of at least 15 characters and deploy the change. This signs out all browsers without deleting your data or disconnecting your machines.', '在 Cloudflare 控制台打开你的 Worker，进入 Settings > Variables and Secrets，将 LOGIN_PASSWORD 修改为新的独立密码（至少 15 个字符），然后部署更新。所有浏览器会退出登录，但数据和已连接的机器不会受到影响。'],
+  reauth: ['Sign in again to change your security settings.', '请重新登录以修改安全设置。'],
+  footer: ['Your own agent. Your own workspace.', '你的智能体，你的工作台。'],
 };
 
 function locale() {
   try {
-    if (localStorage.getItem('pip.locale') === 'zh') return 'zh';
-  } catch {
-    // Storage can be blocked (private mode, embedded views); fall through to navigator.language.
-  }
-  return navigator.language && navigator.language.startsWith('zh') ? 'zh' : 'en';
+    const saved = localStorage.getItem('pip.locale');
+    if (saved === 'en' || saved === 'zh') return saved;
+  } catch {}
+  return navigator.language?.startsWith('zh') ? 'zh' : 'en';
 }
 
-const t = (key) => STRINGS[key][locale() === 'zh' ? 1 : 0];
+const language = locale();
+const t = (key) => STRINGS[key][language === 'zh' ? 1 : 0];
+document.documentElement.lang = language === 'zh' ? 'zh-CN' : 'en';
+for (const element of document.querySelectorAll('[data-copy]')) element.textContent = t(element.dataset.copy);
+const query = new URLSearchParams(location.search);
+document.getElementById('reauth-notice').hidden = query.get('reauth') !== '1';
+const requestedNext = query.get('next') ?? (location.pathname.startsWith('/app') ? location.pathname : null);
+const nextPath = requestedNext && /^\/app(?:\/|$)/.test(requestedNext) ? requestedNext : '/app';
 
 function b64urlToBuffer(value) {
   const base64 = value.replace(/-/g, '+').replace(/_/g, '/');
   const binary = atob(base64 + '='.repeat((4 - (base64.length % 4)) % 4));
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return bytes.buffer;
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0)).buffer;
 }
 
 function bufferToB64url(buffer) {
@@ -34,34 +50,97 @@ function bufferToB64url(buffer) {
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-const button = document.getElementById('passkey-signin');
-const status = document.getElementById('passkey-status');
+const passwordForm = document.getElementById('password-form');
+const passwordInput = document.getElementById('login-password');
+const passwordButton = document.getElementById('password-signin');
+const passwordStatus = document.getElementById('password-status');
+const passkeyButton = document.getElementById('passkey-signin');
+const passkeyStatus = document.getElementById('passkey-status');
+let retryAt = 0;
+let retryTimer;
+let passkeyRetryAt = 0;
+let passkeyRetryTimer;
 
-function showError() {
-  status.textContent = t('failed');
-  status.hidden = false;
+function showStatus(element, message) {
+  element.textContent = message;
+  element.hidden = false;
 }
 
-async function signInWithPasskey() {
-  button.disabled = true;
-  status.hidden = true;
+function startCooldown(retryAfter, button = passwordButton, status = passwordStatus, getRetryAt = () => retryAt) {
+  const seconds = Number(retryAfter);
+  const deadline = Number.isFinite(seconds) && seconds > 0 ? Date.now() + seconds * 1000 : Date.parse(retryAfter);
+  const deadlineAt = Number.isFinite(deadline) && deadline > Date.now() ? deadline : Date.now() + 60_000;
+  if (button === passwordButton) retryAt = deadlineAt;
+  else passkeyRetryAt = deadlineAt;
+  const timer = button === passwordButton ? retryTimer : passkeyRetryTimer;
+  clearInterval(timer);
+  const update = () => {
+    const remaining = Math.max(0, Math.ceil((getRetryAt() - Date.now()) / 1000));
+    button.disabled = remaining > 0;
+    const retryCopy = button === passwordButton ? 'retry' : 'retryPasskey';
+    showStatus(status, remaining ? t(retryCopy).replace('{seconds}', String(remaining)) : t('retryReady'));
+    if (!remaining) clearInterval(timer);
+  };
+  update();
+  if (button === passwordButton) retryTimer = setInterval(update, 1000);
+  else passkeyRetryTimer = setInterval(update, 1000);
+}
+
+passwordForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if (passwordButton.disabled || Date.now() < retryAt) return;
+  passwordButton.disabled = true;
+  passwordButton.textContent = t('signingIn');
+  passwordStatus.hidden = true;
   try {
-    const optionsRes = await fetch('/webauthn/login/options', { method: 'POST', credentials: 'same-origin', cache: 'no-store' });
-    if (!optionsRes.ok) throw new Error('options_failed');
-    const { challenge, challengeToken, rpId } = await optionsRes.json();
+    const response = await fetch('/auth/password', {
+      method: 'POST', credentials: 'same-origin', cache: 'no-store', redirect: 'error',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ password: passwordInput.value }),
+    });
+    if (response.status === 200) {
+      passwordInput.value = '';
+      location.assign(nextPath);
+    } else if (response.status === 429) {
+      startCooldown(response.headers.get('retry-after'));
+    } else {
+      showStatus(passwordStatus, t(response.status === 401 ? 'invalid' : response.status === 503 ? 'unavailable' : 'network'));
+    }
+  } catch {
+    showStatus(passwordStatus, t('network'));
+  } finally {
+    passwordButton.textContent = t('passwordSignIn');
+    passwordButton.disabled = Date.now() < retryAt;
+  }
+});
+
+async function signInWithPasskey() {
+  if (passkeyButton.disabled || Date.now() < passkeyRetryAt) return;
+  passkeyButton.disabled = true;
+  passkeyStatus.hidden = true;
+  try {
+    const optionsResponse = await fetch('/webauthn/login/options', { method: 'POST', credentials: 'same-origin', cache: 'no-store', redirect: 'error' });
+    if (optionsResponse.status === 429) {
+      startCooldown(optionsResponse.headers.get('retry-after'), passkeyButton, passkeyStatus, () => passkeyRetryAt);
+      return;
+    }
+    if (!optionsResponse.ok) throw new Error('options_failed');
+    const { challenge, challengeToken, rpId } = await optionsResponse.json();
     let credential;
     try {
       credential = await navigator.credentials.get({
         publicKey: { challenge: b64urlToBuffer(challenge), rpId, userVerification: 'preferred', timeout: 60000 },
       });
-    } catch {
-      // The user cancelled the platform prompt, or no matching passkey is on this device.
-      showError();
+    } catch (error) {
+      showStatus(passkeyStatus, t(error.name === 'NotAllowedError' || error.name === 'AbortError' ? 'cancelled' : 'failed'));
+      return;
+    }
+    if (!credential) {
+      showStatus(passkeyStatus, t('cancelled'));
       return;
     }
     const verify = await fetch('/webauthn/login/verify', {
-      method: 'POST',
-      credentials: 'same-origin',
+      method: 'POST', credentials: 'same-origin', cache: 'no-store', redirect: 'error',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         challengeToken,
@@ -72,22 +151,25 @@ async function signInWithPasskey() {
       }),
     });
     if (verify.status === 200) {
-      location.assign('/app');
+      location.assign(nextPath);
       return;
     }
-    showError();
+    if (verify.status === 429) {
+      startCooldown(verify.headers.get('retry-after'), passkeyButton, passkeyStatus, () => passkeyRetryAt);
+      return;
+    }
+    showStatus(passkeyStatus, t('failed'));
   } catch {
-    showError();
+    showStatus(passkeyStatus, t('failed'));
   } finally {
-    button.disabled = false;
+    passkeyButton.disabled = Date.now() < passkeyRetryAt;
   }
 }
 
-if (window.PublicKeyCredential) {
-  button.textContent = t('signIn');
-  button.hidden = false;
-  button.addEventListener('click', () => { void signInWithPasskey(); });
+if (window.PublicKeyCredential && navigator.credentials?.get) {
+  passkeyButton.hidden = false;
+  document.getElementById('passkey-divider').hidden = false;
+  passkeyButton.addEventListener('click', () => { void signInWithPasskey(); });
 } else {
-  status.textContent = t('unsupported');
-  status.hidden = false;
+  showStatus(passkeyStatus, t('unsupported'));
 }

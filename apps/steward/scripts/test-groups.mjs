@@ -98,13 +98,12 @@ if (passthrough.length > 0) {
   process.exit(code);
 }
 
-// claim-*.test.ts run the production Worker entry with the ADR-0004 doors (vitest.claim.config.ts);
-// every other file runs the historical transport fixture (vitest.config.ts: the pre-web entry,
-// kept so the Feishu-era suites keep guarding that code).
-const isAccessTest = (f) => f.startsWith("claim-");
+// generated-auth.test.ts runs a no-SERVER_KEY workerd (vitest.generated-auth.config.ts). Every
+// other file runs the explicit-key compatibility suite in vitest.config.ts.
+const isGeneratedAuthTest = (f) => f === "generated-auth.test.ts";
 const allTests = readdirSync(testDir).filter((f) => f.endsWith(".test.ts")).sort();
-const files = allTests.filter((f) => !isAccessTest(f));
-const accessFiles = allTests.filter(isAccessTest);
+const files = allTests.filter((f) => !isGeneratedAuthTest(f));
+const generatedAuthFiles = allTests.filter(isGeneratedAuthTest);
 if (files.length === 0) {
   console.error(`no *.test.ts files under ${testDir}`);
   process.exit(1);
@@ -133,21 +132,24 @@ console.log(
     `(groups: ${groups.map((g) => `~${g.cost}s/${g.files.length}f`).join("  ")}; per-process workerd, serial within)`,
 );
 
-const accessRun = accessFiles.length === 0
+const generatedAuthRun = generatedAuthFiles.length === 0
   ? Promise.resolve({ code: 0, seconds: 0 })
-  : runVitest(["run", "--config", "vitest.claim.config.ts", ...accessFiles.map((f) => path.join("test", f))], `${PALETTE[groups.length % PALETTE.length]}[access: ${accessFiles.map((f) => f.replace(".test.ts", "")).join(" ")}]${RESET}`);
+  : runVitest(
+      ["run", "--config", "vitest.generated-auth.config.ts", ...generatedAuthFiles.map((f) => path.join("test", f))],
+      `${PALETTE[groups.length % PALETTE.length]}[fresh-deploy: ${generatedAuthFiles.map((f) => f.replace(".test.ts", "")).join(" ")}]${RESET}`,
+    );
 const results = await Promise.all([
   ...groups.map((g, i) => {
     if (g.files.length === 0) return Promise.resolve({ code: 0, seconds: 0 });
     return runVitest(["run", ...g.files.map((f) => path.join("test", f))], label(i, g.files));
   }),
-  accessRun,
+  generatedAuthRun,
 ]);
 
 let failed = false;
-if (accessFiles.length > 0) {
+if (generatedAuthFiles.length > 0) {
   const r = results[results.length - 1];
-  console.log(`${r.code === 0 ? "✓" : "✗"} access: ${accessFiles.length} files in ${r.seconds.toFixed(1)}s`);
+  console.log(`${r.code === 0 ? "✓" : "✗"} fresh-deploy: ${generatedAuthFiles.length} files in ${r.seconds.toFixed(1)}s`);
   if (r.code !== 0) failed = true;
 }
 for (const [i, r] of results.slice(0, groups.length).entries()) {

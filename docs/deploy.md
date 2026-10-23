@@ -2,7 +2,7 @@
 
 A Sig deployment lives entirely in **your own Cloudflare account**: one Worker (the steward, with its Durable Object), no third-party service in the middle. Around it you connect machines, each running a small connector process. This guide walks the whole path: deploy → custom domain → model key → connector, then everything operational (costs, secret rotation, updates).
 
-There is no chat channel for now ([ADR-0003](adr/0003-owner-api-replaces-chat-channel.md)): you drive the deployment through the `SERVER_KEY`-gated HTTP API (`POST /api/messages` and friends — see [Usage and API](usage.md#the-owner-api)) and the web workspace — one continuous conversation with Threads, decisions and worker session viewing ([ADR-0004](adr/0004-web-workspace.md)).
+Open the deployment URL to use the web workspace. Sign in with your deployment password or a registered passkey. Existing deployments can also use their `SERVER_KEY`-gated [owner API](usage.md#the-owner-api). [ADR-0010](adr/0010-browser-password-authentication.md) describes browser authentication and recovery.
 
 ## Two ways to deploy
 
@@ -17,7 +17,7 @@ The form clones the repo into your own account and asks for two secrets:
 
 | Secret | What it is |
 |---|---|
-| `SERVER_KEY` | An `openssl rand -hex 32`. Signs connector device tokens, seals the model key at rest, and authenticates the owner API (`Authorization: Bearer …`). Keep a copy. |
+| `LOGIN_PASSWORD` | Your Sig login password. Use at least 15 characters and save it in a password manager. Common and compromised passwords are rejected. |
 | `MODEL_KEY` | Your model provider's API key (default provider: DeepSeek — [platform.deepseek.com](https://platform.deepseek.com)). Sealed into the Durable Object's storage on first boot; deletable afterwards. Optional — you can also paste it into the workspace's **Settings** after signing in. |
 
 From a terminal instead:
@@ -26,11 +26,14 @@ From a terminal instead:
 git clone https://github.com/iefnaf/sig && cd sig
 pnpm install
 wrangler deploy
-wrangler secret put SERVER_KEY
+wrangler secret put LOGIN_PASSWORD
 wrangler secret put MODEL_KEY   # optional; the workspace Settings page works too
+wrangler deploy
 ```
 
-You can now talk to Sig through the owner API:
+Open the Worker URL to sign in. Internal keys are generated and retained in the owner Durable Object. You do not need a `SERVER_KEY` for the browser or machine pairing.
+
+For an existing deployment with an explicit `SERVER_KEY`, keep that secret and any rotation-window key. Its owner API remains available:
 
 ```sh
 curl -X POST https://<your-worker>.workers.dev/api/messages \
@@ -41,16 +44,28 @@ curl "https://<your-worker>.workers.dev/api/messages?limit=5" -H "Authorization:
 
 ## Opening the web workspace
 
-The workspace at `/app` is the everyday entry: the same conversation as the API, with Threads, "Needs you" decisions, and each worker's session viewer. The door is a one-time link:
+Open the root URL or `/app`. Sign in with the password set during deployment, or choose **Use a passkey**. An authenticated browser opens the workspace directly. A second device uses the same URL and either authentication method without requiring the first device to be online.
+
+The browser session lasts seven days. On first use, the workspace guides you through connecting a model and offers passkey registration. You can skip the passkey step and add one later in **Settings → Security**. Authentication changes require a recent sign-in.
+
+Existing explicit-key deployments can still generate single-use links for compatibility:
 
 ```sh
 curl -X POST https://<your-worker>.workers.dev/api/login-link -H "Authorization: Bearer $SERVER_KEY"
 # → { "url": "https://<your-worker>.workers.dev/link/wl1.home.…" }  — one use, 15 minutes
 ```
 
-Opening it sets the session cookie (7 days). Report cards carry the same kind of link on their 查看详情 button.
+These links are not required for ordinary browser sign-in.
 
-On first use, the workspace guides you through connecting a model and offers passkey registration. You can skip the passkey step and add one later in **Settings → Security**. Connect a machine when you want Sig to work on your code.
+## Recover browser access
+
+If neither your password nor a passkey is available, open your Worker in the Cloudflare dashboard. In **Settings → Variables and Secrets**, replace the `LOGIN_PASSWORD` secret with a new strong password and deploy the updated Worker version. Open the Sig URL and sign in with the new password.
+
+A password reset revokes existing browser sessions and outstanding login links. Existing passkeys remain registered. Machine credentials and encrypted model settings are independent of the login password and remain usable.
+
+Keep `LOGIN_PASSWORD` configured as the dashboard-managed source of truth. The application stores a salted verifier, while Cloudflare retains the configured Secret. Removing the Secret disables password login; it does not provide a way for an anonymous visitor to claim the instance. If password screening is unavailable or the configured password fails policy, use a passkey or correct the Secret and retry.
+
+Deploy authentication changes to the whole Worker version. Do not use gradual deployments with different password Secrets, because old and new versions must not alternate password configuration.
 
 ## Pull request previews
 
@@ -71,6 +86,8 @@ Not required for function anymore (there is no chat platform that must reach you
 
 1. Dashboard → **Workers & Pages** → your Sig Worker → **Settings → Domains & Routes** → **Add → Custom domain**, e.g. `sig.example.com` (a zone hosted on Cloudflare DNS). Cloudflare creates the DNS record and the certificate.
 2. Use `https://sig.example.com` everywhere: API calls, `sig connect`, web links.
+
+Passkeys are bound to the deployment hostname by WebAuthn. If you add or change the custom domain later, sign in with the password on the new hostname and register a new passkey there; recovery and rate limits remain deployment-wide.
 
 A Cloudflare custom domain is not guaranteed reachable from mainland China either; if your machine cannot connect, verify with a direct `curl` before debugging anything else.
 
@@ -94,7 +111,9 @@ The daily budget soft cap (issue #28): `vars.DAILY_BUDGET_USD` (dollars per UTC 
 
 For agent-guided setup, follow [agent-connect.md](agent-connect.md), including a source-install fallback if the npm package is unavailable. Install the CLI with `npm install --global @nightboats/sig` (or that source fallback) before using the `sig` management commands below.
 
-Each machine you want to dispatch work to runs a small daemon that holds a WebSocket to the steward and drives the local coding agents. Ask your deployment for a pairing code:
+Each machine you want to dispatch work to runs a small daemon that holds a WebSocket to the steward and drives the local coding agents. Open **Machines** in the workspace and generate the connection command there.
+
+Existing explicit-key deployments can also request a pairing code through the owner API:
 
 ```sh
 curl -X POST https://sig.example.com/api/pairing -H "Authorization: Bearer $SERVER_KEY"
@@ -126,6 +145,10 @@ Sig is designed to be **dormant — and cost nothing — most of the time** (spe
 - **Model**: the real cost. deepseek-flash list prices make a typical day (a handful of dispatches + bookkeeping wakes) well under the default $1/day cap; the budget counter is exact and `/花费` reads it without a model call.
 
 ## Secrets and rotation
+
+New deployments generate internal keys in the owner Durable Object. Keep that object's storage when updating or recovering the deployment. Do not add `SERVER_KEY` or `SERVER_KEY_PREVIOUS` to a generated-key deployment; it fails closed instead of replacing the existing keys. The internal keys are not exposed as an API credential. Changing `LOGIN_PASSWORD` does not rotate them.
+
+For existing deployments, retain `SERVER_KEY` and any `SERVER_KEY_PREVIOUS` during the upgrade. Set `LOGIN_PASSWORD` to enable password sign-in. Do not remove the old key as part of this feature's migration. Rollback to an older build is supported only for deployments retaining their explicit keys; a deployment with generated keys requires a build that understands those keys.
 
 `SERVER_KEY` signs connector device tokens, seals secrets at rest, and gates the owner API. It is rotatable without re-pairing every machine — tokens carry the signing key's id, and `SERVER_KEY_PREVIOUS` keeps a verification window open (protocol design §5.1). The API accepts the previous key through the window, so your scripts keep working while you swap them:
 

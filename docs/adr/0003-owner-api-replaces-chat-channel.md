@@ -1,5 +1,7 @@
 # No chat channel: a SERVER_KEY-gated owner API
 
+Browser sign-in and new-deployment key ownership are superseded by [ADR-0010](0010-browser-password-authentication.md). The explicit-key owner API remains available for compatibility.
+
 The Feishu integration — QR onboarding, manual credentials, the event webhook, the sealed tenant token, and card rendering — is removed for now: it was the largest and most intricate slice of the deployment, and the product works without a chat provider. Whoever holds `SERVER_KEY` is the owner. The Worker now serves four keyed routes that forward into the Durable Object:
 
 - `POST /api/messages` — the owner's text (quote with `replyTo` = a sent message id for deterministic Thread routing); the spend phrases (`/花费` 等) stay deterministic.

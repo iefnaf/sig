@@ -5,20 +5,28 @@
 // standing in for the browser + platform authenticator. webauthn.test.ts already covers the
 // protocol-verification functions in isolation; this file covers the HTTP/session/DB wiring
 // around them: single-use challenges, RP ID binding, sign-count regression, and remove.
-import { SELF } from "cloudflare:test";
+import { SELF, runInDurableObject } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { isoBase64URL, isoCBOR } from "@simplewebauthn/server/helpers";
 import { mintWebauthnChallenge, WEBAUTHN_CHALLENGE_TTL_MS } from "../src/web.ts";
-import { configureAndBind, resetLedgerState, webLogin } from "./helpers.ts";
+import { configureAndBind, ownerStub, resetLedgerState, webLogin } from "./helpers.ts";
+import type { Steward } from "../src/steward.ts";
 
 const BASE = "https://example.com";
 const RP_ID = "example.com";
 const ORIGIN = "https://example.com";
 const SERVER_KEY = "test-server-key-not-a-secret";
+let testIp = "";
+let ipCounter = 0;
 
 beforeEach(async () => {
+  testIp = `198.18.0.${++ipCounter}`;
   await resetLedgerState();
   await configureAndBind("ou_owner");
+  await runInDurableObject(ownerStub(), (instance: Steward) => {
+    const sql = (instance as unknown as { sql: (strings: TemplateStringsArray) => unknown }).sql.bind(instance);
+    sql`DELETE FROM sh_auth_limit`;
+  });
 });
 
 interface Settings {
@@ -156,7 +164,7 @@ interface LoginOptions {
 }
 
 async function loginOptions(): Promise<LoginOptions> {
-  const res = await SELF.fetch(`${BASE}/webauthn/login/options`, { method: "POST" });
+  const res = await SELF.fetch(`${BASE}/webauthn/login/options`, { method: "POST", headers: { origin: ORIGIN, "CF-Connecting-IP": testIp } });
   expect(res.status).toBe(200);
   return (await res.json()) as LoginOptions;
 }
@@ -184,12 +192,12 @@ describe("registering a passkey from an open session", () => {
 /** The full two-leg login ceremony against one already-registered authenticator. */
 async function signIn(auth: { assertion: (challenge: string, signCount: number, opts?: { rpId?: string; origin?: string }) => Promise<Record<string, string>> }, signCount: number, opts: { host?: string } = {}) {
   const host = opts.host ?? BASE;
-  const optionsRes = await SELF.fetch(`${host}/webauthn/login/options`, { method: "POST" });
+  const optionsRes = await SELF.fetch(`${host}/webauthn/login/options`, { method: "POST", headers: { origin: host, "CF-Connecting-IP": testIp } });
   const options = (await optionsRes.json()) as LoginOptions;
   const assertion = await auth.assertion(options.challenge, signCount);
   const verify = await SELF.fetch(`${host}/webauthn/login/verify`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", origin: host, "CF-Connecting-IP": testIp },
     body: JSON.stringify({ challengeToken: options.challengeToken, ...assertion }),
   });
   return verify;
@@ -217,10 +225,25 @@ describe("signing in with a passkey (full ceremony)", () => {
     const options = await loginOptions();
     const assertion = await auth.assertion(options.challenge, 1);
     const body = JSON.stringify({ challengeToken: options.challengeToken, ...assertion });
-    const first = await SELF.fetch(`${BASE}/webauthn/login/verify`, { method: "POST", headers: { "content-type": "application/json" }, body });
+    const first = await SELF.fetch(`${BASE}/webauthn/login/verify`, { method: "POST", headers: { "content-type": "application/json", origin: ORIGIN, "CF-Connecting-IP": testIp }, body });
     expect(first.status).toBe(200);
-    const second = await SELF.fetch(`${BASE}/webauthn/login/verify`, { method: "POST", headers: { "content-type": "application/json" }, body });
+    const second = await SELF.fetch(`${BASE}/webauthn/login/verify`, { method: "POST", headers: { "content-type": "application/json", origin: ORIGIN, "CF-Connecting-IP": testIp }, body });
     expect(second.status).toBe(409);
+  });
+
+  it("keeps a used assertion unusable after a deployment password reset", async () => {
+    await ownerStub().configureBrowserPasswordForTests("an earlier owner password 41!");
+    const session = await browser();
+    const auth = await registerPasskey(session);
+    const options = await loginOptions();
+    const assertion = await auth.assertion(options.challenge, 1);
+    const body = JSON.stringify({ challengeToken: options.challengeToken, ...assertion });
+    const first = await SELF.fetch(`${BASE}/webauthn/login/verify`, { method: "POST", headers: { "content-type": "application/json", origin: ORIGIN, "CF-Connecting-IP": testIp }, body });
+    expect(first.status).toBe(200);
+
+    await ownerStub().configureBrowserPasswordForTests("a replacement owner password 52!");
+    const replay = await SELF.fetch(`${BASE}/webauthn/login/verify`, { method: "POST", headers: { "content-type": "application/json", origin: ORIGIN, "CF-Connecting-IP": testIp }, body });
+    expect(replay.status).toBe(409);
   });
 
   it("rejects an expired challenge", async () => {
@@ -230,7 +253,7 @@ describe("signing in with a passkey (full ceremony)", () => {
     const assertion = await auth.assertion(expired.challenge, 1);
     const res = await SELF.fetch(`${BASE}/webauthn/login/verify`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", origin: ORIGIN, "CF-Connecting-IP": testIp },
       body: JSON.stringify({ challengeToken: expired.token, ...assertion }),
     });
     expect(res.status).toBe(410);
@@ -245,7 +268,7 @@ describe("signing in with a passkey (full ceremony)", () => {
     const assertion = await auth.assertion(options.challenge, 1, { rpId: "not-example.com" });
     const res = await SELF.fetch(`${BASE}/webauthn/login/verify`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", origin: ORIGIN, "CF-Connecting-IP": testIp },
       body: JSON.stringify({ challengeToken: options.challengeToken, ...assertion }),
     });
     expect(res.status).toBe(401);
@@ -268,5 +291,16 @@ describe("signing in with a passkey (full ceremony)", () => {
     expect(removed.status).toBe(200);
     expect((await session.settings()).passkeys).toEqual([]);
     expect((await signIn(auth, 1)).status).toBe(401);
+  });
+
+  it("keeps registered passkeys usable after a deployment password reset", async () => {
+    const session = await browser();
+    const auth = await registerPasskey(session);
+    await ownerStub().configureBrowserPasswordForTests("a replacement owner password 51!");
+
+    const oldSession = await SELF.fetch(`${BASE}/app`, { headers: { cookie: session.cookie } });
+    expect(oldSession.status).toBe(200);
+    expect(await oldSession.text()).toContain('id="password-form"');
+    expect((await signIn(auth, 1)).status).toBe(200);
   });
 });

@@ -1,23 +1,19 @@
-// The signed-link web (issue #22, spec §7.3–7.4 / §12.2, steward.md §10; ADR-0001 decisions
-// 7 and 12, superseded by ADR-0005): the only door into the web app is a signed login link
-// minted by `POST /api/login-link` (the SERVER_KEY holder, ADR-0003) or a card's 查看详情
-// button. Production links are single-use and short-expiry; Preview deployments can make
-// them reusable. Opening one exchanges the token for a session cookie bound to the owner;
-// the session opens the web workspace (workspace.ts / workspace-api.ts: a static page that
-// talks to a small JSON API), plus the server-rendered machine and raw-process pages.
+// The browser web app (issue #22; browser entry superseded by ADR-0010). Password, passkey,
+// and signed-link exchanges all open the same database-backed session, which gates the
+// workspace. Production links are single-use and short-expiry; Preview deployments can make
+// them reusable.
 //
-// Token formats (SERVER_KEY-signed, rotatable like every other MAC in the deployment):
+// Token formats (deployment-key-signed and rotatable):
 //   link    wl1.<target>.<expiresAt>.<nonce>.<mac>   production: one use, ≤15 min
 //   session ws1.<sid>.<mac>                           random sid, DB-backed, 7 days
-// The Worker layer verifies the HMACs statelessly (index.ts) so blind probes never wake the
-// Durable Object; single-use and session liveness are DB facts, checked here.
+// The owner Durable Object owns the keys and checks single-use/session liveness.
 //
 // Page content comes from the memory module's `views` (ledger.ts) and the protocol-layer
 // device list — never raw table SQL scattered in handlers. Write actions from the web are
 // logged to the audit trail like every other management action.
 import type { Ledger } from "./ledger.ts";
 import type { SqlExecutor } from "./schema.ts";
-import { BRAND_HEAD, BRAND_LOCKUP, BRAND_STYLE } from "./brand.ts";
+import { loginPage } from "./login-page.ts";
 import { verifyAssertionResponse, verifyRegistrationResponse, WebauthnVerifyError } from "./webauthn.ts";
 import { handleWorkspaceApi, type WorkspaceApiDeps } from "./workspace-api.ts";
 import { WorkspaceError } from "./workspace.ts";
@@ -287,50 +283,11 @@ export interface WebDeps {
 interface SessionRow {
   sid: string;
   csrf: string;
+  recent: boolean;
 }
 
-function esc(text: string): string {
-  return text.replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch] ?? ch);
-}
-
-/** Served as a new unauthenticated static asset, next to how index.ts already handles
- *  LOGO_PATH/AVATAR_PATH — the sign-in page has no session, so it cannot reach anything under
- *  the session-gated /app/assets/* tree (including i18n.js), and carries its own tiny inline
- *  string table instead. */
-export const LOGIN_SCRIPT_PATH = "/login.js";
-
-function loginPromptPage(message: string, status: number, policy: LoginLinkPolicy = DEFAULT_LOGIN_LINK_POLICY): Response {
-  const html = `<!doctype html>
-<html lang="zh-CN">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex">
-<title>Sig</title>
-${BRAND_HEAD}
-<style>${BRAND_STYLE}body{font:15px/1.7 -apple-system,"PingFang SC",sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:0 16px}main{max-width:480px}button{font:inherit;margin-top:12px;padding:8px 16px;border-radius:8px;border:1px solid #1c3656;background:#1c3656;color:#fff;cursor:pointer}button:disabled{opacity:.6;cursor:default}.hint{opacity:.75;font-size:13px}#passkey-status{color:#b3261e}</style>
-</head>
-<body><main>
-${BRAND_LOCKUP}
-<p>${esc(message)}</p>
-<p><button id="passkey-signin" type="button" hidden>使用通行密钥登录</button></p>
-<p id="passkey-status" hidden></p>
-<p class="hint">新的登录链接用 <code>POST /api/login-link</code> 签发（${policy.singleUse ? "只能打开一次" : "在有效期内可重复打开"}，${Math.floor(policy.ttlMs / 60_000)} 分钟内有效）。</p>
-<script type="module" src="${LOGIN_SCRIPT_PATH}"></script>
-</main></body></html>`;
-  return new Response(html, {
-    status,
-    headers: {
-      "content-type": "text/html; charset=utf-8",
-      "content-security-policy": [
-        "default-src 'none'",
-        "script-src 'self'",
-        "style-src 'self' 'unsafe-inline'",
-        "img-src 'self' data:",
-        "connect-src 'self'",
-        "base-uri 'none'",
-        "form-action 'none'",
-        "frame-ancestors 'none'",
-      ].join("; "),
-    },
-  });
+function loginPromptPage(message: string, status: number): Response {
+  return loginPage(message, status);
 }
 
 export class WebApp {
@@ -390,8 +347,10 @@ export class WebApp {
       SELECT target, usedAt, expiresAt FROM sh_web_link WHERE tokenHash = ${hash}
     `[0];
     const policy = this.#deps.loginLinkPolicy ?? DEFAULT_LOGIN_LINK_POLICY;
-    if (!row) return loginPromptPage("链接无效。", 403, policy);
-    if (row.expiresAt <= this.#now()) return loginPromptPage("链接已过期。", 410, policy);
+    if (!row) return loginPromptPage("This sign-in link is invalid. / 登录链接无效。", 403);
+    if (row.expiresAt <= this.#now()) {
+      return loginPromptPage("This sign-in link has expired. / 登录链接已过期。", 410);
+    }
     if (policy.singleUse) {
       // Conditional consume (spike bug 1's pattern): exactly one concurrent open can flip
       // usedAt from NULL — the loser sees changes() == 0 and is told the link is spent.
@@ -400,7 +359,9 @@ export class WebApp {
         WHERE tokenHash = ${hash} AND usedAt IS NULL AND expiresAt > ${this.#now()}
       `;
       const consumed = this.#sql<{ changes: number }>`SELECT changes() AS changes`[0]!.changes > 0;
-      if (!consumed) return loginPromptPage("链接已使用过，只能打开一次。", 410, policy);
+      if (!consumed) {
+        return loginPromptPage("This sign-in link has already been used. / 链接已使用过，只能打开一次。", 410);
+      }
     }
     const location = row.target === "home" ? "/app" : `/app/threads/${row.target.replace(/^t\//, "")}`;
     const { cookie } = await this.openSession(secure);
@@ -420,7 +381,11 @@ export class WebApp {
    *  replay. mintWebauthnChallenge never touches the DB, so this insert is the only state a
    *  WebAuthn challenge ever has — there is nothing to pre-register before the attempt. */
   #consumeWebauthnNonce(nonce: string): boolean {
-    this.#sql`INSERT OR IGNORE INTO sh_web_webauthn_nonce (nonce, usedAt) VALUES (${nonce}, ${this.#now()})`;
+    const now = this.#now();
+    // Invalid assertions consume nonces too; prune here so anonymous traffic cannot grow the
+    // replay ledger indefinitely when nobody completes a session.
+    this.#sql`DELETE FROM sh_web_webauthn_nonce WHERE usedAt < ${now - 24 * 3600_000}`;
+    this.#sql`INSERT OR IGNORE INTO sh_web_webauthn_nonce (nonce, usedAt) VALUES (${nonce}, ${now})`;
     return this.#sql<{ changes: number }>`SELECT changes() AS changes`[0]!.changes > 0;
   }
 
@@ -439,6 +404,12 @@ export class WebApp {
       userId: toBase64Url(enc.encode("owner")),
       excludeCredentials: this.listPasskeys().map((passkey) => ({ id: passkey.credentialId, transports: passkey.transports })),
     };
+  }
+
+  /** Discoverable passkey sign-in options; the challenge key never leaves the owner DO. */
+  async webauthnLoginOptions(rpId: string): Promise<{ challenge: string; challengeToken: string; rpId: string; expiresAt: number }> {
+    const { token, challenge, expiresAt } = await mintWebauthnChallenge(this.#deps.secrets[0]!, "authenticate", "-", this.#now());
+    return { challenge, challengeToken: token, rpId, expiresAt };
   }
 
   /**
@@ -482,17 +453,19 @@ export class WebApp {
     const challengeToken = typeof wire.challengeToken === "string" ? wire.challengeToken : null;
     const credentialId = typeof wire.credentialId === "string" ? wire.credentialId : null;
     const verified = await verifyWebauthnChallenge(this.#deps.secrets, challengeToken);
-    if (!verified || verified.purpose !== "authenticate" || !credentialId) return loginPromptPage("登录已过期，请重试。", 410);
+    if (!verified || verified.purpose !== "authenticate" || !credentialId) {
+      return loginPromptPage("This sign-in request expired. Try again. / 登录已过期，请重试。", 410);
+    }
     if (!this.#consumeWebauthnNonce(verified.nonce)) {
       this.#deps.audit("webauthn_login_failed", "replay");
-      return loginPromptPage("此登录请求已被使用。", 409);
+      return loginPromptPage("This sign-in request has already been used. / 此登录请求已被使用。", 409);
     }
     const row = this.#sql<{ publicKeyCose: string; signCount: number }>`
       SELECT publicKeyCose, signCount FROM sh_web_credential WHERE credentialId = ${credentialId}
     `[0];
     if (!row) {
       this.#deps.audit("webauthn_login_failed", "unknown_credential");
-      return loginPromptPage("未找到匹配的通行密钥。", 401);
+      return loginPromptPage("No matching passkey was found. / 未找到匹配的通行密钥。", 401);
     }
     let result;
     try {
@@ -505,7 +478,7 @@ export class WebApp {
       });
     } catch (err) {
       this.#deps.audit("webauthn_login_failed", err instanceof WebauthnVerifyError ? err.reason : (err instanceof Error ? err.message : String(err)));
-      return loginPromptPage("通行密钥验证失败。", 401);
+      return loginPromptPage("Passkey verification failed. / 通行密钥验证失败。", 401);
     }
     const now = this.#now();
     this.#sql`UPDATE sh_web_credential SET signCount = ${result.newSignCount}, lastUsedAt = ${now} WHERE credentialId = ${credentialId}`;
@@ -530,9 +503,8 @@ export class WebApp {
     }));
   }
 
-  /** No "last passkey" guard, deliberately: the link flow is always available regardless of
-   *  passkey count (ADR-0003/0005), so removing one — even the only one — never locks the
-   *  owner out. */
+  /** No "last passkey" guard: the deployment password remains available, so removing the only
+   *  passkey cannot lock the owner out. */
   removePasskey(credentialId: string): void {
     this.#sql`DELETE FROM sh_web_credential WHERE credentialId = ${credentialId}`;
   }
@@ -573,12 +545,13 @@ export class WebApp {
     const raw = cookie.split(/;\s*/).find((part) => part.startsWith(`${SESSION_COOKIE}=`))?.slice(SESSION_COOKIE.length + 1) ?? null;
     const sid = await parseSessionCookie(this.#deps.secrets, raw);
     if (!sid) return null;
-    const row = this.#sql<{ csrf: string }>`
-      SELECT csrf FROM sh_web_session WHERE sid = ${sid} AND expiresAt > ${this.#now()}
+    const now = this.#now();
+    const row = this.#sql<{ csrf: string; createdAt: number }>`
+      SELECT csrf, createdAt FROM sh_web_session WHERE sid = ${sid} AND expiresAt > ${now}
     `[0];
     if (!row) return null;
-    this.#sql`UPDATE sh_web_session SET lastSeenAt = ${this.#now()} WHERE sid = ${sid}`;
-    return { sid, csrf: row.csrf };
+    this.#sql`UPDATE sh_web_session SET lastSeenAt = ${now} WHERE sid = ${sid}`;
+    return { sid, csrf: row.csrf, recent: now - row.createdAt <= 10 * 60_000 };
   }
 
   // ---- the app pages -------------------------------------------------------------------------------
@@ -586,14 +559,31 @@ export class WebApp {
   /** Handles /app* with the session cookie gate; every other route is the caller's. */
   async handle(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    const thread = /^\/app\/threads\/([\w-]+)$/.exec(url.pathname);
+    const rawProcess = /^\/app\/threads\/([\w-]+)\/workers\/([A-Za-z0-9._-]+)$/.exec(url.pathname);
+    const api = url.pathname.startsWith("/app/api/");
+    const asset = url.pathname.startsWith("/app/assets/");
+    const assetName = asset ? url.pathname.slice("/app/assets/".length) : "";
+    if (asset && (request.method !== "GET" || !/^[A-Za-z0-9][\w.-]*$/.test(assetName))) {
+      return new Response("not found", { status: 404 });
+    }
+    const page = request.method === "GET" && (
+      url.pathname === "/app" || url.pathname === "/app/" || url.pathname === "/app/settings" ||
+      url.pathname === "/app/machines" || thread !== null || rawProcess !== null
+    );
+    // Unknown app routes stay 404 even without a session; the login gate is not a route index.
+    if (!api && !asset && !page) return new Response("not found", { status: 404 });
+
     const session = await this.#sessionFromRequest(request);
     if (!session) {
-      return url.pathname.startsWith("/app/api/")
-        ? Response.json({ error: "auth_required" }, { status: 401, headers: { "cache-control": "no-store" } })
-        : loginPromptPage("请先登录。", 401);
+      if (api) {
+        return Response.json({ error: "auth_required" }, { status: 401, headers: { "cache-control": "no-store" } });
+      }
+      if (asset) return new Response("unauthorized", { status: 401 });
+      return loginPage();
     }
 
-    if (url.pathname.startsWith("/app/api/")) {
+    if (api) {
       return handleWorkspaceApi(request, url, session, {
         ledger: this.#ledger,
         devices: () => this.#deviceViews().map(({ deviceId, name, online, revoked }) => ({ deviceId, name, online, revoked })),
@@ -604,17 +594,21 @@ export class WebApp {
       });
     }
 
+    if (asset) {
+      return new Response(null, { status: 204, headers: { "x-sig-asset": "1", "cache-control": "no-store" } });
+    }
+
     // The workspace: /app is the whole conversation; a Thread URL (the card links and the
     // session viewer's way back) opens the same page with that Thread selected; settings
     // and machines are dialogs the page opens over the same shell.
-    if (request.method === "GET" && (url.pathname === "/app" || url.pathname === "/app/settings" || url.pathname === "/app/machines")) return this.workspaceShell();
-    const thread = /^\/app\/threads\/([\w-]+)$/.exec(url.pathname);
-    if (thread && request.method === "GET") {
+    if (url.pathname === "/app" || url.pathname === "/app/" || url.pathname === "/app/settings" || url.pathname === "/app/machines") {
+      return this.workspaceShell();
+    }
+    if (thread) {
       return this.#ledger.threads.get(thread[1]!) ? this.workspaceShell() : new Response("not found", { status: 404 });
     }
     // The old raw-process URL (ADR-0001 decision 12) opens the workspace's session viewer.
-    const rawProcess = /^\/app\/threads\/([\w-]+)\/workers\/([A-Za-z0-9._-]+)$/.exec(url.pathname);
-    if (rawProcess && request.method === "GET") return this.workspaceShell();
+    if (rawProcess) return this.workspaceShell();
 
     return new Response("not found", { status: 404 });
   }

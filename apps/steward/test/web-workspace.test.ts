@@ -332,7 +332,8 @@ describe("the page and its files", () => {
     expect(response.headers.get("x-sig-workspace-shell")).toBe("1");
     expect(await response.text()).toBe("");
     const denied = await ownerStub().fetch(new Request(`${BASE}/app`));
-    expect(denied.status).toBe(401);
+    expect(denied.status).toBe(200);
+    expect(await denied.text()).toContain('id="password-form"');
   });
 
   it("serve the workspace shell with a policy that forbids inline script and foreign origins", async () => {

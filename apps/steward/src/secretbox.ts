@@ -1,13 +1,13 @@
 // AES-GCM sealing for secrets at rest (steward.md §9.0 / spec §12.2: "credentials are stored
-// encrypted"). The AES key is HKDF-derived from a SERVER_KEY, so a raw storage dump alone does
-// not expose the plaintext.
+// encrypted"). The AES key is HKDF-derived from the deployment signing key (an explicit
+// SERVER_KEY or the generated key held by the owner Durable Object).
 //
 // Format v2 — `v2.<keyId>.<iv>.<cipher>` — embeds the sealing key's id (the same derivation as
-// device tokens, see protocol/token.ts), so during a SERVER_KEY rotation window the opener
-// picks the right key from the configured set. Format v1 — `v1.<iv>.<cipher>`, sealed before
-// keyIds existed — is tried against every configured key. Callers are encouraged to re-seal
-// under the primary key after a non-primary open (the steward does this lazily on read), so
-// ciphertexts converge onto the current key and the window can close.
+// device tokens, see protocol/token.ts), so during an explicit-key rotation the opener picks
+// the right key from the configured set. Format v1 — `v1.<iv>.<cipher>`, sealed before keyIds
+// existed — is tried against every configured key. Callers are encouraged to re-seal under the
+// primary key after a non-primary open (the steward does this lazily on read), so ciphertexts
+// converge onto the current key and the window can close.
 import { deriveKeyId, type ServerKey } from "@nightboats/protocol";
 
 const enc = new TextEncoder();

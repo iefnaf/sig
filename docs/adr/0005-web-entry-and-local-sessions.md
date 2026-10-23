@@ -1,5 +1,7 @@
 # ADR-0005: Web entry and local worker sessions
 
+The browser authentication entry is superseded by [ADR-0010](0010-browser-password-authentication.md). Session viewing and local transcript ownership remain unchanged.
+
 Status: accepted and implemented (2026-10-18; renumbered when ADR-0002/0003 took the Sig brand and the owner API). Decision 2 (Cloudflare Access front door) was superseded twice — first by the device-first claim (ADR-0006, then rejected), finally by ADR-0003: the session is opened by a one-time link minted through the SERVER_KEY-gated owner API. Decision 8 (keep the Feishu code, unreachable) is superseded by ADR-0003's deletion of the channel. Amends ADR-0001 decisions 4, 7–9 and 12, and ADR-0004's channel and onboarding decisions. How it is built is in [design/web-entry.md](../design/web-entry.md).
 
 The owner wants to use the web workspace as the sole user entry for now and retire any chat-platform dependence. The first session viewer covers sessions started by Pip; the owner does not need to read full sessions while their machines are offline. Keeping original session records on the machine preserves the existing data boundary and avoids a cloud transcript archive.

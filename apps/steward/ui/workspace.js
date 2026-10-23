@@ -1394,7 +1394,7 @@ async function signOut() {
   unmountViewer();
   closeDialog();
   renderFatal();
-  location.assign('/app'); // back to the sign-in page (ADR-0003/0005: the way in is a one-time link minted through the owner API)
+  location.assign('/app'); // back to the shared password/passkey sign-in page (ADR-0010)
 }
 
 // ---- settings, pairing, revoking ---------------------------------------------------------------------------
@@ -1604,6 +1604,10 @@ async function addPasskey() {
   bumpDialog();
   try {
     const { status, data } = await request('/app/api/settings/webauthn/register/options', {});
+    if (status === 403) {
+      location.assign(`/?reauth=1&next=${encodeURIComponent(location.pathname)}`);
+      return;
+    }
     if (status !== 200 || !data) throw new Error('options_failed');
     let credential;
     try {
@@ -1630,6 +1634,10 @@ async function addPasskey() {
       attestationObject: bufferToB64url(credential.response.attestationObject),
       label,
     });
+    if (verifyStatus === 403) {
+      location.assign(`/?reauth=1&next=${encodeURIComponent(location.pathname)}`);
+      return;
+    }
     if (verifyStatus !== 200) throw new Error('verify_failed');
     state.passkeyLabelDraft = '';
     security.passkeyAdd = null;
@@ -1645,6 +1653,10 @@ async function addPasskey() {
 async function removePasskey(credentialId) {
   try {
     const { status } = await request('/app/api/settings/webauthn/remove', { credentialId });
+    if (status === 403) {
+      location.assign(`/?reauth=1&next=${encodeURIComponent(location.pathname)}`);
+      return;
+    }
     if (status !== 200 && status !== 401) toast(t('passkeyRemoveFailed'));
   } catch {
     toast(t('passkeyRemoveFailed'));

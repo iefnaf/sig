@@ -90,7 +90,7 @@ export const MIGRATIONS: readonly Migration[] = [
     id: "003_channel_feishu",
     up: (sql) => {
       // One row per channel once manual credentials are submitted (ADR-0001 decisions 8-9).
-      // Secrets are AES-GCM sealed under SERVER_KEY (secretbox.ts); `ownerOpenId` NULL means
+      // Secrets are AES-GCM sealed under the deployment key (secretbox.ts); `ownerOpenId` NULL means
       // "credentials configured, awaiting the owner's first DM". Once set, setup is closed
       // forever — the row is never unbound.
       sql`CREATE TABLE IF NOT EXISTS sh_channel (
@@ -276,7 +276,7 @@ export const MIGRATIONS: readonly Migration[] = [
         PRIMARY KEY (scope, key)
       )`;
       // Model provider credentials (spec §12.2 "model keys stored encrypted"): single row,
-      // apiKey AES-GCM sealed under SERVER_KEY exactly like the Feishu secrets. The LLM wiring
+      // apiKey AES-GCM sealed under the deployment key exactly like the Feishu secrets. The LLM wiring
       // (M2) reads it back through Steward.modelConfig(); nothing stores the raw key.
       sql`CREATE TABLE IF NOT EXISTS sh_model (
         id INTEGER PRIMARY KEY CHECK (id = 0),
@@ -355,11 +355,10 @@ export const MIGRATIONS: readonly Migration[] = [
     },
   },
   {
-    // The signed-link web (issue #22, spec §7.3/§12.2, steward.md §10): login links minted
-    // for the owner's chat, the sessions they are exchanged for, and the deployment's public
-    // origin (links and pairing commands need absolute URLs, and the DO only ever sees the
-    // origin through the requests it serves). These tables belong to web.ts. Numbered 009:
-    // #6's steward_llm took 008 first in the merge.
+    // The browser web (issue #22; auth superseded by ADR-0010): card/login links, the shared
+    // sessions they and password/passkey login open, and the deployment's public origin (links
+    // and pairing commands need absolute URLs, and the DO only sees origin through requests).
+    // These tables belong to web.ts. Numbered 009: #6's steward_llm took 008 first in the merge.
     id: "009_web",
     up: (sql) => {
       // Single-use enforcement for signed links: the token's HMAC covers target + expiry
@@ -858,8 +857,8 @@ export const MIGRATIONS: readonly Migration[] = [
   },
   {
     // The workspace's idempotent pairing mints (ADR-0004): a retried "add machine" request
-    // gets the same one-time code back instead of a second one. The owner needs no row —
-    // ADR-0003: whoever holds SERVER_KEY is the owner.
+    // gets the same one-time code back instead of a second one. The owner needs no row; the
+    // deployment has one browser authority under ADR-0010.
     id: "020_web_owner",
     up: (sql) => {
       sql`CREATE TABLE IF NOT EXISTS sh_web_session (
@@ -940,6 +939,14 @@ export const MIGRATIONS: readonly Migration[] = [
       ignoringDuplicateColumn(() => {
         sql`ALTER TABLE sh_report ADD COLUMN answer TEXT`;
       });
+    },
+  },
+  {
+    id: "025_browser_login",
+    up: (sql) => {
+      sql`CREATE TABLE sh_auth_deployment (id INTEGER PRIMARY KEY CHECK(id = 0), mode TEXT NOT NULL, secret TEXT)`;
+      sql`CREATE TABLE sh_auth_password (id INTEGER PRIMARY KEY CHECK(id = 0), salt TEXT NOT NULL, digest TEXT NOT NULL, revision TEXT NOT NULL)`;
+      sql`CREATE TABLE sh_auth_limit (bucket TEXT PRIMARY KEY, windowStart INTEGER NOT NULL, attempts INTEGER NOT NULL, failures INTEGER NOT NULL, blockedUntil INTEGER NOT NULL, expiresAt INTEGER NOT NULL)`;
     },
   },
 ];

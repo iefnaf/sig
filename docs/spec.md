@@ -2,13 +2,18 @@
 
 > Status: draft v0.2.
 >
-> **Update (ADR-0003):** the chat-channel requirement (Feishu) is deferred. The owner
-> interacts through a SERVER_KEY-gated HTTP API and the web workspace; everything else in
-> this document stands. The channel sections remain as the future-integration design.
+> **Update (ADR-0003/0010):** the chat-channel requirement (Feishu) is deferred. The owner
+> uses the browser workspace, whose optional programmatic API remains SERVER_KEY-gated;
+> everything else in this document stands. The channel sections remain as the future-integration
+> design.
 >
 > **Update (ADR-0004/0005):** the web workspace is the owner's everyday entry — one
 > continuous conversation over the API's local channel, with Threads, "Needs you" decisions,
 > and worker session records read on demand from their machines ([web entry](design/web-entry.md)).
+>
+> **Update (ADR-0010):** browser access now uses a deployment password or passkey at the public
+> root URL. The one-time-link statements below record the earlier Feishu-era design. Card detail
+> links remain; API-issued login links are now an explicit-key compatibility path.
 > This document defines only **product requirements and boundaries** and does not cover specific technical implementation approaches. Technology-related assumptions and items to verify are collected in the "Items to Verify" section.
 
 ## 1. Overview
@@ -134,7 +139,8 @@ Content that does not fit in chat is viewed on the web via a link. The web is no
 - Routine and patrol list (view, pause, delete).
 - Machine management (pair, revoke).
 
-Login is handled by the IM: links the steward issues carry a one-time signature; opening one logs you in.
+Historical design: login was handled by the IM, with one-time signed links. Browser password and
+passkey sign-in now supersede this flow ([ADR-0010](adr/0010-browser-password-authentication.md)).
 
 ### 7.4 Visibility Layers
 
@@ -291,7 +297,9 @@ The connector is effectively a remote-code-execution entry point and is fully au
 
 - **Identity**: carried by the Feishu account system; only the owner's direct messages are answered.
 - **Machine pairing**: the command embeds a one-time pairing code that expires once used; each machine has its own credentials, revocable individually on the web.
-- **Web access**: login via one-time signed links issued through the IM.
+- **Web access**: historical one-time IM links are superseded by password/passkey
+  authentication with rate limits and recent-auth checks for security changes
+  ([ADR-0010](adr/0010-browser-password-authentication.md)).
 - **Model keys**: stored encrypted in the user's own Cloudflare account, never passing through a third party.
 - Content from external sources (agent reports, future external events) is never treated as a trusted instruction.
 

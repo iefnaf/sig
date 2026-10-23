@@ -69,6 +69,7 @@ describe("the raw process page", () => {
 
   it("requires the login session", async () => {
     const res = await SELF.fetch("https://example.com/app/threads/t_x/workers/w_y");
-    expect(res.status).toBe(401);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('id="password-form"');
   });
 });

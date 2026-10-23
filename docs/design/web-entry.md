@@ -1,6 +1,6 @@
 # Web entry and the session viewer
 
-Status: implemented ([ADR-0005](../adr/0005-web-entry-and-local-sessions.md), on the owner API of [ADR-0003](../adr/0003-owner-api-replaces-chat-channel.md) — the device-first claim variant was rejected as [ADR-0006](../adr/0006-device-first-claim-rejected.md)). This is how it is built; the decisions and their reasons are in the ADRs, the operator's steps in [deploy.md](../deploy.md).
+Status: implemented ([ADR-0005](../adr/0005-web-entry-and-local-sessions.md), [ADR-0010](../adr/0010-browser-password-authentication.md); browser authentication supersedes the link-only entry in ADR-0003/0005. The device-first claim variant was rejected as [ADR-0006](../adr/0006-device-first-claim-rejected.md)). This is how it is built; the decisions and their reasons are in the ADRs, the operator's steps in [deploy.md](../deploy.md).
 
 ## Doors
 
@@ -8,29 +8,34 @@ Status: implemented ([ADR-0005](../adr/0005-web-entry-and-local-sessions.md), on
 
 | Path | Who | Checked by |
 | --- | --- | --- |
-| `/app`, `/app/*` (pages, `/app/api/*`, `/app/assets/*`) | the owner's browser | the application session cookie (HMAC at the Worker, liveness in the Durable Object); without it: the sign-in page, which has no input |
-| `/app/ws` (WebSocket) | the owner's browser | a well-formed application session cookie at the Worker; session liveness in the Durable Object |
-| `/api/*` (POST/GET) | the owner (scripts, agents) | the `SERVER_KEY` bearer at the Worker — [ADR-0003](../adr/0003-owner-api-replaces-chat-channel.md)'s four routes only |
+| `/` | anyone | a valid session redirects to `/app`; otherwise the shared password/passkey sign-in page |
+| `/login.js`, brand assets | anyone | public static assets used only by the sign-in/error pages |
+| `/auth/password`, `/webauthn/login/*` (POST) | the owner's browser | exact-origin request, edge and Durable Object admission budgets, then password/passkey verification in the Durable Object |
+| `/app`, `/app/*` (pages, `/app/api/*`, `/app/assets/*`) | the owner's browser | the application session cookie (HMAC and liveness in the Durable Object); without it: the shared sign-in page, or a JSON `401` under `/app/api/*` |
+| `/app/ws` (WebSocket) | the owner's browser | session HMAC and liveness in the Durable Object |
+| `/api/*` (POST/GET) | explicit-key deployments (scripts, agents) | the `SERVER_KEY` bearer at the Worker and again in the Durable Object; fresh generated-key deployments answer `401` |
 | `/pair` (POST) | machines | the one-time pairing code minted via `POST /api/pairing`, brute-force guarded |
-| `/link/<token>` (GET) | a browser with the link | the token's HMAC at the Worker; single-use in the Durable Object |
-| `/agents/steward/owner` (WebSocket) | a paired machine | the per-machine device token at the Worker pre-check (`onBeforeConnect`); a browser socket instead presents the session cookie with `role=web` |
+| `/link/<token>` (GET) | card/detail links; legacy sign-in links | the token's HMAC and single-use state in the Durable Object |
+| `/agents/steward/owner` (exact WebSocket) | a paired machine | generated/explicit deployment key and device token in the Durable Object; a browser socket instead presents the session cookie with `role=web` |
 
-The Worker rewrites the workspace's socket (`/app/ws`) onto the Agents SDK route with an explicit `role=web` and re-checks the cookie there; machine sockets authenticate with device tokens. The doors are pinned by `test/routes-audit.test.ts`: nothing beyond `POST /pair` and the two brand assets answers without credentials.
+Every other path, including Agent subpaths, returns `404`. The Worker rewrites the workspace socket (`/app/ws`) onto the Agents SDK route with `role=web`; machine sockets authenticate with device tokens. The doors are pinned by `test/routes-audit.test.ts` and `test/generated-auth.test.ts`.
 
 ### Keys and the application session
 
-Everything is signed by the deploy-time `SERVER_KEY` (`SERVER_KEY_PREVIOUS` keeps a rotation window open, issue #27): device tokens, session cookies, one-time links, the sealed model key. The application session (`sh_web_session`) carries the CSRF token and the logout. It is opened only by consuming a one-time link (`openLink`) — minted by `POST /api/login-link` (the owner's SERVER_KEY) or attached to a report card's 查看详情 button; the browser that opens it gets the session cookie. Every mutation needs the CSRF header, a non-cross-origin `Origin` and a JSON body. Logout deletes the session, closes the sockets it opened, and the page returns to the sign-in page, which names the one way in.
+Fresh deployments generate a signing/encryption key in the owner Durable Object and never expose it through the owner API. Existing explicit-key deployments keep `SERVER_KEY` and the optional `SERVER_KEY_PREVIOUS` rotation window (issue #27). The same key set signs device tokens, session cookies, WebAuthn challenges, legacy one-time links, and seals model settings.
+
+The application session (`sh_web_session`) carries the CSRF token and logout state. Password login, passkey login, and a legacy one-time link all open this same session; a second device can use the public URL and either primary credential. Every mutation needs the CSRF header, an exact-origin `Origin`, and a JSON body. Logout deletes the session and closes the sockets it opened. A password change revokes all browser sessions, sockets, outstanding links, and attempt state while preserving passkeys, machine credentials, and sealed model settings.
 
 ### The owner
 
-The owner is whoever holds `SERVER_KEY` (ADR-0003): no owner row, no messaging identity. Legacy rows from a deployment that had a Feishu owner keep their old `receiveId` values; new outbound rows address the constant owner id.
+The owner is the single person who controls the deployment password/passkeys and, on an explicit-key deployment, `SERVER_KEY`. There is no owner row or messaging identity. Legacy rows from a deployment that had a Feishu owner keep their old `receiveId` values; new outbound rows address the constant owner id.
 
 ## Owner workflow without Feishu
 
-- **Settings** (`/app/api/settings`, `/app/api/settings/model`): the model selection (`apiKey` is a boolean — the key is never returned). Issue #70: saving takes `{provider, modelId, apiKey, baseUrl?}` together — a runtime switch, not just a key replacement — and re-seals all of it under `SERVER_KEY`; from then on it wins over `vars.STEWARD_MODEL` entirely (steward.ts `mergeModelSelection`).
+- **Settings** (`/app/api/settings`, `/app/api/settings/model`): the model selection (`apiKey` is a boolean — the key is never returned). Issue #70: saving takes `{provider, modelId, apiKey, baseUrl?}` together — a runtime switch, not just a key replacement — and re-seals all of it under the deployment key; from then on it wins over `vars.STEWARD_MODEL` entirely (steward.ts `mergeModelSelection`).
 - **Pairing** (`/app/api/pairing`): mints a one-time code (10 minutes) keyed by the client's request id, so a retry gets the same code, and returns the full `npx @nightboats/sig connect <origin> <code>` command. It is shown only in the machines panel, never in the conversation feed (`private: true` on the outbound row).
 - **Revoke** (`/app/api/machines/revoke`): bumps the device epoch and closes the connection with `4403`.
-- **First run**: the page asks for settings (a model key) and then a machine, one notice at a time.
+- **First run**: after password sign-in, the page asks for settings (a model key), then offers an optional passkey and machine connection.
 - **Reports, questions and decisions** are outbound rows on the one local channel (ADR-0003: the row settles with `providerMsgId` = row id; `GET /api/messages` reads the same rows back). The workspace derives its structured view (tone, title, body, note) from the message templates' own markers — the leading 【Thread】 prefix and tone emoji — so the API's flat text and the workspace's cards can never disagree. They exist whether or not a browser is connected; a connected one is nudged. Detail links are not generated inside the workspace: it is the page.
 
 ## Session content
@@ -62,4 +67,4 @@ The transport is the existing history relay (protocol §6.6) with one new field,
 
 ## Tests
 
-`vitest.config.ts` runs the whole suite against the production entry with the test bindings (`SERVER_KEY` et al.). `scripts/test-groups.mjs` parallelizes the files. The connector and protocol suites cover the reader and the schemas; `ui-session.test.ts` covers the browser model, `ui-modules.test.ts` the shipped files.
+`vitest.config.ts` runs the explicit-key compatibility suite against the production entry; `vitest.generated-auth.config.ts` runs fresh-deploy coverage in a separate no-`SERVER_KEY` workerd. `scripts/test-groups.mjs` parallelizes both. The connector and protocol suites cover the reader and the schemas; `ui-session.test.ts` covers the browser model, `ui-modules.test.ts` the shipped files.

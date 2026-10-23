@@ -13,11 +13,11 @@ Sig’s coordinating role: the agent that owns the conversation, memory and Thre
 _Avoid_: 总管 in interface copy.
 
 **Owner**:
-The single user of a deployment — whoever holds its SERVER_KEY. No chat-platform identity is involved while the chat channel is deferred.
+The single user of a deployment. Browser access uses the deployment login password or a registered passkey. Existing deployments can also use their explicit SERVER_KEY for the owner API. See ADR-0010 for initialization, recovery, and key ownership.
 _Avoid_: "bound owner", open_id.
 
 **Owner API**:
-The SERVER_KEY-gated HTTP surface the owner talks through: messages in, sent messages and button actions back, pairing, login links.
+The optional SERVER_KEY-gated HTTP surface for programmatic access: messages in, sent messages and button actions back, pairing, login links. Fresh deployments use the browser without requiring this API credential.
 _Avoid_: calling it "the bot" or "the webhook".
 
 **Message**:

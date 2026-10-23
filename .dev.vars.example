@@ -1,10 +1,4 @@
-# Deploy-to-Cloudflare reads this file and prompts for every key in it, so the two secrets
-# are generated during the deploy flow itself (issue #25): paste a fresh `openssl rand -hex
-# 32` for the first and your model API key for the second. Descriptions shown in the deploy
-# form live in the root package.json under cloudflare.bindings. For local dev, copy this file
-# to .dev.vars (repo root) next to the wrangler.jsonc you run against. See docs/deploy.md.
-SERVER_KEY=generate-with-openssl-rand-hex-32
-# Your model provider's API key (default provider: DeepSeek — ADR-0001 decision 11). It stays
-# an encrypted secret inside your own Cloudflare account; Sig never proxies it. You can also
-# leave this out and paste the key in the web workspace's Settings page after signing in.
-MODEL_KEY=paste-your-model-provider-api-key
+# Copy this file to .dev.vars (repo root) for local development. Pick a unique local password
+# of at least 15 characters; the deployment stores only a salted verifier. MODEL_KEY is optional.
+LOGIN_PASSWORD=replace-with-a-long-local-password
+MODEL_KEY=

@@ -1,8 +1,7 @@
-// Routes audit (issue #27 + ADR-0003): the ONLY unauthenticated entry points are POST /pair
-// and the two static brand assets. The owner API (/api/*) answers only to the SERVER_KEY
-// bearer; everything else must be walled — 401/404 at the Worker, or an SDK error for unknown
-// bindings — for any request that arrives without valid credentials. This test sweeps a
-// route/method matrix so a newly added route fails here before it ships.
+// Routes audit (issue #27 + ADR-0010): public entry points are the login page, its script,
+// the brand assets, POST /pair, and the password/passkey authentication endpoints. The owner
+// API answers only to an explicit SERVER_KEY; every other route must stay walled. This sweep
+// makes a new accidental public route fail before it ships.
 import { SELF } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { connect, ownerStub, pairDevice, resetChannelState } from "./helpers.ts";
@@ -39,6 +38,7 @@ const PROBE_PATHS = [
   "/api/actions",
   "/api/pairing",
   "/api/login-link",
+  "/app/unknown", // unknown app pages are not a login-gated route index
   "/setup", // removed with the Feishu channel (ADR-0003) — stays a 404 forever
   "/channels/feishu/events", // removed with the Feishu channel (ADR-0003) — stays a 404 forever
 ];
@@ -53,6 +53,16 @@ describe("routes audit: no unauthenticated surface beyond the documented entry p
   it("every probed route/method without credentials is walled (no 2xx, no redirects)", async () => {
     for (const path of PROBE_PATHS) {
       for (const method of METHODS) {
+        if (path === "/") {
+          if (method === "GET" || method === "HEAD") {
+            const page = await request(path, { method });
+            expect(page.status).toBe(200);
+            if (method === "GET") expect(await page.text()).toContain('id="password-form"');
+          } else {
+            expect((await request(path, { method })).status).toBe(404);
+          }
+          continue;
+        }
         // POST /pair is the documented entry point — probed for reachability below.
         if (path === "/pair" && method === "POST") continue;
         // The four /api/* routes are served WITH the key (the dedicated auth test covers
@@ -109,12 +119,16 @@ describe("routes audit: no unauthenticated surface beyond the documented entry p
   it("WebSocket upgrades on agent subpaths cannot bypass the pre-check", async () => {
     for (const path of ["/agents/steward/owner/", "/agents/steward/owner/ws", "/agents/steward/owner/pair", "/agents/steward/owner/api/messages"]) {
       const res = await request(path, { headers: { Upgrade: "websocket" } });
-      expect(res.status, path).toBe(401);
+      expect(res.status, path).toBe(404);
     }
   });
 
   it("POST /pair is reachable unauthenticated (the documented pairing entry point)", async () => {
-    const res = await request("/pair", { method: "POST", body: JSON.stringify({ code: "BADCODE1", name: "x" }) });
+    const res = await request("/pair", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ code: "BADCODE1", name: "x" }),
+    });
     expect(res.status).toBe(400); // served: invalid code — not 401/404
     expect(((await res.json()) as { error: string }).error).toBe("invalid code");
   });

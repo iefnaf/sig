@@ -3,9 +3,9 @@
 // §4 (envelope and reliability), §6.2-6.4 (commands/events), ADR-0001 (heartbeat + redelivery
 // corrections), and docs/spike-conclusions.md bugs 5 and 10.
 //
-// Owner channel (ADR-0003): the Feishu integration is gone for now. The owner talks to the
-// deployment through SERVER_KEY-gated /api/* routes on the Worker (messages in, sent rows
-// and button actions back); the outbound queue renders rows locally instead of sending them.
+// Owner channel (ADR-0003, browser authority in ADR-0010): the Feishu integration is gone for
+// now. The owner uses the password/passkey web workspace; explicit-key deployments also retain
+// the SERVER_KEY-gated /api/* routes. The outbound queue renders rows locally.
 //
 // Ledger core (issue #5, steward.md §2/§5/§6): machines/repositories from hello, online state
 // from connections, the deterministic event reducer (one transaction, derived Thread state),
@@ -61,7 +61,7 @@ import {
   type ServerKey,
   type WelcomeMessage,
 } from "@nightboats/protocol";
-import { bearer, resolveServerKeys } from "./auth.ts";
+import { bearer, resolveKeySecrets } from "./auth.ts";
 import {
   formatUsd,
   renderOverBudgetNote,
@@ -88,6 +88,8 @@ import {
   type StewardModels,
 } from "./llm/models.ts";
 import { createLedger, QUIET_MERGE_MS, type Ledger, type LedgerSql, type NotifyRow, type OutboundDeliveryRow, type QuestionRow, type RunRow, type WakeRow } from "./ledger.ts";
+import { DeploymentAuth, deploymentSecrets, ownerAuthorized } from "./deployment-auth.ts";
+import { loginPage } from "./login-page.ts";
 import { renderChangeReports } from "./notes.ts";
 import { FAILED_RUN_NOTICE, failedRunNotice } from "./owner-notices.ts";
 import { RoutineService } from "./routines.ts";
@@ -122,7 +124,7 @@ import { ambiguousWakeText, commandAttentionWakeText, escapeMarkers, verifyWakeT
 import { WorkspaceError, cardOpen, cardView, type WorkspaceActionInput, type WorkspaceInput } from "./workspace.ts";
 import type { MachineDirectoryBrowseInput, MachineDirectoryInput, MachineDirectoryResult } from "./workspace-api.ts";
 import { WorkspaceStream } from "./workspace-stream.ts";
-import { WebApp, linkTargetForThread, loginLinkPolicyFromEnv, parseSessionCookie } from "./web.ts";
+import { WebApp, linkTargetForThread, loginLinkPolicyFromEnv, parseSessionCookie, verifyLinkToken } from "./web.ts";
 
 /** Messages the workspace will queue before telling the owner to wait for the steward to catch up. */
 const MAX_OPEN_USER_RUNS = 10;
@@ -130,6 +132,39 @@ const MAX_OPEN_USER_RUNS = 10;
 const WORKSPACE_TAG = "workspace";
 /** How long a burst of ledger writes is coalesced into one `workspace_changed` frame. */
 const WORKSPACE_NUDGE_MS = 150;
+
+function clientIp(request: Request): string {
+  return request.headers.get("CF-Connecting-IP") ?? "unknown";
+}
+
+function rateLimited(retryAfterSec: number): Response {
+  return Response.json({ error: "rate_limited" }, {
+    status: 429,
+    headers: { "retry-after": String(Math.max(1, retryAfterSec)), "cache-control": "no-store" },
+  });
+}
+
+export async function readJsonObject(request: Request, maximumBytes: number): Promise<Record<string, unknown>> {
+  const reader = request.body?.getReader();
+  if (!reader) throw new Error("missing body");
+  const decoder = new TextDecoder();
+  let bytes = 0;
+  let text = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    bytes += value.byteLength;
+    if (bytes > maximumBytes) {
+      await reader.cancel();
+      throw new Error("body too large");
+    }
+    text += decoder.decode(value, { stream: true });
+  }
+  text += decoder.decode();
+  const parsed: unknown = JSON.parse(text);
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("body must be an object");
+  return parsed as Record<string, unknown>;
+}
 
 interface ConnState {
   /** Set on browser connections (the L3 stream and workspace consumers); connector connections carry deviceId. */
@@ -194,7 +229,7 @@ const WORKER_SWEEP_INTERVAL_S = 60;
 // delivery pass, so the inline fire and the alarm pass can never both settle it.
 const OUTBOUND_CLAIM_MS = 30_000;
 const OUTBOUND_BATCH = 20;
-/** ADR-0003: with no chat channel, whoever holds SERVER_KEY is the single owner. */
+/** The single local-channel recipient; browser authority is defined by ADR-0010. */
 const OWNER_ID = "owner";
 // steward.md §6.3: while any sh_run is open, an alarm-driven task polls every 2 seconds; on
 // settlement a user run's final text becomes the reply, everything else is discarded.
@@ -328,6 +363,8 @@ export class Steward extends Agent<Env> {
     // a multi-statement rebuild can never persist half of itself, and the ledger write
     // cannot lag the commit (the copy-drop-rename migrations are not re-runnable).
     runMigrations(this.sql.bind(this), MIGRATIONS, (fn) => this.ctx.storage.transactionSync(fn));
+    // Fail before any credential is minted if this deployment cannot establish its durable key.
+    this.deploymentKeySecrets();
     // Notes maintenance is daily (steward.md §2.5, issue #19): a 02:00 UTC cron, idempotent
     // by expression — re-arming at boot dedups onto the same row and never postpones it,
     // so the chain cannot die (or drift) with an evicted isolate.
@@ -508,10 +545,15 @@ export class Steward extends Agent<Env> {
 
   private appliedRootModel: string | undefined;
 
-  // The signing/sealing key set (primary = SERVER_KEY, plus SERVER_KEY_PREVIOUS during a
-  // rotation window). Overridable so tests can simulate rotation states inside the DO.
+  /** Durable key authority. Fresh deployments generate this key; explicit-key deployments keep
+   *  the operator's SERVER_KEY and SERVER_KEY_PREVIOUS rotation window. */
+  protected deploymentKeySecrets(): [string, ...string[]] {
+    return deploymentSecrets(this.sql.bind(this) as unknown as import("./schema.ts").SqlExecutor, this.env);
+  }
+
+  // The signing/sealing key set (primary first). Overridable so tests can simulate rotation.
   protected async serverKeys(): Promise<ServerKey[]> {
-    return resolveServerKeys(this.env);
+    return resolveKeySecrets(this.deploymentKeySecrets());
   }
 
   // Tests shrink the /pair lockout (see feishuSendTimeoutMs for the same pattern).
@@ -696,13 +738,13 @@ export class Steward extends Agent<Env> {
     }
   }
 
-  // The signed-link web app (issue #22, steward.md §10): login exchange, Thread timeline,
-  // machine management. Same lazy-bind pattern as the ledger.
+  // The browser web app (issue #22, ADR-0010): password/passkey and legacy-link sessions,
+  // Thread timeline, machine management. Same lazy-bind pattern as the ledger.
   private web_?: WebApp;
   private get web(): WebApp {
     return (this.web_ ??= new WebApp({
       sql: this.sql.bind(this) as unknown as import("./schema.ts").SqlExecutor,
-      secrets: [this.env.SERVER_KEY, this.env.SERVER_KEY_PREVIOUS].filter((k): k is string => typeof k === "string" && k.length > 0),
+      secrets: this.deploymentKeySecrets(),
       loginLinkPolicy: loginLinkPolicyFromEnv(this.env.LOGIN_LINK_TTL_MS, this.env.LOGIN_LINK_REUSABLE),
       ledger: this.ledger,
       listDevices: () =>
@@ -745,6 +787,22 @@ export class Steward extends Agent<Env> {
       },
       sessionEnded: (sid) => this.closeWebSession({ sid }),
     }));
+  }
+
+  private deploymentAuth_?: DeploymentAuth;
+  private get deploymentAuth(): DeploymentAuth {
+    return (this.deploymentAuth_ ??= new DeploymentAuth({
+      sql: this.sql.bind(this) as unknown as import("./schema.ts").SqlExecutor,
+      env: this.env,
+      transaction: (operation) => this.ctx.storage.transactionSync(operation),
+      sessionsRevoked: () => this.closeAllBrowserSessions(),
+      audit: (reason, detail) => this.logChannel(reason, detail),
+    }));
+  }
+
+  /** Dedicated workerd auth tests install a verifier without calling the external screen. */
+  async configureBrowserPasswordForTests(password: string): Promise<void> {
+    await this.deploymentAuth.provisionForTests(password);
   }
 
   /** The tools' reach (steward.md §4.3): ledger, dispatch, outbound — nothing else. */
@@ -1016,7 +1074,7 @@ export class Steward extends Agent<Env> {
     }
   }
 
-  /** ADR-0003: no chat channel — whoever holds SERVER_KEY is the owner. */
+  /** The local channel has one recipient; it is not a chat-platform identity. */
   private ownerOpenIdSync(): string | null {
     return OWNER_ID;
   }
@@ -1100,37 +1158,96 @@ export class Steward extends Agent<Env> {
     }
   }
 
-  // Plain-HTTP surface reached via the Worker's stub.fetch forwards (index.ts): the owner
-  // API (the Worker has already verified the SERVER_KEY bearer before forwarding) and the
-  // signed-link web (the Worker has already HMAC-verified the link token / session cookie).
+  // Plain-HTTP surface reached only through the Worker's exact-route forwards. Credentials are
+  // rechecked here because this method also owns the generated-key surface the Worker cannot see.
   async onRequest(request: Request): Promise<Response> {
     const url = new URL(request.url);
     // Every request the DO serves reveals the deployment's public origin — the source for the
     // pairing command's URL and the absolute one-time card links (web.ts owns the value).
     if (url.protocol === "https:" || url.protocol === "http:") this.web.recordOrigin(url.origin);
-    if (url.pathname === "/api/messages" && (request.method === "POST" || request.method === "GET")) {
-      return request.method === "POST" ? this.handleApiMessage(request) : this.handleApiListMessages(url);
+    if (url.pathname.startsWith("/api/")) {
+      if (!ownerAuthorized(request, this.env)) return new Response("unauthorized", { status: 401 });
+      if (url.pathname === "/api/messages" && (request.method === "POST" || request.method === "GET")) {
+        return request.method === "POST" ? this.handleApiMessage(request) : this.handleApiListMessages(url);
+      }
+      if (url.pathname === "/api/actions" && request.method === "POST") return this.handleApiActions(request);
+      if (url.pathname === "/api/pairing" && request.method === "POST") return this.handleApiPairing();
+      if (url.pathname === "/api/login-link" && request.method === "POST") return this.handleApiLoginLink();
+      return new Response("not found", { status: 404 });
     }
-    if (url.pathname === "/api/actions" && request.method === "POST") return this.handleApiActions(request);
-    if (url.pathname === "/api/pairing" && request.method === "POST") return this.handleApiPairing();
-    if (url.pathname === "/api/login-link" && request.method === "POST") return this.handleApiLoginLink();
+    if (url.pathname === "/auth/password" && request.method === "POST") return this.handlePasswordLogin(request, url);
     if (url.pathname.startsWith("/link/") && request.method === "GET") {
-      // index.ts verified the HMAC and expiry before forwarding; single-use is decided here.
+      await this.deploymentAuth.ready();
+      const token = url.pathname.slice("/link/".length);
+      if (!(await verifyLinkToken(this.deploymentKeySecrets(), token))) {
+        return loginPage("This sign-in link is invalid or expired. / 登录链接无效或已过期。", 410);
+      }
       const secure = url.protocol === "https:" && url.hostname !== "localhost" && url.hostname !== "127.0.0.1";
-      return this.web.openLink(url.pathname.slice("/link/".length), secure);
+      return this.web.openLink(token, secure);
+    }
+    if (url.pathname === "/webauthn/login/options" && request.method === "POST") {
+      await this.deploymentAuth.ready();
+      return Response.json(await this.web.webauthnLoginOptions(url.hostname), { headers: { "cache-control": "no-store" } });
     }
     if (url.pathname === "/webauthn/login/verify" && request.method === "POST") {
-      // index.ts shape-checked the body (non-empty strings on the expected keys) and forwarded
-      // it unconditionally — the assertion's validity depends on a public key that only exists
-      // in this DO's SQLite, so there is no stateless pre-check available at the Worker layer.
+      await this.deploymentAuth.ready();
+      const admission = this.deploymentAuth.admit("passkey", clientIp(request));
+      if (!admission.allowed) {
+        this.logChannel("browser_auth_throttled", "passkey");
+        return rateLimited(admission.retryAfterSec);
+      }
+      let body: unknown;
+      try {
+        body = await readJsonObject(request, 8 * 1024);
+      } catch {
+        return Response.json({ error: "bad_request" }, { status: 400, headers: { "cache-control": "no-store" } });
+      }
+      const wire = body as Record<string, unknown>;
+      const keys = ["challengeToken", "credentialId", "clientDataJSON", "authenticatorData", "signature"];
+      if (!keys.every((key) => typeof wire[key] === "string" && (wire[key] as string).length > 0)) {
+        return Response.json({ error: "bad_request" }, { status: 400, headers: { "cache-control": "no-store" } });
+      }
       const secure = url.protocol === "https:" && url.hostname !== "localhost" && url.hostname !== "127.0.0.1";
-      const body: unknown = await request.json();
       return this.web.webauthnLoginVerify(url.hostname, url.origin, secure, body);
     }
     if ((url.pathname === "/app" || url.pathname.startsWith("/app/")) && (request.method === "GET" || request.method === "POST")) {
+      await this.deploymentAuth.ready();
       return this.web.handle(request);
     }
     return new Response("not found", { status: 404 });
+  }
+
+  private async handlePasswordLogin(request: Request, url: URL): Promise<Response> {
+    await this.deploymentAuth.ready();
+    const ip = clientIp(request);
+    const admission = this.deploymentAuth.admit("password", ip);
+    if (!admission.allowed) {
+      this.logChannel("browser_auth_throttled", "password");
+      return rateLimited(admission.retryAfterSec);
+    }
+    let body: Record<string, unknown>;
+    try {
+      body = await readJsonObject(request, 8 * 1024);
+    } catch {
+      return Response.json({ error: "bad_request" }, { status: 400, headers: { "cache-control": "no-store" } });
+    }
+    const password = typeof body.password === "string" ? body.password.normalize("NFC") : null;
+    if (!password || [...password].length > 128 || new TextEncoder().encode(password).byteLength > 1024) {
+      return Response.json({ error: "bad_request" }, { status: 400, headers: { "cache-control": "no-store" } });
+    }
+    const result = await this.deploymentAuth.verifyPassword(password, ip);
+    if (result === "unavailable") {
+      this.logChannel("browser_password_unavailable", "verifier_unavailable");
+      return Response.json({ error: "password_unavailable" }, { status: 503, headers: { "cache-control": "no-store" } });
+    }
+    if (result === "invalid") {
+      this.logChannel("browser_password_failed", "invalid_credential");
+      return Response.json({ error: "invalid_password" }, { status: 401, headers: { "cache-control": "no-store" } });
+    }
+    const secure = url.protocol === "https:" && url.hostname !== "localhost" && url.hostname !== "127.0.0.1";
+    const { cookie } = await this.web.openSession(secure);
+    this.logChannel("browser_password_verified", "session_opened");
+    return Response.json({ ok: true }, { headers: { "set-cookie": cookie, "cache-control": "no-store" } });
   }
 
   shouldSendProtocolMessages(): boolean {
@@ -1141,7 +1258,15 @@ export class Steward extends Agent<Env> {
     // §5.3: the role query param routes/tags the connection; legitimacy is decided by the
     // credential — device token for connectors (onConnect), session cookie for browsers.
     const params = new URL(ctx.request.url).searchParams;
-    if (params.get("role") === "web") return params.get("view") === "workspace" ? ["web", WORKSPACE_TAG] : ["web"];
+    if (params.get("role") === "web") {
+      const raw = (ctx.request.headers.get("cookie") ?? "")
+        .split(/;\s*/)
+        .find((part) => part.startsWith("sig_session="))
+        ?.slice("sig_session=".length) ?? null;
+      const sid = await parseSessionCookie(this.deploymentKeySecrets(), raw);
+      if (!sid || !this.web.sessionAlive(sid)) return [];
+      return params.get("view") === "workspace" ? ["web", WORKSPACE_TAG] : ["web"];
+    }
     const parsed = await parseToken(await this.serverKeys(), bearer(ctx.request));
     return parsed ? [`dev:${parsed.deviceId}`] : [];
   }
@@ -1151,17 +1276,16 @@ export class Steward extends Agent<Env> {
   }
 
   async onConnect(connection: Connection, ctx: ConnectionContext): Promise<void> {
-    // Browser connections (§5.3 `web` role): authenticated by the session cookie the Worker
-    // layer already HMAC-verified (index.ts onBeforeConnect); liveness stays a DB fact here.
+    // Browser connections (§5.3 `web` role): both the HMAC and liveness are checked here.
     if (new URL(ctx.request.url).searchParams.get("role") === "web") {
+      // Reconcile a changed deployment password before validating the cookie. Otherwise a
+      // browser could reconnect a pre-reset cookie without touching an HTTP route that does so.
+      await this.deploymentAuth.ready();
       const raw = (ctx.request.headers.get("cookie") ?? "")
         .split(/;\s*/)
         .find((part) => part.startsWith("sig_session="))
         ?.slice("sig_session=".length) ?? null;
-      const sid = await parseSessionCookie(
-        [this.env.SERVER_KEY, this.env.SERVER_KEY_PREVIOUS].filter((k): k is string => typeof k === "string" && k.length > 0),
-        raw,
-      );
+      const sid = await parseSessionCookie(this.deploymentKeySecrets(), raw);
       if (!sid || !this.web.sessionAlive(sid)) {
         connection.close(CloseCode.UNAUTHORIZED, "unauthorized");
         return;
@@ -1229,6 +1353,13 @@ export class Steward extends Agent<Env> {
   closeWebSession(input: { sid: string }): void {
     for (const connection of this.getConnections<ConnState>("web")) {
       if (connection.state?.sid === input.sid) connection.close(CloseCode.UNAUTHORIZED, "sign in again");
+    }
+  }
+
+  /** A password change revokes every browser socket, not just database-backed sessions. */
+  private closeAllBrowserSessions(): void {
+    for (const connection of this.getConnections<ConnState>("web")) {
+      connection.close(CloseCode.UNAUTHORIZED, "sign in again");
     }
   }
 
@@ -2760,7 +2891,7 @@ export class Steward extends Agent<Env> {
   private deliveryChain: Promise<void> = Promise.resolve();
 
   // ---- Model credentials (spec §12.2 "model keys stored encrypted", issues #27/#74) ---------------
-  // Provider API keys are AES-GCM sealed under SERVER_KEY exactly like the Feishu secrets
+  // Provider API keys are AES-GCM sealed under the deployment key exactly like Feishu secrets
   // (sh_provider_key.apiKeyEnc, one row per provider); the plaintext exists only in transit
   // and in memory. sh_model id=0 is the active selection and mirrors the selected provider's
   // key for pre-#74 readers. Not reachable over HTTP — RPC on the stub only, which the
