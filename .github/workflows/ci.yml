@@ -46,7 +46,6 @@ jobs:
               console.error('runtime dependencies leaked into the manifest'); process.exit(1); }"
 
   preview:
-    needs: test
     if: >-
       github.event_name == 'pull_request' &&
       github.event.action != 'closed' &&

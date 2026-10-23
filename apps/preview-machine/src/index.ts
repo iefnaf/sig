@@ -48,7 +48,8 @@ function websocketUrl(serverUrl: string): string {
 export class PreviewMachine extends Agent<Env> {
   private socket: WebSocket | null = null;
 
-  onStart(): void {
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
     this.sql`
       CREATE TABLE IF NOT EXISTS machine_state (
         id INTEGER PRIMARY KEY CHECK (id = 1),
