@@ -1,6 +1,6 @@
 {
   "name": "@nightboats/sig",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Sig connector: pairs this machine with your steward and runs pi workers as a background service.",
   "type": "module",
   "bin": {
