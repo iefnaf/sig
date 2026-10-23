@@ -349,6 +349,8 @@ export interface FakeWorkerRun {
   status?: "done" | "blocked" | "needs_decision";
   summary?: string;
   changes?: string[];
+  /** The worker's full finding (issue #76). */
+  answer?: string;
   question?: string;
   next?: string;
   leftovers?: string[];
@@ -576,6 +578,7 @@ export class FakeConnector {
       status: run.status ?? "done",
       summary: run.summary ?? "任务完成",
       ...(run.changes ? { changes: run.changes } : {}),
+      ...(run.answer ? { answer: run.answer } : {}),
       ...(run.question ? { question: run.question } : {}),
       ...(run.next ? { next: run.next } : {}),
       ...(run.leftovers ? { leftovers: run.leftovers } : {}),

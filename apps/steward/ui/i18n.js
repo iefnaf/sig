@@ -89,8 +89,6 @@ export const STRINGS = {
   kindOffline: ['Machine offline', '机器离线'],
   kindOffer: ['Routine suggestion', '例行任务建议'],
   kindMemory: ['Memory', '记忆'],
-  kindReport: ['Report', '汇报'],
-  kindUpdate: ['Update', '动态'],
   cardHandled: ['Handled', '已处理'],
   cardWorking: ['Working on it…', '处理中…'],
   cardAlreadyHandled: ['This was already handled.', '这个决定已经处理过了。'],

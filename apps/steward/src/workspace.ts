@@ -46,6 +46,9 @@ export interface CardButton {
 /** What a card is about; the workspace labels and icons it by this, not by its (Chinese) title. */
 export type CardKind = "question" | "consent" | "offline" | "offer" | "memory" | "report" | "update";
 
+/** Only a card that holds a decision is drawn as a card; reports and updates are plain messages. */
+const DECISION_KINDS: ReadonlySet<CardKind> = new Set(["question", "consent", "offline", "offer", "memory"]);
+
 export interface CardView {
   tone: "success" | "attention" | "failure" | "info";
   title: string;
@@ -70,11 +73,16 @@ const TONE_EMOJI: Array<[string, CardView["tone"]]> = [
   ["💡", "info"],
 ];
 
+/** The 详情 line is a one-time login into this very workspace — pointless inside it. */
+const DETAIL_LINK_LINE = /^详情：\S*\/link\/wl1\.\S*[ \t]*$/gm;
+const workspaceText = (text: string): string => text.replace(DETAIL_LINK_LINE, "").replace(/\n{3,}/g, "\n\n").trim();
+
 /** A flat LocalMessage ({text, buttons}) → the structured view: the optional leading
  *  【Thread】 prefix becomes the note, the tone emoji sets the tone, the rest of the first
- *  line is the title and the remaining lines are the body — verbatim, hints included. */
+ *  line is the title and everything after it is ONE markdown body — blank lines and
+ *  indentation intact, so lists, code fences and paragraphs survive. */
 function localMessageView(text: string, rawButtons: unknown): CardView {
-  let rest = text;
+  let rest = workspaceText(text);
   let note: string | null = null;
   const prefixed = /^【([^】]{1,120})】([\s\S]*)$/.exec(rest);
   if (prefixed) {
@@ -89,9 +97,10 @@ function localMessageView(text: string, rawButtons: unknown): CardView {
       break;
     }
   }
-  const lines = rest.split("\n");
-  const title = (lines.shift() ?? "").trim();
-  const body = lines.map((line) => line.trim()).filter((line) => line !== "");
+  const [first = "", ...lines] = rest.split("\n");
+  const title = first.trim();
+  const markdown = lines.join("\n").trim();
+  const body = markdown === "" ? [] : [markdown];
   const buttons: CardButton[] = (Array.isArray(rawButtons) ? rawButtons : []).map(obj)
     .filter((b) => typeof b.label === "string" && b.label !== "")
     .map((b) => ({
@@ -176,6 +185,13 @@ export function cardKind(row: Pick<CardRow, "id" | "questionId">, view: CardView
   if (id.startsWith("notify:report:")) return view.buttons.some((button) => button.action === "pr_approve") ? "consent" : "report";
   if (row.questionId !== null || view.buttons.some((button) => /^ask(?:new)?:/.test(button.action ?? ""))) return "question";
   return "update";
+}
+
+/** A non-decision card read as the ordinary message it is: the template's own text, or, for
+ *  records from before ADR-0003, the structured view's title and body. */
+function messageText(card: unknown, view: CardView): string {
+  const text = obj(card).text;
+  return typeof text === "string" ? workspaceText(text) : [view.title, ...view.body].filter(Boolean).join("\n\n");
 }
 
 interface CardRow {
@@ -288,7 +304,9 @@ export function workspaceSnapshot(input: { ledger: Ledger; budget: BudgetState; 
       if (row.kind === "card") {
         const ref = { id, questionId: (row.questionId as string | null) ?? null };
         const card = cardView(payload.card);
-        return { ...base, card: { ...card, kind: cardKind(ref, card) }, open: cardOpen(ledger, ref, card) };
+        const kind = cardKind(ref, card);
+        if (!DECISION_KINDS.has(kind)) return { ...base, text: messageText(payload.card, card) };
+        return { ...base, card: { ...card, kind }, open: cardOpen(ledger, ref, card) };
       }
       return { ...base, text: payload.text ?? "" };
     }),
