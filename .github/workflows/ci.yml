@@ -94,12 +94,19 @@ jobs:
           fs.writeFileSync(output, text.slice(start, end + 1));
           NODE
           preview_url="$(jq -er '.preview.urls[0]' "$json_file")"
-          login_status="$(curl --silent --show-error --request POST "$preview_url/api/login-link" \
-            --header "Authorization: Bearer $preview_key" \
-            --header 'content-type: application/json' \
-            --data '{}' --output "$login_body_file" --write-out '%{http_code}')"
+          login_status=000
+          for attempt in $(seq 1 45); do
+            login_status="$(curl --silent --show-error --request POST "$preview_url/api/login-link" \
+              --header "Authorization: Bearer $preview_key" \
+              --header 'content-type: application/json' \
+              --data '{}' --output "$login_body_file" --write-out '%{http_code}')" || login_status=000
+            if [ "$login_status" -ge 200 ] && [ "$login_status" -lt 300 ]; then
+              break
+            fi
+            sleep 2
+          done
           if [ "$login_status" -lt 200 ] || [ "$login_status" -ge 300 ]; then
-            echo "Login-link request failed with HTTP $login_status:"
+            echo "Login-link request did not become available; last HTTP status was $login_status:"
             cat "$login_body_file" >&2
             exit 1
           fi
