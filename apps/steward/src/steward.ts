@@ -25,7 +25,7 @@
 import { Agent, type Connection, type ConnectionContext, type WSMessage } from "agents";
 import { PiHarness } from "agents/harness/pi";
 import { Harness, createRegistry, type Extension, type Registry } from "@earendil-works/pi-durable";
-import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import {
   CloseCode,
   CmdAckMessageSchema,
@@ -67,12 +67,16 @@ import {
 import { Dispatcher, parseOwnerCommand } from "./dispatch.ts";
 import { buildSituationBrief } from "./llm/brief.ts";
 import { buildStewardExtension, type StewardExtensionContext } from "./llm/extension.ts";
-import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
+import { testModelConnection } from "./llm/connection-test.ts";
 import {
   buildStewardModels,
   installModel,
   mergeModelSelection,
+  providerCatalog,
+  stewardProviders,
   resolveModelConfig,
+  resolveModelThinking,
+  type ComposerModelInput,
   type FauxRequestRecord,
   type StewardModels,
 } from "./llm/models.ts";
@@ -349,6 +353,7 @@ export class Steward extends Agent<Env> {
   // eagerly (defaults.model), and with class-field semantics a later `undefined` initializer
   // would clobber what the getter wrote.
 
+  private testingModel = false;
   private stewardModels_?: StewardModels;
   private piRegistry_?: Registry;
   private stewardExtension_?: Extension;
@@ -475,9 +480,11 @@ export class Steward extends Agent<Env> {
         `provider ${config.provider} 没有模型 ${config.modelId}；用 vars.STEWARD_MODEL 指定该 provider 存在的 modelId（或为 ${config.modelId} 配置对应 provider 的 sealed key）`,
       );
     }
-    const signature = `${config.provider}/${config.modelId}/${apiKey ? "keyed" : "keyless"}`;
+    const { thinkingLevel } = resolveModelThinking(config);
+    const signature = JSON.stringify([config.provider, config.modelId, config.baseUrl, Boolean(apiKey), thinkingLevel]);
     if (this.appliedRootModel === signature) return;
-    await this.piHarness.session().setModel({ provider: config.provider, id: config.modelId });
+    const root = await (await this.piHarness.pi()).root(BACKGROUND_CONTEXT);
+    await root.configure({ model: { provider: config.provider, modelId: config.modelId }, thinkingLevel }, BACKGROUND_CONTEXT);
     this.appliedRootModel = signature;
   }
 
@@ -690,8 +697,24 @@ export class Steward extends Agent<Env> {
         budget: () => this.budgetState(),
         submitMessage: (input) => this.submitWorkspaceMessage(input),
         submitAction: (input) => this.submitWorkspaceAction(input),
-        settings: async () => ({ model: await this.llmSelection(), passkeys: this.web.listPasskeys() }),
-        saveModel: async (input) => { await this.setModelConfig(input.provider, input.apiKey, input.modelId, input.baseUrl); },
+        settings: async () => ({
+          model: await this.llmSelection(),
+          passkeys: this.web.listPasskeys(),
+          providers: providerCatalog(),
+          keyedProviders: await this.keyedProviders(),
+        }),
+        testModel: async (input) => {
+          if (this.testingModel) return { ok: false, error: "busy" };
+          this.testingModel = true;
+          try {
+            const apiKey = input.apiKey ?? await this.sealedKeyFor(input.provider) ?? undefined;
+            return await testModelConnection({ ...input, explicit: true }, apiKey);
+          } finally {
+            this.testingModel = false;
+          }
+        },
+        saveModel: async (input) => { await this.setModelConfig(input.provider, input.apiKey, input.modelId, input.baseUrl, input.thinkingLevel); },
+        selectModel: (input) => this.selectComposerModel(input),
         pairing: (id: string) => this.webPairing(id),
         revoke: (id: string) => { this.logChannel("web_machine_revoked", id); void this.revoke(id); },
         webauthnRegisterOptions: (sid: string, rpId: string) => this.web.webauthnRegisterOptions(sid, rpId),
@@ -700,7 +723,6 @@ export class Steward extends Agent<Env> {
         webauthnRemove: (credentialId: string) => this.web.removePasskey(credentialId),
       },
       sessionEnded: (sid) => this.closeWebSession({ sid }),
-      shell: () => this.env.ASSETS.fetch(new Request("https://assets.invalid/workspace.html")),
     }));
   }
 
@@ -2608,60 +2630,104 @@ export class Steward extends Agent<Env> {
   // row itself, this keeps the *wire* quiet too.
   private deliveryChain: Promise<void> = Promise.resolve();
 
-  // ---- Model credentials (spec §12.2  // ---- Model credentials (spec §12.2 "model keys stored encrypted", issue #27) ---------------
-  // The provider API key is AES-GCM sealed under SERVER_KEY exactly like the Feishu secrets
-  // (sh_model.apiKeyEnc); the plaintext exists only in transit and in memory. The LLM wiring
-  // (M2) reads it back through modelConfig(). Not reachable over HTTP — RPC on the stub only,
-  // which the routes-audit test pins down.
+  // ---- Model credentials (spec §12.2 "model keys stored encrypted", issues #27/#74) ---------------
+  // Provider API keys are AES-GCM sealed under SERVER_KEY exactly like the Feishu secrets
+  // (sh_provider_key.apiKeyEnc, one row per provider); the plaintext exists only in transit
+  // and in memory. sh_model id=0 is the active selection and mirrors the selected provider's
+  // key for pre-#74 readers. Not reachable over HTTP — RPC on the stub only, which the
+  // routes-audit test pins down.
 
   // ADR-0001 decision 11: the default provider for keys collected at deploy time (the model
   // itself is deepseek-flash); M2's setup/chat step can reconfigure via setModelConfig.
   static readonly DEFAULT_MODEL_PROVIDER = "deepseek";
 
   /**
-   * `modelId`/`baseUrl` are present for an owner-driven runtime switch (issue #70, the
-   * Settings page): once set, they win over vars.STEWARD_MODEL entirely (ensureRootModel),
-   * not just the provider. Omitting them (the MODEL_KEY seed path, and the pre-#70
-   * provider-only form) keeps the legacy behavior — vars still supply modelId/baseUrl.
+   * `apiKey` omitted (issue #74) means "keep the key already sealed for this provider" —
+   * switching provider or model no longer re-asks for a saved key. `modelId`/`baseUrl` are
+   * present for an owner-driven runtime switch (issue #70, the Settings page): once set,
+   * they win over vars.STEWARD_MODEL entirely (ensureRootModel). Omitting them (the
+   * MODEL_KEY seed path, and the pre-#70 provider-only form) keeps the legacy behavior —
+   * vars still supply modelId/baseUrl.
    */
-  async setModelConfig(provider: string, apiKey: string, modelId?: string, baseUrl?: string): Promise<void> {
-    if (!provider.trim() || !apiKey.trim()) throw new Error("provider and apiKey are required");
+  async setModelConfig(provider: string, apiKey?: string, modelId?: string, baseUrl?: string, thinkingLevel?: ModelThinkingLevel): Promise<void> {
+    if (!provider.trim()) throw new Error("provider is required");
+    const providerId = provider.trim();
     const [primary] = await this.serverKeys();
-    const apiKeyEnc = await sealSecret(primary!, apiKey);
+    const key = apiKey?.trim() || "";
+    // No key given: the selection moves to a provider whose key was sealed earlier, so mirror
+    // that stored key — a pre-#74 reader of sh_model keeps seeing a matching provider+key.
+    const sealedKey = key || (await this.sealedKeyFor(providerId)) || "";
+    const apiKeyEnc = sealedKey ? await sealSecret(primary!, sealedKey) : "";
+    if (key) {
+      this.sql`
+        INSERT INTO sh_provider_key (provider, apiKeyEnc, updatedAt)
+        VALUES (${providerId}, ${await sealSecret(primary!, key)}, ${Date.now()})
+        ON CONFLICT(provider) DO UPDATE SET
+          apiKeyEnc = excluded.apiKeyEnc, updatedAt = excluded.updatedAt
+      `;
+    }
     const modelIdValue = modelId?.trim() || null;
     const baseUrlValue = baseUrl?.trim() || null;
+    const previous = this.sql<{ provider: string; modelId: string | null; thinkingLevel: ModelThinkingLevel | null }>`SELECT provider, modelId, thinkingLevel FROM sh_model WHERE id = 0`[0];
+    const thinkingValue = thinkingLevel ?? (previous?.provider === providerId && previous.modelId === modelIdValue ? previous.thinkingLevel : null);
     this.sql`
-      INSERT INTO sh_model (id, provider, apiKeyEnc, modelId, baseUrl, updatedAt)
-      VALUES (0, ${provider}, ${apiKeyEnc}, ${modelIdValue}, ${baseUrlValue}, ${Date.now()})
+      INSERT INTO sh_model (id, provider, apiKeyEnc, modelId, baseUrl, thinkingLevel, updatedAt)
+      VALUES (0, ${providerId}, ${apiKeyEnc}, ${modelIdValue}, ${baseUrlValue}, ${thinkingValue}, ${Date.now()})
       ON CONFLICT(id) DO UPDATE SET
         provider = excluded.provider, apiKeyEnc = excluded.apiKeyEnc,
-        modelId = excluded.modelId, baseUrl = excluded.baseUrl, updatedAt = excluded.updatedAt
+        modelId = excluded.modelId, baseUrl = excluded.baseUrl, thinkingLevel = excluded.thinkingLevel, updatedAt = excluded.updatedAt
     `;
     // The LLM wiring (issue #6) installs the sealed selection lazily (ensureRootModel, before
     // the next submit) — resetting the memo is enough; the models collection handed to pi at
     // open stays the same object and is re-keyed in place. The faux provider's scripted state
     // is per-isolate and never rebuilt.
     this.appliedRootModel = undefined;
+    const frame = JSON.stringify({ t: "model_changed" });
+    for (const connection of this.getConnections(WORKSPACE_TAG)) if (this.webConnectionAlive(connection)) connection.send(frame);
   }
 
-  async modelConfig(): Promise<{ provider: string; modelId: string | null; baseUrl: string | null; apiKey: string } | null> {
-    // One-click-deploy glue (issue #25, spec §12.1 step 1): MODEL_KEY — the secret the
-    // Deploy-to-Cloudflare form collects — seeds the sealed config on first read, so the key
-    // never lives anywhere outside the user's own account. Seeding only fills an empty
-    // sh_model: an explicit setModelConfig (M2's setup/chat step, or the Settings switch)
-    // always wins, and the env secret is dead weight once the sealed row exists (delete it if
-    // you like).
-    if (this.sql`SELECT 1 AS one FROM sh_model WHERE id = 0`.length === 0 && this.env.MODEL_KEY?.trim()) {
-      await this.setModelConfig(Steward.DEFAULT_MODEL_PROVIDER, this.env.MODEL_KEY.trim());
-    }
-    const row = this.sql<{ provider: string; apiKeyEnc: string; modelId: string | null; baseUrl: string | null }>`
-      SELECT provider, apiKeyEnc, modelId, baseUrl FROM sh_model WHERE id = 0
-    `[0];
+  private async selectComposerModel(input: ComposerModelInput) {
+    const model = providerCatalog().find((provider) => provider.id === input.provider)?.models.find((entry) => entry.id === input.modelId);
+    if (!model || !(await this.sealedKeyFor(input.provider))) throw new WorkspaceError("model_not_available");
+    if (!model.thinkingLevels.includes(input.thinkingLevel)) throw new WorkspaceError("thinking_not_supported");
+    if (await this.piHarness.session().busy()) throw new WorkspaceError("model_busy", 409);
+    await this.setModelConfig(input.provider, undefined, input.modelId, undefined, input.thinkingLevel);
+    await this.ensureRootModel();
+    return this.llmSelection();
+  }
+
+  private async sealedKeyFor(provider: string): Promise<string | null> {
+    const row = this.sql<{ apiKeyEnc: string }>`SELECT apiKeyEnc FROM sh_provider_key WHERE provider = ${provider}`[0];
     if (!row) return null;
     const opened = await openSecret(await this.serverKeys(), row.apiKeyEnc);
-    // Sealed under a dropped key: report unconfigured rather than failing calls forever.
-    if (!opened) return null;
-    return { provider: row.provider, modelId: row.modelId, baseUrl: row.baseUrl, apiKey: opened.text };
+    return opened?.text ?? null;
+  }
+
+  async modelConfig(): Promise<{ provider: string; modelId: string | null; baseUrl: string | null; apiKey: string; thinkingLevel?: ModelThinkingLevel } | null> {
+    // One-click-deploy glue (issue #25, spec §12.1 step 1): MODEL_KEY — the secret the
+    // Deploy-to-Cloudflare form collects — seeds the sealed config on first read, so the key
+    // never lives anywhere outside the user's own account. Seeding fills an empty deployment
+    // only: an explicit setModelConfig (any provider's saved key counts, issue #74) always
+    // wins, and the env secret is dead weight once a sealed row exists (delete it if you like).
+    if (
+      this.env.MODEL_KEY?.trim() &&
+      this.sql`SELECT 1 AS one FROM sh_model WHERE id = 0`.length === 0 &&
+      !this.sql`SELECT 1 AS one FROM sh_provider_key WHERE provider = ${Steward.DEFAULT_MODEL_PROVIDER}`.length
+    ) {
+      await this.setModelConfig(Steward.DEFAULT_MODEL_PROVIDER, this.env.MODEL_KEY.trim());
+    }
+    const row = this.sql<{ provider: string; modelId: string | null; baseUrl: string | null; thinkingLevel: ModelThinkingLevel | null }>`
+      SELECT provider, modelId, baseUrl, thinkingLevel FROM sh_model WHERE id = 0
+    `[0];
+    if (!row) return null;
+    // The key lives with the provider now (issue #74): a selection whose provider has no
+    // sealed key still resolves, keyless — apiKey: "" — and fails visibly at run time.
+    return { provider: row.provider, modelId: row.modelId, baseUrl: row.baseUrl, ...(row.thinkingLevel ? { thinkingLevel: row.thinkingLevel } : {}), apiKey: (await this.sealedKeyFor(row.provider)) ?? "" };
+  }
+
+  /** Providers with a sealed key (issue #74): what the Settings page marks as ready to switch to. */
+  async keyedProviders(): Promise<string[]> {
+    return this.sql<{ provider: string }>`SELECT provider FROM sh_provider_key ORDER BY provider`.map((row) => row.provider);
   }
 
   /**
@@ -2680,6 +2746,8 @@ export class Steward extends Agent<Env> {
     /** False when the selected provider's catalog has no such model — runs would settle
      *  `unanswered` with `no_model` (review #10); ensureRootModel logs model_config_error. */
     modelKnown: boolean;
+    thinkingLevel: ModelThinkingLevel;
+    thinkingLevels: ModelThinkingLevel[];
   }> {
     const sealed = await this.modelConfig();
     // `varsRaw: null` models an unset deploy config; `undefined` (the production call) reads env.
@@ -2688,11 +2756,12 @@ export class Steward extends Agent<Env> {
     return {
       provider: config.provider,
       modelId: config.modelId,
+      ...resolveModelThinking(config),
       baseUrl: config.baseUrl ?? null,
       explicitVars: vars.explicit,
       sealedProvider: sealed?.provider ?? null,
-      apiKey: Boolean(sealed && sealed.provider === config.provider),
-      modelKnown: config.provider === "faux" || builtinProviders().some((p) => p.id === config.provider && p.getModels().some((m) => m.id === config.modelId)),
+      apiKey: Boolean(sealed && sealed.provider === config.provider && sealed.apiKey),
+      modelKnown: config.provider === "faux" || stewardProviders().some((p) => p.id === config.provider && p.getModels().some((m) => m.id === config.modelId)),
     };
   }
 
@@ -3020,7 +3089,7 @@ export class Steward extends Agent<Env> {
         // Issue #28: bring the counter current before the over-budget note reads it — the
         // run that just settled is the spend that may tip today over the cap.
         await this.syncUsageQuietly();
-        const failedNotice = run.kind === "user" && result.status !== "done" ? await this.noticeForFailedRun(modelErrorDetail) : undefined;
+        const failedNotice = run.kind === "user" && result.status !== "done" ? await this.noticeForFailedRun(modelErrorDetail, result.status === "unanswered" ? result.reason : result.status) : undefined;
         this.settleRun(run, result, failedNotice);
       }
     } catch (err) {
@@ -3041,11 +3110,11 @@ export class Steward extends Agent<Env> {
   /** What the owner is told when a user-triggered run did not complete. "Try again" is wrong
    *  advice for a deployment that has no model key yet (owner-notices.ts); resolved here, in the
    *  async poll, so settleRun stays synchronous. */
-  private async noticeForFailedRun(modelErrorDetail?: string): Promise<string> {
+  private async noticeForFailedRun(modelErrorDetail?: string, reason?: string): Promise<string> {
     try {
       // The workspace is always part of the deployment now (ADR-0004): its Settings page is
       // where a rejected or missing model key gets fixed.
-      return failedRunNotice(await this.llmSelection(), true, modelErrorDetail);
+      return failedRunNotice(await this.llmSelection(), true, modelErrorDetail, reason);
     } catch {
       return FAILED_RUN_NOTICE;
     }
@@ -3140,7 +3209,7 @@ export class Steward extends Agent<Env> {
       }
       if (owner && result.status === "done" && !hasText && !alreadyNotified) {
         // Review #9: done, empty, and nothing reached the user — say so instead of silence.
-        void reply(withRelay("⚠️ 总管这轮没有给出回复（可能只调用了内部工具）；需要的话再说一次。"));
+        void reply(withRelay("⚠️ 模型没有给出回复。请重新发送这条消息；如果仍没有回复，请在「设置 → 模型服务」中测试连接或切换模型。"));
         return;
       }
 

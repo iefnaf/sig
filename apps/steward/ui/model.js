@@ -84,6 +84,16 @@ export function previewOf(thread, messages) {
 /** Open messages that ask for a decision, newest last. */
 export const openCards = (messages) => messages.filter((message) => message.card && message.open);
 
+/** The model id the Settings draft should carry after its provider changed (issue #74): the
+ *  current id when the new provider's catalog has it, else its first model. `null` means the
+ *  provider is not in the catalog (custom free text) — leave the field as typed. */
+export function modelAfterProviderChange(providers, provider, currentModelId) {
+  const entry = (providers ?? []).find((candidate) => candidate.id === provider);
+  if (!entry) return null;
+  if (entry.models.some((model) => model.id === currentModelId)) return currentModelId;
+  return entry.models[0]?.id ?? null;
+}
+
 /** Open worker requests the composer can answer: cards with something to reply to. */
 export const replyTarget = (snapshot, cardId) => snapshot.attention.find((item) => item.id === cardId) ?? null;
 
@@ -108,3 +118,20 @@ export const FATAL_COPY = {
   logged_out: ['signedOutTitle', 'signedOut'],
   unreachable: ['loadFailedTitle', 'loadFailedBody'],
 };
+
+/** Missing model credentials block first use; passkeys are an optional first-run step. */
+export function initialSetupStep(settings, hasConversation, securitySkipped) {
+  if (!settings.model?.apiKey) return 'model';
+  if (!settings.passkeys.length && !hasConversation && !securitySkipped) return 'security';
+  return null;
+}
+
+/** Preserve a compatible choice; otherwise use the model's advertised default. */
+export function thinkingAfterModelChange(model, current = 'off') {
+  return model?.thinkingLevels?.includes(current) ? current : model?.defaultThinkingLevel ?? 'off';
+}
+
+/** Only configured providers belong in the chat's model menu. */
+export function availableChatModels(settings) {
+  return (settings?.providers ?? []).filter((provider) => settings.keyedProviders.includes(provider.id));
+}

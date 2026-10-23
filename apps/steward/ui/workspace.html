@@ -13,7 +13,7 @@
   <script type="module" src="/app/assets/workspace.js"></script>
 </head>
 <body>
-  <div class="workspace" id="workspace" data-mobile="chat" data-ready="false">
+  <div class="workspace" id="workspace" hidden data-mobile="chat" data-ready="false">
     <header class="topbar">
       <a href="/app" class="brand" data-nav="all" data-i18n-label="brandHome" aria-label="Sig · All messages"><img class="brand-mark" src="/brand/sig.svg" width="32" height="32" alt=""><span class="brand-word">Sig</span><span class="workspace-label" data-i18n="personalAgent">your personal agent</span></a>
       <div class="global-status">
@@ -29,8 +29,8 @@
       </div>
     </header>
 
-    <aside class="sidebar" data-i18n-label="threads" aria-label="Threads">
-      <div class="sidebar-top"><span class="eyebrow" data-i18n="threads">Threads</span><button class="icon-button" data-action="new" data-i18n-title="newThread" data-i18n-label="newThread" title="New task" aria-label="New task" data-icon="plus"></button></div>
+    <aside class="sidebar" id="threads-panel" data-i18n-label="threads" aria-label="Threads">
+      <div class="sidebar-top"><button type="button" class="icon-button sidebar-mobile-close" data-mobile-view="chat" data-i18n-label="backToChat" aria-label="Back to chat" data-icon="chevron-left"></button><span class="eyebrow" data-i18n="threads">Threads</span><button class="icon-button" data-action="new" data-i18n-title="newThread" data-i18n-label="newThread" title="New task" aria-label="New task" data-icon="plus"></button></div>
       <a class="all-conversation active" href="/app" data-nav="all"><span data-icon="chat"></span><span data-i18n="allMessages">All messages</span><span class="shortcut">⌘ K</span></a>
       <label class="search-box"><span data-icon="search"></span><input id="thread-search" type="search" data-i18n-placeholder="searchThreads" data-i18n-label="searchThreads" placeholder="Search threads" aria-label="Search threads" autocomplete="off"></label>
       <nav id="thread-list" class="thread-list" data-i18n-label="threadNavigation" aria-label="Threads by status"></nav>
@@ -42,7 +42,7 @@
     </aside>
 
     <main class="conversation" data-i18n-label="chatLabel" aria-label="Conversation with Sig">
-      <header class="conversation-header"><div class="conversation-heading"><div class="heading-line"><h1 id="conversation-title">Sig</h1></div><p id="conversation-subtitle"></p></div><button class="icon-button detail-toggle" data-action="details" data-i18n-label="detailToggle" data-i18n-title="detailToggle" aria-label="Toggle details" aria-controls="context-panel" aria-expanded="true" title="Toggle details" data-icon="panel"></button></header>
+      <header class="conversation-header"><button class="icon-button sidebar-toggle" type="button" data-action="sidebar" data-i18n-label="sidebarToggle" data-i18n-title="sidebarToggle" aria-label="Toggle threads" aria-controls="threads-panel" aria-expanded="true" data-icon="panel-left"></button><div class="conversation-heading"><div class="heading-line"><h1 id="conversation-title">All messages</h1></div><p id="conversation-subtitle"></p></div><button class="icon-button detail-toggle" data-action="details" data-i18n-label="detailToggle" data-i18n-title="detailToggle" aria-label="Toggle details" aria-controls="context-panel" aria-expanded="true" title="Toggle details" data-icon="panel"></button></header>
       <div class="view-tabs" id="view-tabs" role="group" data-i18n-label="viewTabs" aria-label="Thread views" hidden></div>
       <div class="setup-banner" id="setup-banner" hidden></div>
       <div class="scope-banner" id="scope-banner" hidden></div>
@@ -53,14 +53,14 @@
           <div class="composer-toolbar"><button type="button" class="scope-chip" id="scope-chip" data-action="scope"><span data-icon="route"></span><span id="scope-label">Auto</span><span data-icon="chevron-down"></span></button><span class="composer-status" id="composer-status"></span></div>
           <div class="reply-chip" id="reply-chip" hidden></div>
           <label class="sr-only" for="message-input" data-i18n="inputLabel">Message Sig</label><textarea id="message-input" rows="2" placeholder="Message Sig…" maxlength="16000"></textarea>
-          <div class="composer-bottom"><span class="composer-shortcuts"><kbd>↵</kbd> <span data-i18n="send">Send</span><span class="keyboard-separator">·</span><kbd>Shift ↵</kbd> <span data-i18n="newline">New line</span></span><button type="submit" class="send-button" id="send-button" data-i18n-label="send" aria-label="Send" disabled data-icon="arrow-up"></button></div>
+          <div class="composer-bottom"><span class="composer-shortcuts"><kbd>↵</kbd> <span data-i18n="send">Send</span><span class="keyboard-separator">·</span><kbd>Shift ↵</kbd> <span data-i18n="newline">New line</span></span><div id="composer-model-controls" class="composer-model-controls"></div><button type="submit" class="send-button" id="send-button" data-i18n-label="send" aria-label="Send" disabled data-icon="arrow-up"></button></div>
         </form>
         <p class="composer-note"><span data-icon="shield"></span><span data-i18n="notifications">Decisions wait here until you answer them.</span></p>
       </div>
     </main>
 
     <main class="session-view" id="session-view" data-i18n-label="sessionLabel" aria-label="Agent session" hidden>
-      <header class="conversation-header"><div class="conversation-heading"><div class="heading-line"><h1 id="session-title">Agent session</h1></div><p id="session-subtitle"></p></div><button class="icon-button detail-toggle" data-action="details" data-i18n-label="detailToggle" data-i18n-title="detailToggle" aria-label="Toggle details" aria-controls="context-panel" aria-expanded="true" title="Toggle details" data-icon="panel"></button></header>
+      <header class="conversation-header"><button class="icon-button sidebar-toggle" type="button" data-action="sidebar" data-i18n-label="sidebarToggle" data-i18n-title="sidebarToggle" aria-label="Toggle threads" aria-controls="threads-panel" aria-expanded="true" data-icon="panel-left"></button><div class="conversation-heading"><div class="heading-line"><h1 id="session-title">Agent session</h1></div><p id="session-subtitle"></p></div><button class="icon-button detail-toggle" data-action="details" data-i18n-label="detailToggle" data-i18n-title="detailToggle" aria-label="Toggle details" aria-controls="context-panel" aria-expanded="true" title="Toggle details" data-icon="panel"></button></header>
       <div class="view-tabs" id="session-tabs" role="group" data-i18n-label="viewTabs" aria-label="Thread views"></div>
       <div class="session-toolbar" id="session-toolbar"></div>
       <div class="session-body" id="session-body"></div>
@@ -70,6 +70,7 @@
     <button class="panel-scrim" data-action="close-details" data-i18n-label="closeDetails" aria-label="Close details" tabindex="-1"></button>
     <nav class="mobile-tabs" data-i18n-label="mainNavigation" aria-label="Main navigation"><button class="active" data-mobile-view="chat"><span data-icon="chat"></span><span data-i18n="chat">Chat</span></button><button data-mobile-view="threads"><span data-icon="layers"></span><span data-i18n="threads">Threads</span><span id="mobile-count" hidden>0</span></button><button data-action="machines"><span data-icon="monitor"></span><span data-i18n="machines">Machines</span></button></nav>
   </div>
+  <main id="onboarding" class="onboarding"><div class="onboarding-content"><p data-i18n="settingsLoading" role="status">Loading…</p></div></main>
   <dialog id="dialog" aria-labelledby="dialog-title"><div class="dialog-shell"><header class="dialog-header"><h2 id="dialog-title"></h2><button class="icon-button" data-action="close-dialog" data-i18n-label="close" aria-label="Close" data-icon="close"></button></header><div id="dialog-body"></div></div></dialog>
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
   <div class="sr-only" id="announcer" role="status" aria-live="polite"></div>

@@ -11,10 +11,11 @@ type Sql = (strings: TemplateStringsArray, ...values: unknown[]) => unknown;
 
 beforeEach(async () => {
   await resetChannelState();
-  // sh_model is deliberately not part of resetChannelState (it survives channel resets); this
-  // suite owns its rows explicitly.
+  // sh_model/sh_provider_key are deliberately not part of resetChannelState (they survive
+  // channel resets); this suite owns their rows explicitly.
   await runInDurableObject(ownerStub(), (instance: Steward) => {
     (instance as unknown as { sql: Sql }).sql.bind(instance)`DELETE FROM sh_model`;
+    (instance as unknown as { sql: Sql }).sql.bind(instance)`DELETE FROM sh_provider_key`;
   });
 });
 
@@ -33,6 +34,14 @@ describe("modelConfig: MODEL_KEY seeding", () => {
     expect(row.provider).toBe("deepseek");
     expect(row.apiKeyEnc).not.toContain(env.MODEL_KEY!);
     expect(row.apiKeyEnc.length).toBeGreaterThan(0);
+
+    // The credential itself lives in the per-provider registry (issue #74).
+    const keyRows = await runInDurableObject(ownerStub(), (instance: Steward) =>
+      (instance as unknown as { sql: Sql }).sql.bind(instance)`SELECT provider, apiKeyEnc FROM sh_provider_key` as unknown as { provider: string; apiKeyEnc: string }[],
+    );
+    expect(keyRows).toHaveLength(1);
+    expect(keyRows[0]).toMatchObject({ provider: "deepseek" });
+    expect(keyRows[0]!.apiKeyEnc).not.toContain(env.MODEL_KEY!);
   });
 
   it("never overwrites an explicit config: setModelConfig beats the env seed", async () => {

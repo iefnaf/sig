@@ -325,6 +325,16 @@ describe("live updates", () => {
 });
 
 describe("the page and its files", () => {
+  it("authorizes pages in the Durable Object without serving assets from its pinned environment", async () => {
+    const { cookie } = await browser();
+    const response = await ownerStub().fetch(new Request(`${BASE}/app`, { headers: { cookie } }));
+    expect(response.status).toBe(204);
+    expect(response.headers.get("x-sig-workspace-shell")).toBe("1");
+    expect(await response.text()).toBe("");
+    const denied = await ownerStub().fetch(new Request(`${BASE}/app`));
+    expect(denied.status).toBe(401);
+  });
+
   it("serve the workspace shell with a policy that forbids inline script and foreign origins", async () => {
     const { cookie } = await browser();
     const response = await SELF.fetch(`${BASE}/app`, { headers: { cookie } });

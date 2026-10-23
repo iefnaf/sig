@@ -5,13 +5,14 @@
 //
 // Everything on screen is built with h() (dom.js) from text nodes: nothing a message, an agent
 // or a repository contains is ever parsed as HTML.
-import { h, icon, paintIcons } from './dom.js';
+import { h, icon, paintIcons, providerIcon } from './dom.js';
 import { applyStatic, getLocale, localeTag, setLocale, t, tOr } from './i18n.js';
 import { dayKey, formatClock, formatDay, formatRelative, formatUsd, trimOpenMarkup } from './format.js';
+import { modelPicker } from './model-picker.js';
 import { markup } from './markup.js';
 import { mountSessionViewer } from './session.js';
 import {
-  ACTION_KEYS, FATAL_COPY, KNOWN_TITLES, attentionFor, groupByDay, groupThreads, isActiveWorker, messagesFor, previewOf, summarize, withPending, workOn,
+  ACTION_KEYS, FATAL_COPY, KNOWN_TITLES, attentionFor, groupByDay, groupThreads, isActiveWorker, messagesFor, modelAfterProviderChange, thinkingAfterModelChange, availableChatModels, initialSetupStep, previewOf, summarize, withPending, workOn,
 } from './model.js';
 
 const $ = (selector) => document.querySelector(selector);
@@ -38,6 +39,11 @@ const state = {
   settings: null, // { model, passkeys } from /app/api/settings
   modelDraft: null, // { provider, modelId, baseUrl, apiKey } being typed; kept out of the dialog's redraw signature
   passkeyLabelDraft: '', // ditto, for the new-passkey label field
+  setupChecked: false,
+  initialDialog: null,
+  settingsError: false,
+  changingModel: false,
+  onboarding: null, // { step: 'model' | 'security', passkeyAdd, confirm }
 
 };
 
@@ -248,10 +254,11 @@ function renderFeed(stick) {
     const nearBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 40;
     const oldTop = feed.scrollTop;
 
-    $('#conversation-title').textContent = thread ? thread.title : 'Sig';
+    $('#conversation-title').textContent = thread ? thread.title : t('allMessages');
     $('#conversation-subtitle').textContent = thread
       ? [thread.repos.join(', '), [...new Set(thread.workers.map((worker) => worker.agent))].join(', '), thread.machine].filter(Boolean).join(' · ')
-      : t('allThreads');
+      : '';
+    $('#conversation-subtitle').hidden = !$('#conversation-subtitle').textContent;
     document.querySelector('.heading-line .state-badge')?.remove();
     if (thread) $('.heading-line').append(stateBadge(thread.state));
     const banner = $('#scope-banner');
@@ -372,17 +379,19 @@ function renderPane() {
 
 /** The first thing a new deployment needs: a model key, then a machine. One notice at a time. */
 function renderSetup() {
+  renderOnboarding();
   const banner = $('#setup-banner');
   const needsKey = state.settings !== null && !state.settings.model?.apiKey;
   const needsMachine = !needsKey && state.snapshot.machines.every((machine) => machine.revoked);
   const which = needsKey ? 'model' : needsMachine ? 'machine' : null;
   redraw('setup', [getLocale(), which], () => {
     banner.hidden = which === null;
+    banner.classList.toggle('machine-hint', which === 'machine');
     const forKey = which === 'model';
     banner.replaceChildren(...(which === null ? [] : [
       icon(forKey ? 'shield' : 'laptop'),
       h('span', null, forKey ? t('setupModel') : t('setupMachine')),
-      h('button', { type: 'button', class: 'button primary', dataset: { action: forKey ? 'account' : 'machines', focus: 'setup' } }, forKey ? t('setupModelAction') : t('setupMachineAction')),
+      h('button', { type: 'button', class: forKey ? 'button primary' : 'text-button', dataset: { action: forKey ? 'account' : 'machines', focus: 'setup' } }, forKey ? t('setupModelAction') : t('setupMachineAction')),
     ]));
   });
 }
@@ -397,6 +406,7 @@ function resizeInput() {
 }
 
 function renderComposer() {
+  renderComposerModels();
   const thread = state.selected ? threadById(state.selected) : null;
   const target = state.replyTo ? state.snapshot.attention.find((item) => item.id === state.replyTo) : null;
   if (state.replyTo && !target) state.replyTo = null; // the card was handled in the meantime
@@ -410,6 +420,56 @@ function renderComposer() {
   chip.replaceChildren(...(target
     ? [icon('help'), h('span', null, t('replyingTo', { title: cardHeading(target) })), h('button', { type: 'button', dataset: { action: 'clear-reply' }, 'aria-label': t('clearReply'), title: t('clearReply') }, icon('close'))]
     : []));
+}
+
+function providerChoiceName(provider) {
+  const info = provider.info;
+  return [info?.familyName ?? provider.name, info?.plan ? t(`providerPlan_${info.plan}`) : '', info?.region ? t(`providerRegion_${info.region}`) : ''].filter(Boolean).join(' · ');
+}
+
+function renderComposerModels() {
+  const node = $('#composer-model-controls');
+  const model = state.settings?.model;
+  const busy = state.changingModel || working();
+  redraw('composer-model', [getLocale(), state.settings, busy], () => {
+    if (!model?.apiKey) { node.replaceChildren(); return; }
+    const entries = availableChatModels(state.settings).flatMap((provider) => provider.models.map((entry) => ({
+      ...entry, id: JSON.stringify([provider.id, entry.id]), modelId: entry.id, provider: provider.id, group: providerChoiceName(provider),
+    })));
+    const selected = entries.find((entry) => entry.provider === model.provider && entry.modelId === model.modelId);
+    const levels = selected?.thinkingLevels ?? model.thinkingLevels;
+    const ready = Boolean(levels?.includes(model.thinkingLevel));
+    node.replaceChildren(...[
+      modelPicker(entries, selected?.id ?? model.modelId, (id) => {
+        const entry = entries.find((item) => item.id === id);
+        if (entry) void changeComposerModel({ provider: entry.provider, modelId: entry.modelId, thinkingLevel: thinkingAfterModelChange(entry, model.thinkingLevel) });
+      }, { name: 'chat-model', compact: true, disabled: busy || !ready, label: `${t('composerModel')}: ${selected?.name ?? model.modelId}`, minWidth: 320 }),
+      ready ? modelPicker(levels.map((level) => ({ id: level, name: t(`thinking_${level}`) })), model.thinkingLevel, (level) => {
+        void changeComposerModel({ provider: model.provider, modelId: model.modelId, thinkingLevel: level });
+      }, { name: 'chat-thinking', compact: true, searchable: false, leadingIcon: 'memory', disabled: busy || levels.length < 2, label: `${t('thinkingTitle')}: ${t(`thinking_${model.thinkingLevel}`)}`, minWidth: 180 })
+        : h('button', { type: 'button', class: 'model-picker-trigger model-choice-chip', disabled: busy, dataset: { action: 'retry-settings' } }, t('modelOptionsReload')),
+      state.changingModel ? h('span', { class: 'model-saving', role: 'status' }, t('modelSaving')) : null].filter(Boolean));
+  });
+}
+
+async function changeComposerModel(input) {
+  if (state.changingModel || working()) return;
+  state.changingModel = true;
+  renderComposer();
+  $('#send-button').disabled = true;
+  try {
+    const { status, data } = await request('/app/api/settings/model/selection', input);
+    if (status === 200 && data?.model) {
+      const adjusted = state.settings.model.thinkingLevel !== data.model.thinkingLevel && state.settings.model.modelId !== data.model.modelId;
+      state.settings = { ...state.settings, model: data.model };
+      if (adjusted) toast(t('thinkingAdjusted', { level: t(`thinking_${data.model.thinkingLevel}`) }));
+    } else if (status !== 401) toast(t(status === 409 ? 'modelChangeBusy' : 'modelChangeFailed'));
+  } catch { toast(t('modelChangeFailed')); }
+  finally {
+    state.changingModel = false;
+    renderComposer();
+    $('#send-button').disabled = state.changingModel || !$('#message-input').value.trim();
+  }
 }
 
 // ---- the context panel ----------------------------------------------------------------------------------
@@ -551,7 +611,7 @@ function pairingSection() {
 
 /** One row in the Security section. Mirrors machineCard()'s confirm-then-commit shape. */
 function passkeyRow(passkey) {
-  const confirming = state.dialog.confirm === passkey.credentialId;
+  const confirming = securityState().confirm === passkey.credentialId;
   return h('div', { class: 'passkey-row' },
     h('div', null, h('strong', null, passkey.label),
       h('p', { class: 'dialog-hint' }, t('passkeyMeta', {
@@ -568,52 +628,247 @@ function passkeyRow(passkey) {
         h('button', { type: 'button', class: 'button danger', dataset: { action: 'passkey-remove', passkey: passkey.credentialId } }, t('passkeyRemove'))));
 }
 
-/** Rendered inside accountSection(), below the existing model-settings block. */
+const securityState = () => state.onboarding ?? state.dialog;
+
 function securitySection() {
-  const passkeys = state.settings?.passkeys ?? null;
-  return h('section', { class: 'security-settings' },
-    h('h3', null, t('securityTitle')),
-    passkeys === null ? h('p', { class: 'dialog-copy' }, t('settingsLoading'))
-      : [
-        passkeys.map(passkeyRow),
-        !passkeys.length ? h('p', { class: 'dialog-copy' }, t('passkeysEmpty')) : null,
-        state.dialog.passkeyAdd === 'unsupported' ? h('p', { class: 'dialog-error' }, t('passkeyUnsupported')) : null,
-        state.dialog.passkeyAdd === 'failed' ? h('p', { class: 'dialog-error' }, t('passkeyAddFailed')) : null,
-        h('form', { id: 'passkey-form', class: 'model-form' },
-          h('label', { class: 'sr-only', for: 'passkey-label' }, t('passkeyLabelLabel')),
-          h('input', { id: 'passkey-label', autocomplete: 'off', placeholder: t('passkeyLabelPlaceholder'), value: state.passkeyLabelDraft }),
-          h('button', { type: 'submit', class: 'button primary', disabled: state.dialog.passkeyAdd === 'creating' ? true : null },
-            state.dialog.passkeyAdd === 'creating' ? t('passkeyAdding') : t('passkeyAdd'))),
-      ]);
+  const passkeys = state.settings?.passkeys ?? [];
+  const security = securityState();
+  return h('section', { class: 'security-settings settings-section' },
+    h('div', { class: 'section-heading' }, icon('shield'),
+      h('div', null, h('h3', null, t('securityTitle')), h('p', { class: 'dialog-copy' }, t('securityHelp')))),
+    passkeys.map(passkeyRow),
+    security.passkeyAdd === 'unsupported' ? h('p', { class: 'dialog-error', role: 'alert' }, t('passkeyUnsupported')) : null,
+    security.passkeyAdd === 'failed' ? h('p', { class: 'dialog-error', role: 'alert' }, t('passkeyAddFailed')) : null,
+    h('form', { id: 'passkey-form', class: 'passkey-form model-form' },
+      h('label', { for: 'passkey-label' }, t('passkeyLabelLabel')),
+      h('div', { class: 'passkey-input-row' },
+        h('input', { id: 'passkey-label', maxlength: '80', autocomplete: 'off', placeholder: t('passkeyLabelPlaceholder'), value: state.passkeyLabelDraft, dataset: { focus: 'passkey-label' } }),
+        h('button', { type: 'submit', class: 'button primary', disabled: security.passkeyAdd === 'creating' },
+          security.passkeyAdd === 'creating' ? t('passkeyAdding') : t('passkeyAdd')))));
+}
+
+function providerGrid() {
+  const { model, providers = [], keyedProviders = [] } = state.settings;
+  const groups = new Map();
+  for (const provider of providers) {
+    const family = provider.info?.family ?? provider.id;
+    if (!groups.has(family)) groups.set(family, []);
+    groups.get(family).push(provider);
+  }
+  const entries = [...groups.entries()].map(([family, variants]) => {
+    const entry = variants.find((p) => p.id === model?.provider) ?? variants.find((p) => keyedProviders.includes(p.id)) ?? variants[0];
+    return { ...entry, family, name: entry.info?.familyName ?? entry.name, variants };
+  });
+  if (model && !entries.some((entry) => entry.id === model.provider)) entries.unshift({ id: model.provider, name: model.provider });
+  const common = ['anthropic', 'openai', 'google', 'deepseek', 'xai', 'moonshotai', 'zai', 'minimax', 'openrouter', 'xiaomi', 'qwen-token-plan'];
+  const featured = entries.filter((entry) => common.includes(entry.family) || entry.id === model?.provider || keyedProviders.includes(entry.id));
+  featured.sort((a, b) => (common.indexOf(a.family) < 0 ? 99 : common.indexOf(a.family)) - (common.indexOf(b.family) < 0 ? 99 : common.indexOf(b.family)));
+  const others = entries.filter((entry) => !featured.includes(entry));
+  const tile = (provider) => {
+    const active = model?.apiKey && model.provider === provider.id;
+    const saved = (provider.variants ?? [provider]).some((entry) => keyedProviders.includes(entry.id));
+    return h('button', { type: 'button', class: `provider-tile${active ? ' is-active' : ''}`, 'aria-label': active || saved ? `${provider.name} · ${t(active ? 'providerActive' : 'providerSaved')}` : provider.name, dataset: { action: 'provider', provider: provider.id, focus: `provider:${provider.family ?? provider.id}` } },
+      h('span', { class: 'provider-mark', 'aria-hidden': 'true' }, providerIcon(provider.id)),
+      h('span', { class: 'provider-name' }, provider.name,
+        active || saved ? h('span', { class: 'provider-saved-dot', title: t(active ? 'providerActive' : 'providerSaved'), 'aria-label': t(active ? 'providerActive' : 'providerSaved') }) : null));
+  };
+  return h('div', null, h('div', { class: 'provider-grid' }, featured.map(tile)),
+    h('details', { class: 'more-providers' },
+      h('summary', null, t('providersMore', { count: others.length })),
+      h('div', { class: 'provider-grid' }, others.map(tile))),
+    h('button', { type: 'button', class: 'provider-tile provider-custom', dataset: { action: 'provider', provider: MODEL_CUSTOM, focus: 'provider:custom' } },
+    h('span', { class: 'provider-mark' }, icon('plus')), h('span', { class: 'provider-name' }, t('modelCustomOption')), icon('chevron-right')));
+}
+
+function modelSection() {
+  const model = state.settings.model;
+  return h('section', { class: 'model-settings settings-section' },
+    h('div', { class: 'section-heading' }, icon('sparkle'),
+      h('div', null, h('h3', null, t('modelTitle')), h('p', { class: 'dialog-copy' }, t('providersHelp')))),
+    model?.apiKey ? h('p', { class: 'active-model' }, h('span', { class: 'status-dot green' }), t('providerActive'), h('strong', null, model.modelId)) : null,
+    providerGrid());
 }
 
 function accountSection() {
-  const settings = state.settings;
-  const model = settings?.model;
+  if (!state.settings) return [h('p', { class: 'dialog-copy' }, t(state.settingsError ? 'settingsLoadFailed' : 'settingsLoading')),
+    state.settingsError ? h('button', { class: 'button', dataset: { action: 'retry-settings' } }, t('settingsRetry')) : null];
+  return [modelSection(), securitySection(),
+    h('div', { class: 'settings-footer' }, h('p', { class: 'dialog-hint' }, t('accountBody')),
+      h('button', { type: 'button', class: 'button quiet', dataset: { action: 'sign-out' } }, t('signOut')))];
+}
+
+function providerSection() {
   const draft = state.modelDraft;
-  return [
-    h('p', { class: 'dialog-copy' }, settings ? t('accountBody') : t('settingsLoading')),
-    model && draft ? h('section', { class: 'model-settings' },
-      h('h3', null, t('modelTitle')),
-      h('p', { class: 'dialog-copy' }, t(model.apiKey ? 'modelReady' : 'modelNoKey', { provider: model.provider, model: model.modelId })),
-      h('form', { id: 'model-form', class: 'model-form' },
-        h('label', { class: 'sr-only', for: 'model-provider' }, t('modelProviderLabel')),
-        h('input', { id: 'model-provider', type: 'text', autocomplete: 'off', spellcheck: 'false', placeholder: t('modelProviderPlaceholder'), value: draft.provider }),
-        h('label', { class: 'sr-only', for: 'model-id' }, t('modelIdLabel')),
-        h('input', { id: 'model-id', type: 'text', autocomplete: 'off', spellcheck: 'false', placeholder: t('modelIdPlaceholder'), value: draft.modelId }),
-        h('label', { class: 'sr-only', for: 'model-base-url' }, t('modelBaseUrlLabel')),
-        h('input', { id: 'model-base-url', type: 'text', autocomplete: 'off', spellcheck: 'false', placeholder: t('modelBaseUrlPlaceholder'), value: draft.baseUrl }),
-        h('label', { class: 'sr-only', for: 'model-key' }, t('modelKeyLabel')),
-        h('input', { id: 'model-key', type: 'password', autocomplete: 'off', spellcheck: 'false', placeholder: t('modelKeyPlaceholder'), value: draft.apiKey }),
-        h('button', { type: 'submit', class: 'button primary' }, t('modelSave'))),
-      h('p', { class: 'dialog-hint' }, t('modelHelp'))) : null,
-    securitySection(),
-    h('div', { class: 'dialog-actions' }, h('button', { type: 'button', class: 'button danger', dataset: { action: 'sign-out' } }, t('signOut'))),
-  ];
+  const provider = state.settings.providers.find((entry) => entry.id === draft.provider);
+  const models = provider?.models ?? [];
+  const known = models.some((entry) => entry.id === draft.modelId);
+  const keyed = state.settings.keyedProviders.includes(draft.provider);
+  const variants = provider?.info ? state.settings.providers.filter((entry) => entry.info?.family === provider.info.family) : [];
+  const selectedModel = models.find((entry) => entry.id === draft.modelId);
+  const busy = state.dialog.saving || state.dialog.testing;
+  const link = (url, label) => h('a', { class: 'provider-link', href: url, target: '_blank', rel: 'noopener noreferrer' }, label, icon('external'));
+  return h('form', { id: 'model-form', class: 'model-form provider-form' },
+    h('div', { class: 'provider-intro' },
+      h('p', { class: 'dialog-copy' }, t('providerConnectHelp')),
+      provider?.info ? link(provider.info.consoleUrl, t('providerConsole')) : null),
+    variants.length > 1 ? [
+      h('span', { id: 'provider-variant-label', class: 'field-label' }, t('providerVariant')),
+      h('div', { class: 'provider-variants', role: 'group', 'aria-labelledby': 'provider-variant-label' }, variants.map((entry) =>
+        h('button', { type: 'button', class: 'provider-variant', 'aria-pressed': String(entry.id === draft.provider), disabled: busy, dataset: { action: 'provider-variant', provider: entry.id, focus: `variant:${entry.id}` } },
+          [entry.info.plan ? t(`providerPlan_${entry.info.plan}`) : '', entry.info.region ? t(`providerRegion_${entry.info.region}`) : ''].filter(Boolean).join(' · '),
+          state.settings.keyedProviders.includes(entry.id) ? h('span', { class: 'provider-saved-dot', title: t('providerSaved') }) : null))),
+      h('p', { class: 'dialog-hint' }, t('providerVariantHelp')),
+    ] : null,
+    h('div', { class: 'provider-key-label' }, h('label', { for: 'model-key' }, t('modelKeyLabel')),
+      provider?.info ? link(provider.info.keysUrl, t('providerGetKey')) : null),
+    h('div', { class: 'key-input-row' },
+      h('input', { id: 'model-key', type: state.dialog.showKey ? 'text' : 'password', autocomplete: 'off', spellcheck: 'false', required: !keyed, placeholder: t(keyed ? 'modelKeyKeep' : 'modelKeyPlaceholder'), value: draft.apiKey, dataset: { focus: 'model-key' } }),
+      h('button', { type: 'button', class: 'button quiet', dataset: { action: 'toggle-key' }, 'aria-pressed': String(Boolean(state.dialog.showKey)) }, t(state.dialog.showKey ? 'keyHide' : 'keyShow'))),
+    h('p', { class: 'dialog-hint' }, t('modelHelp')),
+    h('div', { class: 'provider-endpoint' }, h('span', null, t('providerEndpoint')),
+      h('code', { id: 'provider-endpoint' }, draft.baseUrl.trim() || selectedModel?.baseUrl || t('providerEndpointUnknown'))),
+    h('label', { for: provider ? 'model-picker-trigger' : 'model-id-custom' }, t('modelIdLabel')),
+    provider ? modelPicker(models, draft.modelId, (id) => {
+      state.modelDraft.modelId = id;
+      state.modelDraft.thinkingLevel = thinkingAfterModelChange(models.find((entry) => entry.id === id), state.modelDraft.thinkingLevel);
+      state.dialog.test = null;
+      bumpDialog();
+      $('#model-picker-trigger').focus();
+    }) : [
+      h('label', { for: 'model-provider-custom' }, t('modelProviderLabel')),
+      h('input', { id: 'model-provider-custom', required: true, autocomplete: 'off', value: draft.provider }),
+      h('input', { id: 'model-id-custom', required: true, autocomplete: 'off', value: draft.modelId }),
+    ],
+    provider && selectedModel ? [h('label', { for: 'provider-thinking-picker-trigger' }, t('thinkingTitle')),
+      modelPicker((selectedModel.thinkingLevels ?? ['off']).map((level) => ({ id: level, name: t(`thinking_${level}`) })), draft.thinkingLevel ?? 'off', (level) => {
+        state.modelDraft.thinkingLevel = level;
+        state.dialog.test = null;
+        bumpDialog();
+        $('#provider-thinking-picker-trigger').focus();
+      }, { name: 'provider-thinking', searchable: false, label: t('thinkingTitle'), disabled: busy || selectedModel.thinkingLevels?.length < 2 }),
+      h('p', { class: 'dialog-hint' }, t('thinkingHelp')),
+    ] : null,
+    provider && !known ? h('p', { class: 'dialog-hint' }, t('modelChooseKnown')) : null,
+    h('div', { class: 'connection-test' },
+      h('button', { type: 'button', class: 'button', disabled: busy, dataset: { action: 'test-model' } }, t(state.dialog.testing ? 'modelTesting' : 'modelTest')),
+      h('p', { class: 'dialog-hint' }, t('modelTestHelp', { model: draft.modelId }))),
+    h('p', { id: 'model-test-result', class: `connection-result${state.dialog.test?.ok ? ' success' : ' dialog-error'}`, role: 'status', 'aria-live': 'polite' },
+      state.dialog.test ? t(state.dialog.test.ok ? 'modelTestSuccess' : `modelTest_${state.dialog.test.error}`) : ''),
+    state.dialog.saveError ? h('p', { class: 'dialog-error', role: 'alert' }, t('modelSaveFailed')) : null,
+    h('div', { class: 'provider-footer' },
+      h('button', { type: 'button', class: 'button quiet', dataset: { action: 'close-dialog' } }, t('actionCancel')),
+      h('button', { type: 'submit', class: 'button primary', disabled: busy }, t(state.dialog.saving ? 'modelSaving' : 'modelSave'))));
+}
+
+function selectProviderVariant(provider) {
+  const current = state.settings.model;
+  state.modelDraft = current?.provider === provider
+    ? { provider, modelId: current.modelId, baseUrl: '', apiKey: '' }
+    : { provider, modelId: modelAfterProviderChange(state.settings.providers, provider, state.modelDraft.modelId) ?? '', baseUrl: '', apiKey: '' };
+  const selected = state.settings.providers.find((entry) => entry.id === provider)?.models.find((entry) => entry.id === state.modelDraft.modelId);
+  state.modelDraft.thinkingLevel = thinkingAfterModelChange(selected, current?.thinkingLevel);
+  state.dialog.test = null;
+  state.dialog.saveError = false;
+  state.dialog.showKey = false;
+  bumpDialog();
+}
+
+async function testModel() {
+  const dialog = state.dialog;
+  if (!state.modelDraft || dialog.testing || dialog.saving || !$('#model-form').reportValidity()) return;
+  const draft = Object.fromEntries(Object.entries(state.modelDraft).map(([key, value]) => [key, value.trim()]));
+  const signature = JSON.stringify(state.modelDraft);
+  dialog.testing = true;
+  dialog.test = null;
+  bumpDialog();
+  try {
+    const { status, data } = await request('/app/api/settings/model/test', draft);
+    if (state.dialog === dialog && JSON.stringify(state.modelDraft) === signature) {
+      dialog.test = status === 200 ? data : { ok: false, error: 'provider_error' };
+    }
+  } catch {
+    if (state.dialog === dialog && JSON.stringify(state.modelDraft) === signature) dialog.test = { ok: false, error: 'provider_error' };
+  } finally {
+    dialog.testing = false;
+    if (state.dialog === dialog) bumpDialog();
+  }
+}
+
+function openProvider(id) {
+  const current = state.settings.model;
+  const provider = id === MODEL_CUSTOM ? '' : id;
+  state.modelDraft = current?.provider === provider
+    ? { provider, modelId: current.modelId, baseUrl: '', apiKey: '' }
+    : { provider, modelId: modelAfterProviderChange(state.settings.providers, provider, '') ?? '', baseUrl: '', apiKey: '' };
+  state.dialog = { type: 'provider', rev: 0, returnTo: state.onboarding ? null : 'account', returnFocus: `provider:${id === MODEL_CUSTOM ? 'custom' : state.settings.providers.find((entry) => entry.id === id)?.info?.family ?? id}` };
+  const selected = state.settings.providers.find((entry) => entry.id === provider)?.models.find((entry) => entry.id === state.modelDraft.modelId);
+  state.modelDraft.thinkingLevel = thinkingAfterModelChange(selected, current?.thinkingLevel);
+  renderDialog();
+  $('#model-key').focus();
+}
+
+function renderOnboarding() {
+  const page = $('#onboarding');
+  const active = !state.setupChecked || state.onboarding !== null;
+  page.hidden = !active;
+  const wasHidden = $('#workspace').hidden;
+  $('#workspace').hidden = active;
+  if (!active) {
+    if (wasHidden && state.snapshot) {
+      drawn.delete('feed');
+      renderFeed(true);
+      resizeInput();
+    }
+    return;
+  }
+  redraw('onboarding', [getLocale(), state.setupChecked, state.settingsError, state.onboarding, state.settings], () => {
+    preservingFocus(page, () => {
+      const security = state.onboarding?.step === 'security';
+      page.replaceChildren(
+        h('header', { class: 'onboarding-header' },
+          h('div', { class: 'brand' }, h('img', { class: 'brand-mark', src: '/brand/sig.svg', width: 32, height: 32, alt: '' }), h('span', { class: 'brand-word' }, 'Sig')),
+          h('div', { class: 'language-switch' }, ['en', 'zh'].map((locale) => h('button', { type: 'button', dataset: { locale }, 'aria-pressed': String(getLocale() === locale) }, locale === 'en' ? 'EN' : '中文')))),
+        h('div', { class: 'onboarding-content' },
+          !state.setupChecked ? [h('h1', null, t(state.settingsError ? 'settingsLoadFailed' : 'settingsLoading')),
+            state.settingsError ? h('button', { class: 'button primary', dataset: { action: 'retry-settings' } }, t('settingsRetry')) : null] : [
+            h('ol', { class: 'setup-steps', 'aria-label': t('setupSteps') },
+              h('li', { class: security ? 'is-complete' : 'is-current', 'aria-current': security ? null : 'step' }, h('span', null, security ? icon('check') : '1'), t('setupStepModel')),
+              h('li', { class: security ? 'is-current' : '', 'aria-current': security ? 'step' : null }, h('span', null, '2'), t('setupStepSecurity'))),
+            h('h1', { id: 'setup-title', tabindex: '-1' }, t(security ? 'setupSecurityTitle' : 'setupWelcome')),
+            h('p', { class: 'onboarding-intro' }, t(security ? 'setupSecurityBody' : 'setupWelcomeBody')),
+            security ? securitySection() : modelSection(),
+            h('footer', { class: 'onboarding-footer' },
+              security ? h('button', { class: 'button quiet', disabled: state.onboarding.passkeyAdd === 'creating', dataset: { action: 'setup-back' } }, t('setupBack')) : h('p', { class: 'dialog-hint' }, t('setupKeyRequired')),
+              security ? h('button', { class: `button${state.settings.passkeys.length ? ' primary' : ' quiet'}`, disabled: state.onboarding.passkeyAdd === 'creating', dataset: { action: 'setup-finish' } }, t(state.settings.passkeys.length ? 'setupFinish' : 'setupSkip'))
+                : state.settings.model?.apiKey ? h('button', { class: 'button primary', dataset: { action: 'setup-next' } }, t('setupContinue')) : null)]));
+    });
+  });
+}
+
+function setSetupStep(step) {
+  if (state.onboarding?.passkeyAdd === 'creating') return;
+  state.onboarding = { step, passkeyAdd: null, confirm: null };
+  renderOnboarding();
+  $('#setup-title')?.focus();
+}
+
+function finishSetup() {
+  if (!state.settings?.model?.apiKey || state.onboarding?.passkeyAdd === 'creating') return;
+  try { localStorage.setItem('sig.setup.securitySkipped', 'true'); } catch { /* Storage may be unavailable. */ }
+  state.onboarding = null;
+  const type = state.initialDialog;
+  state.initialDialog = null;
+  renderAll();
+  if (type) openDialog(type);
+  else $('#message-input').focus();
 }
 
 function dialogContent() {
   const snapshot = state.snapshot;
+  if (state.dialog.type === 'provider') {
+    const provider = state.settings.providers.find((entry) => entry.id === state.modelDraft.provider);
+    return { title: provider?.info?.familyName || provider?.name || state.modelDraft.provider || t('modelCustomOption'), body: providerSection() };
+  }
   if (state.dialog.type === 'machines') {
     const summary = summarize(snapshot);
     return {
@@ -649,7 +904,8 @@ function renderDialog() {
     type === 'account' ? [state.settings, state.dialog.passkeyAdd] : null];
   redraw('dialog', signature, () => {
     const { title, body } = dialogContent();
-    $('#dialog-title').textContent = title;
+    $('#dialog').classList.toggle('settings-dialog', type === 'account');
+    $('#dialog-title').replaceChildren(...(type === 'provider' ? [providerIcon(state.modelDraft.provider), document.createTextNode(title)] : [document.createTextNode(title)]));
     preservingFocus($('#dialog-body'), () => $('#dialog-body').replaceChildren(...[body].flat(Infinity).filter(Boolean)));
   });
   if (!$('#dialog').open) $('#dialog').showModal();
@@ -657,6 +913,7 @@ function renderDialog() {
 
 /** A local change to the dialog's own state (a pairing command arrived, a confirmation opened). */
 function bumpDialog() {
+  renderOnboarding();
   if (!state.dialog) return;
   state.dialog.rev = (state.dialog.rev ?? 0) + 1;
   renderDialog();
@@ -670,6 +927,19 @@ function openDialog(type) {
 }
 
 function closeDialog() {
+  if (state.dialog?.saving || securityState()?.passkeyAdd === 'creating') return;
+  const returnTo = state.dialog?.returnTo;
+  const returnFocus = state.dialog?.returnFocus;
+  state.modelDraft = null;
+  if (returnTo) {
+    state.dialog = { type: returnTo, rev: 0, confirm: null, passkeyAdd: null };
+    bumpDialog();
+    const target = returnFocus ? document.querySelector(`[data-focus="${CSS.escape(returnFocus)}"]`) : null;
+    const details = target?.closest('details');
+    if (details) details.open = true;
+    target?.focus();
+    return;
+  }
   state.dialog = null;
   drawn.delete('dialog');
   if ($('#dialog').open) $('#dialog').close();
@@ -819,11 +1089,11 @@ function accept(data) {
   markSelectedRead();
   if (!socket) connect();
   if (first) {
-    void loadSettings();
+    void loadSettings(true);
     const dialog = { '/app/machines': 'machines', '/app/settings': 'account' }[location.pathname];
     if (dialog) {
       history.replaceState(null, '', '/app');
-      openDialog(dialog);
+      state.initialDialog = dialog;
     }
   }
 }
@@ -852,6 +1122,7 @@ function connect() {
     state.connection = 'live';
     renderConnection();
     refresh(); // anything that changed while the socket was down
+    if (state.setupChecked) void loadSettings();
   });
   current.addEventListener('message', (event) => {
     let frame;
@@ -861,6 +1132,7 @@ function connect() {
       return; // not a frame of ours
     }
     if (frame.t === 'workspace_changed') void refresh();
+    else if (frame.t === 'model_changed') void loadSettings();
     else if (frame.t === 'stream') showLive(frame);
   });
   current.addEventListener('close', () => {
@@ -913,7 +1185,7 @@ async function postMessage(entry) {
 function send() {
   const input = $('#message-input');
   const text = input.value;
-  if (!text.trim()) return;
+  if (!text.trim() || state.changingModel) return;
   const entry = { id: uuid(), text, threadId: state.selected, replyTo: state.replyTo, at: Date.now(), status: 'sending' };
   state.pending.set(entry.id, entry);
   input.value = '';
@@ -959,41 +1231,75 @@ async function signOut() {
 
 // ---- settings, pairing, revoking ---------------------------------------------------------------------------
 
-async function loadSettings() {
+async function loadSettings(initial = false) {
   try {
     const { status, data } = await request('/app/api/settings');
-    if (status !== 200 || !data) return;
+    if (status === 401) return;
+    if (status !== 200 || !data) throw new Error('settings_failed');
     state.settings = data;
-    state.modelDraft = data.model
-      ? { provider: data.model.provider, modelId: data.model.modelId, baseUrl: data.model.baseUrl ?? '', apiKey: '' }
-      : null;
+    renderComposerModels();
+    state.settingsError = false;
+    if (initial || !state.setupChecked) {
+      state.setupChecked = true;
+      let skipped = false;
+      try { skipped = localStorage.getItem('sig.setup.securitySkipped') === 'true'; } catch { /* Storage may be unavailable. */ }
+      const step = initialSetupStep(data, state.snapshot.messages.length > 0, skipped);
+      if (step) setSetupStep(step);
+      else if (state.initialDialog) {
+        const type = state.initialDialog;
+        state.initialDialog = null;
+        openDialog(type);
+      }
+    }
     renderSetup();
     if (state.dialog?.type === 'account') bumpDialog();
+    return true;
   } catch {
-    // Settings are secondary; the workspace works without them.
+    state.settingsError = true;
+    renderOnboarding();
+    bumpDialog();
+    return false;
   }
 }
 
-/** Issue #70: provider + modelId (+ optional baseUrl) and the matching API key, switched
- *  without a redeploy — the same request/toast/reload flow the key-only form used. */
+/** Issues #70/#74: provider + modelId (+ optional baseUrl) switched without a redeploy.
+ *  The API key is optional once the provider has a sealed one — switching back to a keyed
+ *  provider is the whole point — and a pasted key reseals it. */
 async function saveModel() {
   const draft = state.modelDraft;
-  if (!draft) return;
+  if (!draft || state.dialog?.saving || state.dialog?.testing) return;
   const provider = draft.provider.trim();
   const modelId = draft.modelId.trim();
   const baseUrl = draft.baseUrl.trim();
   const apiKey = draft.apiKey.trim();
-  if (!provider || !modelId || !apiKey) return;
+  if (!provider || !modelId) return;
+  const catalog = state.settings.providers.find((entry) => entry.id === provider);
+  if (catalog && !catalog.models.some((entry) => entry.id === modelId)) { toast(t('modelChooseKnown')); return; }
+  if (!apiKey && !(state.settings?.keyedProviders ?? []).includes(provider)) {
+    toast(t('modelKeyMissing'));
+    return;
+  }
+  const dialog = state.dialog;
+  dialog.saving = true;
+  dialog.saveError = false;
+  bumpDialog();
   try {
-    const { status } = await request('/app/api/settings/model', { provider, modelId, apiKey, ...(baseUrl ? { baseUrl } : {}) });
+    const { status } = await request('/app/api/settings/model', { provider, modelId, ...(apiKey ? { apiKey } : {}), ...(baseUrl ? { baseUrl } : {}), thinkingLevel: draft.thinkingLevel ?? 'off' });
     if (status === 200) {
       draft.apiKey = '';
       toast(t('modelSaved'));
-      await loadSettings();
+      const loaded = await loadSettings();
+      dialog.saving = false;
+      if (!loaded) { dialog.saveError = true; return bumpDialog(); }
+      closeDialog();
+      if (state.onboarding) setSetupStep('security');
       await refresh();
-    } else if (status !== 401) toast(t('modelSaveFailed'));
+    } else if (status !== 401) dialog.saveError = true;
   } catch {
-    toast(t('modelSaveFailed'));
+    dialog.saveError = true;
+  } finally {
+    dialog.saving = false;
+    bumpDialog();
   }
 }
 
@@ -1066,12 +1372,14 @@ function defaultPasskeyLabel() {
 
 /** addPasskey(): see candidate-2 design §Usage 1 for the full call sequence. */
 async function addPasskey() {
+  const security = securityState();
+  if (!security || security.passkeyAdd === 'creating') return;
   if (!window.PublicKeyCredential) {
-    state.dialog.passkeyAdd = 'unsupported';
+    security.passkeyAdd = 'unsupported';
     return bumpDialog();
   }
   const label = state.passkeyLabelDraft.trim() || defaultPasskeyLabel();
-  state.dialog.passkeyAdd = 'creating';
+  security.passkeyAdd = 'creating';
   bumpDialog();
   try {
     const { status, data } = await request('/app/api/settings/webauthn/register/options', {});
@@ -1092,7 +1400,7 @@ async function addPasskey() {
     } catch {
       // The user cancelled the platform prompt, or no compatible authenticator answered —
       // not a failure worth a toast, just back to the idle add-a-passkey state.
-      state.dialog.passkeyAdd = null;
+      security.passkeyAdd = null;
       return bumpDialog();
     }
     const { status: verifyStatus } = await request('/app/api/settings/webauthn/register/verify', {
@@ -1103,11 +1411,11 @@ async function addPasskey() {
     });
     if (verifyStatus !== 200) throw new Error('verify_failed');
     state.passkeyLabelDraft = '';
-    state.dialog.passkeyAdd = null;
+    security.passkeyAdd = null;
     toast(t('passkeyAdded'));
     await loadSettings();
   } catch {
-    state.dialog.passkeyAdd = 'failed';
+    security.passkeyAdd = 'failed';
     bumpDialog();
   }
 }
@@ -1120,7 +1428,7 @@ async function removePasskey(credentialId) {
   } catch {
     toast(t('passkeyRemoveFailed'));
   }
-  if (state.dialog) state.dialog.confirm = null;
+  if (securityState()) securityState().confirm = null;
   await loadSettings();
   bumpDialog();
 }
@@ -1163,6 +1471,7 @@ function latestWorker(thread) {
 
 function setMobile(view) {
   $('#workspace').dataset.mobile = view;
+  syncDetailButton();
   for (const button of document.querySelectorAll('[data-mobile-view]')) {
     const active = button.dataset.mobileView === view;
     button.classList.toggle('active', active);
@@ -1171,24 +1480,43 @@ function setMobile(view) {
   }
 }
 
+function sidebarOpen() {
+  return matchMedia('(max-width: 650px)').matches ? $('#workspace').dataset.mobile === 'threads' : !$('#workspace').classList.contains('sidebar-hidden');
+}
+
+function toggleSidebar() {
+  if (matchMedia('(max-width: 650px)').matches) return setMobile(sidebarOpen() ? 'chat' : 'threads');
+  $('#workspace').classList.toggle('sidebar-hidden');
+  try { localStorage.setItem('sig.sidebar.hidden', String(!sidebarOpen())); } catch { /* Storage may be unavailable. */ }
+  syncDetailButton();
+  resizeInput();
+}
+
 function detailsOpen() {
   const workspace = $('#workspace');
   return matchMedia('(max-width: 990px)').matches ? workspace.classList.contains('context-overlay') : !workspace.classList.contains('context-hidden');
 }
 
 function syncDetailButton() {
+  for (const button of document.querySelectorAll('.sidebar-toggle')) button.setAttribute('aria-expanded', String(sidebarOpen()));
   for (const button of document.querySelectorAll('.detail-toggle')) button.setAttribute('aria-expanded', String(detailsOpen()));
 }
 
 function openDetails() {
-  $('#workspace').classList.remove('context-hidden');
-  $('#workspace').classList.add('context-overlay');
+  if (matchMedia('(max-width: 990px)').matches) $('#workspace').classList.add('context-overlay');
+  else {
+    $('#workspace').classList.remove('context-hidden');
+    try { localStorage.setItem('sig.context.hidden', 'false'); } catch { /* Storage may be unavailable. */ }
+  }
   syncDetailButton();
 }
 
 function closeDetails() {
   $('#workspace').classList.remove('context-overlay');
-  $('#workspace').classList.add('context-hidden');
+  if (!matchMedia('(max-width: 990px)').matches) {
+    $('#workspace').classList.add('context-hidden');
+    try { localStorage.setItem('sig.context.hidden', 'true'); } catch { /* Storage may be unavailable. */ }
+  }
   syncDetailButton();
 }
 
@@ -1219,7 +1547,7 @@ $('#composer-form').addEventListener('submit', (event) => {
   send();
 });
 $('#message-input').addEventListener('input', () => {
-  $('#send-button').disabled = !$('#message-input').value.trim();
+  $('#send-button').disabled = state.changingModel || !$('#message-input').value.trim();
   resizeInput();
 });
 $('#message-input').addEventListener('keydown', (event) => {
@@ -1245,15 +1573,17 @@ document.addEventListener('visibilitychange', () => {
   void refresh();
   if (socket && socket.readyState > 1 && !state.fatal) connect();
 });
-$('#dialog').addEventListener('close', () => { state.dialog = null; });
+$('#dialog').addEventListener('close', () => { if (!$('#dialog').open) { state.dialog = null; state.modelDraft = null; } });
+$('#dialog').addEventListener('cancel', (event) => { event.preventDefault(); closeDialog(); });
 $('#dialog').addEventListener('click', (event) => {
   if (event.target !== $('#dialog')) return;
   const rect = $('#dialog').getBoundingClientRect();
   if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) closeDialog();
 });
 document.addEventListener('keydown', (event) => {
-  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k' && !$('#dialog').open) {
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k' && !$('#dialog').open && !state.onboarding) {
     event.preventDefault();
+    if (!matchMedia('(max-width: 650px)').matches && !sidebarOpen()) toggleSidebar();
     setMobile('threads');
     $('#thread-search').focus();
   }
@@ -1298,6 +1628,16 @@ document.addEventListener('click', (event) => {
   }
   if (dataset.jump) return jumpTo(dataset.jump);
   switch (dataset.action) {
+    case 'provider': return openProvider(dataset.provider);
+    case 'provider-variant': return selectProviderVariant(dataset.provider);
+    case 'test-model': return void testModel();
+    case 'toggle-key':
+      state.dialog.showKey = !state.dialog.showKey;
+      return bumpDialog();
+    case 'retry-settings': return void loadSettings(!state.setupChecked);
+    case 'setup-back': return setSetupStep('model');
+    case 'setup-next': return setSetupStep('security');
+    case 'setup-finish': return finishSetup();
     case 'all': return select(null);
     case 'new':
       select(null);
@@ -1307,6 +1647,7 @@ document.addEventListener('click', (event) => {
     case 'account': return openDialog('account');
     case 'scope': return openDialog('scope');
     case 'close-dialog': return closeDialog();
+    case 'sidebar': return toggleSidebar();
     case 'details': return detailsOpen() ? closeDetails() : openDetails();
     case 'attention':
       select(null);
@@ -1331,24 +1672,33 @@ document.addEventListener('click', (event) => {
       return bumpDialog();
     case 'revoke-yes': return void revokeMachine(dataset.machine);
     case 'passkey-remove':
-      state.dialog.confirm = dataset.passkey;
+      securityState().confirm = dataset.passkey;
       return bumpDialog();
     case 'passkey-remove-no':
-      state.dialog.confirm = null;
+      securityState().confirm = null;
       return bumpDialog();
     case 'passkey-remove-yes': return void removePasskey(dataset.passkey);
   }
 });
 
-// The model form and the passkey label are typed in the settings dialog, which is not
-// redrawn while either is being typed.
-const MODEL_DRAFT_FIELDS = { 'model-provider': 'provider', 'model-id': 'modelId', 'model-base-url': 'baseUrl', 'model-key': 'apiKey' };
-$('#dialog').addEventListener('input', (event) => {
+// Draft values stay outside redraw signatures so refreshes preserve typing and focus.
+const MODEL_CUSTOM = '__custom';
+const MODEL_DRAFT_FIELDS = { 'model-provider-custom': 'provider', 'model-id-custom': 'modelId', 'model-key': 'apiKey' };
+document.addEventListener('input', (event) => {
   const field = MODEL_DRAFT_FIELDS[event.target.id];
-  if (field && state.modelDraft) state.modelDraft[field] = event.target.value;
+  if (field && state.modelDraft) {
+    state.dialog.test = null;
+    $('#model-test-result')?.replaceChildren();
+    const isSelect = event.target.tagName === 'SELECT';
+    state.modelDraft[field] = isSelect && event.target.value === MODEL_CUSTOM ? '' : event.target.value;
+    if (isSelect) {
+      bumpDialog();
+      if (event.target.value === MODEL_CUSTOM) $('#model-id-custom')?.focus();
+    }
+  }
   if (event.target.id === 'passkey-label') state.passkeyLabelDraft = event.target.value;
 });
-$('#dialog').addEventListener('submit', (event) => {
+document.addEventListener('submit', (event) => {
   if (event.target.id === 'model-form') {
     event.preventDefault();
     return void saveModel();
@@ -1363,6 +1713,10 @@ $('#dialog').addEventListener('submit', (event) => {
 
 applyStatic();
 paintIcons();
+try {
+  $('#workspace').classList.toggle('sidebar-hidden', localStorage.getItem('sig.sidebar.hidden') === 'true');
+  $('#workspace').classList.toggle('context-hidden', localStorage.getItem('sig.context.hidden') === 'true');
+} catch { /* Storage may be unavailable. */ }
 {
   const route = routeFromLocation();
   state.selected = route.thread;

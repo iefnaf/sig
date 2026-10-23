@@ -30,7 +30,7 @@ wrangler secret put SERVER_KEY
 wrangler secret put MODEL_KEY   # optional; the workspace Settings page works too
 ```
 
-That's the whole setup — no onboarding page, no webhook to register. Talk to it:
+You can now talk to Sig through the owner API:
 
 ```sh
 curl -X POST https://<your-worker>.workers.dev/api/messages \
@@ -50,6 +50,8 @@ curl -X POST https://<your-worker>.workers.dev/api/login-link -H "Authorization:
 
 Opening it sets the session cookie (7 days). Report cards carry the same kind of link on their 查看详情 button.
 
+On first use, the workspace guides you through connecting a model and offers passkey registration. You can skip the passkey step and add one later in **Settings → Security**. Connect a machine when you want Sig to work on your code.
+
 ## Custom domain
 
 Not required for function anymore (there is no chat platform that must reach you), but **mainland users should bind one**: `*.workers.dev` is blocked there outright (DNS pollution + SNI reset, live-tested in the spike), and the API, the web app, and the connector's WebSocket all need to reach the deployment. The agent runbook keeps this as an appendix attached only when workers.dev is unreachable.
@@ -67,7 +69,11 @@ The steward needs one LLM behind it. Default: `deepseek` / `deepseek-flash` (the
 "vars": { "STEWARD_MODEL": "{\"provider\": \"deepseek\", \"modelId\": \"deepseek-v4-pro\"}" }
 ```
 
-…or switch it at runtime instead, from the workspace's **Settings**: pick provider, model ID and (optionally) a custom base URL, paste the matching API key, and save — no redeploy. A switch made this way wins over `vars.STEWARD_MODEL` entirely, so it works whether or not the deploy config names a model. The API key never rides in vars either way: it is the sealed `sh_model` row inside the Durable Object — seeded once from the `MODEL_KEY` you set at deploy, or set through Settings (which replaces whatever was saved, including the provider and model). A missing key or unknown provider/model fails visibly (`sh_run` settles `unanswered`), never with a silently different model; a key the provider rejects is diagnosed in place ([ADR-0004](adr/0004-web-workspace.md)'s workspace tells you to fix the key, not to retry). Changing the *shipped default* (`deepseek`/`deepseek-flash` above) requires re-running the routing eval (ADR-0001 decision 14); switching your own deployment's model from Settings does not.
+To connect a provider at runtime, open **Settings → Model providers** and select its tile. Choose the plan and region if offered, paste the API key, and choose a model and thinking level. The dialog shows the preset endpoint and links to the provider's key page and console. **Test connection** makes a small model request using the current form values without saving them. It may use provider credits. Save the configuration when ready.
+
+The chat input shows the active model and thinking level. Its searchable model menu groups models by configured provider; the thinking menu shows only levels that the model supports. Changes are saved and applied to the conversation without a redeploy. If a model does not support the current thinking level, Sig uses its advertised default and tells you. Wait for the current reply to finish before switching.
+
+A runtime selection wins over `vars.STEWARD_MODEL`. Each provider's key is sealed separately in the Durable Object (`sh_provider_key`), so switching back does not require key re-entry. `MODEL_KEY` seeds the default provider's key once. Missing credentials, rejected keys, and unavailable models produce instructions for fixing the configuration. Changing the shipped default (`deepseek` / `deepseek-flash`) requires re-running the routing eval (ADR-0001 decision 14); changing your own deployment's selection does not.
 
 The daily budget soft cap (issue #28): `vars.DAILY_BUDGET_USD` (dollars per UTC day, default $1, `0` disables automatic model wakes). Past it, events/routines/follow-ups stop waking the model while done reports, pushes, digests, and replies continue.
 
