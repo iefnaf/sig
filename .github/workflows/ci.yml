@@ -76,26 +76,38 @@ jobs:
           json_file="$RUNNER_TEMP/wrangler-preview-payload.json"
           login_body_file="$RUNNER_TEMP/login-link-response.json"
           preview_name="pr-${{ github.event.pull_request.number }}"
+          machine_name="pr-${{ github.event.pull_request.number }}-machine"
           preview_delete_body_file="$RUNNER_TEMP/preview-delete-response.json"
-          preview_delete_status="$(curl --silent --show-error --output "$preview_delete_body_file" \
-            --write-out '%{http_code}' \
-            --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/workers/sig-steward/previews/$preview_name")"
-          case "$preview_delete_status" in
-            200)
-              pnpm --filter @nightboats/steward exec wrangler preview delete \
-                --config ../../wrangler.preview.jsonc \
-                --name "$preview_name" \
-                --skip-confirmation
-              ;;
-            404)
-              echo "Preview $preview_name is absent; creating a fresh deployment."
-              ;;
-            *)
-              cat "$preview_delete_body_file" >&2
-              exit 1
-              ;;
-          esac
+
+          delete_preview() {
+            local worker_name="$1"
+            local preview_name="$2"
+            local config="$3"
+            local body_file="$RUNNER_TEMP/${worker_name}-${preview_name}-delete.json"
+            local status
+            status="$(curl --silent --show-error --output "$body_file" \
+              --write-out '%{http_code}' \
+              --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/workers/$worker_name/previews/$preview_name")"
+            case "$status" in
+              200)
+                pnpm --filter @nightboats/steward exec wrangler preview delete \
+                  --config "$config" \
+                  --name "$preview_name" \
+                  --skip-confirmation
+                ;;
+              404)
+                echo "Preview $preview_name is absent; creating a fresh deployment."
+                ;;
+              *)
+                cat "$body_file" >&2
+                return 1
+                ;;
+            esac
+          }
+
+          delete_preview sig-steward "$preview_name" ../../wrangler.preview.jsonc
+          delete_preview sig-preview-machine "$machine_name" ../../wrangler.machine-preview.jsonc
           printf 'SERVER_KEY=%s\n' "$preview_key" > "$secrets_file"
           trap 'rm -f "$secrets_file"' EXIT
 
@@ -148,6 +160,69 @@ jobs:
             exit 1
           fi
 
+          machine_key="$(openssl rand -hex 32)"
+          machine_secrets_file="$RUNNER_TEMP/machine-secrets.env"
+          machine_output_file="$RUNNER_TEMP/wrangler-machine-preview.json"
+          machine_json_file="$RUNNER_TEMP/wrangler-machine-preview-payload.json"
+          pairing_body_file="$RUNNER_TEMP/pairing-response.json"
+          machine_start_body_file="$RUNNER_TEMP/machine-start-response.json"
+          printf 'PREVIEW_MACHINE_KEY=%s\n' "$machine_key" > "$machine_secrets_file"
+          trap 'rm -f "$secrets_file" "$machine_secrets_file"' EXIT
+
+          pnpm --filter @nightboats/steward exec wrangler preview \
+            --config ../../wrangler.machine-preview.jsonc \
+            --name "$machine_name" \
+            --secrets-file "$machine_secrets_file" \
+            --json > "$machine_output_file"
+
+          node - "$machine_output_file" "$machine_json_file" <<'NODE'
+          const fs = require("node:fs");
+          const [input, output] = process.argv.slice(2);
+          const text = fs.readFileSync(input, "utf8");
+          const start = text.indexOf("{");
+          const end = text.lastIndexOf("}");
+          if (start === -1 || end <= start) throw new Error("Wrangler preview output has no JSON payload");
+          fs.writeFileSync(output, text.slice(start, end + 1));
+          NODE
+          machine_url="$(jq -er '.preview.urls[] | select(endswith(".previews.iefnaf.cc"))' "$machine_json_file")"
+
+          last_machine_status=000
+          for attempt in $(seq 1 45); do
+            machine_status="$(curl --silent --show-error --request GET "$machine_url/status" \
+              --header "Authorization: Bearer $machine_key" \
+              --output /dev/null --write-out '%{http_code}')" || machine_status=000
+            last_machine_status="$machine_status"
+            [ "$machine_status" -eq 200 ] && break
+            sleep 2
+          done
+          if [ "$last_machine_status" -ne 200 ]; then
+            echo "Simulated machine control API did not become available; last status was $last_machine_status."
+            exit 1
+          fi
+
+          pairing_status="$(curl --silent --show-error --request POST "$preview_url/api/pairing" \
+            --header "Authorization: Bearer $preview_key" \
+            --header 'content-type: application/json' \
+            --data '{}' --output "$pairing_body_file" --write-out '%{http_code}')"
+          if [ "$pairing_status" -ne 200 ]; then
+            echo "Could not mint a simulated-machine pairing code; status was $pairing_status:"
+            cat "$pairing_body_file" >&2
+            exit 1
+          fi
+          pairing_code="$(jq -er '.code' "$pairing_body_file")"
+
+          start_status="$(curl --silent --show-error --request POST "$machine_url/start" \
+            --header "Authorization: Bearer $machine_key" \
+            --header 'content-type: application/json' \
+            --data "$(jq -nc --arg serverUrl "$preview_url" --arg pairingCode "$pairing_code" '{serverUrl:$serverUrl,pairingCode:$pairingCode}')" \
+            --output "$machine_start_body_file" --write-out '%{http_code}')"
+          if [ "$start_status" -ne 200 ]; then
+            echo "Simulated machine did not complete pairing and welcome; status was $start_status:"
+            cat "$machine_start_body_file" >&2
+            exit 1
+          fi
+          jq -e '.phase == "welcomed"' "$machine_start_body_file" >/dev/null
+
           printf 'preview_url=%s\n' "$preview_url" >> "$GITHUB_OUTPUT"
           printf 'login_url=%s\n' "$login_url" >> "$GITHUB_OUTPUT"
       - name: Comment Preview URL
@@ -159,7 +234,7 @@ jobs:
             printf '%s\n' '### Cloudflare Preview'
             printf '%s\n' "Preview URL: ${{ steps.preview.outputs.preview_url }}"
             printf '%s\n' "Sign-in (24 hours, reusable): ${{ steps.preview.outputs.login_url }}"
-            printf '%s\n' 'The preview uses the zero-cost faux model. Each push rotates the preview key, so use the latest sign-in link. Closing the pull request deletes the preview.'
+            printf '%s\n' 'The preview includes one simulated machine (`preview-machine`) and repository `repo-a`. The model is zero-cost faux. Each push recreates both previews, so use the latest sign-in link. Closing the pull request deletes both.'
           } > "$body_file"
           gh pr comment "${{ github.event.pull_request.number }}" \
             --edit-last --create-if-none --body-file "$body_file"
@@ -185,24 +260,34 @@ jobs:
         run: |
           set -euo pipefail
           preview_name="pr-${{ github.event.pull_request.number }}"
-          preview_body_file="$RUNNER_TEMP/preview-response.json"
-          preview_status="$(curl --silent --show-error --output "$preview_body_file" \
-            --write-out '%{http_code}' \
-            --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/workers/sig-steward/previews/$preview_name")"
+          machine_name="pr-${{ github.event.pull_request.number }}-machine"
 
-          case "$preview_status" in
-            200)
-              pnpm --filter @nightboats/steward exec wrangler preview delete \
-                --config ../../wrangler.preview.jsonc \
-                --name "$preview_name" \
-                --skip-confirmation
-              ;;
-            404)
-              echo "Preview $preview_name already absent."
-              ;;
-            *)
-              cat "$preview_body_file" >&2
-              exit 1
-              ;;
-          esac
+          delete_preview() {
+            local worker_name="$1"
+            local preview_name="$2"
+            local config="$3"
+            local body_file="$RUNNER_TEMP/${worker_name}-${preview_name}-delete.json"
+            local status
+            status="$(curl --silent --show-error --output "$body_file" \
+              --write-out '%{http_code}' \
+              --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/workers/$worker_name/previews/$preview_name")"
+            case "$status" in
+              200)
+                pnpm --filter @nightboats/steward exec wrangler preview delete \
+                  --config "$config" \
+                  --name "$preview_name" \
+                  --skip-confirmation
+                ;;
+              404)
+                echo "Preview $preview_name already absent."
+                ;;
+              *)
+                cat "$body_file" >&2
+                return 1
+                ;;
+            esac
+          }
+
+          delete_preview sig-steward "$preview_name" ../../wrangler.preview.jsonc
+          delete_preview sig-preview-machine "$machine_name" ../../wrangler.machine-preview.jsonc
