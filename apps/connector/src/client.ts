@@ -7,10 +7,12 @@ import os from "node:os";
 import WebSocket from "ws";
 import {
   CloseCode,
+  DirectoryListMessageSchema,
   PROTOCOL_VERSION,
   reconnectOn,
   ulid,
   type CmdMessage,
+  type DirectoryListingMessage,
   type WelcomeMessage,
 } from "@nightboats/protocol";
 import { CommandLog, type CommandResult } from "./commands.ts";
@@ -20,6 +22,7 @@ import type { HistoryPage } from "@nightboats/protocol";
 import type { Agent } from "node:http";
 import type { LocalStore } from "./store.ts";
 import { VERSION } from "./version.ts";
+import { browseDirectory } from "./directory-browser.ts";
 
 export type CommandHandler = (cmd: CmdMessage) => Promise<CommandResult>;
 
@@ -83,6 +86,7 @@ export class ConnectorClient {
   private lastFrameAt = 0;
   private sendQueue: StoredEvent[] = [];
   private flushTimer?: NodeJS.Timeout;
+  private directoryReads = 0;
   /** §6.6 history streams for the current connection; reset whenever the socket dies. */
   private readonly history: HistoryStreams | undefined;
 
@@ -159,6 +163,7 @@ export class ConnectorClient {
           bootId: this.bootId,
           connEpoch,
           connector: { version: VERSION, os: process.platform, arch: process.arch, node: process.version },
+          capabilities: { directoryBrowse: true },
           machine: {
             name: this.options.machineName ?? os.hostname(),
             memTotalMB: Math.round(os.totalmem() / 1_000_000),
@@ -248,6 +253,20 @@ export class ConnectorClient {
       case "cmd":
         this.handleCmd(ws, message as unknown as CmdMessage);
         return;
+      case "directory_list": {
+        const parsed = DirectoryListMessageSchema.safeParse(message);
+        if (!parsed.success) return;
+        const request = parsed.data;
+        if (this.directoryReads >= 4) {
+          this.send(ws, { t: "directory_listing", re: request.id, ok: false, code: "busy" } satisfies DirectoryListingMessage);
+          return;
+        }
+        this.directoryReads++;
+        void browseDirectory(request).then((result) => {
+          if (this.ws === ws) this.send(ws, { t: "directory_listing", re: request.id, ...result } satisfies DirectoryListingMessage);
+        }).finally(() => { this.directoryReads--; });
+        return;
+      }
       case "history_req": {
         // §6.6: same wire as cmd but deliberately outside the outbox/command log — a fresh
         // request per browser view, deduped by nothing, re-sent by nobody.

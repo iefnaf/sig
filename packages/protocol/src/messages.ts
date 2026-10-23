@@ -45,6 +45,7 @@ export const HelloMessageSchema = z.object({
   bootId: z.string(),
   connEpoch: z.number().int(),
   connector: z.object({ version: z.string(), os: z.string(), arch: z.string(), node: z.string() }),
+  capabilities: z.object({ directoryBrowse: z.boolean().optional() }).optional(),
   machine: z.object({ name: z.string(), memTotalMB: z.number(), memFreeMB: z.number() }),
   agents: z.array(AgentCapabilitySchema),
   repos: z.array(RepoSchema),
