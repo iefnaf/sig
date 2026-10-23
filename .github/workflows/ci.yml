@@ -131,6 +131,7 @@ jobs:
           fs.writeFileSync(output, text.slice(start, end + 1));
           NODE
           preview_url="$(jq -er '.preview.urls[] | select(endswith(".previews.iefnaf.cc"))' "$json_file")"
+          steward_internal_url="$(jq -er '.preview.urls[] | select(endswith(".workers.dev"))' "$json_file")"
           login_url=""
           last_login_status=000
           last_first_open=000
@@ -222,7 +223,7 @@ jobs:
           start_status="$(curl --silent --show-error --request POST "$machine_url/start" \
             --header "Authorization: Bearer $machine_key" \
             --header 'content-type: application/json' \
-            --data "$(jq -nc --arg serverUrl "$preview_url" --arg pairingCode "$pairing_code" '{serverUrl:$serverUrl,pairingCode:$pairingCode}')" \
+            --data "$(jq -nc --arg serverUrl "$steward_internal_url" --arg pairingCode "$pairing_code" '{serverUrl:$serverUrl,pairingCode:$pairingCode}')" \
             --output "$machine_start_body_file" --write-out '%{http_code}')"
           if [ "$start_status" -ne 200 ]; then
             echo "Simulated machine did not complete pairing and welcome; status was $start_status:"
