@@ -37,5 +37,13 @@
   "durable_objects": {
     "bindings": [{ "name": "Steward", "class_name": "Steward" }]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Steward"] }]
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Steward"] }],
+  "previews": {
+    "vars": {
+      "STEWARD_MODEL": "{\"provider\":\"faux\",\"modelId\":\"faux-1\"}"
+    },
+    "durable_objects": {
+      "bindings": [{ "name": "Steward", "class_name": "Steward" }]
+    }
+  }
 }
