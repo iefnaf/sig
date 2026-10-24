@@ -1,0 +1,16 @@
+{
+  "name": "sig-preview-machine",
+  "main": "apps/preview-machine/src/index.ts",
+  "workers_dev": true,
+  "compatibility_date": "2026-10-10",
+  "durable_objects": {
+    "bindings": [{ "name": "PreviewMachine", "class_name": "PreviewMachine" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["PreviewMachine"] }],
+  "previews": {
+    "observability": { "enabled": true },
+    "durable_objects": {
+      "bindings": [{ "name": "PreviewMachine", "class_name": "PreviewMachine" }]
+    }
+  }
+}

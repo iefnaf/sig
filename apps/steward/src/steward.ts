@@ -30,6 +30,8 @@ import {
   CloseCode,
   CmdAckMessageSchema,
   CmdResultMessageSchema,
+  DIRECTORY_BROWSE_TIMEOUT_MS,
+  DirectoryListingMessageSchema,
   EventsGapMessageSchema,
   EventsMessageSchema,
   HelloMessageSchema,
@@ -47,6 +49,9 @@ import {
   ulid,
   type CmdMessage,
   type CmdResult,
+  type DirectoryBrowseResult,
+  type DirectoryListing,
+  type DirectoryListMessage,
   type ErrorMessage,
   type EventsAckMessage,
   type HistoryReqMessage,
@@ -115,9 +120,9 @@ import { MIGRATIONS, runMigrations } from "./schema.ts";
 import { openSecret, sealSecret } from "./secretbox.ts";
 import { ambiguousWakeText, commandAttentionWakeText, escapeMarkers, verifyWakeText } from "./wake-text.ts";
 import { WorkspaceError, cardOpen, cardView, type WorkspaceActionInput, type WorkspaceInput } from "./workspace.ts";
-import type { MachineDirectoryInput, MachineDirectoryResult } from "./workspace-api.ts";
+import type { MachineDirectoryBrowseInput, MachineDirectoryInput, MachineDirectoryResult } from "./workspace-api.ts";
 import { WorkspaceStream } from "./workspace-stream.ts";
-import { WebApp, linkTargetForThread, parseSessionCookie } from "./web.ts";
+import { WebApp, linkTargetForThread, loginLinkPolicyFromEnv, parseSessionCookie } from "./web.ts";
 
 /** Messages the workspace will queue before telling the owner to wait for the steward to catch up. */
 const MAX_OPEN_USER_RUNS = 10;
@@ -137,7 +142,10 @@ interface ConnState {
   /** Key that authenticated the connection (issue #27): ≠ primary ⇒ welcome rekeys. */
   keyId: string;
   connEpoch?: number;
+  directoryBrowse?: boolean;
 }
+
+type DirectoryReadResult = DirectoryBrowseResult | { ok: false; code: "machine_offline" | "browse_timeout" };
 
 export interface OutboxRow {
   cmdId: string;
@@ -308,6 +316,13 @@ export type PairResult =
 // generic there breaks Liskov substitutability against `Agent`'s own declarations; state is
 // cast at the read/write sites instead (same tradeoff the do-protocol spike made).
 export class Steward extends Agent<Env> {
+  private directoryBrowseTimeoutMs = DIRECTORY_BROWSE_TIMEOUT_MS;
+  private readonly directoryReads = new Map<string, {
+    deviceId: string;
+    connectionId: string;
+    finish(result: DirectoryReadResult): void;
+  }>();
+
   onStart(): void {
     // Each migration commits atomically WITH its ledger row (reviews #47-2 + #48 finding 3):
     // a multi-statement rebuild can never persist half of itself, and the ledger write
@@ -688,6 +703,7 @@ export class Steward extends Agent<Env> {
     return (this.web_ ??= new WebApp({
       sql: this.sql.bind(this) as unknown as import("./schema.ts").SqlExecutor,
       secrets: [this.env.SERVER_KEY, this.env.SERVER_KEY_PREVIOUS].filter((k): k is string => typeof k === "string" && k.length > 0),
+      loginLinkPolicy: loginLinkPolicyFromEnv(this.env.LOGIN_LINK_TTL_MS, this.env.LOGIN_LINK_REUSABLE),
       ledger: this.ledger,
       listDevices: () =>
         this.sql<{ deviceId: string; name: string | null; revoked: number }>`
@@ -721,6 +737,7 @@ export class Steward extends Agent<Env> {
         pairing: (id: string) => this.webPairing(id),
         revoke: (id: string) => { this.logChannel("web_machine_revoked", id); void this.revoke(id); },
         addDirectory: (input) => this.addMachineDirectory(input),
+        browseDirectory: (input, signal) => this.browseMachineDirectory(input, signal),
         webauthnRegisterOptions: (sid: string, rpId: string) => this.web.webauthnRegisterOptions(sid, rpId),
         webauthnRegisterVerify: (sid: string, rpId: string, origin: string, label: string, attestation: unknown) =>
           this.web.webauthnRegisterVerify(sid, rpId, origin, label, attestation),
@@ -1187,6 +1204,9 @@ export class Steward extends Agent<Env> {
       return;
     }
     if (!state.deviceId) return;
+    for (const pending of this.directoryReads.values()) {
+      if (pending.connectionId === connection.id) pending.finish({ ok: false, code: "machine_offline" });
+    }
     // A superseded old connection closes after its replacement is live: only the last
     // connection for the device takes the machine offline.
     const remaining = [...this.getConnections<ConnState>(`dev:${state.deviceId}`)].filter((c) => c.id !== connection.id);
@@ -1285,6 +1305,9 @@ export class Steward extends Agent<Env> {
         return;
       case "history_chunk":
         this.handleHistoryChunk(connection, message);
+        return;
+      case "directory_listing":
+        this.handleDirectoryListing(connection, message);
         return;
       case "error":
         // A connector reply to something the DO itself sent. The only DO-originated requests
@@ -1454,8 +1477,11 @@ export class Steward extends Agent<Env> {
         return;
       }
       other.close(CloseCode.SUPERSEDED, "superseded by a newer connection");
+      for (const pending of this.directoryReads.values()) {
+        if (pending.connectionId === other.id) pending.finish({ ok: false, code: "machine_offline" });
+      }
     }
-    connection.setState({ deviceId: auth.deviceId, epoch: auth.epoch, keyId: auth.keyId, connEpoch: hello.connEpoch } satisfies ConnState);
+    connection.setState({ deviceId: auth.deviceId, epoch: auth.epoch, keyId: auth.keyId, connEpoch: hello.connEpoch, directoryBrowse: hello.capabilities?.directoryBrowse === true } satisfies ConnState);
     // hello is the machine/repo snapshot's source of truth (protocol §6.1, steward.md §2.2):
     // name, agents, limits, and the full repo list — removals included — land in the ledger.
     this.ledger.machines.upsertFromHello(hello);
@@ -2212,9 +2238,55 @@ export class Steward extends Agent<Env> {
 
   async revoke(deviceId: string): Promise<void> {
     this.sql`UPDATE device SET epoch = epoch + 1, revoked = 1 WHERE deviceId = ${deviceId}`;
+    for (const pending of this.directoryReads.values()) {
+      if (pending.deviceId === deviceId) pending.finish({ ok: false, code: "not_found" });
+    }
     for (const connection of this.getConnections<ConnState>(`dev:${deviceId}`)) {
       connection.close(CloseCode.REVOKED, "revoked");
     }
+  }
+
+  private browseMachineDirectory(input: MachineDirectoryBrowseInput, signal: AbortSignal): Promise<DirectoryListing> {
+    const device = this.sql<{ revoked: number }>`SELECT revoked FROM device WHERE deviceId = ${input.deviceId}`[0];
+    if (!device || device.revoked) throw new WorkspaceError("not_found", 404);
+    const connection = this.connFor(input.deviceId);
+    if (!connection) throw new WorkspaceError("machine_offline", 409);
+    const connectionState = connection.state as ConnState | null;
+    if (!connectionState?.directoryBrowse) throw new WorkspaceError("unsupported", 409);
+    if (this.directoryReads.size >= 32) throw new WorkspaceError("busy", 429);
+    const id = ulid();
+    return new Promise((resolve, reject) => {
+      const finish = (result: DirectoryReadResult) => {
+        if (!this.directoryReads.delete(id)) return;
+        clearTimeout(timer);
+        signal.removeEventListener("abort", abort);
+        if (result.ok) resolve(result.listing);
+        else {
+          const status = { not_found: 404, forbidden: 403, invalid_directory: 400, unsupported: 409, machine_offline: 409, busy: 429, browse_timeout: 504, browse_failed: 502 }[result.code];
+          reject(new WorkspaceError(result.code, status));
+        }
+      };
+      const abort = () => finish({ ok: false, code: "browse_failed" });
+      const timer = setTimeout(() => finish({ ok: false, code: "browse_timeout" }), this.directoryBrowseTimeoutMs);
+      this.directoryReads.set(id, { deviceId: input.deviceId, connectionId: connection.id, finish });
+      signal.addEventListener("abort", abort, { once: true });
+      if (signal.aborted) { abort(); return; }
+      const { deviceId: _, ...args } = input;
+      try {
+        connection.send(JSON.stringify({ t: "directory_list", id, ...args } satisfies DirectoryListMessage));
+      } catch {
+        finish({ ok: false, code: "machine_offline" });
+      }
+    });
+  }
+
+  private handleDirectoryListing(connection: Connection, raw: unknown): void {
+    if (raw === null || typeof raw !== "object" || !("re" in raw) || typeof raw.re !== "string") return;
+    const pending = this.directoryReads.get(raw.re);
+    const state = connection.state as ConnState | null;
+    if (!pending || pending.connectionId !== connection.id || pending.deviceId !== state?.deviceId) return;
+    const parsed = DirectoryListingMessageSchema.safeParse(raw);
+    pending.finish(parsed.success ? parsed.data : { ok: false, code: "browse_failed" });
   }
 
   private async addMachineDirectory(input: MachineDirectoryInput): Promise<MachineDirectoryResult> {

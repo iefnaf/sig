@@ -3,7 +3,7 @@ import { parseToken } from "@nightboats/protocol";
 import { bearer, resolveServerKeys } from "./auth.ts";
 import { AVATAR_PATH, LOGO_PATH, BRAND_HEAD, BRAND_LOCKUP, BRAND_STYLE } from "./brand.ts";
 import { Steward } from "./steward.ts";
-import { LOGIN_SCRIPT_PATH, mintWebauthnChallenge, parseSessionCookie, verifyLinkToken } from "./web.ts";
+import { LOGIN_SCRIPT_PATH, loginLinkPolicyFromEnv, mintWebauthnChallenge, parseSessionCookie, verifyLinkToken } from "./web.ts";
 
 export { Steward };
 
@@ -42,7 +42,12 @@ async function workspaceShell(env: Env, url: URL): Promise<Response> {
 
 // The web's shared "get a fresh link" page (web.ts renders the full variant inside the DO;
 // this stateless twin answers rejected probes without waking it).
-const LINK_HINT = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex"><title>Sig</title>${BRAND_HEAD}<style>${BRAND_STYLE}body{font:15px/1.7 -apple-system,"PingFang SC",sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:0 16px}main{max-width:480px}</style></head><body><main>${BRAND_LOCKUP}<p>链接无效或已过期。</p><p style="opacity:.75;font-size:13px">新的登录链接用 <code>POST /api/login-link</code> 签发（15 分钟内有效，只能打开一次）。</p></main></body></html>`;
+function linkHint(env: Env, message = "链接无效或已过期。"): string {
+  const policy = loginLinkPolicyFromEnv(env.LOGIN_LINK_TTL_MS, env.LOGIN_LINK_REUSABLE);
+  const use = policy.singleUse ? "只能打开一次" : "在有效期内可重复打开";
+  const minutes = Math.floor(policy.ttlMs / 60_000);
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex"><title>Sig</title>${BRAND_HEAD}<style>${BRAND_STYLE}body{font:15px/1.7 -apple-system,"PingFang SC",sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:0 16px}main{max-width:480px}</style></head><body><main>${BRAND_LOCKUP}<p>${message}</p><p style="opacity:.75;font-size:13px">新的登录链接用 <code>POST /api/login-link</code> 签发（${use}，${minutes} 分钟内有效）。</p></main></body></html>`;
+}
 
 /** The session cookie's raw value, if the request carries one. */
 function sessionCookie(request: Request): string | null {
@@ -167,7 +172,7 @@ export default {
     // rotation still open until the window closes.
     if (url.pathname.startsWith("/link/") && request.method === "GET") {
       const verified = await verifyLinkToken(webVerifyKeys(env), url.pathname.slice("/link/".length));
-      if (!verified) return htmlPage(LINK_HINT, 410);
+      if (!verified) return htmlPage(linkHint(env), 410);
       const stub = await getAgentByName(env.Steward, "owner");
       return stub.fetch(request);
     }
@@ -181,7 +186,7 @@ export default {
       if (!(await parseSessionCookie(webVerifyKeys(env), raw))) {
         return url.pathname.startsWith("/app/api/") || url.pathname === "/app/ws"
           ? json({ error: "auth_required" }, 401)
-          : htmlPage(LINK_HINT.replace("链接无效或已过期。", "这一页需要先登录。"), 401);
+          : htmlPage(linkHint(env, "这一页需要先登录。"), 401);
       }
       // The workspace's own static files (ADR-0004): plain HTML/CSS/ES modules under the
       // assets directory, served through the ASSETS binding here — behind the same session

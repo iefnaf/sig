@@ -27,6 +27,7 @@
 {
   "name": "sig-steward",
   "main": "apps/steward/src/index.ts",
+  "workers_dev": true,
   // Static assets, one directory (ADR-0004): the web workspace's plain HTML/CSS/JS files
   // (no frontend build) plus the two brand files under brand/ — only those two are public;
   // index.ts gates every other route, so /app/assets/* sits behind the same session gate
@@ -37,5 +38,14 @@
   "durable_objects": {
     "bindings": [{ "name": "Steward", "class_name": "Steward" }]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Steward"] }]
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Steward"] }],
+  "previews": {
+    "observability": { "enabled": true },
+    "vars": {
+      "STEWARD_MODEL": "{\"provider\":\"faux\",\"modelId\":\"faux-1\"}"
+    },
+    "durable_objects": {
+      "bindings": [{ "name": "Steward", "class_name": "Steward" }]
+    }
+  }
 }

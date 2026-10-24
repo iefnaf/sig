@@ -384,6 +384,10 @@ export class FakeConnector {
   historyError: { code: string; message: string } | null = null;
   /** When true, history_req is swallowed entirely (a machine that never answers). */
   historySilent = false;
+  /** Advertises the directory browsing capability in hello (off = old connector). */
+  directoryBrowse = false;
+  /** Every directory_list request received so far. */
+  readonly directoryRequests: Array<Record<string, unknown>> = [];
   /** Every history_req the machine was asked (the full-session reads carry `format`/`since`). */
   readonly historyRequests: Array<Record<string, unknown>> = [];
   /** When set, the connector drops its connection after sending this many chunks. */
@@ -430,6 +434,7 @@ export class FakeConnector {
         : { steer: true, followUp: true, interrupt: true, resume: true, history: true, images: true, structuredReport: true, readonly: true };
     return {
       bootId: this.bootId,
+      ...(this.directoryBrowse ? { capabilities: { directoryBrowse: true } } : {}),
       workers: this.workers,
       machine: { name: this.machineName, memTotalMB: 65536, memFreeMB: 31000 },
       agents: this.agents.map((kind) => ({ kind, version: "1.0.0-test", capabilities: caps(kind) })),
@@ -469,6 +474,10 @@ export class FakeConnector {
         this.startHistory(message);
         continue;
       }
+      if (message.t === "directory_list") {
+        this.directoryRequests.push(message);
+        continue;
+      }
       if (message.t === "error") {
         this.errors.push(message);
         continue;
@@ -496,6 +505,16 @@ export class FakeConnector {
     for (;;) {
       if (this.cmds.length >= count) return this.cmds.slice(0, count);
       if (Date.now() - startedAt > timeoutMs) throw new Error(`only ${this.cmds.length}/${count} cmds arrived`);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+
+  /** Waits until `count` directory_list frames have arrived and returns them in order. */
+  async waitForDirectoryRequests(count: number, timeoutMs = 5000): Promise<Array<Record<string, unknown>>> {
+    const startedAt = Date.now();
+    for (;;) {
+      if (this.directoryRequests.length >= count) return this.directoryRequests.slice(0, count);
+      if (Date.now() - startedAt > timeoutMs) throw new Error(`only ${this.directoryRequests.length}/${count} directory requests arrived`);
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
   }

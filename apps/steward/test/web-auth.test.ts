@@ -7,6 +7,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   LINK_TTL_MS,
   mintLinkToken,
+  loginLinkPolicyFromEnv,
   parseSessionCookie,
   sessionCookieValue,
   verifyLinkToken,
@@ -80,6 +81,14 @@ describe("link tokens: HMAC, expiry, tampering (pure functions)", () => {
     const { token } = await mintLinkToken(previous, "home");
     expect(await verifyLinkToken(["the-new-server-key"], token)).toBeNull(); // alone: dead
     expect(await verifyLinkToken(["the-new-server-key", previous], token)).toMatchObject({ target: "home" });
+  });
+
+  it("parses the preview login policy and embeds its longer expiry", async () => {
+    const policy = loginLinkPolicyFromEnv("86400000", "true");
+    expect(policy).toEqual({ ttlMs: 24 * 60 * 60_000, singleUse: false });
+    const now = Date.now();
+    const { token } = await mintLinkToken("test-server-key-not-a-secret", "home", now, policy.ttlMs);
+    await expect(verifyLinkToken(["test-server-key-not-a-secret"], token)).resolves.toMatchObject({ expiresAt: now + policy.ttlMs });
   });
 });
 

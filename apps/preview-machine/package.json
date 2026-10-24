@@ -1,0 +1,22 @@
+{
+  "name": "@nightboats/preview-machine",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "cf-typegen": "wrangler types --config ../../wrangler.machine-preview.jsonc worker-configuration.d.ts",
+    "typecheck": "wrangler types --config ../../wrangler.machine-preview.jsonc worker-configuration.d.ts && tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@nightboats/protocol": "workspace:*",
+    "agents": "0.28.1"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "1.4.3",
+    "@types/node": "26.6.5",
+    "typescript": "7.0.2",
+    "vitest": "4.1.12",
+    "wrangler": "4.151.0"
+  }
+}

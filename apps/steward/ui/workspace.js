@@ -582,6 +582,9 @@ function directoryForm(machine) {
     invalid_directory: 'directoryInvalid', unsupported: 'directoryUnsupported', unsupported_command: 'directoryUnsupported',
     machine_offline: 'directoryOffline', not_found: 'directoryUnavailable', outcome_unknown: 'directoryUnknown',
   }[form.code] ?? 'directoryFailed';
+  if (state.dialog?.type !== 'directory' && (form.state === 'editing' || form.state === 'failed')) {
+    return form.state === 'failed' ? h('p', { class: 'directory-error', role: 'alert' }, t(errorKey)) : null;
+  }
   return h('form', { class: 'directory-form', dataset: { directoryMachine: machine.id }, 'aria-busy': busy ? 'true' : 'false' },
     h('label', { for: inputId }, t('directoryPath')),
     h('p', { id: `${inputId}-help`, class: 'directory-help' }, t('directoryHelp')),
@@ -593,6 +596,134 @@ function directoryForm(machine) {
     h('div', { class: 'dialog-actions' },
       h('button', { type: 'submit', class: 'button primary', disabled: busy || !machine.online }, t(retry ? 'directoryRetryAction' : 'addDirectory')),
       !busy ? h('button', { type: 'button', class: 'button', dataset: { action: 'directory-close', machine: machine.id } }, t('actionCancel')) : null));
+}
+
+function directoryCrumbs(path, home) {
+  const separator = path.startsWith('/') ? '/' : '\\';
+  const root = separator === '\\' ? path.match(/^(?:[A-Za-z]:\\|\\\\[^\\]+\\[^\\]+\\?)/)?.[0] ?? '\\' : '/';
+  const underHome = path === home || path.startsWith(`${home.replace(/[\\/]$/, '')}${separator}`);
+  const start = underHome ? home : root;
+  const crumbs = [{ name: underHome ? '~' : root, path: start }];
+  let current = start;
+  for (const name of path.slice(start.length).split(separator).filter(Boolean)) {
+    current = `${current.replace(/[\\/]$/, '')}${separator}${name}`;
+    crumbs.push({ name, path: current });
+  }
+  return { root, crumbs };
+}
+
+function directoryPicker() {
+  const dialog = state.dialog;
+  const machine = state.snapshot.machines.find((entry) => entry.id === dialog.deviceId);
+  const form = state.directoryForms.get(dialog.deviceId);
+  const browse = dialog.browse;
+  const listing = browse.listing;
+  const available = machine?.online && !machine.revoked;
+  const registering = form?.state === 'pending' || form?.state === 'retry';
+  const locked = !available || registering;
+  const loading = browse.state === 'loading';
+  const { root, crumbs } = listing ? directoryCrumbs(listing.path, listing.home) : { root: '/', crumbs: [] };
+  const navButton = (label, path, symbol, disabled = false, focus = path) => h('button', {
+    type: 'button', class: 'button', disabled: locked || disabled,
+    dataset: { action: 'directory-navigate', path, focus: `folder:${focus}` },
+  }, symbol ? icon(symbol) : null, label);
+  const errorKey = {
+    unsupported: 'directoryBrowseUnsupported', machine_offline: 'directoryOffline',
+    not_found: 'directoryBrowseMissing', forbidden: 'directoryBrowseForbidden',
+    invalid_directory: 'directoryBrowseInvalid', browse_timeout: 'directoryBrowseTimeout',
+  }[browse.code] ?? 'directoryBrowseFailed';
+  const registrationError = {
+    invalid_directory: 'directoryInvalid', unsupported: 'directoryUnsupported', unsupported_command: 'directoryUnsupported',
+    machine_offline: 'directoryOffline', not_found: 'directoryUnavailable', outcome_unknown: 'directoryUnknown',
+  }[form?.code] ?? 'directoryFailed';
+  const closeLabel = form?.state === 'done' ? 'directoryDone' : 'actionCancel';
+  return h('section', { class: 'directory-picker', 'aria-label': t('directoryPickerTitle') },
+    h('p', { class: 'directory-machine' }, icon('laptop'), machine?.name ?? t('directoryUnavailable')),
+    !available ? h('p', { class: 'directory-error', role: 'alert' }, t(machine?.revoked || !machine ? 'directoryUnavailable' : 'directoryOffline')) : null,
+    h('div', { class: 'directory-toolbar' },
+      navButton(t('directoryHome'), '~', 'folder', false, 'home'),
+      navButton(t('directoryRoot'), root, 'monitor', !listing, 'root'),
+      navButton(t('directoryUp'), listing?.parent ?? '', 'arrow-up', !listing?.parent, 'up'),
+      h('button', { type: 'button', class: 'button quiet', disabled: locked, dataset: { action: 'directory-manual', focus: 'folder:manual' }, 'aria-expanded': String(dialog.manual) }, t(dialog.manual ? 'directoryBrowse' : 'directoryManual'))),
+    dialog.manual ? directoryForm(machine ?? { id: dialog.deviceId, online: false }) : [
+      h('nav', { class: 'directory-crumbs', 'aria-label': t('directoryLocation') },
+        crumbs.length ? crumbs.map((crumb, index) => [index ? icon('chevron-right') : null,
+          h('button', { type: 'button', disabled: locked, 'aria-current': index === crumbs.length - 1 ? 'location' : null,
+            dataset: { action: 'directory-navigate', path: crumb.path, focus: `crumb:${crumb.path}` } }, crumb.name)]) : h('span', null, t('directoryHome'))),
+      h('form', { class: 'directory-path-form', id: 'directory-browse-form' },
+        h('label', { for: 'directory-browse-path', class: 'sr-only' }, t('directoryGoPath')),
+        h('input', { id: 'directory-browse-path', type: 'text', value: dialog.pathDraft, placeholder: t('directoryGoPath'), maxlength: 4096,
+          autocomplete: 'off', spellcheck: 'false', disabled: locked, dataset: { focus: 'folder:path' } }),
+        h('button', { type: 'submit', class: 'button', disabled: locked }, t('directoryGo'))),
+      browse.state === 'failed' ? h('div', { class: 'directory-browse-error', role: 'alert' },
+        h('p', null, t(errorKey)),
+        h('button', { type: 'button', class: 'button', disabled: locked, dataset: { action: 'directory-navigate', path: browse.path, focus: 'folder:retry' } }, t('directoryRetryAction'))) : null,
+      h('div', { class: 'directory-list', 'aria-busy': String(loading), 'aria-label': t('directoryFolders') },
+        loading ? h('p', { class: 'directory-empty', role: 'status' }, t('directoryLoading')) : listing?.directories.length
+          ? listing.directories.map((entry) => h('button', { type: 'button', class: 'directory-entry', disabled: locked,
+            dataset: { action: 'directory-navigate', path: entry.path, focus: `entry:${entry.path}` } },
+            icon('folder'), h('span', null, entry.name), icon('chevron-right')))
+          : h('p', { class: 'directory-empty', role: 'status' }, t(listing ? 'directoryNoFolders' : 'directoryBrowsePrompt'))),
+      listing?.truncated && !loading ? h('p', { class: 'directory-help' }, t('directoryTruncated')) : null,
+      h('label', { class: 'directory-hidden' }, h('input', { type: 'checkbox', checked: dialog.showHidden, disabled: locked,
+        dataset: { focus: 'folder:hidden' }, onchange: (event) => {
+          dialog.showHidden = event.target.checked;
+          void browseDirectory(listing?.path ?? browse.path);
+        } }), t('directoryShowHidden')),
+      h('div', { class: 'directory-selection' }, h('span', null, t('directorySelected')), h('code', null, listing?.path ?? '~')),
+      h('p', { class: 'directory-help' }, t('directoryGitHelp')),
+      form?.state === 'failed' ? h('p', { class: 'directory-error', role: 'alert' }, t(registrationError)) : null,
+      form?.state === 'retry' ? h('p', { class: 'directory-error', role: 'alert' }, t('directoryRetry')) : null,
+      form?.state === 'pending' ? h('p', { class: 'directory-message', role: 'status' }, t('directoryAdding')) : null,
+      form?.state === 'done' ? h('div', { class: 'directory-result', role: 'status' }, h('p', null, t('directoryAdded')), h('code', null, form.repo.path)) : null,
+      h('div', { class: 'directory-footer' },
+        h('button', { type: 'button', class: 'button', dataset: { action: 'close-dialog', focus: 'folder:cancel' } }, t(closeLabel)),
+        form?.state !== 'done' ? h('button', { type: 'button', class: 'button primary',
+          disabled: !available || form?.state === 'pending' || (form?.state !== 'retry' && (browse.state !== 'ready' || !listing)),
+          dataset: { action: 'directory-add-current', focus: 'folder:add' } }, t(form?.state === 'retry' ? 'directoryRetryAction' : 'directoryAddCurrent')) : null),
+    ]);
+}
+
+function openDirectoryPicker(deviceId) {
+  const machine = state.snapshot.machines.find((entry) => entry.id === deviceId);
+  if (!machine?.online || machine.revoked) return;
+  state.directoryForms.set(deviceId, { state: 'editing', path: '' });
+  state.dialog = { type: 'directory', deviceId, rev: 0, returnTo: 'machines', returnFocus: `directory-open:${deviceId}`,
+    browse: { state: 'loading', path: '~', listing: null }, pathDraft: '', showHidden: false, manual: false };
+  drawn.delete('dialog');
+  bumpDialog();
+  void browseDirectory('~');
+  document.querySelector('[data-focus="folder:home"]')?.focus();
+}
+
+async function browseDirectory(path) {
+  const dialog = state.dialog;
+  if (dialog?.type !== 'directory') return;
+  const form = state.directoryForms.get(dialog.deviceId);
+  const machine = state.snapshot.machines.find((entry) => entry.id === dialog.deviceId);
+  if (!machine?.online || machine.revoked || form?.state === 'pending' || form?.state === 'retry') return;
+  const browse = { state: 'loading', path: path || '~', listing: dialog.browse.listing };
+  dialog.browse = browse;
+  if (form?.state === 'failed' || form?.state === 'done') state.directoryForms.set(dialog.deviceId, { state: 'editing', path: '' });
+  bumpDialog();
+  let response;
+  try {
+    response = await request('/app/api/machines/directories/browse', { deviceId: dialog.deviceId, path: browse.path, showHidden: dialog.showHidden });
+  } catch {
+    response = { status: 0, data: { error: 'browse_failed' } };
+  }
+  if (state.dialog !== dialog || dialog.browse !== browse) return;
+  const { status, data } = response;
+  if (status === 200 && data && Array.isArray(data.directories)) {
+    dialog.browse = { state: 'ready', path: data.path, listing: data };
+    dialog.pathDraft = data.path;
+  } else {
+    dialog.browse = { ...browse, state: 'failed', code: data?.error ?? 'browse_failed' };
+  }
+  bumpDialog();
+  if (document.activeElement === document.body || document.activeElement === $('#dialog')) {
+    document.querySelector('[data-focus="folder:home"]')?.focus();
+  }
 }
 
 function machineCard(machine) {
@@ -616,7 +747,7 @@ function machineCard(machine) {
           h('button', { type: 'button', class: 'button danger', dataset: { action: 'revoke-yes', machine: machine.id, focus: `revoke-yes:${machine.id}` } }, t('revokeConfirmAction')),
           h('button', { type: 'button', class: 'button', dataset: { action: 'revoke-no', focus: `revoke-no:${machine.id}` } }, t('actionCancel'))))
       : h('div', { class: 'dialog-actions' },
-        !state.directoryForms.has(machine.id) || state.directoryForms.get(machine.id).state === 'done'
+        !['pending', 'retry'].includes(state.directoryForms.get(machine.id)?.state)
           ? h('button', { type: 'button', class: 'button primary', disabled: !machine.online, dataset: { action: 'directory-open', machine: machine.id, focus: `directory-open:${machine.id}` } }, icon('plus'), t('addDirectory')) : null,
         h('button', { type: 'button', class: 'button danger', dataset: { action: 'revoke', machine: machine.id, focus: `revoke:${machine.id}` } }, t('revokeMachine'))));
 }
@@ -898,6 +1029,7 @@ function dialogContent() {
     const provider = state.settings.providers.find((entry) => entry.id === state.modelDraft.provider);
     return { title: provider?.info?.familyName || provider?.name || state.modelDraft.provider || t('modelCustomOption'), body: providerSection() };
   }
+  if (state.dialog.type === 'directory') return { title: t('directoryPickerTitle'), body: directoryPicker() };
   if (state.dialog.type === 'machines') {
     const summary = summarize(snapshot);
     return {
@@ -929,11 +1061,13 @@ function renderDialog() {
   const snapshot = state.snapshot;
   const signature = [type, rev, getLocale(), pairing, confirm,
     type === 'machines' ? [snapshot.machines, snapshot.threads.map((entry) => [entry.id, entry.state, entry.workers.map((worker) => [worker.state, worker.machine])]), minuteBucket()] : null,
+    type === 'directory' ? snapshot.machines : null,
     type === 'scope' ? [state.selected, snapshot.threads.map((entry) => [entry.id, entry.title, entry.state, entry.repos])] : null,
     type === 'account' ? [state.settings, state.dialog.passkeyAdd] : null];
   redraw('dialog', signature, () => {
     const { title, body } = dialogContent();
     $('#dialog').classList.toggle('settings-dialog', type === 'account');
+    $('#dialog').classList.toggle('directory-dialog', type === 'directory');
     $('#dialog-title').replaceChildren(...(type === 'provider' ? [providerIcon(state.modelDraft.provider), document.createTextNode(title)] : [document.createTextNode(title)]));
     preservingFocus($('#dialog-body'), () => $('#dialog-body').replaceChildren(...[body].flat(Infinity).filter(Boolean)));
   });
@@ -960,6 +1094,7 @@ function openDialog(type) {
 
 function closeDialog() {
   if (state.dialog?.saving || securityState()?.passkeyAdd === 'creating') return;
+  if (state.dialog?.type === 'directory' && state.directoryForms.get(state.dialog.deviceId)?.state === 'editing') state.directoryForms.delete(state.dialog.deviceId);
   const returnTo = state.dialog?.returnTo;
   const returnFocus = state.dialog?.returnFocus;
   state.modelDraft = null;
@@ -1356,7 +1491,7 @@ const directoryRequests = new Set();
 
 async function submitDirectory(deviceId, element) {
   const form = state.directoryForms.get(deviceId);
-  if (!form || form.state === 'pending' || !element.reportValidity()) return;
+  if (!form || form.state === 'pending' || (element && !element.reportValidity())) return;
   const requestBody = form.state === 'retry' ? form.request : { id: uuid(), deviceId, path: form.path };
   const pending = { state: 'pending', path: form.path, request: requestBody, startedAt: Date.now() };
   state.directoryForms.set(deviceId, pending);
@@ -1368,7 +1503,7 @@ async function runDirectoryRegistration(deviceId, pending) {
   if (directoryRequests.has(deviceId)) return;
   directoryRequests.add(deviceId);
   try {
-    while (state.directoryForms.get(deviceId) === pending && state.dialog?.type === 'machines' && !state.fatal) {
+    while (state.directoryForms.get(deviceId) === pending && (state.dialog?.type === 'machines' || (state.dialog?.type === 'directory' && state.dialog.deviceId === deviceId)) && !state.fatal) {
       let response;
       try {
         response = await request('/app/api/machines/directories', pending.request);
@@ -1750,11 +1885,28 @@ document.addEventListener('click', (event) => {
     case 'sign-out': return void signOut();
     case 'create-pairing': return void createPairing();
     case 'copy-pairing': return void copyPairing();
-    case 'directory-open':
-      state.directoryForms.set(dataset.machine, { state: 'editing', path: '' });
+    case 'directory-open': return openDirectoryPicker(dataset.machine);
+    case 'directory-navigate': return void browseDirectory(dataset.path);
+    case 'directory-manual': {
+      const dialog = state.dialog;
+      dialog.manual = !dialog.manual;
+      const form = state.directoryForms.get(dialog.deviceId);
+      if (form?.state === 'editing') form.path = dialog.browse.listing?.path ?? '';
       bumpDialog();
-      return document.getElementById(`directory-path-${dataset.machine}`)?.focus();
+      if (dialog.manual) document.getElementById(`directory-path-${dialog.deviceId}`)?.focus();
+      return;
+    }
+    case 'directory-add-current': {
+      const dialog = state.dialog;
+      const form = state.directoryForms.get(dialog.deviceId);
+      if (form?.state !== 'retry') {
+        if (dialog.browse.state !== 'ready') return;
+        state.directoryForms.set(dialog.deviceId, { state: 'editing', path: dialog.browse.listing.path });
+      }
+      return void submitDirectory(dialog.deviceId);
+    }
     case 'directory-close':
+      if (state.dialog?.type === 'directory') return closeDialog();
       state.directoryForms.delete(dataset.machine);
       return bumpDialog();
     case 'revoke':
@@ -1778,6 +1930,7 @@ document.addEventListener('click', (event) => {
 const MODEL_CUSTOM = '__custom';
 const MODEL_DRAFT_FIELDS = { 'model-provider-custom': 'provider', 'model-id-custom': 'modelId', 'model-key': 'apiKey' };
 document.addEventListener('input', (event) => {
+  if (event.target.id === 'directory-browse-path' && state.dialog?.type === 'directory') state.dialog.pathDraft = event.target.value;
   const directory = state.directoryForms.get(event.target.dataset?.directoryPath);
   if (directory && (directory.state === 'editing' || directory.state === 'failed')) directory.path = event.target.value;
   const field = MODEL_DRAFT_FIELDS[event.target.id];
@@ -1794,6 +1947,10 @@ document.addEventListener('input', (event) => {
   if (event.target.id === 'passkey-label') state.passkeyLabelDraft = event.target.value;
 });
 document.addEventListener('submit', (event) => {
+  if (event.target.id === 'directory-browse-form') {
+    event.preventDefault();
+    return void browseDirectory(state.dialog.pathDraft.trim());
+  }
   if (event.target.dataset.directoryMachine) {
     event.preventDefault();
     return void submitDirectory(event.target.dataset.directoryMachine, event.target);

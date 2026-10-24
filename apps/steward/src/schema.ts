@@ -355,7 +355,7 @@ export const MIGRATIONS: readonly Migration[] = [
     },
   },
   {
-    // The signed-link web (issue #22, spec §7.3/§12.2, steward.md §10): one-time links minted
+    // The signed-link web (issue #22, spec §7.3/§12.2, steward.md §10): login links minted
     // for the owner's chat, the sessions they are exchanged for, and the deployment's public
     // origin (links and pairing commands need absolute URLs, and the DO only ever sees the
     // origin through the requests it serves). These tables belong to web.ts. Numbered 009:
