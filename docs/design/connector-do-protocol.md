@@ -145,9 +145,9 @@ mac   = HMAC-SHA256(key.secret, "st1." + keyId + "." + deviceId + "." + epoch + 
 keyId = first 8 hex chars of SHA-256("sig:keyid:v1:" + key.secret)
 ```
 
-- `SERVER_KEY` is a random value generated at deploy time and stored as a Worker secret. The optional `SERVER_KEY_PREVIOUS` secret holds the preceding key during a rotation window (below); the verifier accepts tokens signed by either — tokens minted before the `keyId` segment existed (`st1.<deviceId>.<epoch>.<issuedAt>.<mac>`) are tried against every configured key.
-- **Worker-layer pre-check** (`onBeforeConnect`, does not wake the DO): validates the format and the `mac` against the key set, returning 401 outright on failure. Blindly probed requests never reach the DO and trigger no DO billing.
-- **DO-layer check** (`onConnect`): consults the `device` table and confirms the device exists, its `epoch` matches the current one, and it has not been revoked; otherwise it closes with `4401` / `4403`.
+- Fresh deployments generate a random signing key inside the owner Durable Object; existing explicit-key deployments use the `SERVER_KEY` Worker secret and optional `SERVER_KEY_PREVIOUS` rotation window. The verifier accepts tokens signed by either configured explicit key. Tokens minted before the `keyId` segment existed (`st1.<deviceId>.<epoch>.<issuedAt>.<mac>`) are tried against every configured key.
+- **Worker-layer pre-check** (explicit-key deployments only; does not wake the DO): validates the format and `mac`, returning 401 outright on failure. Generated-key deployments cannot expose their key to the Worker, so their DO performs the only token check.
+- **DO-layer check** (always): validates the token against the deployment key set, then consults the `device` table and confirms the device exists, its `epoch` matches the current one, and it has not been revoked; otherwise it closes with `4401` / `4403`.
 - Revocation = increment the device's `epoch` and close its connection; every previously issued token becomes invalid at once, so there is no blacklist to maintain.
 - The token is a **bearer token**: whoever steals it can impersonate the device. Mitigations: transport is TLS-only; it is stored locally with `0600` permissions; revocation is cheap; it can later be upgraded to a device key pair with a signed challenge — the protocol already reserves room for that (the `hello.auth` extension field).
 
@@ -181,7 +181,7 @@ User (Feishu/web)                                  DO                           
 ```
 
 - Pairing code: 8 characters of Crockford Base32 (40 bits), **valid only for the 10 minutes after the user initiates "add machine", single-use**.
-- `/pair` is the only unauthenticated entry point on the Worker. Rate limits: both per source IP and globally there is a cap on failures (e.g. locked for 15 minutes after 5 failures); the code's entropy plus the short validity window makes brute-force enumeration infeasible.
+- `/pair` is one of the Worker's public entry points (the login page, authentication endpoints, and static sign-in assets are the others). Rate limits: both per source IP and globally there is a cap on failures (e.g. locked for 15 minutes after 5 failures); the code's entropy plus the short validity window makes brute-force enumeration infeasible.
 - Pairing happens exactly once; after that the connector uses only the token. The connector stores `{serverUrl, deviceId, token}`, and once the server address has been written, **downgrading to non-TLS is not allowed** (local development excepted).
 - The command hint is sent to the user by the steward in chat, and the user runs it on the computer being enrolled, because pairing must be completed by the machine's owner on that machine.
 
@@ -190,7 +190,7 @@ User (Feishu/web)                                  DO                           
 | Role | How it is identified | May send | May receive |
 |---|---|---|---|
 | `connector` | Valid token | `hello`, `cmd_ack`, `cmd_result`, `events`, `history_chunk`, `machine_update`, `error` | `welcome`, `cmd`, `events_ack`, `resync`, `history_req`, etc. |
-| `web` | A session exchanged for a one-time link issued by the IM (designed separately) | `subscribe`, `history_open`, and other browser-type messages | State pushes, history chunks |
+| `web` | A password/passkey browser session (or a legacy one-time link on an explicit-key deployment) | `subscribe`, `history_open`, and other browser-type messages | State pushes, history chunks |
 
 A connector connection sending browser-type messages, or a browser connection sending connector-type messages, always gets `error{code:"forbidden"}` back and the violation is counted; repeated violations may get the connection closed.
 
@@ -397,7 +397,7 @@ The `interrupt` command travels through `outbox` like any other command, with no
 3. **Passing large images**: connector-pi.md allows a single image up to 4 MB base64, beyond this protocol's 256 KiB per-message cap. Options: compress on the steward side to fit within the cap (the MVP approach); stage in R2 first with the command carrying only a reference, the connector downloading over a signed URL (inside Cloudflare, can ship with the one-click deploy); or the connector uploading separately over HTTP in chunks. Leaning toward R2 staging later.
 4. **Interest-driven progress levels.** Silent by default (`coarse`); when the user opens a worker in the web UI, raise the frequency via `set_progress{workerId, level:"live"}` and restore it when they leave. This reduces wake-ups while nobody is watching. This command needs to be added to the command set.
 5. **Device key pairs** (Ed25519 signing challenge): when to replace bearer tokens; `hello.auth` already reserves the room.
-6. **The `web` role's session**: how it is exchanged for an IM link (one-time link, validity period, binding to the owner) belongs to the companion web design.
+6. ~~**The `web` role's session.**~~ **Resolved:** password/passkey login creates the same database-backed session as the legacy one-time link path; see [ADR-0010](../adr/0010-browser-password-authentication.md).
 7. **Load isolation between browser and connector connections inside one DO**: as message types multiply, whether to split into two Agent classes sharing one SQLite (not feasible — different DOs do not share storage); hence the lean toward keeping one class and dispatching by role.
 8. **Clocks**: `ts` is diagnostics only. `notAfter` depends on the offset between the connector clock and the DO clock; `welcome.serverTime` can let the connector compute the offset and correct locally.
 

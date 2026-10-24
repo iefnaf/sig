@@ -5,10 +5,9 @@
 // instead of apps/steward/. Local dev/tests pass `--config ../../wrangler.jsonc` from
 // apps/steward.
 //
-// SERVER_KEY and MODEL_KEY are secrets, deliberately NOT declared here: they
-// are generated at deploy time through the Deploy-to-Cloudflare form (root .dev.vars.example
-// + cloudflare.bindings descriptions in the root package.json) or set manually with
-// `wrangler secret put`. See docs/deploy.md.
+// LOGIN_PASSWORD and MODEL_KEY are secrets, deliberately NOT declared here. New deployments
+// generate their signing key inside the owner Durable Object. Existing explicit-key deployments
+// retain SERVER_KEY and SERVER_KEY_PREVIOUS. See docs/deploy.md and ADR-0010.
 //
 // The steward's model selection (issue #6, ADR-0001 decision 11) is deploy config — set
 // `vars.STEWARD_MODEL` here to override the default deepseek/deepseek-flash (the eval
@@ -35,6 +34,9 @@
   "assets": { "directory": "./apps/steward/ui", "binding": "ASSETS", "run_worker_first": true },
   "compatibility_date": "2026-10-10",
   "compatibility_flags": ["nodejs_compat"],
+  "ratelimits": [
+    { "name": "LOGIN_RATE_LIMITER", "namespace_id": "1001", "simple": { "limit": 10, "period": 60 } }
+  ],
   "durable_objects": {
     "bindings": [{ "name": "Steward", "class_name": "Steward" }]
   },

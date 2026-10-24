@@ -240,7 +240,11 @@ export async function waitWhileOutboundPending(timeoutMs = 5000): Promise<void> 
 
 export async function pairDevice(name: string): Promise<{ deviceId: string; token: string }> {
   const { code } = await ownerStub().createPairing();
-  const res = await SELF.fetch("https://example.com/pair", { method: "POST", body: JSON.stringify({ code, name }) });
+  const res = await SELF.fetch("https://example.com/pair", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ code, name }),
+  });
   return res.json();
 }
 

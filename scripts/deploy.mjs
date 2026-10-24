@@ -1,14 +1,3 @@
-// The deploy command (ADR-0007): `npm run deploy` wraps `wrangler deploy` and prints the
-// steps that make the deployment usable — setting SERVER_KEY (the owner API's auth, ADR-0003)
-// and connecting the first machine. A Deploy-to-Cloudflare deployment runs this same script
-// as its deploy command.
-//
-// `--name <name>` overrides the Worker name from wrangler.jsonc — the deploy and the printed
-// steps. workers.dev addresses are global across accounts, so the agent runbook deploys under
-// a collision-safe unique name instead of the repository default. `--dry-run` stops after the
-// deploy build. Secrets are NOT handled here on purpose: SERVER_KEY and MODEL_KEY go through
-// the deploy form or `wrangler secret put` (docs/deploy.md); an agent orchestrates them but
-// never observes them (ADR-0007's secret discipline).
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 
@@ -37,13 +26,17 @@ if (dryRun) {
 
 const name = overrideName ?? JSON.parse(readFileSync("wrangler.jsonc", "utf8").replace(/\/\/[^\n]*/g, "")).name;
 console.log(`
-Sig is deployed as "${name}" at the URL wrangler printed above. Steps that make it yours:
+Sig is deployed as "${name}" at the URL wrangler printed above.
 
-1. Set SERVER_KEY if the deploy form did not (the owner API's Bearer secret):
-     npx wrangler secret put SERVER_KEY --name ${name}
-   Generate one with: openssl rand -hex 32   (keep a copy — see docs/deploy.md)
-2. On the computer you want Sig to work on, pair it:
-     POST /api/pairing   (with the SERVER_KEY Bearer)  →  prints the exact connect command
-3. Open the workspace: POST /api/login-link gives a one-time sign-in URL.
+1. Open that URL and sign in with the password from the deployment form.
+   If you deployed from a terminal, set a password interactively:
+     npx wrangler secret put LOGIN_PASSWORD --name ${name}
+     npx wrangler deploy --name ${name}
+   Use at least 15 characters before redeploying.
+2. Connect a model in the setup wizard, then add a passkey for future sign-ins.
+3. To connect a computer, open Machines in the workspace and follow its pairing instructions.
+
+Existing deployments must keep SERVER_KEY and any SERVER_KEY_PREVIOUS unchanged.
+Password recovery and upgrade instructions are in docs/deploy.md.
 
 The full walk — or an agent that runs it for you — is docs/agent-deploy.md.`);

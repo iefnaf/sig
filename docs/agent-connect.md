@@ -58,7 +58,7 @@ sig connect https://sig.example.com <pairing-code>
 
 The owner can run it directly in their terminal, keeping the pairing code out of the agent transcript. With an authorized browser session, an agent may carry out pairing without repeating the code in its report. Use the final reachable deployment URL and do not reuse a code from an example.
 
-`connect` saves the device credentials, installs the background service, and starts it. On a machine without launchd/systemd user services, use `sig connect <url> <code> --foreground` in a persistent terminal instead. If the code expires or has already been used, generate a fresh one in the workspace. If the owner cannot sign in, use the login-link procedure in [deploy.md](deploy.md#opening-the-web-workspace); do not ask for their SERVER_KEY in chat.
+`connect` saves the device credentials, installs the background service, and starts it. On a machine without launchd/systemd user services, use `sig connect <url> <code> --foreground` in a persistent terminal instead. If the code expires or has already been used, generate a fresh one in the workspace. If the owner cannot sign in, follow [browser access recovery](deploy.md#recover-browser-access). Never ask for a password or SERVER_KEY in chat.
 
 ## 3 · Register the selected repositories
 

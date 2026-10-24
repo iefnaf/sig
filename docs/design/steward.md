@@ -1,9 +1,10 @@
 # Design: the steward (Durable Object internals)
 
-> **Status note (ADR-0003):** the Feishu channel this design describes — QR onboarding,
-> the webhook inbound, cards — is removed for now. The owner talks to the deployment through
-> the SERVER_KEY-gated `/api/*` routes; outbound rows render locally as text + buttons. The
-> rest of this document (ledger, routing, routines, questions) still describes the system.
+> **Status note (ADR-0003/0010):** the Feishu channel this design describes — QR onboarding,
+> the webhook inbound, cards — is removed for now. The owner uses the password/passkey web
+> workspace; the optional `/api/*` surface remains SERVER_KEY-gated. Outbound rows render
+> locally as text + buttons. The rest of this document (ledger, routing, routines, questions)
+> still describes the system.
 
 
 Status: draft v0.1. Based on: the [product spec](../spec.md), the [connector–DO protocol](connector-do-protocol.md), and [protocol spike field tests](../research/do-protocol-spike.md).
@@ -659,7 +660,7 @@ The web app is the workspace (spec §7.3, [ADR-0004](../adr/0004-web-workspace.m
 
 Owner actions come in over `/app/api` (session cookie + CSRF token + same origin + JSON): a message, a card button, "read", logout. Each carries a client request id (`sh_web_request`; the run is `user:web:<id>`), so a retry is one effect. A button is validated against the card's own buttons and its decision must still be open; it then enters the same handlers an owner API action does — the workspace and `GET /api/messages` are two views of the one local channel (ADR-0003).
 
-Login exchanges a one-time signed link (minted via `POST /api/login-link`) for a session; it is designed in a separate document ([web-entry.md](web-entry.md)). Write operations issued from the web are likewise logged to `sh_note_log` / audit, keeping "forgetting and changes visible to the user".
+Password or passkey sign-in opens the browser session; explicit-key deployments can still exchange a legacy one-time link. See [ADR-0010](../adr/0010-browser-password-authentication.md) and [web-entry.md](web-entry.md). Write operations issued from the web are likewise logged to `sh_note_log` / audit, keeping "forgetting and changes visible to the user".
 
 ## 11. Consistency and idempotency
 
@@ -719,7 +720,7 @@ Legend: ✓ verified in the protocol spike; ◦ seen only in docs or type declar
 | M2 Steward and routing | `PiHarness` steward, tools, policy hooks, `find_threads`, situation-brief injection, `ask_user`, reply retrieval | The routing evaluation set (§3.4) |
 | M3 Notes and forgetting | Two-phase note writes, layering, ChangeReport, maintenance | Unit tests for note capacity, conflicts, and demotion; manual review |
 | M4 Proactive behavior | Routines, follow-ups, stall detection, the 90-second-window fallback | Fault injection: LLM failure, DO reset |
-| M5 Web | Timeline, memory page, machine management, one-time-link login | Manual |
+| M5 Web | Timeline, memory page, machine management, password/passkey login | Manual |
 
 Not included: multi-tenancy, event sources (GitHub, CI, etc.), voice, the autonomy switch, cheap-model routing, vector retrieval.
 

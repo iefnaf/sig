@@ -16,6 +16,10 @@ export default defineConfig({
         bindings: {
           SERVER_KEY: "test-server-key-not-a-secret",
           SERVER_KEY_PREVIOUS: "test-previous-server-key-not-a-secret",
+          // Keep the legacy/link suite independent of a developer's ignored .dev.vars. Browser
+          // password coverage uses configureBrowserPasswordForTests, and the generated-key suite
+          // supplies its own deployment password in a separate workerd.
+          LOGIN_PASSWORD: "",
           // The deploy-form model key (issue #25): modelConfig() seeds sh_model from it once.
           MODEL_KEY: "test-model-key-not-a-secret",
           // The scripted model provider (issue #6): replies are queued per-test through

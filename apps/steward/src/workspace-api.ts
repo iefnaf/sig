@@ -69,6 +69,8 @@ export interface WorkspaceApiDeps {
 export interface ApiSession {
   sid: string;
   csrf: string;
+  /** Passkey enrollment and removal require a recent password or passkey ceremony. */
+  recent: boolean;
 }
 
 /** A message may be long (pasted logs), but not unbounded: the model sees it verbatim. */
@@ -171,6 +173,11 @@ export async function handleWorkspaceApi(request: Request, url: URL, session: Ap
   if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json")) return json({ error: "json_required" }, 415);
 
   try {
+    if ((url.pathname === "/app/api/settings/webauthn/register/options" ||
+         url.pathname === "/app/api/settings/webauthn/register/verify" ||
+         url.pathname === "/app/api/settings/webauthn/remove") && !session.recent) {
+      return json({ error: "reauth_required" }, 403);
+    }
     if (url.pathname === "/app/api/pairing" && deps.pairing) {
       const { id } = await readJson(request);
       if (typeof id !== "string" || !REQUEST_ID.test(id)) return json({ error: "bad_request" }, 400);

@@ -4,7 +4,9 @@
 
 ## The owner API
 
-There is no chat channel for now ([ADR-0003](adr/0003-owner-api-replaces-chat-channel.md)); whoever holds `SERVER_KEY` is the owner. Natural language in, natural language out — the model dispatches through its `start_worker` tool (machine choice, branch relay, and the three-part done-report stay deterministic) and only ever disturbs you on its own initiative through `notify_user`/`ask_user`. In event-triggered runs its plain text output is discarded by structure — quiet by default is guaranteed by the code, not the prompt.
+This API requires an explicit `SERVER_KEY` and remains available for existing deployments and programmatic clients. New deployments can use the web workspace and machine pairing without configuring this API credential. The generated internal signing key is never exposed as a bearer token.
+
+There is no chat channel for now ([ADR-0003](adr/0003-owner-api-replaces-chat-channel.md)). Browser authority comes from the deployment password or a registered passkey ([ADR-0010](adr/0010-browser-password-authentication.md)); holding `SERVER_KEY` authorizes the optional owner API. Natural language in, natural language out — the model dispatches through its `start_worker` tool (machine choice, branch relay, and the three-part done-report stay deterministic) and only ever disturbs you on its own initiative through `notify_user`/`ask_user`. In event-triggered runs its plain text output is discarded by structure — quiet by default is guaranteed by the code, not the prompt.
 
 ```sh
 KEY="Authorization: Bearer $SERVER_KEY"
@@ -41,6 +43,6 @@ Two exact phrases stay deterministic and never reach the model — they mint cre
 
 `/app` is the owner's everyday entry ([ADR-0004](adr/0004-web-workspace.md)): one continuous conversation — the same local channel the owner API serves — with the Threads behind it, a "Needs you" view over open decisions (questions, PR consent, offline asks, routine and memory suggestions), machines and pairing, and the day's model spend against the budget cap. The page is plain HTML/CJS/ES modules with no frontend build and a CSP that forbids inline script and every other origin; it stays current over a browser WebSocket nudge and can show a reply as it is being written. The interface is English by default with an in-page EN/中文 switch.
 
-The door is a one-time login link minted by `POST /api/login-link` (or a report card's 查看详情 button); opening it exchanges the token for a 7-day session cookie.
+Open the deployment URL and sign in with the deployment password or a registered passkey. Either method creates a seven-day browser session. Existing explicit-key deployments can still use `POST /api/login-link` for a single-use login link. See [browser access and recovery](deploy.md#opening-the-web-workspace).
 
 Each Thread exposes its workers' **session records** ([ADR-0005](adr/0005-web-entry-and-local-sessions.md)): the full recorded session — messages, tool calls and results, images, compaction notes — streamed from the machine through the Durable Object over the browser socket and never stored or logged server-side (protocol doc §6.6). The connector serves it from the live agent process or, once the process is gone, from the session file on disk, resumable with a cursor and bounded per page; an offline machine shows why the record is unavailable instead of an empty page. Machines are listed and revoked in the workspace too (撤销 bumps the device epoch and closes the connection with 4403, so a stolen token dies instantly).

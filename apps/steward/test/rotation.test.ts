@@ -18,7 +18,7 @@ import {
   waitWhileOutboundPending,
 } from "./helpers.ts";
 
-const PRIMARY_SECRET = env.SERVER_KEY;
+const PRIMARY_SECRET = env.SERVER_KEY!;
 const PREVIOUS_SECRET = env.SERVER_KEY_PREVIOUS!;
 
 type Sql = (strings: TemplateStringsArray, ...values: unknown[]) => unknown;

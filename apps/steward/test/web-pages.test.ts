@@ -156,6 +156,7 @@ describe("/加机器: chat-issued pairing (protocol §5.2)", () => {
 
     const res = await SELF.fetch("https://example.com/pair", {
       method: "POST",
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({ code: match![2], name: "mac-mini" }),
     });
     expect(res.status).toBe(200);
@@ -165,6 +166,7 @@ describe("/加机器: chat-issued pairing (protocol §5.2)", () => {
     // Single use: the second redemption of the same code fails.
     const again = await SELF.fetch("https://example.com/pair", {
       method: "POST",
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({ code: match![2], name: "evil" }),
     });
     expect(again.status).toBe(400);

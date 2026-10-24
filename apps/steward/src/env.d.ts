@@ -17,7 +17,9 @@
 // picks the provider, and only when vars are unset (llm/models.ts mergeModelSelection). Tests
 // bind STEWARD_MODEL = {provider: "faux", modelId: "faux-1"} for the scripted provider.
 interface Env {
-  SERVER_KEY: string;
+  SERVER_KEY?: string;
+  LOGIN_PASSWORD?: string;
+  LOGIN_RATE_LIMITER?: RateLimit;
   SERVER_KEY_PREVIOUS?: string;
   MODEL_KEY?: string;
   STEWARD_MODEL?: string | { provider?: unknown; modelId?: unknown; baseUrl?: unknown };
@@ -32,7 +34,9 @@ interface Env {
 
 declare namespace Cloudflare {
   interface Env {
-    SERVER_KEY: string;
+    SERVER_KEY?: string;
+    LOGIN_PASSWORD?: string;
+    LOGIN_RATE_LIMITER?: RateLimit;
     SERVER_KEY_PREVIOUS?: string;
     MODEL_KEY?: string;
     STEWARD_MODEL?: string | { provider?: unknown; modelId?: unknown; baseUrl?: unknown };

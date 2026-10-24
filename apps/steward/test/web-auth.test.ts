@@ -92,12 +92,14 @@ describe("link tokens: HMAC, expiry, tampering (pure functions)", () => {
   });
 });
 
-describe("the worker-layer gate: invalid links never reach the DO", () => {
-  it("answers garbage, tampered, and expired link URLs with 410 and the hint", async () => {
+describe("the Durable Object gate: invalid links never open a session", () => {
+  it("answers garbage, tampered, and expired link URLs with the shared login page", async () => {
     for (const token of ["garbage", "wl1.home.1.2.3", `${(await mintLinkToken("wrong-key", "home")).token}`]) {
       const res = await SELF.fetch(`https://example.com/link/${token}`, { redirect: "manual" });
       expect(res.status).toBe(410);
-      expect(await res.text()).toContain("/api/login-link");
+      const html = await res.text();
+      expect(html).toContain("This sign-in link is invalid or expired.");
+      expect(html).toContain('id="password-form"');
     }
     // Valid shape but long-expired: still rejected statelessly.
     const expired = await mintLinkToken("test-server-key-not-a-secret", "home", Date.now() - LINK_TTL_MS - 1);
@@ -138,21 +140,26 @@ describe("/网页 → one-time link → session cookie → /app", () => {
     expect(await again.text()).toContain("只能打开一次");
   });
 
-  it("/app without a session cookie is 401 at the worker, never reaching the DO", async () => {
-    const res = await SELF.fetch("https://example.com/app");
-    expect(res.status).toBe(401);
-    expect(await res.text()).toContain("先登录");
-    // A syntactically valid but unknown session id passes the worker HMAC gate only if
-    // signed; a bare random sid is rejected right there.
+  it("/app without a session opens the shared password-or-passkey login page", async () => {
+    for (const path of ["/app", "/app/"]) {
+      const res = await SELF.fetch(`https://example.com${path}`);
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain('id="password-form"');
+      expect(html).toContain('id="passkey-signin"');
+    }
     const res2 = await SELF.fetch("https://example.com/app", { headers: { cookie: "sig_session=ws1.deadbeef.notamac" } });
-    expect(res2.status).toBe(401);  });
+    expect(res2.status).toBe(200);
+    expect((await SELF.fetch("https://example.com/app/unknown")).status).toBe(404);
+  });
 
-  it("a well-formed but unknown session sid is rejected by the DO", async () => {
+  it("a well-formed but unknown session sid falls back to the login page", async () => {
     const fakeSid = "ab".repeat(32);
     const cookie = `sig_session=${await sessionCookieValue("test-server-key-not-a-secret", fakeSid)}`;
     expect(await parseSessionCookie(["test-server-key-not-a-secret"], cookie.split("=")[1]!)).toBe(fakeSid);
     const res = await SELF.fetch("https://example.com/app", { headers: { cookie } });
-    expect(res.status).toBe(401);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('id="password-form"');
   });
 
   it("the SERVER_KEY_PREVIOUS window keeps old-key links and cookies alive; dropping it kills them (issue #27)", async () => {
