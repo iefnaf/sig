@@ -45,7 +45,7 @@ async function relayRowCount(): Promise<number> {
 
 async function outboxRowFor(cmdId: string): Promise<{ kind: string } | undefined> {
   return runInDurableObject(ownerStub(), (instance: Steward) => {
-    const sql = (instance as unknown as { sql: <T>(s: TemplateStringsArray) => T[] }).sql.bind(instance);
+    const sql = (instance as unknown as { sql: <T>(s: TemplateStringsArray, ...values: unknown[]) => T[] }).sql.bind(instance);
     return sql<{ kind: string }>`SELECT kind FROM outbox WHERE cmdId = ${cmdId}`[0];
   });
 }
