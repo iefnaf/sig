@@ -104,53 +104,54 @@ describe("bin/sig.js (skipped when dist has not been built)", () => {
     const repo = await makeGitRepo(home);
 
     // Not registered yet: refuse with the hint, never auto-register via a config call.
-    const unregistered = await run(["repo-config", repo, "--workspace", "serial"]);
+    const unregistered = await run(["repo-config", repo, "--concurrency", "serial"]);
     expect(unregistered.code).toBe(1);
     expect(unregistered.stderr).toContain("not registered");
 
     expect((await run(["add-repo", repo])).code).toBe(0);
 
-    // Invalid mode is rejected with the valid vocabulary.
-    const bad = await run(["repo-config", repo, "--workspace", "sometimes"]);
+    // Invalid value is rejected with the valid vocabulary.
+    const bad = await run(["repo-config", repo, "--isolation", "sometimes"]);
     expect(bad.code).toBe(1);
-    expect(bad.stderr).toContain("worktree | serial | main");
+    expect(bad.stderr).toContain("worktree | in-place");
 
-    const set = await run(["repo-config", repo, "--workspace", "serial", "--approve"]);
+    const set = await run(["repo-config", repo, "--concurrency", "serial", "--approve"]);
     expect(set.code).toBe(0);
-    expect(set.stdout).toContain("workspace=serial");
+    expect(set.stdout).toContain("concurrency=serial");
     expect(set.stdout).toContain("approved=yes");
 
     // No flags: print the current configuration.
     const show = await run(["repo-config", repo]);
     expect(show.code).toBe(0);
-    expect(show.stdout).toContain("workspace: serial");
+    expect(show.stdout).toContain("capability:");
+    expect(show.stdout).toContain("concurrency: serial");
     expect(show.stdout).toContain("--approve");
 
     // And status surfaces the per-repo settings.
     const status = await run(["status"]);
-    expect(status.stdout).toContain("repo-a[serial, approved]");
+    expect(status.stdout).toContain("repo-a[worktree/serial, approved]");
   });
 
-  it("repo-config parses flags in any position and both --workspace spellings (review finding 4)", async () => {
+  it("repo-config parses flags in any position and both --isolation/--concurrency spellings (review finding 4)", async () => {
     const repo = await makeGitRepo(home);
     expect((await run(["add-repo", repo])).code).toBe(0);
 
     // Flags before the path: the path is still the path.
-    const flagsFirst = await run(["repo-config", "--workspace", "main", repo]);
+    const flagsFirst = await run(["repo-config", "--isolation", "in-place", repo]);
     expect(flagsFirst.code).toBe(0);
-    expect(flagsFirst.stdout).toContain("workspace=main");
+    expect(flagsFirst.stdout).toContain("isolation=in-place");
 
-    // The --workspace=value form is honored, not silently ignored.
-    const eqForm = await run(["repo-config", repo, "--workspace=serial"]);
+    // The --flag=value form is honored, not silently ignored.
+    const eqForm = await run(["repo-config", repo, "--concurrency=serial"]);
     expect(eqForm.code).toBe(0);
-    expect(eqForm.stdout).toContain("workspace=serial");
+    expect(eqForm.stdout).toContain("concurrency=serial");
 
-    // A valueless --workspace and unknown flags fail loudly instead of degrading into a
+    // A valueless --isolation and unknown flags fail loudly instead of degrading into a
     // read-only print with exit 0.
-    const missingValue = await run(["repo-config", repo, "--workspace"]);
+    const missingValue = await run(["repo-config", repo, "--isolation"]);
     expect(missingValue.code).toBe(1);
     expect(missingValue.stderr).toContain("requires a value");
-    const unknown = await run(["repo-config", repo, "--workspacex"]);
+    const unknown = await run(["repo-config", repo, "--isolationx"]);
     expect(unknown.code).toBe(1);
     expect(unknown.stderr).toContain("unknown option");
   });

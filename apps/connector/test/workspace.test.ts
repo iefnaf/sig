@@ -3,7 +3,7 @@
 // main checkout via the local CLI; approveProject is a connector-local setting that a command
 // must never set; cleanup_worktree refuses dirty or unpushed worktrees unless forced, and
 // nothing is ever auto-deleted.
-import { existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { installAssets } from "../src/install.ts";
@@ -513,6 +513,18 @@ describe("readonly relay legs continue from the previous branch (issue #8, spec 
     await expect(
       manager.startWorker("cmd-ro-2", args({ workerId, mode: "readonly", base: "sig/never-pushed" })),
     ).rejects.toMatchObject({ code: "worktree_failed" });
+  }, 30_000);
+
+  it("a readonly base against a plain (non-Git) repo is rejected, not shelled into git (issue #88)", async () => {
+    setup([]);
+    const plainRepo = join(dir, "plain-repo");
+    mkdirSync(plainRepo);
+    store.addRepo({ repoId: plainRepo, name: "plain-repo", path: plainRepo, capability: { kind: "plain" } });
+    const workerId = "w-review-plain";
+    workerIds.add(workerId);
+    await expect(
+      manager.startWorker("cmd-ro-plain", args({ workerId, repoId: plainRepo, mode: "readonly", base: "main" })),
+    ).rejects.toMatchObject({ code: "unsupported_base" });
   }, 30_000);
 });
 

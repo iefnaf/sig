@@ -515,7 +515,7 @@ export class WorkerManager {
       // Readonly + base → a DETACHED-HEAD worktree at that base (issue #8): a review leg
       // continues from the write leg's branch without checking anything out in the owner's
       // working directory.
-      const useWorktree = (args.mode === "write" && repo.writePolicy.isolation !== "in-place") || (args.mode === "readonly" && !!args.base);
+      const useWorktree = useWorktreeFor(repo, args);
       let cwd = repo.path;
       if (useWorktree) {
         try {
@@ -2237,6 +2237,28 @@ export class WorkerManager {
     if (!worker) throw new CommandError("not_found", `worker ${workerId} is unknown on this machine`);
     return worker;
   }
+}
+
+/** Does this task get an isolated `git worktree`, or run directly in `repo.path`?
+ *  Write tasks follow the repo's configured write policy — `isolation !== "in-place"` is
+ *  always false for a plain (non-Git) repo by construction (a plain repo's `writePolicy`
+ *  can only ever be `"in-place"`), so no separate capability check is needed for that half.
+ *  Readonly tasks with a relay `base` always isolate into a detached-HEAD worktree (diffing
+ *  against a base commit needs a real Git ancestry — there is no in-place equivalent), and
+ *  that genuinely requires a Git-backed repo, checked explicitly here since the type of
+ *  `args.base` alone can't express it. */
+function useWorktreeFor(repo: RegisteredRepo, args: Pick<StartWorkerArgs, "mode" | "base">): boolean {
+  if (args.mode === "readonly") {
+    if (!args.base) return false;
+    if (repo.capability.kind !== "git") {
+      throw new CommandError(
+        "unsupported_base",
+        `'${repo.name}' is a plain workspace (no Git); a relay base requires Git ancestry to review, which this directory doesn't have`,
+      );
+    }
+    return true;
+  }
+  return repo.writePolicy.isolation !== "in-place";
 }
 
 function commandWorkerId(args: Record<string, unknown>, envelopeWorkerId: string | undefined, kind: string): string {
