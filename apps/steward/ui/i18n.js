@@ -405,6 +405,17 @@ export const STRINGS = {
   svMeta_summary: ['Summary', '摘要'],
   svMeta_info: ['System', '系统'],
   svMeta_error: ['Error', '错误'],
+  // direct worker chat (issue #84, ADR-0011, §6.8)
+  svComposePlaceholder: ['Message this session…', '给这个会话发消息…'],
+  svSendButton: ['Send', '发送'],
+  svInterruptButton: ['Interrupt', '中断'],
+  svComposeSending: ['Sending…', '发送中…'],
+  svComposeAccepted: ['Delivering…', '正在送达…'],
+  svComposeSent: ['Sent.', '已送达。'],
+  svInterruptDone: ['Interrupted.', '已中断。'],
+  svComposeFailed: ['Didn’t go through: {reason}', '没有送达：{reason}'],
+  svComposeUnknown: ['Unclear whether this reached the machine.', '是否送达尚不确定。'],
+  svComposeOffline: ['Not connected right now.', '当前未连接。'],
 };
 
 const LOCALE_KEY = 'pip.locale';

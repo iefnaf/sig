@@ -554,6 +554,15 @@ a.button { text-decoration: none; }
 .sv-jump { position: absolute; right: 36px; bottom: 18px; display: inline-flex; align-items: center; gap: 4px; padding: 6px 12px; font-size: 11px; color: #fff; background: var(--green); border-radius: 99px; box-shadow: 0 4px 14px #23372a33; }
 .sv-jump svg { width: 13px; height: 13px; }
 
+/* §6.8 direct worker chat: a send box + interrupt button scoped to the worker this view shows */
+.sv-compose { display: flex; align-items: center; gap: 8px; margin: 0 32px; flex-shrink: 0; }
+.sv-compose-input { flex: 1; min-width: 0; padding: 8px 11px; border: 1px solid #dce2d3; border-radius: 7px; background: #fff; font: inherit; font-size: 13px; }
+.sv-compose-input::placeholder { color: #acb29f; }
+.sv-compose-input:disabled, .sv-compose-send:disabled, .sv-compose-interrupt:disabled { opacity: .55; }
+.sv-compose-status { display: block; margin: 5px 32px 0; font-size: 10px; color: #8b967d; min-height: 1.4em; }
+@media (max-width: 900px) { .sv-compose, .sv-compose-status { margin-left: 24px; margin-right: 24px; } }
+@media (max-width: 640px) { .sv-compose, .sv-compose-status { margin-left: 20px; margin-right: 20px; } }
+
 /* settings and pairing dialogs */
 .pairing { margin-top: 18px; border-top: 1px solid var(--line); padding-top: 14px; }
 .pairing h3, .model-settings h3, .security-settings h3 { font-size: 12px; font-weight: 550; margin: 0 0 6px; }

@@ -75,7 +75,15 @@ export function mountSessionViewer(root, { workerId, agentLabel, isActive, isRea
   const more = h('button', { type: 'button', class: 'button sv-more', hidden: true }, t('svLoadMore'));
   const jump = h('button', { type: 'button', class: 'sv-jump', hidden: true }, t('svJumpLatest'), icon('chevron-down'));
   const feed = h('div', { class: 'sv-feed', tabindex: '0', 'aria-label': t('svFeedLabel') }, h('div', { class: 'sv-inner' }, earlier, list, more));
-  root.replaceChildren(h('div', { class: 'sv-statusbar' }, statusLine, retryButton), feed, jump);
+
+  // ---- direct worker chat (issue #84, ADR-0011, §6.8): this view already knows which worker it
+  // is showing, so a send/interrupt here goes straight to the connector — no steward step.
+  const composeInput = h('input', { type: 'text', class: 'sv-compose-input', placeholder: t('svComposePlaceholder'), autocomplete: 'off' });
+  const sendButton = h('button', { type: 'submit', class: 'button primary sv-compose-send' }, t('svSendButton'));
+  const interruptButton = h('button', { type: 'button', class: 'button danger sv-compose-interrupt' }, t('svInterruptButton'));
+  const composeStatus = h('span', { class: 'sv-compose-status', role: 'status' });
+  const composeForm = h('form', { class: 'sv-compose' }, composeInput, sendButton, interruptButton);
+  root.replaceChildren(h('div', { class: 'sv-statusbar' }, statusLine, retryButton), feed, jump, composeForm, composeStatus);
 
   const nearBottom = () => feed.scrollHeight - feed.scrollTop - feed.clientHeight < 80;
   const toBottom = () => { feed.scrollTop = feed.scrollHeight; };
@@ -319,6 +327,7 @@ export function mountSessionViewer(root, { workerId, agentLabel, isActive, isRea
     statusLine.replaceChildren(h('span', { class: `status-dot ${view.status === 'live' ? 'green pulse' : view.status === 'loading' || view.status === 'connecting' ? 'amber' : view.status === 'done' ? 'green' : 'gray'}` }), text);
     retryButton.hidden = !['offline', 'error', 'empty', 'disconnected', 'outdated'].includes(view.status);
     more.hidden = view.status !== 'more';
+    refreshCompose();
   }
 
   function setStatus(status, detail = '') {
@@ -350,6 +359,9 @@ export function mountSessionViewer(root, { workerId, agentLabel, isActive, isRea
     view.ws = ws;
     ws.addEventListener('open', () => {
       view.attempts = 0;
+      // §6.8: declared on every (re)connect — the DO verifies worker_cmd against this, never
+      // against the message itself, and the declaration does not survive a dropped socket.
+      ws.send(JSON.stringify({ t: 'subscribe', workerId }));
       if (view.wantOpen) openStream();
     });
     ws.addEventListener('message', onMessage);
@@ -420,7 +432,8 @@ export function mountSessionViewer(root, { workerId, agentLabel, isActive, isRea
     }
     if (message.t === 'history_chunk') return onChunk(message);
     if (message.t === 'machine_offline') return onOffline();
-    if (message.t === 'error') return onError(message);
+    if (message.t === 'cmd_ack' || message.t === 'cmd_result') return onWorkerCmdReply(message);
+    if (message.t === 'error') return pendingCmds.has(message.re) ? onWorkerCmdError(message) : onError(message);
   }
 
   /** A connector that predates full reads ignores the request and answers with its old summary pages, which carry no
@@ -506,6 +519,76 @@ export function mountSessionViewer(root, { workerId, agentLabel, isActive, isRea
     list.replaceChildren();
   }
 
+  // ---- direct worker chat (issue #84, ADR-0011, §6.8) -----------------------------------------------------
+
+  const pendingCmds = new Map(); // cmdId → 'send' | 'interrupt', while waiting on a terminal cmd_ack/cmd_result
+  let composeBusy = false;
+
+  function refreshCompose() {
+    const offline = view.status === 'offline';
+    composeInput.disabled = composeBusy || offline;
+    sendButton.disabled = composeBusy || offline;
+    interruptButton.disabled = composeBusy || offline || !isActive();
+  }
+
+  function settleWorkerCmd(cmdId, text) {
+    pendingCmds.delete(cmdId);
+    composeBusy = false;
+    composeStatus.textContent = text;
+    refreshCompose();
+  }
+
+  function sendWorkerCmd(kind, args) {
+    if (!view.ws || view.ws.readyState !== WebSocket.OPEN) {
+      composeStatus.textContent = t('svComposeOffline');
+      return;
+    }
+    const id = uuid();
+    pendingCmds.set(id, kind);
+    composeBusy = true;
+    refreshCompose();
+    composeStatus.textContent = t('svComposeSending');
+    view.ws.send(JSON.stringify({ t: 'worker_cmd', id, workerId, kind, ...(args ? { args } : {}) }));
+  }
+
+  /** Real cmd_ack/cmd_result only — never a fabricated optimistic one (§6.8). */
+  function onWorkerCmdReply(message) {
+    const kind = pendingCmds.get(message.re);
+    if (!kind) return; // not a command this view issued
+    const doneKey = kind === 'interrupt' ? 'svInterruptDone' : 'svComposeSent';
+    if (message.t === 'cmd_result') {
+      settleWorkerCmd(message.re, message.ok
+        ? t(doneKey)
+        : t('svComposeFailed', { reason: (message.error && (message.error.message || message.error.code)) || '' }));
+      return;
+    }
+    // cmd_ack: 'accepted' and a result-less 'duplicate' are not terminal — still waiting on cmd_result.
+    if (message.status === 'accepted' || (message.status === 'duplicate' && !message.result)) {
+      composeStatus.textContent = t('svComposeAccepted');
+      return;
+    }
+    if (message.status === 'rejected') return settleWorkerCmd(message.re, t('svComposeFailed', { reason: message.code ?? '' }));
+    if (message.status === 'ambiguous') return settleWorkerCmd(message.re, t('svComposeUnknown'));
+    if (message.result) {
+      settleWorkerCmd(message.re, message.result.ok ? t(doneKey) : t('svComposeFailed', { reason: '' }));
+    }
+  }
+
+  /** A `worker_cmd` the DO refused outright (unknown/broken worker, empty text): never reached
+   *  outbox, so no cmd_ack is coming — settle right away instead of leaving the UI waiting. */
+  function onWorkerCmdError(message) {
+    settleWorkerCmd(message.re, t('svComposeFailed', { reason: message.message || message.code || '' }));
+  }
+
+  composeForm.addEventListener('submit', (event) => {
+    event.preventDefault();
+    const text = composeInput.value.trim();
+    if (!text) return;
+    sendWorkerCmd('send', { text, intent: 'auto' });
+    composeInput.value = '';
+  });
+  interruptButton.addEventListener('click', () => sendWorkerCmd('interrupt'));
+
   function schedulePoll() {
     clearTimeout(view.pollTimer);
     if (view.destroyed || !isActive() || document.visibilityState !== 'visible') return;
@@ -557,6 +640,9 @@ export function mountSessionViewer(root, { workerId, agentLabel, isActive, isRea
       more.textContent = t('svLoadMore');
       jump.replaceChildren(t('svJumpLatest'), icon('chevron-down'));
       feed.setAttribute('aria-label', t('svFeedLabel'));
+      composeInput.setAttribute('placeholder', t('svComposePlaceholder'));
+      sendButton.textContent = t('svSendButton');
+      interruptButton.textContent = t('svInterruptButton');
       redrawAll();
     },
     destroy() {
@@ -566,7 +652,10 @@ export function mountSessionViewer(root, { workerId, agentLabel, isActive, isRea
       stopWatchdog();
       if (view.renderTimer) cancelAnimationFrame(view.renderTimer);
       document.removeEventListener('visibilitychange', onVisible);
+      // §6.8: best-effort — the socket closing right after revokes the subscription either way.
+      if (view.ws?.readyState === WebSocket.OPEN) view.ws.send(JSON.stringify({ t: 'unsubscribe' }));
       view.ws?.close();
+      pendingCmds.clear();
       root.replaceChildren();
     },
   };

@@ -949,4 +949,21 @@ export const MIGRATIONS: readonly Migration[] = [
       sql`CREATE TABLE sh_auth_limit (bucket TEXT PRIMARY KEY, windowStart INTEGER NOT NULL, attempts INTEGER NOT NULL, failures INTEGER NOT NULL, blockedUntil INTEGER NOT NULL, expiresAt INTEGER NOT NULL)`;
     },
   },
+  {
+    // Direct worker chat (issue #84, ADR-0011, protocol §6.8): bookkeeping only — which
+    // browser connection issued a web-direct `worker_cmd`, so the real `cmd_ack`/`cmd_result`
+    // (never fabricated) can be relayed back once the connector answers. Same shape and
+    // lifetime idea as `history_relay` (009): short-lived, cleaned up on terminal settlement
+    // or on the browser connection closing. (Numbered 026: 025_browser_login took 025 first —
+    // same precedent as 009_web vs 009_history_relay above.)
+    id: "026_web_cmd_relay",
+    up: (sql) => {
+      sql`CREATE TABLE IF NOT EXISTS web_cmd_relay (
+        cmdId TEXT PRIMARY KEY,
+        webConnId TEXT NOT NULL,
+        createdAt INTEGER NOT NULL
+      )`;
+      sql`CREATE INDEX IF NOT EXISTS web_cmd_relay_conn ON web_cmd_relay (webConnId)`;
+    },
+  },
 ];

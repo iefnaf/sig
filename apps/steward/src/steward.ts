@@ -43,6 +43,9 @@ import {
   PingMessageSchema,
   PROTOCOL_VERSION,
   RegisterRepoResultSchema,
+  SubscribeMessageSchema,
+  UnsubscribeMessageSchema,
+  WorkerCmdMessageSchema,
   generatePairingCode,
   mintToken,
   parseToken,
@@ -178,6 +181,9 @@ interface ConnState {
   keyId: string;
   connEpoch?: number;
   directoryBrowse?: boolean;
+  /** Set on a browser connection by `subscribe` (issue #84, §6.8): the one worker session
+   *  view it currently has open, and the only `workerId` it may send `worker_cmd` to. */
+  viewingWorkerId?: string;
 }
 
 type DirectoryReadResult = DirectoryBrowseResult | { ok: false; code: "machine_offline" | "browse_timeout" };
@@ -1323,6 +1329,10 @@ export class Steward extends Agent<Env> {
     if (state.role === "web") {
       // §6.6 termination: the browser closing its connection ends every stream it opened.
       this.sql`DELETE FROM history_relay WHERE webConnId = ${connection.id}`;
+      // §6.8: any web-direct command still waiting on this connection's cmd_ack/cmd_result
+      // loses its relay target — the outbox row itself is untouched, only the bookkeeping
+      // that would have forwarded the answer to this now-gone browser.
+      this.sql`DELETE FROM web_cmd_relay WHERE webConnId = ${connection.id}`;
       // Nobody left watching a workspace: let go of pi's event stream (the close may still list this socket).
       if ([...this.getConnections(WORKSPACE_TAG)].every((other) => other.id === connection.id)) void this.workspaceStream_?.stop();
       return;
@@ -1396,12 +1406,21 @@ export class Steward extends Agent<Env> {
         case "history_ack":
           this.handleHistoryAck(connection, message);
           return;
+        case "subscribe":
+          this.handleSubscribe(connection, message);
+          return;
+        case "unsubscribe":
+          this.handleUnsubscribe(connection);
+          return;
+        case "worker_cmd":
+          this.handleWorkerCmd(connection, message);
+          return;
         default:
           this.sendError(connection, "forbidden", `message type ${JSON.stringify(t)} is not allowed on a web connection`);
           return;
       }
     }
-    if (t === "history_open" || t === "history_ack") {
+    if (t === "history_open" || t === "history_ack" || t === "subscribe" || t === "unsubscribe" || t === "worker_cmd") {
       // §5.3: browser-type messages on a connector connection.
       const id = (message as { id?: unknown }).id;
       this.sendError(
@@ -1572,6 +1591,91 @@ export class Steward extends Agent<Env> {
     this.getConnection(relay.webConnId)?.send(JSON.stringify(raw));
   }
 
+  // ---- Direct worker chat from an open session view (issue #84, ADR-0011, protocol §6.8) ----
+  // Mechanical only (send/interrupt): the DO calls the same Dispatcher methods a steward tool
+  // call would, with no LLM step in between. Targeting is server-verified (subscribe state on
+  // the connection itself), never trusted from the message.
+
+  /** browser → DO: this connection is now watching `workerId`'s session view. */
+  private handleSubscribe(connection: Connection, raw: unknown): void {
+    const parsed = SubscribeMessageSchema.safeParse(raw);
+    if (!parsed.success) {
+      this.sendError(connection, "bad_request", "invalid subscribe");
+      return;
+    }
+    if (!this.ledger.workers.get(parsed.data.workerId)) {
+      this.sendError(connection, "not_found", `worker ${parsed.data.workerId} is unknown`);
+      return;
+    }
+    const state = connection.state as unknown as ConnState | null;
+    connection.setState({
+      role: "web",
+      sid: state?.sid,
+      expiresAt: state?.expiresAt,
+      deviceId: state?.deviceId ?? "",
+      epoch: state?.epoch ?? 0,
+      keyId: state?.keyId ?? "",
+      connEpoch: state?.connEpoch,
+      viewingWorkerId: parsed.data.workerId,
+    } satisfies ConnState);
+  }
+
+  /** browser → DO: the session view closed, or is about to subscribe to a different worker. */
+  private handleUnsubscribe(connection: Connection): void {
+    const state = connection.state as unknown as ConnState | null;
+    if (!state) return;
+    const { viewingWorkerId: _drop, ...rest } = state;
+    connection.setState(rest as ConnState);
+  }
+
+  /** browser → DO → connector: §6.8. Dispatches through the ordinary Dispatcher path (same
+   *  outbox write, same Thread timeline entry a steward tool call would produce) and registers
+   *  a relay row so the real cmd_ack/cmd_result — never fabricated — finds its way back. */
+  private async handleWorkerCmd(connection: Connection, raw: unknown): Promise<void> {
+    const parsed = WorkerCmdMessageSchema.safeParse(raw);
+    if (!parsed.success) {
+      this.sendError(connection, "bad_request", "invalid worker_cmd");
+      return;
+    }
+    const cmd = parsed.data;
+    const state = connection.state as unknown as ConnState | null;
+    if (state?.viewingWorkerId !== cmd.workerId) {
+      this.sendError(connection, "forbidden", `subscribe to ${cmd.workerId} before sending worker_cmd`, cmd.id);
+      return;
+    }
+    this.sql`INSERT OR REPLACE INTO web_cmd_relay (cmdId, webConnId, createdAt) VALUES (${cmd.id}, ${connection.id}, ${Date.now()})`;
+    const outcome =
+      cmd.kind === "send"
+        ? await this.dispatcher.sendToWorker({
+            workerId: cmd.workerId,
+            text: cmd.args?.text ?? "",
+            intent: cmd.args?.intent ?? "auto",
+            provenance: "web_direct",
+            cmdId: cmd.id,
+          })
+        : await this.dispatcher.interruptWorker({
+            workerId: cmd.workerId,
+            ...(cmd.args?.then !== undefined ? { then: cmd.args.then } : {}),
+            provenance: "web_direct",
+            cmdId: cmd.id,
+          });
+    if (outcome.kind === "refused") {
+      // Never reached `outbox` (unknown/broken worker, empty text): no cmd_ack is ever
+      // coming, so answer directly instead of leaving the browser waiting.
+      this.sql`DELETE FROM web_cmd_relay WHERE cmdId = ${cmd.id}`;
+      this.sendError(connection, "bad_request", outcome.reason, cmd.id);
+    }
+  }
+
+  /** Forwards a real cmd_ack/cmd_result to the browser that issued a web-direct worker_cmd, if
+   *  any is waiting; `terminal` clears the relay row (the command will not answer again). */
+  private relayWebCmd(cmdId: string, payload: unknown, terminal: boolean): void {
+    const relay = this.sql<{ webConnId: string }>`SELECT webConnId FROM web_cmd_relay WHERE cmdId = ${cmdId}`[0];
+    if (!relay) return;
+    this.getConnection(relay.webConnId)?.send(JSON.stringify(payload));
+    if (terminal) this.sql`DELETE FROM web_cmd_relay WHERE cmdId = ${cmdId}`;
+  }
+
   /** Alarm-driven §6.6 termination: relays older than the TTL disappear, browser or not. */
   async sweepHistoryRelays(): Promise<void> {
     this.relaySweepAt = 0;
@@ -1732,6 +1836,7 @@ export class Steward extends Agent<Env> {
     if (!row || row.deviceId !== deviceId) return;
     if (ack.status === "accepted") {
       this.sql`UPDATE outbox SET state = 'accepted' WHERE cmdId = ${ack.re} AND state IN ('sent', 'queued')`;
+      this.relayWebCmd(ack.re, ack, false);
     } else if (ack.status === "duplicate") {
       if (ack.result) {
         if (row.kind === "register_repo") return this.settleDirectoryRegistration(row, ack.result);
@@ -1739,8 +1844,10 @@ export class Steward extends Agent<Env> {
           UPDATE outbox SET state = ${ack.result.ok ? "done" : "failed"}, result = ${JSON.stringify(ack.result)}
           WHERE cmdId = ${ack.re}
         `;
+        this.relayWebCmd(ack.re, ack, true);
       } else {
         this.sql`UPDATE outbox SET state = 'accepted' WHERE cmdId = ${ack.re} AND state IN ('sent', 'queued')`;
+        this.relayWebCmd(ack.re, ack, false);
       }
     } else if (ack.status === "rejected") {
       if (row.kind === "register_repo") return this.settleDirectoryRegistration(row, { ok: false, error: { code: ack.code ?? "registration_failed" } });
@@ -1749,11 +1856,13 @@ export class Steward extends Agent<Env> {
         WHERE cmdId = ${ack.re}
       `;
       this.noteCommandFailure(ack.re, `连接器拒绝（${ack.code ?? "未知原因"}）`);
+      this.relayWebCmd(ack.re, ack, true);
     } else if (ack.status === "ambiguous") {
       // protocol §4.2: a crash during `sending`, undecidable — no automatic re-send. The row
       // is marked ambiguous; #15 wakes the steward to ask, except pr_worker rows, which the
       // consent gate answers deterministically (issue #21).
       this.markCommandAmbiguous(ack.re, "cmd_ack");
+      this.relayWebCmd(ack.re, ack, true);
     }
   }
 
@@ -1769,6 +1878,7 @@ export class Steward extends Agent<Env> {
       UPDATE outbox SET state = ${result.ok ? "done" : "failed"}, result = ${JSON.stringify(result.ok ? result.data ?? null : result.error ?? null)}
       WHERE cmdId = ${result.re}
     `;
+    this.relayWebCmd(result.re, result, true);
     if (result.ok) {
       // Review finding 4 (#57): a pr_worker settles with the URL even when its pr_created
       // event was lost (the connector's emit raced a shutdown). This backstop delivers the
@@ -2563,6 +2673,9 @@ export class Steward extends Agent<Env> {
     for (const row of due) {
       if (row.attempts >= MAX_SEND_ATTEMPTS) {
         this.sql`UPDATE outbox SET state = 'failed', failReason = 'ack_timeout' WHERE cmdId = ${row.cmdId}`;
+        // §6.8: a web-direct command that never got an ack at all — the browser would
+        // otherwise wait forever with no feedback.
+        this.relayWebCmd(row.cmdId, { t: "cmd_result", re: row.cmdId, ok: false, error: { code: "ack_timeout" } }, true);
       } else if (!this.deliver(row.cmdId)) {
         // Deadline passed and there is no live connection (deliver refused): park the row back
         // in `queued` for redelivery at the next hello. Leaving it `sent` would hot-loop the
