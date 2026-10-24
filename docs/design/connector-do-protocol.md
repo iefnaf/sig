@@ -197,8 +197,8 @@ A connector connection sending browser-type messages, or a browser connection se
 ### 5.4 Trust in commands
 
 - The connector accepts commands only on **its own authenticated connection**.
-- Worker commands still require a locally registered repository. Registration can be requested by the owner through the authenticated web machine page as `register_repo{path}` or through the local CLI. The connector validates the existing Git directory and persists its canonical root. The model has no registration tool.
-- Web registration trusts the steward to convey owner authorization, so it replaces the former guarantee against whitelist expansion by a compromised steward. `approveProject` and workspace mode remain settable only on the machine (connector-pi.md §8.1, §13).
+- Worker commands still require a locally registered repository. Registration can be requested by the owner through the authenticated web machine page as `register_repo{path}` or through the local CLI. The connector persists the directory's canonical identity and detects, opportunistically, whether it is a Git repository (issue #88) — Git is a capability, not a registration requirement. The model has no registration tool.
+- Web registration trusts the steward to convey owner authorization, so it replaces the former guarantee against whitelist expansion by a compromised steward. `approveProject` and write policy remain settable only on the machine (connector-pi.md §8.1, §8.2, §13).
 
 ## 6. Message catalog
 
@@ -214,7 +214,7 @@ A connector connection sending browser-type messages, or a browser connection se
   "connector": { "version": "0.1.0", "os": "darwin", "arch": "arm64", "node": "22.13.0" },
   "machine": { "name": "mac-studio", "memTotalMB": 65536, "memFreeMB": 31000 },
   "agents": [ { "kind": "pi", "version": "1.2.0", "capabilities": { "steer": true, "followUp": true, "interrupt": true, "resume": true, "history": true, "images": true, "structuredReport": true, "readonly": true } } ],
-  "repos": [ { "repoId": "…", "name": "sig", "path": "/Users/x/code/sig", "defaultBranch": "main", "remote": "git@github.com:…" } ],
+  "repos": [ { "repoId": "…", "name": "sig", "path": "/Users/x/code/sig", "defaultBranch": "main", "remote": "git@github.com:…", "capability": { "kind": "git", "gitRoot": "/Users/x/code/sig", "defaultBranch": "main", "remote": "git@github.com:…" } } ],
   "limits": { "maxWorkers": 4, "running": 1 },
   "workers": [ { "workerId": "w…", "agent": "pi", "state": "idle", "lastSeq": 128, "sessionId": "…", "lastOutcome": "reported:done" } ],
   "pendingAcks": [ { "cmdId": "…", "state": "done" } ]
@@ -223,6 +223,7 @@ A connector connection sending browser-type messages, or a browser connection se
 
 - `bootId`: randomly generated at each start of the connector process. The DO uses it to tell "reconnect after a network blip" (same `bootId`) from "connector restart" (new `bootId`; all pi processes exited in between).
 - `workers` is a full snapshot from the connector's point of view, used for reconciliation.
+- `repos[].capability` (issue #88): `{kind:"git", gitRoot, defaultBranch, remote}` or `{kind:"plain"}`. Optional on the wire — absent on a connector build that predates it, in which case the repo is a Git repository (no earlier connector could register anything else) and `defaultBranch`/`remote` carry the same facts the deprecated flat fields always have.
 
 **`welcome`** (DO → connector)
 
@@ -253,7 +254,7 @@ Common envelope:
 
 | `kind` | `args` | Notes |
 |---|---|---|
-| `register_repo` | `path` | Authenticated owner web action. Registers an existing Git directory and returns its canonical metadata. No project approval or workspace-mode changes. |
+| `register_repo` | `path` | Authenticated owner web action. Registers any existing directory and returns its canonical identity plus detected Git capability. No project approval or write-policy changes. |
 | `start_worker` | `threadId, repoId, mode, base?, prompt, images?, model?` | Maps to connector-pi.md §6.1; `repoId` must be in the connector's whitelist |
 | `send` | `text, images?, intent` | `intent: now \| after \| auto` |
 | `interrupt` | `then?: { text }` | Abort, optionally followed by one new instruction |
