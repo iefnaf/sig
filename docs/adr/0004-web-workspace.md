@@ -1,6 +1,6 @@
 # ADR-0004: The Sig web workspace
 
-Status: accepted (2026-10-17; renumbered and adapted when ADR-0002/0003 took the Sig brand and the owner API). Amends ADR-0001 decisions 4, 7 and 12, which limited the web to companion pages, chat-only intervention, and client JavaScript for the raw-process stream only. Its channel, onboarding and separate raw-process-page decisions are amended by [ADR-0005](0005-web-entry-and-local-sessions.md) (implemented).
+Status: accepted (2026-10-17; renumbered and adapted when ADR-0002/0003 took the Sig brand and the owner API). Amends ADR-0001 decisions 4, 7 and 12, which limited the web to companion pages, chat-only intervention, and client JavaScript for the raw-process stream only. Its channel, onboarding and separate raw-process-page decisions are amended by [ADR-0005](0005-web-entry-and-local-sessions.md) (implemented). Its phase-one omission of direct worker chat is narrowed by [ADR-0011](0011-direct-worker-chat-from-session-view.md) (implemented) for the case of a session view the owner already has open.
 
 Context: the web is where the owner wants to talk to the agent day to day — read replies, answer questions, make decisions. The prototype in [`docs/design/web-workspace/`](../design/web-workspace/) settled the shape; this records the decisions behind its implementation. In the merged design the workspace sits on the owner API's local channel (ADR-0003): the workspace and `GET /api/messages` are two views of one conversation, not two channels.
 
@@ -17,4 +17,4 @@ Context: the web is where the owner wants to talk to the agent day to day — re
 
 - The thread list and timeline pages of ADR-0001 are replaced by the workspace; their URLs (`/app`, `/app/threads/:id`, the card links) open it. `/app/machines` (revoke) and the raw-process page stay server-rendered.
 - **Known limit:** text the system itself generates — report and question cards, timeline lines, failure explanations, the machines and raw-process pages — is written in Chinese by the existing templates. The workspace labels what it can (card kinds, the standard buttons, states) and shows the rest as written. Localising those templates needs the owner's language on the server side; recommended as the next step.
-- Phase one omits memory management, routine management and direct worker chat; stopping a worker is still asked of Pip in conversation.
+- Phase one omits memory management, routine management and direct worker chat; stopping a worker is still asked of Pip in conversation. (An open session view's mechanical control — send/interrupt/resume/stop — is carved out by [ADR-0011](0011-direct-worker-chat-from-session-view.md); routine and memory management, and anything needing Sig's judgment, remain through conversation.)

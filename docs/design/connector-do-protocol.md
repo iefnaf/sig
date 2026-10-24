@@ -190,9 +190,9 @@ User (Feishu/web)                                  DO                           
 | Role | How it is identified | May send | May receive |
 |---|---|---|---|
 | `connector` | Valid token | `hello`, `cmd_ack`, `cmd_result`, `events`, `history_chunk`, `machine_update`, `error` | `welcome`, `cmd`, `events_ack`, `resync`, `history_req`, etc. |
-| `web` | A password/passkey browser session (or a legacy one-time link on an explicit-key deployment) | `subscribe`, `history_open`, and other browser-type messages | State pushes, history chunks |
+| `web` | A password/passkey browser session (or a legacy one-time link on an explicit-key deployment) | `subscribe`, `history_open`, `worker_cmd` (§6.8, only for a `workerId` currently subscribed), and other browser-type messages | State pushes, history chunks |
 
-A connector connection sending browser-type messages, or a browser connection sending connector-type messages, always gets `error{code:"forbidden"}` back and the violation is counted; repeated violations may get the connection closed.
+A connector connection sending browser-type messages, or a browser connection sending connector-type messages, always gets `error{code:"forbidden"}` back and the violation is counted; repeated violations may get the connection closed. `worker_cmd` for a `workerId` the connection has not subscribed to is likewise `forbidden` — see §6.8.
 
 ### 5.4 Trust in commands
 
@@ -334,6 +334,36 @@ Constraints:
 
 Values for `code`: `bad_request`, `unauthorized`, `forbidden`, `not_found`, `conflict`, `busy`, `expired`, `unsupported`, `too_large`, `rate_limited`, `internal`.
 
+### 6.8 Direct worker commands (web → DO → connector, no steward step)
+
+[ADR-0011](../adr/0011-direct-worker-chat-from-session-view.md): a browser that already has a worker session's view open can act on it directly, without routing through Sig's conversation. v1 scope is `send` and `interrupt` — the two kinds that already have a deterministic, LLM-free dispatch path (`Dispatcher.sendToWorker`/`interruptWorker`). `resume` and `stop_process` are not reachable this way yet; see ADR-0011 decision 1.
+
+**`subscribe`** (web → DO): declares which worker's session view is open. Required before `worker_cmd`; tracked on the connection itself (lost on disconnect or hibernation, never inferred from any other state).
+
+```json
+{ "t": "subscribe", "workerId": "w…" }
+```
+
+**`unsubscribe`** (web → DO): ends it (closing the session view, or switching to another worker before re-subscribing).
+
+```json
+{ "t": "unsubscribe" }
+```
+
+**`worker_cmd`** (web → DO → connector):
+
+```json
+{ "t": "worker_cmd", "id": "<sh_web_request>", "workerId": "w…", "kind": "send", "args": { "text": "也把 lint 跑一下" } }
+```
+
+- `kind ∈ {send, interrupt}`. `args` has the same shape as the corresponding `cmd.args` (§6.2). Anything requiring project/account-level trust (`start_worker`, `register_repo`, `pr_worker`, …) is not reachable this way — those stay steward- or owner-web-page-only.
+- **Subscription-gated, not client-asserted.** The DO accepts `worker_cmd` only when the connection's own `subscribe` state names that exact `workerId`. No subscription, a mismatched one, or one since dropped (tab closed, unsubscribed, DO restarted and not yet re-subscribed): `error{code:"forbidden"}`. This is what makes "the UI already picked the target" an enforced property rather than a convention.
+- **Dispatch**: the DO calls `Dispatcher.sendToWorker`/`interruptWorker` with `provenance: "web_direct"` and `cmdId: id` — the same methods and the same `outbox` write (§4.2) a steward tool call would produce, so the resulting `cmd` the connector receives is indistinguishable from a steward-issued one.
+- **Idempotency**: `id` is the caller's `sh_web_request` (ADR-0004 decision 3), reused directly as `cmdId`; a retry under the same id is one effect, matching every other owner-web mutation. This is the one path where `cmdId` does not originate from a steward tool-call id (§7.1).
+- **Recording, not waking**: `sendToWorker`/`interruptWorker` already add a Thread timeline entry as part of normal dispatch; the `web_direct` provenance is what lets Sig tell, next time it reasons about that Thread, that this one did not come from its own tool call. Sig is not woken synchronously. Sig learns the outcome the ordinary way — the worker's resulting `progress`/`report`/`settled` events flow back through §4.3 and wake Sig under the existing rules, regardless of who issued the command.
+- A `refused` outcome from the `Dispatcher` (unknown/broken worker, empty text) never reaches `outbox`, so the DO answers with `error` directly instead of waiting for a `cmd_ack` that will never come.
+- Otherwise, `cmd_ack`/`cmd_result` follow §6.3 exactly and are relayed verbatim to the subscribed browser connection once the connector answers — the DO does not fabricate an optimistic ack.
+
 ## 7. Key flows
 
 ### 7.1 Dispatching a task
@@ -352,7 +382,7 @@ Steward task (pi-durable)      DO outbox/protocol layer        Connector        
    │◀─ wake steward (report) ──│                               │                             │
 ```
 
-Idempotency key: the steward's tool invocation takes `cmdId` from the tool-call ID (or `requestId`); replaying the same invocation after a crash yields the same `cmdId`, and `outbox`'s primary key guarantees no second command is created (in concert with pi-durable's `requestId` idempotency mechanism).
+Idempotency key: the steward's tool invocation takes `cmdId` from the tool-call ID (or `requestId`); replaying the same invocation after a crash yields the same `cmdId`, and `outbox`'s primary key guarantees no second command is created (in concert with pi-durable's `requestId` idempotency mechanism). A `worker_cmd` sent directly from an open session view (§6.8) takes `cmdId` from the browser's `sh_web_request` instead — same guarantee, different source.
 
 ### 7.2 Disconnect, reconnect, and replay
 
