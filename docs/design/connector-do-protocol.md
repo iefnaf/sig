@@ -189,7 +189,7 @@ User (Feishu/web)                                  DO                           
 
 | Role | How it is identified | May send | May receive |
 |---|---|---|---|
-| `connector` | Valid token | `hello`, `cmd_ack`, `cmd_result`, `events`, `history_chunk`, `machine_update`, `error` | `welcome`, `cmd`, `events_ack`, `resync`, `history_req`, etc. |
+| `connector` | Valid token | `hello`, `cmd_ack`, `cmd_result`, `events`, `history_chunk`, `error` | `welcome`, `cmd`, `events_ack`, `resync`, `history_req`, etc. |
 | `web` | A password/passkey browser session (or a legacy one-time link on an explicit-key deployment) | `subscribe`, `history_open`, `worker_cmd` (§6.8, only for a `workerId` currently subscribed), and other browser-type messages | State pushes, history chunks |
 
 A connector connection sending browser-type messages, or a browser connection sending connector-type messages, always gets `error{code:"forbidden"}` back and the violation is counted; repeated violations may get the connection closed. `worker_cmd` for a `workerId` the connection has not subscribed to is likewise `forbidden` — see §6.8.
@@ -197,7 +197,7 @@ A connector connection sending browser-type messages, or a browser connection se
 ### 5.4 Trust in commands
 
 - The connector accepts commands only on **its own authenticated connection**.
-- Worker commands still require a locally registered repository. Registration can be requested by the owner through the authenticated web machine page as `register_repo{path}` or through the local CLI. The connector validates the existing Git directory and persists its canonical root. The model has no registration tool.
+- Worker commands still require a locally registered repository. The owner requests registration only through **Add directory** on the authenticated web machine page, which sends `register_repo{path}`. The connector validates the existing Git directory and persists its canonical root. The model has no registration tool.
 - Web registration trusts the steward to convey owner authorization, so it replaces the former guarantee against whitelist expansion by a compromised steward. `approveProject` and workspace mode remain settable only on the machine (connector-pi.md §8.1, §13).
 
 ## 6. Message catalog
@@ -296,13 +296,9 @@ Event types and payloads are in connector-pi.md §11.1 and are not repeated here
 
 ### 6.5 Machine status
 
-**`machine_update`** (connector → DO): repositories added or removed, resource changes, connector upgrades, and the like.
+`hello` supplies the full machine and repository snapshot on each connection. During a connection, repository registration comes only from the owner's web **Add directory** action. A successful `register_repo` result updates the DO's repository inventory before the web reports success (§6.3), without a reconnect.
 
-```json
-{ "t": "machine_update", "repos": [ ], "limits": { "maxWorkers": 4, "running": 2 }, "memFreeMB": 18000 }
-```
-
-Sent only when something changes.
+`hello` remains the full reconciliation path, including repository removals. There is no separate live machine-status update message. Live resource telemetry is outside the current protocol.
 
 ### 6.6 History (raw transcript) relay
 

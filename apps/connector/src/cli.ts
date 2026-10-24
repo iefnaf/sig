@@ -14,7 +14,6 @@
 //   uninstall              stop the service and remove its unit (keeps ~/.sig data)
 //   upgrade [--version V]  npm-install @nightboats/sig (default @latest) and restart the
 //                          service; the fresh daemon rewrites the versioned pi assets
-//   add-repo <path>        register a repository so start_worker may run in it (§8.1)
 //   repo-config <path> [--workspace worktree|serial|main] [--approve|--no-approve]
 //                          per-repo local settings (§8.2/§13): how write tasks get a
 //                          directory, and whether pi runs with --approve there. Never
@@ -42,7 +41,6 @@ import {
 import { getServiceInstaller, SIG_LABEL, type ServiceInstaller, type ServiceSpec } from "./service.ts";
 import { isWorkspaceMode, LocalStore, WORKSPACE_MODES } from "./store.ts";
 import { repoTopLevel } from "./worktree.ts";
-import { registerRepository } from "./repository.ts";
 import { runUpgrade } from "./upgrade.ts";
 import { VERSION } from "./version.ts";
 
@@ -76,10 +74,11 @@ usage:
   sig start | stop | restart                 control the background service
   sig uninstall                              remove the service (keeps ~/.sig data)
   sig upgrade [--version <version>]          replace the package and restart the service
-  sig add-repo <path>                        register a repository for start_worker
   sig repo-config <path> [options]           per-repo local settings (workspace mode,
                                                   project trust); never settable remotely
   sig daemon                                 internal: run the connector daemon
+
+Register repositories in the web workspace under Machines > Add directory.
 
 environment:
   SIG_HOME         state directory (default ~/.sig)
@@ -161,8 +160,6 @@ async function main(argv: string[]): Promise<void> {
       return uninstallCommand();
     case "upgrade":
       return upgradeCommand(rest);
-    case "add-repo":
-      return addRepo(rest[0]);
     case "repo-config":
       return repoConfig(rest);
     case "daemon":
@@ -457,7 +454,7 @@ async function statusCommand(): Promise<void> {
     const repos = store.listRepos();
     const repoLine =
       repos.length === 0
-        ? "none (sig add-repo <path>)"
+        ? "none (web workspace: Machines > Add directory)"
         : repos.map((r) => `${r.name}[${r.workspace}${r.approved ? ", approved" : ""}]`).join(", ");
     console.log(`repos:    ${repoLine}`);
   } finally {
@@ -557,20 +554,6 @@ async function daemonCommand(): Promise<void> {
   await new Promise<void>(() => {});
 }
 
-// --- add-repo --------------------------------------------------------------------------------
-
-async function addRepo(path: string | undefined): Promise<void> {
-  if (!path) usage();
-  const store = new LocalStore(join(stateDir(), "connector.sqlite"));
-  try {
-    const repo = await registerRepository({ store, path });
-    console.log(`registered ${repo.name} (${repo.path})${repo.defaultBranch ? ` default branch: ${repo.defaultBranch}` : ""}`);
-    console.log("next: sig repo-config <path> to pick the workspace mode or approve the project");
-  } finally {
-    store.close();
-  }
-}
-
 // --- repo-config -----------------------------------------------------------------------------
 
 /** Parses repo-config argv: positional path + `--workspace worktree|serial|main` (also the
@@ -615,7 +598,7 @@ async function repoConfig(argv: string[]): Promise<void> {
   try {
     const repo = store.getRepo(topLevel);
     if (!repo) {
-      fail(`${topLevel} is not registered; run 'sig add-repo ${path}' first`);
+      fail(`${topLevel} is not registered; open the web workspace and use Machines > Add directory first`);
     }
     if (workspace === undefined && approve === undefined) {
       // Read-only invocation: show the current settings.

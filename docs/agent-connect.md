@@ -62,15 +62,11 @@ The owner can run it directly in their terminal, keeping the pairing code out of
 
 ## 3 · Register the selected repositories
 
-For each path the owner chose, verify that it is a Git repository, then run:
+In the web workspace, open **Machines**, find the connected machine, and choose **Add directory** (中文：**机器 → 添加目录**). Select an existing Git repository or enter its absolute path, then wait for registration to succeed. Repeat for each repository the owner chose.
 
-```sh
-sig add-repo /absolute/path/to/repository
-```
+The connector validates and saves each directory locally before the workspace shows it as registered. Keep the connector online during registration. No restart is needed.
 
 Keep the default `worktree` workspace mode unless the owner wants a different policy. Do not add `--approve` as a setup shortcut: it enables the repository's local pi extensions and is a separate trust choice. Repository settings are documented in [deploy.md](deploy.md#connecting-a-machine).
-
-For a fresh background installation, run `sig restart` after registration so the next handshake advertises the repositories. For a foreground connector, stop it with Ctrl-C and run `sig daemon` in the same persistent terminal to reconnect using its saved pairing; no new code is needed. If an existing connector has running workers, defer its restart until those tasks finish.
 
 ## 4 · Verify the full connection
 

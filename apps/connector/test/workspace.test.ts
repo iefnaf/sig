@@ -513,7 +513,6 @@ describe("LocalStore per-repo config and the queue tables (issue #16)", () => {
     expect(store.getRepo(repo)).toMatchObject({ workspace: "worktree", approved: false });
     expect(store.setRepoConfig(repo, { workspace: "serial", approved: true })).toBe(true);
     expect(store.getRepo(repo)).toMatchObject({ workspace: "serial", approved: true });
-    // Re-registering (add-repo again) never resets local settings.
     store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
     expect(store.getRepo(repo)).toMatchObject({ workspace: "serial", approved: true });
     expect(store.setRepoConfig("/no/such/repo", { workspace: "main" })).toBe(false);

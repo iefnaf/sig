@@ -2,13 +2,14 @@
 // builds. This is the `npx @nightboats/sig` surface: the Node gate, --version, usage, and
 // the read-only subcommands on a clean SIG_HOME.
 import { execFile } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { makeGitRepo } from "./helpers.ts";
 import { VERSION } from "../src/version.ts";
+import { LocalStore } from "../src/store.ts";
 
 const exec = promisify(execFile);
 const bin = join(import.meta.dirname, "..", "bin", "sig.js");
@@ -46,6 +47,16 @@ function run(args: string[], extraEnv: Record<string, string | undefined> = {}):
   );
 }
 
+function seedRegisteredRepo(repo: string, directory = stateDir): void {
+  const path = realpathSync(repo);
+  const store = new LocalStore(join(directory, "connector.sqlite"));
+  try {
+    store.addRepo({ repoId: path, name: basename(path), path, defaultBranch: "main", remote: null });
+  } finally {
+    store.close();
+  }
+}
+
 describe("bin/sig.js (skipped when dist has not been built)", () => {
   beforeEach(() => {
     if (!existsSync(join(import.meta.dirname, "..", "dist", "cli.js"))) {
@@ -63,6 +74,38 @@ describe("bin/sig.js (skipped when dist has not been built)", () => {
     expect(res.code).toBe(2);
     expect(res.stderr).toContain("usage:");
     expect(res.stderr).toContain("connect");
+  });
+
+  it("directs registration to the web workspace in help", async () => {
+    const res = await run(["--help"]);
+    expect(res.code).toBe(0);
+    expect(res.stderr).toContain("Machines > Add directory");
+    expect(res.stderr).not.toContain("add-repo");
+  });
+
+  it("rejects add-repo without creating local state", async () => {
+    const repo = await makeGitRepo(home);
+    const res = await run(["add-repo", repo]);
+    expect(res.code).toBe(2);
+    expect(res.stderr).toContain("Machines > Add directory");
+    expect(existsSync(join(stateDir, "connector.sqlite"))).toBe(false);
+    expect(existsSync(join(home, ".sig", "connector.sqlite"))).toBe(false);
+  });
+
+  it("rejects add-repo without changing existing registrations or local settings", async () => {
+    const repo = await makeGitRepo(home);
+    seedRegisteredRepo(repo);
+    const store = new LocalStore(join(stateDir, "connector.sqlite"));
+    try {
+      store.setRepoConfig(realpathSync(repo), { workspace: "serial", approved: true });
+      const before = store.listRepos();
+      const newRepo = await makeGitRepo(home, "repo-b");
+      expect((await run(["add-repo", newRepo])).code).toBe(2);
+      expect((await run(["add-repo", repo])).code).toBe(2);
+      expect(store.listRepos()).toEqual(before);
+    } finally {
+      store.close();
+    }
   });
 
   it("status on a clean machine reports unpaired and not installed", async () => {
@@ -87,17 +130,24 @@ describe("bin/sig.js (skipped when dist has not been built)", () => {
 
   it("SIG_HOME overrides the ~/.sig default", async () => {
     const repo = await makeGitRepo(home);
-    expect((await run(["add-repo", repo])).code).toBe(0);
-    expect(existsSync(join(stateDir, "connector.sqlite"))).toBe(true);
-    expect(existsSync(join(home, ".sig", "connector.sqlite"))).toBe(false);
+    const defaultRepo = await makeGitRepo(home, "default-repo");
+    seedRegisteredRepo(repo);
+    seedRegisteredRepo(defaultRepo, join(home, ".sig"));
+    const res = await run(["status"]);
+    expect(res.code).toBe(0);
+    expect(res.stdout).toContain("repo-a");
+    expect(res.stdout).not.toContain("default-repo");
   });
 
   it("continues using ~/.sig when no home setting is present", async () => {
     const repo = await makeGitRepo(home);
-    const defaults = { SIG_HOME: undefined };
-    expect((await run(["add-repo", repo], defaults)).code).toBe(0);
-    expect(existsSync(join(home, ".sig", "connector.sqlite"))).toBe(true);
-    expect((await run(["status"], defaults)).stdout).toContain("repo-a");
+    const customRepo = await makeGitRepo(home, "custom-repo");
+    seedRegisteredRepo(repo, join(home, ".sig"));
+    seedRegisteredRepo(customRepo);
+    const res = await run(["status"], { SIG_HOME: undefined });
+    expect(res.code).toBe(0);
+    expect(res.stdout).toContain("repo-a");
+    expect(res.stdout).not.toContain("custom-repo");
   });
 
   it("repo-config sets and shows the per-repo local settings (§8.2/§13, issue #16)", async () => {
@@ -107,8 +157,15 @@ describe("bin/sig.js (skipped when dist has not been built)", () => {
     const unregistered = await run(["repo-config", repo, "--workspace", "serial"]);
     expect(unregistered.code).toBe(1);
     expect(unregistered.stderr).toContain("not registered");
+    expect(unregistered.stderr).toContain("Machines > Add directory");
+    const store = new LocalStore(join(stateDir, "connector.sqlite"));
+    try {
+      expect(store.listRepos()).toEqual([]);
+    } finally {
+      store.close();
+    }
 
-    expect((await run(["add-repo", repo])).code).toBe(0);
+    seedRegisteredRepo(repo);
 
     // Invalid mode is rejected with the valid vocabulary.
     const bad = await run(["repo-config", repo, "--workspace", "sometimes"]);
@@ -133,7 +190,7 @@ describe("bin/sig.js (skipped when dist has not been built)", () => {
 
   it("repo-config parses flags in any position and both --workspace spellings (review finding 4)", async () => {
     const repo = await makeGitRepo(home);
-    expect((await run(["add-repo", repo])).code).toBe(0);
+    seedRegisteredRepo(repo);
 
     // Flags before the path: the path is still the path.
     const flagsFirst = await run(["repo-config", "--workspace", "main", repo]);
