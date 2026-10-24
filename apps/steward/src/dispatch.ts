@@ -268,7 +268,7 @@ export class Dispatcher {
     if (repoRows.length === 0) {
       return {
         kind: "refused",
-        reason: `没有机器登记过仓库「${input.repoRef}」。请告诉用户先在那台机器上 sig add-repo 并重连，或换一个他提过的仓库。`,
+        reason: `没有机器登记过仓库「${input.repoRef}」。请告诉用户在 Web 工作台打开「机器」，找到对应的在线机器并通过「添加目录」登记仓库，或换一个他提过的仓库。`,
       };
     }
     // Issue #17: the steward can target an agent (hello.agents is the menu) — but only
