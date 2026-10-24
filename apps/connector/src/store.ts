@@ -11,8 +11,17 @@
 import { DatabaseSync } from "node:sqlite";
 import { chmodSync, existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import type { GitCapability, PlainCapability, RepoCapability } from "@nightboats/protocol";
 import type { ProcRef } from "./descendants.ts";
 import { normalizeProxyConfig, type ProxyConfig } from "./proxy.ts";
+import {
+  DEFAULT_GIT_WRITE_POLICY,
+  DEFAULT_PLAIN_WRITE_POLICY,
+  type Concurrency,
+  type InPlacePolicy,
+  type Isolation,
+  type WritePolicy,
+} from "./write-policy.ts";
 
 export interface Credentials {
   serverUrl: string;
@@ -21,14 +30,7 @@ export interface Credentials {
   connEpoch: number;
 }
 
-/** Per-repo workspace mode (connector-pi.md §8.2): how write tasks get a working directory. */
-export type WorkspaceMode = "worktree" | "serial" | "main";
-
-export const WORKSPACE_MODES: readonly WorkspaceMode[] = ["worktree", "serial", "main"];
-
-export function isWorkspaceMode(value: unknown): value is WorkspaceMode {
-  return typeof value === "string" && (WORKSPACE_MODES as readonly string[]).includes(value);
-}
+export class WritePolicyError extends Error {}
 
 export class LocalStore {
   private readonly db: DatabaseSync;
@@ -66,6 +68,7 @@ export class LocalStore {
       repoId TEXT PRIMARY KEY,
       name TEXT NOT NULL,
       path TEXT NOT NULL,
+      kind TEXT NOT NULL DEFAULT 'git',
       defaultBranch TEXT,
       remote TEXT,
       addedAt INTEGER NOT NULL
@@ -97,10 +100,23 @@ export class LocalStore {
     }
     this.addColumnIfMissing("command", "markerExpected", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("command", "recovered", "INTEGER NOT NULL DEFAULT 0");
-    // §8.2/§13 (issue #16): per-repo local settings. Both are CLI-only — a command from the
+    // §8.2/§13 (issue #16): per-repo local settings. All are CLI-only — a command from the
     // steward gets their effects but can never set them.
-    this.addColumnIfMissing("repo", "workspace", "TEXT NOT NULL DEFAULT 'worktree'");
+    this.addColumnIfMissing("repo", "kind", "TEXT NOT NULL DEFAULT 'git'"); // 'git' | 'plain' — correct backfill, every pre-existing row was necessarily Git-backed
     this.addColumnIfMissing("repo", "approved", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing("repo", "isolation", "TEXT NOT NULL DEFAULT 'worktree'");
+    this.addColumnIfMissing("repo", "concurrency", "TEXT NOT NULL DEFAULT 'parallel'");
+    // Backfill from the legacy `workspace` column, if it still exists on this database, into the
+    // new isolation/concurrency pair — exact mapping, not best-effort, since only 3 legacy values
+    // ever existed. Then drop the legacy column; nothing reads it after this point (local SQLite
+    // file, single connector binary, no cross-version reader to protect, unlike the wire schema).
+    const repoColumns = this.db.prepare(`PRAGMA table_info(repo)`).all() as Array<{ name: string }>;
+    if (repoColumns.some((c) => c.name === "workspace")) {
+      this.db.exec(`UPDATE repo SET isolation = 'worktree', concurrency = 'parallel' WHERE workspace = 'worktree'`);
+      this.db.exec(`UPDATE repo SET isolation = 'worktree', concurrency = 'serial'   WHERE workspace = 'serial'`);
+      this.db.exec(`UPDATE repo SET isolation = 'in-place', concurrency = 'parallel' WHERE workspace = 'main'`);
+      this.db.exec(`ALTER TABLE repo DROP COLUMN workspace`);
+    }
     // Review finding 5 (PR #43): marks a worktree removed by cleanup_worktree, so a later
     // manual resume can be refused instead of silently running write-mode in the checkout.
     // A NULL worktree alone cannot carry that meaning — synthetic/legacy rows have it NULL.
@@ -213,48 +229,74 @@ export class LocalStore {
     this.db.close();
   }
 
-  // --- Repositories (connector-pi.md §8.1) ---------------------------------------------
-  addRepo(repo: {
-    repoId: string;
-    name: string;
-    path: string;
-    defaultBranch: string | null;
-    remote: string | null;
-  }): void {
+  // --- Repositories (connector-pi.md §8.1; issue #88 git-as-capability) -----------------
+
+  /** Registers a directory's identity + detected capability. A fresh row gets the write
+   *  policy default for its capability (worktree/parallel for Git, in-place/serial for
+   *  plain); re-registering an existing `repoId` only refreshes identity/capability fields —
+   *  the ON CONFLICT clause must never touch isolation/concurrency/approved, or a repo's
+   *  local settings would reset every time the connector reconnects and re-registers it. */
+  addRepo(repo: { repoId: string; name: string; path: string; capability: RepoCapability }): void {
+    const defaultBranch = repo.capability.kind === "git" ? repo.capability.defaultBranch : null;
+    const remote = repo.capability.kind === "git" ? repo.capability.remote : null;
+    const writePolicy = repo.capability.kind === "git" ? DEFAULT_GIT_WRITE_POLICY : DEFAULT_PLAIN_WRITE_POLICY;
     this.db
       .prepare(
-        `INSERT INTO repo (repoId, name, path, defaultBranch, remote, addedAt)
-         VALUES (?, ?, ?, ?, ?, ?)
+        `INSERT INTO repo (repoId, name, path, kind, defaultBranch, remote, isolation, concurrency, addedAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(repoId) DO UPDATE SET name = excluded.name, path = excluded.path,
-           defaultBranch = excluded.defaultBranch, remote = excluded.remote`,
+           kind = excluded.kind, defaultBranch = excluded.defaultBranch, remote = excluded.remote`,
       )
-      .run(repo.repoId, repo.name, repo.path, repo.defaultBranch, repo.remote, Date.now());
+      .run(repo.repoId, repo.name, repo.path, repo.capability.kind, defaultBranch, remote, writePolicy.isolation, writePolicy.concurrency, Date.now());
+  }
+
+  private toRegisteredRepo(row: RepoRow): RegisteredRepo {
+    const base = { repoId: row.repoId, name: row.name, path: row.path, approved: row.approved === 1 };
+    const concurrency = row.concurrency as Concurrency; // validated at the one write boundary, setWritePolicy; trusted here
+    if (row.kind === "git") {
+      return {
+        ...base,
+        capability: { kind: "git", gitRoot: row.path, defaultBranch: row.defaultBranch, remote: row.remote },
+        writePolicy: { isolation: row.isolation as Isolation, concurrency },
+      };
+    }
+    return { ...base, capability: { kind: "plain" }, writePolicy: { isolation: "in-place", concurrency } };
   }
 
   getRepo(repoId: string): RegisteredRepo | null {
     const row = this.db
-      .prepare("SELECT repoId, name, path, defaultBranch, remote, workspace, approved FROM repo WHERE repoId = ?")
-      .get(repoId) as ({ repoId: string; name: string; path: string; defaultBranch: string | null; remote: string | null; workspace: string; approved: number } | undefined);
-    return row ? { ...row, workspace: row.workspace as WorkspaceMode, approved: row.approved === 1 } : null;
+      .prepare("SELECT repoId, name, path, kind, defaultBranch, remote, isolation, concurrency, approved FROM repo WHERE repoId = ?")
+      .get(repoId) as RepoRow | undefined;
+    return row ? this.toRegisteredRepo(row) : null;
   }
 
   listRepos(): RegisteredRepo[] {
     return (
       this.db
-        .prepare("SELECT repoId, name, path, defaultBranch, remote, workspace, approved FROM repo ORDER BY repoId")
-        .all() as Array<{ repoId: string; name: string; path: string; defaultBranch: string | null; remote: string | null; workspace: string; approved: number }>
-    ).map((row) => ({ ...row, workspace: row.workspace as WorkspaceMode, approved: row.approved === 1 }));
+        .prepare("SELECT repoId, name, path, kind, defaultBranch, remote, isolation, concurrency, approved FROM repo ORDER BY repoId")
+        .all() as unknown as RepoRow[]
+    ).map((row) => this.toRegisteredRepo(row));
   }
 
-  /** Updates the local-only per-repo settings (§8.2/§13). False when the repo is unknown. */
-  setRepoConfig(repoId: string, patch: { workspace?: WorkspaceMode; approved?: boolean }): boolean {
+  /** Updates the local-only write policy (§8.2/§13). False when the repo is unknown; throws
+   *  `WritePolicyError` when the requested isolation is `worktree` on a plain (non-Git)
+   *  repo — there is no git mechanism to isolate into. */
+  setWritePolicy(repoId: string, patch: { isolation?: Isolation; concurrency?: Concurrency }): boolean {
+    const repo = this.getRepo(repoId);
+    if (!repo) return false;
+    const isolation = patch.isolation ?? repo.writePolicy.isolation;
+    const concurrency = patch.concurrency ?? repo.writePolicy.concurrency;
+    if (isolation === "worktree" && repo.capability.kind !== "git") {
+      throw new WritePolicyError(`'${repo.name}' is a plain workspace (no Git); worktree isolation is not available.`);
+    }
+    this.db.prepare("UPDATE repo SET isolation = ?, concurrency = ? WHERE repoId = ?").run(isolation, concurrency, repoId);
+    return true;
+  }
+
+  /** Updates the local-only approveProject setting (§13). False when the repo is unknown. */
+  setApproved(repoId: string, approved: boolean): boolean {
     if (!this.getRepo(repoId)) return false;
-    if (patch.workspace !== undefined) {
-      this.db.prepare("UPDATE repo SET workspace = ? WHERE repoId = ?").run(patch.workspace, repoId);
-    }
-    if (patch.approved !== undefined) {
-      this.db.prepare("UPDATE repo SET approved = ? WHERE repoId = ?").run(patch.approved ? 1 : 0, repoId);
-    }
+    this.db.prepare("UPDATE repo SET approved = ? WHERE repoId = ?").run(approved ? 1 : 0, repoId);
     return true;
   }
 
@@ -424,18 +466,34 @@ export class LocalStore {
 
 }
 
-export interface RegisteredRepo {
+/** The raw `repo` table row shape shared by `getRepo`/`listRepos`'s SELECTs. */
+interface RepoRow {
   repoId: string;
   name: string;
   path: string;
+  kind: string;
   defaultBranch: string | null;
   remote: string | null;
-  /** How write tasks get a directory (§8.2): a fresh worktree (default), one-at-a-time serial
-   * worktrees, or the main checkout itself. */
-  workspace: WorkspaceMode;
-  /** approveProject (§13): run pi with --approve in this repo. Set on the machine only. */
-  approved: boolean;
+  isolation: string;
+  concurrency: string;
+  approved: number;
 }
+
+interface RegisteredRepoBase {
+  readonly repoId: string;
+  readonly name: string;
+  readonly path: string;
+  /** approveProject (§13): run pi with --approve in this repo. Set on the machine only. */
+  readonly approved: boolean;
+}
+
+/** A registered directory's identity plus its detected Git capability and write policy
+ *  (issue #88: Git is optional, detected — not a registration requirement). Narrowing on
+ *  `capability.kind` also narrows `writePolicy`'s type: a plain repo can only ever be
+ *  `in-place`, so there is no `worktree`+`plain` combination to handle at call sites. */
+export type RegisteredRepo =
+  | (RegisteredRepoBase & { capability: GitCapability; writePolicy: WritePolicy })
+  | (RegisteredRepoBase & { capability: PlainCapability; writePolicy: InPlacePolicy });
 
 export interface WorkerRow {
   workerId: string;

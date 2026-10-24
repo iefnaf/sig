@@ -1,7 +1,8 @@
 import { rmSync, writeFileSync } from "node:fs";
+import { realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { WorktreeManager, defaultBranch, slugify } from "../src/worktree.ts";
+import { WorktreeManager, defaultBranch, identifyWorkspace, repoTopLevel, slugify } from "../src/worktree.ts";
 import { git, makeGitRepo, tmpDir } from "./helpers.ts";
 
 let dir: string;
@@ -85,6 +86,23 @@ describe("defaultBranch (§8.2: local default branch, no network)", () => {
 
   it("falls back to conventional names", async () => {
     expect(await defaultBranch(repo)).toBe("main");
+  });
+});
+
+describe("identifyWorkspace (issue #88: Git is a detected capability, not a requirement)", () => {
+  it("resolves a Git-backed path to the same identity repoTopLevel returns, with a git capability", async () => {
+    const expected = await repoTopLevel(repo);
+    const identity = await identifyWorkspace(repo);
+    expect(identity.repoId).toBe(expected); // byte-identical: no migration of existing identity
+    expect(identity.capability.kind).toBe("git");
+  });
+
+  it("resolves a plain (non-Git) directory to its realpath, with a plain capability", async () => {
+    const plain = tmpDir("sig-plain-workspace-test");
+    const identity = await identifyWorkspace(plain);
+    expect(identity.capability).toEqual({ kind: "plain" });
+    expect(identity.repoId).toBe(await realpath(plain));
+    rmSync(plain, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
   });
 });
 

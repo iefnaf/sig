@@ -107,7 +107,7 @@ function seedWorker(overrides: Partial<WorkerRow> & { workerId: string }): Worke
     ...rest,
   };
   store.upsertWorker(worker);
-  store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+  store.addRepo({ repoId: repo, name: "repo-a", path: repo, capability: { kind: "git", gitRoot: repo, defaultBranch: "main", remote: null } });
   return worker;
 }
 
@@ -257,7 +257,7 @@ describe("descendant snapshots and orphan cleanup (connector-pi.md §9.3)", () =
       snapshotIntervalMs: 250,
       autoResumeBackoffMs: 60_000,
     });
-    store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+    store.addRepo({ repoId: repo, name: "repo-a", path: repo, capability: { kind: "git", gitRoot: repo, defaultBranch: "main", remote: null } });
     await manager.startWorker("cmd-orph-2", {
       workerId: "w-orph-2",
       threadId: "fix-the-login-bug",
@@ -372,7 +372,7 @@ describe("automatic resume policy (connector-pi.md §9.2)", () => {
       { exit: 7 },
     ];
     const manager = setupManager([crashRun], { autoResumeBackoffMs: 25 });
-    store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+    store.addRepo({ repoId: repo, name: "repo-a", path: repo, capability: { kind: "git", gitRoot: repo, defaultBranch: "main", remote: null } });
     await manager.startWorker("cmd-crashloop-1", {
       workerId: "w-loop-1",
       threadId: "fix-the-login-bug",
@@ -417,7 +417,7 @@ describe("automatic resume policy (connector-pi.md §9.2)", () => {
     const manager = setupManager([transientError, reportRun({ status: "done", summary: "recovered" })], {
       autoResumeBackoffMs: 25,
     });
-    store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+    store.addRepo({ repoId: repo, name: "repo-a", path: repo, capability: { kind: "git", gitRoot: repo, defaultBranch: "main", remote: null } });
     await manager.startWorker("cmd-transient-1", {
       workerId: "w-trans-1",
       threadId: "fix-the-login-bug",
@@ -452,7 +452,7 @@ describe("automatic resume policy (connector-pi.md §9.2)", () => {
     const manager = setupManager([authError, reportRun({ status: "done", summary: "must not run" })], {
       autoResumeBackoffMs: 25,
     });
-    store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+    store.addRepo({ repoId: repo, name: "repo-a", path: repo, capability: { kind: "git", gitRoot: repo, defaultBranch: "main", remote: null } });
     await manager.startWorker("cmd-auth-1", {
       workerId: "w-auth-1",
       threadId: "fix-the-login-bug",

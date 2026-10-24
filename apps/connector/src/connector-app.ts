@@ -153,7 +153,7 @@ export class ConnectorApp {
         data = { workers: this.workersSnapshot() };
       } else if (cmd.kind === "register_repo") {
         const parsed = RegisterRepoArgsSchema.safeParse(cmd.args);
-        if (!parsed.success) throw new CommandError("invalid_directory", "Choose an existing Git directory on this machine.");
+        if (!parsed.success) throw new CommandError("invalid_directory", "A directory path is required.");
         const requested = parsed.data.path;
         const path = requested === "~" ? os.homedir() : requested.startsWith("~/") ? join(os.homedir(), requested.slice(2)) : requested;
         if (!isAbsolute(path)) throw new CommandError("invalid_directory", "Use an absolute path or ~/path on this machine.");
@@ -203,8 +203,9 @@ export class ConnectorApp {
         repoId: r.repoId,
         name: r.name,
         path: r.path,
-        defaultBranch: r.defaultBranch ?? "",
-        remote: r.remote ?? "",
+        defaultBranch: r.capability.kind === "git" ? r.capability.defaultBranch ?? "" : "",
+        remote: r.capability.kind === "git" ? r.capability.remote ?? "" : "",
+        capability: r.capability,
       })),
       limits: {
         maxWorkers: maxWorkersFromMemory(),

@@ -40,7 +40,7 @@ import {
   type ProxyConfig,
 } from "./proxy.ts";
 import { getServiceInstaller, SIG_LABEL, type ServiceInstaller, type ServiceSpec } from "./service.ts";
-import { isWorkspaceMode, LocalStore, WORKSPACE_MODES } from "./store.ts";
+import { LocalStore, type RegisteredRepo } from "./store.ts";
 import { repoTopLevel } from "./worktree.ts";
 import { registerRepository } from "./repository.ts";
 import { runUpgrade } from "./upgrade.ts";
@@ -458,7 +458,7 @@ async function statusCommand(): Promise<void> {
     const repoLine =
       repos.length === 0
         ? "none (sig add-repo <path>)"
-        : repos.map((r) => `${r.name}[${r.workspace}${r.approved ? ", approved" : ""}]`).join(", ");
+        : repos.map((r) => `${r.name}[${cliModeFlagLabel(r)}${r.approved ? ", approved" : ""}]`).join(", ");
     console.log(`repos:    ${repoLine}`);
   } finally {
     store.close();
@@ -573,6 +573,27 @@ async function addRepo(path: string | undefined): Promise<void> {
 
 // --- repo-config -----------------------------------------------------------------------------
 
+// The CLI still speaks the pre-issue-#88 three-value `--workspace` vocabulary (redesigning this
+// flag surface onto isolation/concurrency directly is a later layer's job); these helpers are
+// the one place that vocabulary maps onto the new write-policy axes it decomposes into.
+const CLI_MODE_FLAGS = ["worktree", "serial", "main"] as const;
+type CliModeFlag = (typeof CLI_MODE_FLAGS)[number];
+
+function isCliModeFlag(value: unknown): value is CliModeFlag {
+  return typeof value === "string" && (CLI_MODE_FLAGS as readonly string[]).includes(value);
+}
+
+function cliModeFlagToPolicy(mode: CliModeFlag): { isolation: "worktree" | "in-place"; concurrency: "parallel" | "serial" } {
+  if (mode === "worktree") return { isolation: "worktree", concurrency: "parallel" };
+  if (mode === "serial") return { isolation: "worktree", concurrency: "serial" };
+  return { isolation: "in-place", concurrency: "parallel" };
+}
+
+function cliModeFlagLabel(repo: RegisteredRepo): CliModeFlag {
+  if (repo.writePolicy.isolation === "in-place") return "main";
+  return repo.writePolicy.concurrency === "serial" ? "serial" : "worktree";
+}
+
 /** Parses repo-config argv: positional path + `--workspace worktree|serial|main` (also the
  * `--workspace=x` form) + `--approve|--no-approve`. Unknown flags fail loudly instead of
  * silently degrading into a read-only invocation (review finding 4). */
@@ -606,8 +627,8 @@ function parseRepoConfigArgv(argv: string[]): { path?: string; workspace?: strin
 async function repoConfig(argv: string[]): Promise<void> {
   const { path, workspace, approve } = parseRepoConfigArgv(argv);
   if (!path) usage();
-  if (workspace !== undefined && !isWorkspaceMode(workspace)) {
-    fail(`unknown workspace mode '${workspace}' (expected one of: ${WORKSPACE_MODES.join(" | ")})`);
+  if (workspace !== undefined && !isCliModeFlag(workspace)) {
+    fail(`unknown workspace mode '${workspace}' (expected one of: ${CLI_MODE_FLAGS.join(" | ")})`);
   }
 
   const topLevel = await repoTopLevel(path);
@@ -620,16 +641,14 @@ async function repoConfig(argv: string[]): Promise<void> {
     if (workspace === undefined && approve === undefined) {
       // Read-only invocation: show the current settings.
       console.log(`${repo.name} (${repo.repoId})`);
-      console.log(`workspace: ${repo.workspace}`);
+      console.log(`workspace: ${cliModeFlagLabel(repo)}`);
       console.log(`approved:  ${repo.approved ? "yes (pi runs with --approve)" : "no (pi runs with --no-approve)"}`);
       return;
     }
-    store.setRepoConfig(topLevel, {
-      ...(workspace !== undefined ? { workspace } : {}),
-      ...(approve !== undefined ? { approved: approve } : {}),
-    });
+    if (workspace !== undefined) store.setWritePolicy(topLevel, cliModeFlagToPolicy(workspace));
+    if (approve !== undefined) store.setApproved(topLevel, approve);
     const updated = store.getRepo(topLevel)!;
-    console.log(`${updated.name}: workspace=${updated.workspace}, approved=${updated.approved ? "yes" : "no"}`);
+    console.log(`${updated.name}: workspace=${cliModeFlagLabel(updated)}, approved=${updated.approved ? "yes" : "no"}`);
   } finally {
     store.close();
   }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ErrorMessageSchema, HelloMessageSchema, PROTOCOL_VERSION, WelcomeMessageSchema } from "../src/messages.ts";
+import { capabilityOf, ErrorMessageSchema, HelloMessageSchema, PROTOCOL_VERSION, RepoSchema, WelcomeMessageSchema } from "../src/messages.ts";
 
 const validHello = {
   t: "hello",
@@ -68,6 +68,42 @@ describe("WelcomeMessageSchema", () => {
   it("rejects a missing re", () => {
     const { re, ...withoutRe } = validWelcome;
     expect(WelcomeMessageSchema.safeParse(withoutRe).success).toBe(false);
+  });
+});
+
+describe("RepoSchema / capabilityOf (issue #88: Git as a detected capability)", () => {
+  const legacyRepo = { repoId: "/r", name: "r", path: "/r", defaultBranch: "main", remote: "git@x:r.git" };
+
+  it("accepts a repo with no capability field (a pre-this-change connector's payload)", () => {
+    expect(RepoSchema.safeParse(legacyRepo).success).toBe(true);
+  });
+
+  it("accepts a repo with a git capability", () => {
+    const withCapability = { ...legacyRepo, capability: { kind: "git", gitRoot: "/r", defaultBranch: "main", remote: null } };
+    expect(RepoSchema.safeParse(withCapability).success).toBe(true);
+  });
+
+  it("accepts a repo with a plain capability", () => {
+    const withCapability = { ...legacyRepo, capability: { kind: "plain" } };
+    expect(RepoSchema.safeParse(withCapability).success).toBe(true);
+  });
+
+  it("rejects an unknown capability kind", () => {
+    const withCapability = { ...legacyRepo, capability: { kind: "svn" } };
+    expect(RepoSchema.safeParse(withCapability).success).toBe(false);
+  });
+
+  it("capabilityOf bridges a legacy (capability-less) repo to the git shape it could only ever have been", () => {
+    expect(capabilityOf(legacyRepo)).toEqual({ kind: "git", gitRoot: "/r", defaultBranch: "main", remote: "git@x:r.git" });
+  });
+
+  it("capabilityOf treats empty-string legacy fields as absent (null), not empty strings", () => {
+    expect(capabilityOf({ ...legacyRepo, defaultBranch: "", remote: "" })).toEqual({ kind: "git", gitRoot: "/r", defaultBranch: null, remote: null });
+  });
+
+  it("capabilityOf prefers an explicit capability over the legacy fields", () => {
+    const plain = { ...legacyRepo, capability: { kind: "plain" as const } };
+    expect(capabilityOf(plain)).toEqual({ kind: "plain" });
   });
 });
 

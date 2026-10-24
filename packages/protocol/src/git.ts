@@ -14,3 +14,17 @@ export interface GitFacts {
   changedFiles?: string[];
   pointersTruncated?: boolean;
 }
+
+// Repo capability (issue #88): Git is a detected, optional capability of a registered
+// directory, not a registration requirement. A Git-backed repo keeps worktree isolation,
+// branch/diff reporting, and PR support; a plain workspace has none of those.
+export interface GitCapability {
+  readonly kind: "git";
+  readonly gitRoot: string;
+  readonly defaultBranch: string | null;
+  readonly remote: string | null;
+}
+export interface PlainCapability {
+  readonly kind: "plain";
+}
+export type RepoCapability = GitCapability | PlainCapability;

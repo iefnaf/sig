@@ -72,7 +72,7 @@ beforeEach(async () => {
   eventLog = new EventLog(store.database);
   events = [];
   piLog = join(dir, "pi.log");
-  store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+  store.addRepo({ repoId: repo, name: "repo-a", path: repo, capability: { kind: "git", gitRoot: repo, defaultBranch: "main", remote: null } });
 });
 
 afterEach(async () => {

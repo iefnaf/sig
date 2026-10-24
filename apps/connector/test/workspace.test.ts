@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { installAssets } from "../src/install.ts";
 import { PiAdapter } from "../src/pi-adapter.ts";
-import { LocalStore, WORKSPACE_MODES } from "../src/store.ts";
+import { LocalStore } from "../src/store.ts";
 import { CommandError, WorkerManager, type StartWorkerArgs } from "../src/worker-manager.ts";
 import { EventLog } from "../src/events.ts";
 import { lockPath } from "../src/locks.ts";
@@ -73,11 +73,20 @@ function setup(runs: ScenarioStep[][], extraEnv: Record<string, string> = {}): v
   });
 }
 
+// Legacy three-value vocabulary kept at the test's call sites (unrelated to this layer's
+// scope); mapped here onto the isolation/concurrency axes it decomposes into.
 function registerRepo(workspace?: "worktree" | "serial" | "main", approved = false): void {
-  store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
-  if (workspace !== undefined || approved) {
-    store.setRepoConfig(repo, { ...(workspace !== undefined ? { workspace } : {}), approved });
+  store.addRepo({ repoId: repo, name: "repo-a", path: repo, capability: { kind: "git", gitRoot: repo, defaultBranch: "main", remote: null } });
+  if (workspace !== undefined) {
+    const policy =
+      workspace === "worktree"
+        ? { isolation: "worktree" as const, concurrency: "parallel" as const }
+        : workspace === "serial"
+          ? { isolation: "worktree" as const, concurrency: "serial" as const }
+          : { isolation: "in-place" as const, concurrency: "parallel" as const };
+    store.setWritePolicy(repo, policy);
   }
+  if (approved) store.setApproved(repo, true);
 }
 
 function args(overrides: Partial<StartWorkerArgs> = {}): StartWorkerArgs {
@@ -152,7 +161,7 @@ describe("per-repo workspace modes (spec §11, connector-pi.md §8.2)", () => {
     const result = await manager.startWorker("cmd-wt-1", args());
     await waitFor(() => settledOf("w-ws-test-1"), 15_000, "settled event");
     expect(result.worktree).toMatch(/worktrees\/repo-a-[0-9a-f]{8}\/the-thread-1$/);
-    expect(store.getRepo(repo)).toMatchObject({ workspace: "worktree", approved: false });
+    expect(store.getRepo(repo)).toMatchObject({ writePolicy: { isolation: "worktree", concurrency: "parallel" }, approved: false });
   }, 30_000);
 
   it("main mode: write tasks run directly in the checkout, base is ignored", async () => {
@@ -508,20 +517,21 @@ describe("readonly relay legs continue from the previous branch (issue #8, spec 
 });
 
 describe("LocalStore per-repo config and the queue tables (issue #16)", () => {
-  it("persists workspace/approved per repo, defaulting to worktree/unapproved", () => {
-    store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
-    expect(store.getRepo(repo)).toMatchObject({ workspace: "worktree", approved: false });
-    expect(store.setRepoConfig(repo, { workspace: "serial", approved: true })).toBe(true);
-    expect(store.getRepo(repo)).toMatchObject({ workspace: "serial", approved: true });
+  it("persists write policy/approved per repo, defaulting to worktree/parallel/unapproved", () => {
+    store.addRepo({ repoId: repo, name: "repo-a", path: repo, capability: { kind: "git", gitRoot: repo, defaultBranch: "main", remote: null } });
+    expect(store.getRepo(repo)).toMatchObject({ writePolicy: { isolation: "worktree", concurrency: "parallel" }, approved: false });
+    expect(store.setWritePolicy(repo, { concurrency: "serial" })).toBe(true);
+    expect(store.setApproved(repo, true)).toBe(true);
+    expect(store.getRepo(repo)).toMatchObject({ writePolicy: { isolation: "worktree", concurrency: "serial" }, approved: true });
     // Re-registering (add-repo again) never resets local settings.
-    store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
-    expect(store.getRepo(repo)).toMatchObject({ workspace: "serial", approved: true });
-    expect(store.setRepoConfig("/no/such/repo", { workspace: "main" })).toBe(false);
-    expect(WORKSPACE_MODES).toEqual(["worktree", "serial", "main"]);
+    store.addRepo({ repoId: repo, name: "repo-a", path: repo, capability: { kind: "git", gitRoot: repo, defaultBranch: "main", remote: null } });
+    expect(store.getRepo(repo)).toMatchObject({ writePolicy: { isolation: "worktree", concurrency: "serial" }, approved: true });
+    expect(store.setWritePolicy("/no/such/repo", { isolation: "in-place" })).toBe(false);
+    expect(store.setApproved("/no/such/repo", true)).toBe(false);
   });
 
   it("round-trips queued starts and clears worktree columns", async () => {
-    store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+    store.addRepo({ repoId: repo, name: "repo-a", path: repo, capability: { kind: "git", gitRoot: repo, defaultBranch: "main", remote: null } });
     store.upsertWorker({ workerId: "w-q", threadId: "t", repoId: repo, mode: "write", state: "queued" });
     store.saveQueuedStart("w-q", "cmd-q", { prompt: "task", mode: "write" });
     expect(store.getQueuedStart("w-q")).toMatchObject({ commandId: "cmd-q" });
@@ -534,7 +544,7 @@ describe("LocalStore per-repo config and the queue tables (issue #16)", () => {
   });
 
   it("listWorkers returns creation order (the serial queue's FIFO)", async () => {
-    store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+    store.addRepo({ repoId: repo, name: "repo-a", path: repo, capability: { kind: "git", gitRoot: repo, defaultBranch: "main", remote: null } });
     for (const id of ["w-z-late-created-first", "w-a"]) {
       // createdAt comes from Date.now(); force ordering with a tiny sleep.
       store.upsertWorker({ workerId: id, threadId: "t", repoId: repo, mode: "write", state: "queued" });

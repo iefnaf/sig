@@ -449,7 +449,7 @@ export class WorkerManager {
     // is queued (FIFO) and starts when the current one settles; the command result says so,
     // and the `started` event follows when the slot frees. Readonly tasks are never isolated
     // (§8.3) and never queue.
-    if (args.mode === "write" && repo.workspace === "serial") {
+    if (args.mode === "write" && repo.writePolicy.concurrency === "serial") {
       const holder = this.writeSlotHolder(args.repoId, args.workerId);
       if (holder) {
         this.store.upsertWorker({
@@ -515,7 +515,7 @@ export class WorkerManager {
       // Readonly + base → a DETACHED-HEAD worktree at that base (issue #8): a review leg
       // continues from the write leg's branch without checking anything out in the owner's
       // working directory.
-      const useWorktree = (args.mode === "write" && repo.workspace !== "main") || (args.mode === "readonly" && !!args.base);
+      const useWorktree = (args.mode === "write" && repo.writePolicy.isolation !== "in-place") || (args.mode === "readonly" && !!args.base);
       let cwd = repo.path;
       if (useWorktree) {
         try {
@@ -753,7 +753,7 @@ export class WorkerManager {
   private serialSlotHeldByAnother(worker: WorkerRow): boolean {
     if (worker.mode !== "write") return false; // readonly tasks are never isolated (§8.3)
     const repo = this.store.getRepo(worker.repoId);
-    return repo?.workspace === "serial" && this.writeSlotHolder(worker.repoId, worker.workerId) !== undefined;
+    return repo?.writePolicy.concurrency === "serial" && this.writeSlotHolder(worker.repoId, worker.workerId) !== undefined;
   }
 
   /** Starts the next queued write worker of every repo whose slot freed up. Triggered by
@@ -1715,7 +1715,7 @@ export class WorkerManager {
     if (
       worker.mode === "write" &&
       repo &&
-      repo.workspace !== "main" &&
+      repo.writePolicy.isolation !== "in-place" &&
       !worker.worktree &&
       worker.worktreeCleanedAt
     ) {

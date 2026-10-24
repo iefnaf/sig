@@ -69,7 +69,7 @@ describe.skipIf(!LIVE)("pr_worker against a real repo (issue #21 AC5)", () => {
     // 3. A worker row shaped exactly like a settled write task, then the REAL command:
     //    real git push + real gh pr create, no exec seam anywhere.
     store = new LocalStore(join(stateDir, "connector.sqlite"));
-    store.addRepo({ repoId: clone, name: repoName, path: clone, defaultBranch: "main", remote: `https://github.com/${who}/${repoName}.git` });
+    store.addRepo({ repoId: clone, name: repoName, path: clone, capability: { kind: "git", gitRoot: clone, defaultBranch: "main", remote: `https://github.com/${who}/${repoName}.git` } });
     manager = new WorkerManager({
       store,
       stateDir,

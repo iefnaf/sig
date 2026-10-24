@@ -7,8 +7,10 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
+import { realpath } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
+import type { RepoCapability } from "@nightboats/protocol";
 
 const exec = promisify(execFile);
 
@@ -71,6 +73,32 @@ async function branchExists(repoPath: string, branch: string): Promise<boolean> 
     return true;
   } catch {
     return false;
+  }
+}
+
+/** Canonicalizes a user-selected path into the identity Sig uses as `repoId`, plus whatever
+ *  Git capability is detected there. Git-backed: identity = git top-level (byte-identical to
+ *  what `repoTopLevel` alone returned before this change — every existing repo's `repoId` is
+ *  unaffected). Not Git-backed: identity = realpath(path) — a plain workspace has no repo
+ *  root to normalize to, so its own canonical filesystem path *is* its identity. */
+export async function identifyWorkspace(path: string): Promise<{ repoId: string; capability: RepoCapability }> {
+  try {
+    const gitRoot = await repoTopLevel(path);
+    const remote = await readOriginRemote(gitRoot);
+    const branch = await defaultBranch(gitRoot).catch(() => null);
+    return { repoId: gitRoot, capability: { kind: "git", gitRoot, defaultBranch: branch, remote } };
+  } catch {
+    const real = await realpath(path); // throws only if `path` itself doesn't resolve
+    return { repoId: real, capability: { kind: "plain" } };
+  }
+}
+
+async function readOriginRemote(repoPath: string): Promise<string | null> {
+  try {
+    const stdout = await git(repoPath, ["config", "--get", "remote.origin.url"]);
+    return stdout.trim() || null;
+  } catch {
+    return null;
   }
 }
 

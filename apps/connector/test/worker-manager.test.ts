@@ -97,7 +97,7 @@ describe("WorkerManager over fake-pi (connector-pi.md §4–§8, §11)", () => {
         { shellBefore: "echo fix > fix.txt && git add -A && git commit -m fix", tool: "edit" },
       ),
     ]);
-    store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+    store.addRepo({ repoId: repo, name: "repo-a", path: repo, capability: { kind: "git", gitRoot: repo, defaultBranch: "main", remote: null } });
 
     const result = await manager.startWorker("cmd-happy-1", args());
     await waitFor(() => settled(), 15_000, "settled event");
@@ -154,7 +154,7 @@ describe("WorkerManager over fake-pi (connector-pi.md §4–§8, §11)", () => {
         { emit: { type: "agent_settled", aborted: false } },
       ],
     ]);
-    store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+    store.addRepo({ repoId: repo, name: "repo-a", path: repo, capability: { kind: "git", gitRoot: repo, defaultBranch: "main", remote: null } });
     await manager.startWorker("cmd-prog-1", args());
     await waitFor(() => settled(), 15_000, "settled event");
 
@@ -169,7 +169,7 @@ describe("WorkerManager over fake-pi (connector-pi.md §4–§8, §11)", () => {
 
   it("unreported: no report call → settled carries the last assistant text", async () => {
     setup([assistantTurn("I think the fix is done now.")]);
-    store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+    store.addRepo({ repoId: repo, name: "repo-a", path: repo, capability: { kind: "git", gitRoot: repo, defaultBranch: "main", remote: null } });
     await manager.startWorker("cmd-unrep-1", args());
     await waitFor(() => settled(), 15_000, "settled event");
 
@@ -206,7 +206,7 @@ describe("WorkerManager over fake-pi (connector-pi.md §4–§8, §11)", () => {
       { emit: { type: "agent_settled", aborted: false } },
     ];
     setup([errorRun]);
-    store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+    store.addRepo({ repoId: repo, name: "repo-a", path: repo, capability: { kind: "git", gitRoot: repo, defaultBranch: "main", remote: null } });
     await manager.startWorker("cmd-err-1", args());
     await waitFor(() => settled(), 15_000, "settled event");
 
@@ -225,7 +225,7 @@ describe("WorkerManager over fake-pi (connector-pi.md §4–§8, §11)", () => {
         { emit: { type: "agent_settled", aborted: true } },
       ],
     ]);
-    store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+    store.addRepo({ repoId: repo, name: "repo-a", path: repo, capability: { kind: "git", gitRoot: repo, defaultBranch: "main", remote: null } });
     await manager.startWorker("cmd-abort-1", args());
     await waitFor(() => settled(), 15_000, "settled event");
 
@@ -241,7 +241,7 @@ describe("WorkerManager over fake-pi (connector-pi.md §4–§8, §11)", () => {
         { exit: 7 },
       ],
     ]);
-    store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+    store.addRepo({ repoId: repo, name: "repo-a", path: repo, capability: { kind: "git", gitRoot: repo, defaultBranch: "main", remote: null } });
     await manager.startWorker("cmd-crash-1", args());
     await waitFor(() => events.some((e) => e.type === "lost"), 15_000, "lost event");
 
@@ -253,7 +253,7 @@ describe("WorkerManager over fake-pi (connector-pi.md §4–§8, §11)", () => {
 
   it("rejects images over the 4 MB base64 entrance check (§6.2)", async () => {
     setup([assistantTurn("x")]);
-    store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+    store.addRepo({ repoId: repo, name: "repo-a", path: repo, capability: { kind: "git", gitRoot: repo, defaultBranch: "main", remote: null } });
     const big = "A".repeat(4 * 1024 * 1024 + 1);
     await expect(
       manager.startWorker("cmd-img-1", args({ images: [{ data: big, mimeType: "image/png" }] })),
@@ -271,7 +271,7 @@ describe("WorkerManager over fake-pi (connector-pi.md §4–§8, §11)", () => {
 
   it("rejects with lock_held while the lock names a live process (§4.3)", async () => {
     setup([assistantTurn("x")]);
-    store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+    store.addRepo({ repoId: repo, name: "repo-a", path: repo, capability: { kind: "git", gitRoot: repo, defaultBranch: "main", remote: null } });
     // Hold the lock from a live process (this test process).
     const { acquireLock } = await import("../src/locks.ts");
     const held = acquireLock(stateDir, "w-test-worker-1");
@@ -300,7 +300,7 @@ describe("WorkerManager over fake-pi (connector-pi.md §4–§8, §11)", () => {
         events.push(JSON.parse(stored.payload) as EmittedEvent);
       },
     });
-    store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+    store.addRepo({ repoId: repo, name: "repo-a", path: repo, capability: { kind: "git", gitRoot: repo, defaultBranch: "main", remote: null } });
 
     await expect(manager.startWorker("cmd-startup-1", args())).rejects.toMatchObject({ code: "startup_failed" });
     expect(store.getWorker("w-test-worker-1")?.state).toBe("broken");
@@ -309,7 +309,7 @@ describe("WorkerManager over fake-pi (connector-pi.md §4–§8, §11)", () => {
 
   it("readonly mode: no worktree, cwd is the repository itself", async () => {
     setup([reportRun({ status: "done", summary: "read only" })]);
-    store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+    store.addRepo({ repoId: repo, name: "repo-a", path: repo, capability: { kind: "git", gitRoot: repo, defaultBranch: "main", remote: null } });
     const result = await manager.startWorker("cmd-ro-1", args({ mode: "readonly" }));
     await waitFor(() => settled(), 15_000, "settled event");
 
@@ -338,7 +338,7 @@ describe("WorkerManager over fake-pi (connector-pi.md §4–§8, §11)", () => {
         events.push(JSON.parse(stored.payload) as EmittedEvent);
       },
     });
-    store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+    store.addRepo({ repoId: repo, name: "repo-a", path: repo, capability: { kind: "git", gitRoot: repo, defaultBranch: "main", remote: null } });
 
     await manager.startWorker("cmd-marker-1", args({ prompt: "Fix the login bug" }));
     await waitFor(() => settled(), 15_000, "settled event");
@@ -359,7 +359,7 @@ describe("WorkerManager over fake-pi (connector-pi.md §4–§8, §11)", () => {
 
   it("writes the sig extension into the state dir, not referencing the repo (§4.2)", async () => {
     setup([reportRun({ status: "done", summary: "s" })]);
-    store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+    store.addRepo({ repoId: repo, name: "repo-a", path: repo, capability: { kind: "git", gitRoot: repo, defaultBranch: "main", remote: null } });
     await manager.startWorker("cmd-assets-1", args());
     await waitFor(() => settled(), 15_000, "settled event");
     const ext = join(stateDir, "ext", `sig-pi-${VERSION}.ts`);
