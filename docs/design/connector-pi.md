@@ -272,7 +272,7 @@ Item 6 mitigates the prompt-injection surface: `AGENTS.md` is loaded regardless 
 
 ### 8.1 Repository whitelist
 
-The connector starts workers only in **registered repositories**. The owner registers an existing Git directory through **Add directory** on the web machine page or `sig add-repo <path>` on the machine. Both use the same local Git-root validation and registry operation. A `start_worker` pointing at an unregistered path is always rejected.
+The connector starts workers only in **registered repositories**. The owner registers an existing Git directory through **Add directory** on the web machine page. The connector validates the Git root and persists it in the local registry before returning success. A `start_worker` pointing at an unregistered path is always rejected. Project approval and workspace mode remain local settings managed with `sig repo-config`.
 
 Web registration trusts the steward to convey an authenticated owner's explicit request. The steward model has no registration tool. This replaces the former guarantee that a compromised steward cannot extend the repository whitelist. Project approval and workspace mode remain local settings. Re-registering a directory preserves both.
 
