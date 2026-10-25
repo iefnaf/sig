@@ -339,7 +339,7 @@ describe("StallWatchdog (detection and strike policy)", () => {
 describe("worker stalls through the manager (fake-pi)", () => {
   it("double stall: one respawn with a continuation note, then settles error:stall", async () => {
     setup([stallRun(), stallRun()], { sharedRuns: true });
-    store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+    store.addRepo({ repoId: repo, name: "repo-a", path: repo, capability: { kind: "git", gitRoot: repo, defaultBranch: "main", remote: null } });
     treeScript = [coldTree()];
     const result = await manager.startWorker("cmd-stall", args());
     expect(result.sessionId).toBe("w-stall-1");
@@ -384,7 +384,7 @@ describe("worker stalls through the manager (fake-pi)", () => {
       },
       watchdog: { stallMs: 400, tickMs: 80, cpuSampleGapMs: 10, sampleTreeCpu: scriptedTree },
     });
-    store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+    store.addRepo({ repoId: repo, name: "repo-a", path: repo, capability: { kind: "git", gitRoot: repo, defaultBranch: "main", remote: null } });
     treeScript = [coldTree()];
 
     const result = await manager.startWorker("cmd-stall", args());
@@ -411,7 +411,7 @@ describe("worker stalls through the manager (fake-pi)", () => {
 
   it("quiet-but-hot is not a stall: a silent process whose tree burns CPU is left alone", async () => {
     setup([stallRun(1_500)], { sample: hotTreeSampler() });
-    store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+    store.addRepo({ repoId: repo, name: "repo-a", path: repo, capability: { kind: "git", gitRoot: repo, defaultBranch: "main", remote: null } });
 
     await manager.startWorker("cmd-hot", args());
     // Plenty of ticks pass the silence threshold while the tree keeps accumulating CPU.
@@ -440,7 +440,7 @@ describe("worker stalls through the manager (fake-pi)", () => {
       { emit: { type: "agent_settled", aborted: false } },
     ];
     setup([chatter]);
-    store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+    store.addRepo({ repoId: repo, name: "repo-a", path: repo, capability: { kind: "git", gitRoot: repo, defaultBranch: "main", remote: null } });
     treeScript = [coldTree()];
 
     await manager.startWorker("cmd-chatty", args());
@@ -496,7 +496,7 @@ describe("the strike window vs sends and stops (PR #46 review round 3)", () => {
       ],
       5_000,
     );
-    store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+    store.addRepo({ repoId: repo, name: "repo-a", path: repo, capability: { kind: "git", gitRoot: repo, defaultBranch: "main", remote: null } });
     treeScript = [coldTree()];
     await manager.startWorker("cmd-window", args());
     await strikeFired(); // state is `recovering`, the respawn's spawn is gated
@@ -518,7 +518,7 @@ describe("the strike window vs sends and stops (PR #46 review round 3)", () => {
 
   it("a stop landing mid-respawn wins: no resumed, no error:stall on top of the aborted settle", async () => {
     const { releaseSpawn } = setupGatedRespawn([stallRun(), stallRun()]);
-    store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+    store.addRepo({ repoId: repo, name: "repo-a", path: repo, capability: { kind: "git", gitRoot: repo, defaultBranch: "main", remote: null } });
     treeScript = [coldTree()];
     await manager.startWorker("cmd-window-2", args());
     await strikeFired();
@@ -567,7 +567,7 @@ describe("the production sampler under a busy tool child (fake-pi, real ps)", ()
       // NO sampler injection: the production listDescendants + ps/proc path runs for real.
       watchdog: { stallMs: 500, tickMs: 100, cpuSampleGapMs: 300 },
     });
-    store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+    store.addRepo({ repoId: repo, name: "repo-a", path: repo, capability: { kind: "git", gitRoot: repo, defaultBranch: "main", remote: null } });
 
     await manager.startWorker("cmd-busy-child", args());
     // The child spins for ~9 s; the watchdog becomes eligible at 500 ms of silence. Watch

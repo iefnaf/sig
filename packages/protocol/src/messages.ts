@@ -1,6 +1,7 @@
 // Message schemas, docs/design/connector-do-protocol.md §6. Only the handshake (hello/welcome/error)
 // is needed for this slice; commands/events arrive with the outbox/event-stream tickets.
 import { z } from "zod";
+import { type RepoCapability } from "./git.ts";
 
 export const PROTOCOL_VERSION = { min: 1, max: 1 } as const;
 
@@ -12,13 +13,29 @@ const AgentCapabilitySchema = z.object({
   capabilities: z.record(z.string(), z.boolean()),
 });
 
+const RepoCapabilitySchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("git"), gitRoot: z.string(), defaultBranch: z.string().nullable(), remote: z.string().nullable() }),
+  z.object({ kind: z.literal("plain") }),
+]);
+
 export const RepoSchema = z.object({
   repoId: z.string(),
   name: z.string(),
   path: z.string(),
+  /** @deprecated superseded by `capability`; kept so a pre-this-change connector's payload
+   *  still parses on a mixed-version fleet. A pre-this-change connector could only ever
+   *  register a Git repo, so `capabilityOf()` below bridges it exactly, not a guess. */
   defaultBranch: z.string(),
   remote: z.string(),
+  capability: RepoCapabilitySchema.optional(),
 });
+
+/** The one place a `Repo` (old wire shape, new wire shape, or a mix mid-rollout) becomes a
+ *  real `RepoCapability`. Every reader should call this instead of reading `.defaultBranch`/
+ *  `.remote`/`.capability` directly. */
+export function capabilityOf(repo: { capability?: RepoCapability; path: string; defaultBranch: string; remote: string }): RepoCapability {
+  return repo.capability ?? { kind: "git", gitRoot: repo.path, defaultBranch: repo.defaultBranch || null, remote: repo.remote || null };
+}
 
 const WorkerSnapshotSchema = z.object({
   workerId: z.string(),

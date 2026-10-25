@@ -21,7 +21,7 @@ beforeEach(async () => {
   stateDir = join(dir, "state");
   repo = await makeGitRepo(dir);
   store = new LocalStore(join(stateDir, "connector.sqlite"));
-  store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+  store.addRepo({ repoId: repo, name: "repo-a", path: repo, capability: { kind: "git", gitRoot: repo, defaultBranch: "main", remote: null } });
   mock = startMockSteward();
   const port = await mock.listen();
   store.saveCredentials({ serverUrl: `http://127.0.0.1:${port}`, deviceId: mock.deviceId, token: mock.token });

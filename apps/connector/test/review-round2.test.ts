@@ -114,7 +114,7 @@ beforeEach(() => {
   store = new LocalStore(join(stateDir, "connector.sqlite"));
   const eventLog = new EventLog(store.database);
   events = [];
-  store.addRepo({ repoId: "repo-x", name: "repo-a", path: repoDir, defaultBranch: "main", remote: null });
+  store.addRepo({ repoId: "repo-x", name: "repo-a", path: repoDir, capability: { kind: "git", gitRoot: repoDir, defaultBranch: "main", remote: null } });
   store.upsertWorker({
     workerId: "w-r2",
     threadId: "t1",

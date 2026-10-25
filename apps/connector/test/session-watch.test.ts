@@ -43,7 +43,7 @@ beforeEach(async () => {
   sessionsDir = join(dir, "sessions");
   repo = await makeGitRepo(dir);
   store = new LocalStore(join(stateDir, "connector.sqlite"));
-  store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: null });
+  store.addRepo({ repoId: repo, name: "repo-a", path: repo, capability: { kind: "git", gitRoot: repo, defaultBranch: "main", remote: null } });
   eventLog = new EventLog(store.database);
   events.length = 0;
   mock = startMockSteward();

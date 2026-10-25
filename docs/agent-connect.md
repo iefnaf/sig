@@ -62,11 +62,11 @@ The owner can run it directly in their terminal, keeping the pairing code out of
 
 ## 3 · Register the selected repositories
 
-In the web workspace, open **Machines**, find the connected machine, and choose **Add directory** (中文：**机器 → 添加目录**). Select an existing Git repository or enter its absolute path, then wait for registration to succeed. Repeat for each repository the owner chose.
+In the web workspace, open **Machines**, find the connected machine, and choose **Add directory** (中文：**机器 → 添加目录**). Select an existing directory or enter its absolute path, then wait for registration to succeed. Repeat for each directory the owner chose. The connector detects a Git repository automatically; a plain directory registers the same way, with no branch, worktree isolation, or PR support.
 
-The connector validates and saves each directory locally before the workspace shows it as registered. Keep the connector online during registration. No restart is needed.
+The connector resolves and saves each directory's identity locally before the workspace shows it as registered. Keep the connector online during registration. No restart is needed.
 
-Keep the default `worktree` workspace mode unless the owner wants a different policy. Do not add `--approve` as a setup shortcut: it enables the repository's local pi extensions and is a separate trust choice. Repository settings are documented in [deploy.md](deploy.md#connecting-a-machine).
+Keep the default `worktree` isolation unless the owner wants a different write policy — a plain (non-Git) directory can only run `in-place`. Do not add `--approve` as a setup shortcut: it enables the repository's local pi extensions and is a separate trust choice. Repository settings are documented in [deploy.md](deploy.md#connecting-a-machine).
 
 ## 4 · Verify the full connection
 

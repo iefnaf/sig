@@ -449,7 +449,7 @@ export class WorkerManager {
     // is queued (FIFO) and starts when the current one settles; the command result says so,
     // and the `started` event follows when the slot frees. Readonly tasks are never isolated
     // (§8.3) and never queue.
-    if (args.mode === "write" && repo.workspace === "serial") {
+    if (args.mode === "write" && repo.writePolicy.concurrency === "serial") {
       const holder = this.writeSlotHolder(args.repoId, args.workerId);
       if (holder) {
         this.store.upsertWorker({
@@ -515,7 +515,7 @@ export class WorkerManager {
       // Readonly + base → a DETACHED-HEAD worktree at that base (issue #8): a review leg
       // continues from the write leg's branch without checking anything out in the owner's
       // working directory.
-      const useWorktree = (args.mode === "write" && repo.workspace !== "main") || (args.mode === "readonly" && !!args.base);
+      const useWorktree = useWorktreeFor(repo, args);
       let cwd = repo.path;
       if (useWorktree) {
         try {
@@ -753,7 +753,7 @@ export class WorkerManager {
   private serialSlotHeldByAnother(worker: WorkerRow): boolean {
     if (worker.mode !== "write") return false; // readonly tasks are never isolated (§8.3)
     const repo = this.store.getRepo(worker.repoId);
-    return repo?.workspace === "serial" && this.writeSlotHolder(worker.repoId, worker.workerId) !== undefined;
+    return repo?.writePolicy.concurrency === "serial" && this.writeSlotHolder(worker.repoId, worker.workerId) !== undefined;
   }
 
   /** Starts the next queued write worker of every repo whose slot freed up. Triggered by
@@ -1715,7 +1715,7 @@ export class WorkerManager {
     if (
       worker.mode === "write" &&
       repo &&
-      repo.workspace !== "main" &&
+      repo.writePolicy.isolation !== "in-place" &&
       !worker.worktree &&
       worker.worktreeCleanedAt
     ) {
@@ -2237,6 +2237,28 @@ export class WorkerManager {
     if (!worker) throw new CommandError("not_found", `worker ${workerId} is unknown on this machine`);
     return worker;
   }
+}
+
+/** Does this task get an isolated `git worktree`, or run directly in `repo.path`?
+ *  Write tasks follow the repo's configured write policy — `isolation !== "in-place"` is
+ *  always false for a plain (non-Git) repo by construction (a plain repo's `writePolicy`
+ *  can only ever be `"in-place"`), so no separate capability check is needed for that half.
+ *  Readonly tasks with a relay `base` always isolate into a detached-HEAD worktree (diffing
+ *  against a base commit needs a real Git ancestry — there is no in-place equivalent), and
+ *  that genuinely requires a Git-backed repo, checked explicitly here since the type of
+ *  `args.base` alone can't express it. */
+function useWorktreeFor(repo: RegisteredRepo, args: Pick<StartWorkerArgs, "mode" | "base">): boolean {
+  if (args.mode === "readonly") {
+    if (!args.base) return false;
+    if (repo.capability.kind !== "git") {
+      throw new CommandError(
+        "unsupported_base",
+        `'${repo.name}' is a plain workspace (no Git); a relay base requires Git ancestry to review, which this directory doesn't have`,
+      );
+    }
+    return true;
+  }
+  return repo.writePolicy.isolation !== "in-place";
 }
 
 function commandWorkerId(args: Record<string, unknown>, envelopeWorkerId: string | undefined, kind: string): string {

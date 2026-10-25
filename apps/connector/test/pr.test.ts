@@ -80,7 +80,7 @@ beforeEach(async () => {
   mkdirSync(stateDir, { recursive: true });
   repo = await makeGitRepo(dir);
   store = new LocalStore(join(stateDir, "connector.sqlite"));
-  store.addRepo({ repoId: repo, name: "repo-a", path: repo, defaultBranch: "main", remote: "git@github.com:example/repo-a.git" });
+  store.addRepo({ repoId: repo, name: "repo-a", path: repo, capability: { kind: "git", gitRoot: repo, defaultBranch: "main", remote: "git@github.com:example/repo-a.git" } });
 });
 
 afterEach(async () => {

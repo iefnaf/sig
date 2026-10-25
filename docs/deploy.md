@@ -122,12 +122,12 @@ curl -X POST https://sig.example.com/api/pairing -H "Authorization: Bearer $SERV
 
 Run that command on the machine (macOS or Linux, Node ≥ 22.18). It pairs (redeeming the one-time code), installs a background service — launchd agent (`dev.sig.connector`) on macOS, systemd user unit on Linux — and starts it now and at login. `connect --foreground` runs attached instead (containers, dev boxes). On filtered networks append `--proxy http://127.0.0.1:7890` (issue #68): both channels, `git`, and worker children follow it, and it is stored so the service needs no inherited environment.
 
-In the workspace's **Machines** page, choose **Add directory** on the online machine to register each existing Git repository. Registration updates the machine and the workspace without a restart. Project approval and workspace mode remain local settings managed with `sig repo-config`.
+In the workspace's **Machines** page, choose **Add directory** on the online machine to register each existing directory. Sig detects a Git repository automatically; a plain directory registers too, with no branch, worktree isolation, or PR support. Registration updates the machine and the workspace without a restart. Project approval and write policy remain local settings managed with `sig repo-config`.
 
 Day-to-day:
 
 ```sh
-sig repo-config ~/code/myproject --workspace serial   # worktree (default) | serial | main
+sig repo-config ~/code/myproject --isolation worktree --concurrency serial   # worktree (default) | in-place isolation; parallel (default) | serial concurrency
 sig repo-config ~/code/myproject --approve            # trust the repo's local pi extensions (§13)
 sig status                       # service, pairing, workers, installed assets
 sig proxy [url]                  # show/set the stored proxy; --clear removes it (issue #68)

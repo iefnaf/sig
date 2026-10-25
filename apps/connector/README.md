@@ -55,7 +55,7 @@ sig connect https://sig.example.com <pairing-code> --proxy http://127.0.0.1:7890
 
 With no `--proxy`, `connect` captures `HTTPS_PROXY` from the environment and stores it; the background service, git, and agent workers all inherit it. Check reachability any time with `sig doctor`, and inspect or change the stored proxy with `sig proxy`.
 
-After pairing, open **Machines** in the Sig web workspace. Choose **Add directory** on the online machine, then select an existing Git repository or enter its absolute path. Wait for registration to succeed before starting work. Repeat for each repository that Sig may use. No connector restart is needed.
+After pairing, open **Machines** in the Sig web workspace. Choose **Add directory** on the online machine, then select an existing directory or enter its absolute path. Sig detects a Git repository automatically; a plain directory works too, with no branch, worktree isolation, or PR support. Wait for registration to succeed before starting work. Repeat for each directory that Sig may use. No connector restart is needed.
 
 Keep repository paths explicit. Do not register an entire home directory.
 
@@ -138,7 +138,7 @@ sig connect https://sig.example.com <pairing-code> --proxy http://127.0.0.1:7890
 
 不传 `--proxy` 时，`connect` 会捕获环境变量 `HTTPS_PROXY` 并持久化；后台服务、git 和 agent worker 都会继承该代理。可随时用 `sig doctor` 检查连通性，用 `sig proxy` 查看或修改已存储的代理。
 
-配对后，在 Sig 工作台打开**机器**，找到在线机器并点击**添加目录**。选择已有的 Git 仓库或输入其绝对路径，等待登记成功后再开始任务。逐个添加允许 Sig 使用的仓库，无需重启 connector。
+配对后，在 Sig 工作台打开**机器**，找到在线机器并点击**添加目录**。选择一个已有目录或输入其绝对路径，Sig 会自动检测是否为 Git 仓库；普通目录也能添加，只是没有分支、worktree 隔离和 PR 支持。等待登记成功后再开始任务。逐个添加允许 Sig 使用的目录，无需重启 connector。
 
 请明确指定仓库路径，不要登记整个 home 目录。
 

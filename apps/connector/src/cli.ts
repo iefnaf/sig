@@ -14,7 +14,8 @@
 //   uninstall              stop the service and remove its unit (keeps ~/.sig data)
 //   upgrade [--version V]  npm-install @nightboats/sig (default @latest) and restart the
 //                          service; the fresh daemon rewrites the versioned pi assets
-//   repo-config <path> [--workspace worktree|serial|main] [--approve|--no-approve]
+//   repo-config <path> [--isolation worktree|in-place] [--concurrency parallel|serial]
+//                          [--approve|--no-approve]
 //                          per-repo local settings (§8.2/§13): how write tasks get a
 //                          directory, and whether pi runs with --approve there. Never
 //                          settable by a remote command — only here, on the machine
@@ -39,10 +40,12 @@ import {
   type ProxyConfig,
 } from "./proxy.ts";
 import { getServiceInstaller, SIG_LABEL, type ServiceInstaller, type ServiceSpec } from "./service.ts";
-import { isWorkspaceMode, LocalStore, WORKSPACE_MODES } from "./store.ts";
-import { repoTopLevel } from "./worktree.ts";
+import { LocalStore } from "./store.ts";
+import { identifyWorkspace } from "./worktree.ts";
 import { runUpgrade } from "./upgrade.ts";
 import { VERSION } from "./version.ts";
+import { isConcurrency, isIsolation } from "./write-policy.ts";
+import type { RepoCapability } from "@nightboats/protocol";
 
 const exec = promisify(execFile);
 
@@ -74,8 +77,9 @@ usage:
   sig start | stop | restart                 control the background service
   sig uninstall                              remove the service (keeps ~/.sig data)
   sig upgrade [--version <version>]          replace the package and restart the service
-  sig repo-config <path> [options]           per-repo local settings (workspace mode,
-                                                  project trust); never settable remotely
+  sig repo-config <path> [options]           per-repo local settings (write isolation,
+                                                  concurrency, project trust); never settable
+                                                  remotely
   sig daemon                                 internal: run the connector daemon
 
 Register repositories in the web workspace under Machines > Add directory.
@@ -455,7 +459,7 @@ async function statusCommand(): Promise<void> {
     const repoLine =
       repos.length === 0
         ? "none (web workspace: Machines > Add directory)"
-        : repos.map((r) => `${r.name}[${r.workspace}${r.approved ? ", approved" : ""}]`).join(", ");
+        : repos.map((r) => `${r.name}[${r.writePolicy.isolation}/${r.writePolicy.concurrency}${r.approved ? ", approved" : ""}]`).join(", ");
     console.log(`repos:    ${repoLine}`);
   } finally {
     store.close();
@@ -556,10 +560,22 @@ async function daemonCommand(): Promise<void> {
 
 // --- repo-config -----------------------------------------------------------------------------
 
-/** Parses repo-config argv: positional path + `--workspace worktree|serial|main` (also the
- * `--workspace=x` form) + `--approve|--no-approve`. Unknown flags fail loudly instead of
- * silently degrading into a read-only invocation (review finding 4). */
-function parseRepoConfigArgv(argv: string[]): { path?: string; workspace?: string; approve?: boolean } {
+/** One line naming the repo's detected capability (issue #88): plain Git-ness for a Git repo,
+ *  so the read-only print doesn't leave it implicit in the isolation/concurrency values alone. */
+function describeCapability(capability: RepoCapability): string {
+  if (capability.kind === "git") {
+    return `git (origin: ${capability.remote ?? "none"}, default branch: ${capability.defaultBranch ?? "unknown"})`;
+  }
+  return "plain (no Git)";
+}
+
+/** Parses repo-config argv: positional path + `--isolation worktree|in-place` +
+ * `--concurrency parallel|serial` (also the `--flag=value` form for either) +
+ * `--approve|--no-approve`. Unknown flags fail loudly instead of silently degrading into a
+ * read-only invocation (review finding 4). */
+function parseRepoConfigArgv(
+  argv: string[],
+): { path?: string; isolation?: string; concurrency?: string; approve?: boolean } {
   // Expand `--flag=value` into `--flag value` so both spellings share one path.
   const expanded: string[] = [];
   for (const token of argv) {
@@ -567,9 +583,13 @@ function parseRepoConfigArgv(argv: string[]): { path?: string; workspace?: strin
     if (token.startsWith("--") && eq !== -1) expanded.push(token.slice(0, eq), token.slice(eq + 1));
     else expanded.push(token);
   }
-  const { value: workspace, rest } = takeFlag(expanded, "--workspace");
-  if (expanded.includes("--workspace") && workspace === undefined) {
-    fail("--workspace requires a value: worktree | serial | main");
+  const { value: isolation, rest: afterIsolation } = takeFlag(expanded, "--isolation");
+  if (expanded.includes("--isolation") && isolation === undefined) {
+    fail("--isolation requires a value: worktree | in-place");
+  }
+  const { value: concurrency, rest } = takeFlag(afterIsolation, "--concurrency");
+  if (afterIsolation.includes("--concurrency") && concurrency === undefined) {
+    fail("--concurrency requires a value: parallel | serial");
   }
   if (rest.includes("--approve") && rest.includes("--no-approve")) {
     fail("--approve and --no-approve are mutually exclusive");
@@ -578,41 +598,56 @@ function parseRepoConfigArgv(argv: string[]): { path?: string; workspace?: strin
   const positional = rest.filter((token) => !token.startsWith("--"));
   const knownBooleans = new Set(["--approve", "--no-approve"]);
   const unknown = rest.filter((token) => token.startsWith("--") && !knownBooleans.has(token));
-  if (unknown.length > 0) fail(`unknown option(s): ${unknown.join(" ")} (expected --workspace, --approve, or --no-approve)`);
-  return { path: positional[0], workspace, approve };
+  if (unknown.length > 0) {
+    fail(`unknown option(s): ${unknown.join(" ")} (expected --isolation, --concurrency, --approve, or --no-approve)`);
+  }
+  return { path: positional[0], isolation, concurrency, approve };
 }
 
-/** `sig repo-config <path> [--workspace worktree|serial|main] [--approve|--no-approve]`
- * (§8.2/§13, issue #16): the per-repo settings that live only in the connector's local
- * store. A command from the steward carrying them is rejected; this is the only writer.
- * With no settings flags it just prints the current configuration. */
+/** `sig repo-config <path> [--isolation worktree|in-place] [--concurrency parallel|serial]
+ * [--approve|--no-approve]` (§8.2/§13, issue #16): the per-repo settings that live only in the
+ * connector's local store. A command from the steward carrying them is rejected; this is the
+ * only writer. With no settings flags it just prints the current configuration. Works on a
+ * plain (non-Git) workspace too (issue #88) — identity resolves via `identifyWorkspace`, not
+ * a Git-or-throw lookup. */
 async function repoConfig(argv: string[]): Promise<void> {
-  const { path, workspace, approve } = parseRepoConfigArgv(argv);
+  const { path, isolation, concurrency, approve } = parseRepoConfigArgv(argv);
   if (!path) usage();
-  if (workspace !== undefined && !isWorkspaceMode(workspace)) {
-    fail(`unknown workspace mode '${workspace}' (expected one of: ${WORKSPACE_MODES.join(" | ")})`);
+  if (isolation !== undefined && !isIsolation(isolation)) {
+    fail(`unknown isolation '${isolation}' (expected one of: worktree | in-place)`);
+  }
+  if (concurrency !== undefined && !isConcurrency(concurrency)) {
+    fail(`unknown concurrency '${concurrency}' (expected one of: parallel | serial)`);
   }
 
-  const topLevel = await repoTopLevel(path);
+  const identity = await identifyWorkspace(path);
   const store = new LocalStore(join(stateDir(), "connector.sqlite"));
   try {
-    const repo = store.getRepo(topLevel);
+    const repo = store.getRepo(identity.repoId);
     if (!repo) {
-      fail(`${topLevel} is not registered; open the web workspace and use Machines > Add directory first`);
+      fail(`${identity.repoId} is not registered; open the web workspace and use Machines > Add directory first`);
     }
-    if (workspace === undefined && approve === undefined) {
+    if (isolation === undefined && concurrency === undefined && approve === undefined) {
       // Read-only invocation: show the current settings.
       console.log(`${repo.name} (${repo.repoId})`);
-      console.log(`workspace: ${repo.workspace}`);
-      console.log(`approved:  ${repo.approved ? "yes (pi runs with --approve)" : "no (pi runs with --no-approve)"}`);
+      console.log(`capability:  ${describeCapability(repo.capability)}`);
+      console.log(`isolation:   ${repo.writePolicy.isolation}`);
+      console.log(`concurrency: ${repo.writePolicy.concurrency}`);
+      console.log(`approved:    ${repo.approved ? "yes (pi runs with --approve)" : "no (pi runs with --no-approve)"}`);
       return;
     }
-    store.setRepoConfig(topLevel, {
-      ...(workspace !== undefined ? { workspace } : {}),
-      ...(approve !== undefined ? { approved: approve } : {}),
-    });
-    const updated = store.getRepo(topLevel)!;
-    console.log(`${updated.name}: workspace=${updated.workspace}, approved=${updated.approved ? "yes" : "no"}`);
+    if (isolation !== undefined || concurrency !== undefined) {
+      try {
+        store.setWritePolicy(identity.repoId, { isolation, concurrency });
+      } catch (err) {
+        fail(err instanceof Error ? err.message : String(err));
+      }
+    }
+    if (approve !== undefined) store.setApproved(identity.repoId, approve);
+    const updated = store.getRepo(identity.repoId)!;
+    console.log(
+      `${updated.name}: isolation=${updated.writePolicy.isolation}, concurrency=${updated.writePolicy.concurrency}, approved=${updated.approved ? "yes" : "no"}`,
+    );
   } finally {
     store.close();
   }
