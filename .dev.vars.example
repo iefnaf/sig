@@ -1,4 +1,4 @@
 # Copy this file to .dev.vars (repo root) for local development. Pick a unique local password
-# of at least 15 characters; the deployment stores only a salted verifier. MODEL_KEY is optional.
+# of at least 15 characters; the deployment stores only a salted verifier. The model API key
+# belongs in the workspace's Settings after sign-in, not in this file.
 LOGIN_PASSWORD=replace-with-a-long-local-password
-MODEL_KEY=

@@ -13,12 +13,13 @@ Open the deployment URL to use the web workspace. Sign in with your deployment p
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/iefnaf/sig)
 
-The form clones the repo into your own account and asks for two secrets:
+The form clones the repo into your own account and asks for one secret:
 
 | Secret | What it is |
 |---|---|
 | `LOGIN_PASSWORD` | Your Sig login password. Use at least 15 characters and save it in a password manager. Common and compromised passwords are rejected. |
-| `MODEL_KEY` | Your model provider's API key (default provider: DeepSeek — [platform.deepseek.com](https://platform.deepseek.com)). Sealed into the Durable Object's storage on first boot; deletable afterwards. Optional — you can also paste it into the workspace's **Settings** after signing in. |
+
+Your model provider's API key (default provider: DeepSeek — [platform.deepseek.com](https://platform.deepseek.com)) is not part of the form. After the build, open the Worker URL and sign in; the setup wizard, or the workspace's **Settings** page, takes the key.
 
 From a terminal instead:
 
@@ -27,7 +28,6 @@ git clone https://github.com/iefnaf/sig && cd sig
 pnpm install
 wrangler deploy
 wrangler secret put LOGIN_PASSWORD
-wrangler secret put MODEL_KEY   # optional; the workspace Settings page works too
 wrangler deploy
 ```
 
