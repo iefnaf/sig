@@ -109,7 +109,7 @@ The daily budget soft cap (issue #28): `vars.DAILY_BUDGET_USD` (dollars per UTC 
 
 ## Connecting a machine
 
-For agent-guided setup, follow [agent-connect.md](agent-connect.md), including a source-install fallback if the npm package is unavailable. Install the CLI with `npm install --global @nightboats/sig` (or that source fallback) before using the `sig` management commands below.
+For agent-guided setup, follow [agent-connect.md](agent-connect.md), including a source-install fallback if the npm package is unavailable. Install the CLI with `npm install --global @alexlikevibe/sig` (or that source fallback) before using the `sig` management commands below.
 
 Each machine you want to dispatch work to runs a small daemon that holds a WebSocket to the steward and drives the local coding agents. Open **Machines** in the workspace and generate the connection command there.
 
@@ -117,7 +117,7 @@ Existing explicit-key deployments can also request a pairing code through the ow
 
 ```sh
 curl -X POST https://sig.example.com/api/pairing -H "Authorization: Bearer $SERVER_KEY"
-# → { "code": "AB12CD34", "command": "npx @nightboats/sig connect https://sig.example.com AB12CD34" }
+# → { "code": "AB12CD34", "command": "npx @alexlikevibe/sig connect https://sig.example.com AB12CD34" }
 ```
 
 Run that command on the machine (macOS or Linux, Node ≥ 22.18). It pairs (redeeming the one-time code), installs a background service — launchd agent (`dev.sig.connector`) on macOS, systemd user unit on Linux — and starts it now and at login. `connect --foreground` runs attached instead (containers, dev boxes). On filtered networks append `--proxy http://127.0.0.1:7890` (issue #68): both channels, `git`, and worker children follow it, and it is stored so the service needs no inherited environment.

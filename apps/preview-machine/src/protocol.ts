@@ -1,5 +1,5 @@
-import { PROTOCOL_VERSION } from "@nightboats/protocol";
-import type { DirectoryBrowseResult, DirectoryListing } from "@nightboats/protocol";
+import { PROTOCOL_VERSION } from "@alexlikevibe/protocol";
+import type { DirectoryBrowseResult, DirectoryListing } from "@alexlikevibe/protocol";
 
 export type MachinePhase = "unpaired" | "connecting" | "welcomed" | "disconnected" | "error";
 

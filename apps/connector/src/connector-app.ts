@@ -8,7 +8,7 @@ import os from "node:os";
 import { isAbsolute, join } from "node:path";
 import { ConnectorClient, type ClientOptions } from "./client.ts";
 import { CommandLog, type CommandResult } from "./commands.ts";
-import { RegisterRepoArgsSchema, type CmdMessage } from "@nightboats/protocol";
+import { RegisterRepoArgsSchema, type CmdMessage } from "@alexlikevibe/protocol";
 import { registerRepository } from "./repository.ts";
 import { EventLog } from "./events.ts";
 import type { LocalStore } from "./store.ts";

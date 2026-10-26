@@ -1,6 +1,6 @@
 // Build for the published npm package (issue #26): bundle the CLI into a single plain-JS
-// ESM file so `npx @nightboats/sig` needs no TypeScript stripping and no workspace deps
-// (@nightboats/protocol and ws are bundled in; node: builtins stay external). The pi
+// ESM file so `npx @alexlikevibe/sig` needs no TypeScript stripping and no workspace deps
+// (@alexlikevibe/protocol and ws are bundled in; node: builtins stay external). The pi
 // extension is NOT bundled — pi loads it as a file — so it is copied verbatim to
 // dist/ext/, where install.ts resolves it via import.meta.url.
 import { copyFileSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";

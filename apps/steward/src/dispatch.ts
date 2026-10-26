@@ -6,7 +6,7 @@
 // links — security-sensitive, and they must work without the model. Card button callbacks
 // stay deterministic too (steward.md §3.1 signal 1): the Thread is resolved from the card's
 // providerMsgId, never from data stuffed into the button.
-import { ulid } from "@nightboats/protocol";
+import { ulid } from "@alexlikevibe/protocol";
 import { isSpendQuery } from "./budget.ts";
 import { decideContinuation, renderHandoffBrief, type NewSessionReason } from "./handoff.ts";
 import type { Ledger, OfflineDispatchRow, ThreadRow, WorkerRow } from "./ledger.ts";
@@ -514,7 +514,7 @@ export class Dispatcher {
     await this.#deps.sendText(
       [
         "在要接入的那台电脑的终端里运行：",
-        `npx @nightboats/sig connect ${origin} ${code}`,
+        `npx @alexlikevibe/sig connect ${origin} ${code}`,
         "（配对码 10 分钟内有效，只能使用一次；接好后它会自动上线，直接问我就能看到。）",
       ].join("\n"),
       null,

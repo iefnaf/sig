@@ -2,7 +2,7 @@ import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CloseCode, HelloMessageSchema } from "@nightboats/protocol";
+import { CloseCode, HelloMessageSchema } from "@alexlikevibe/protocol";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConnectorClient } from "../src/client.ts";
 import { LocalStore } from "../src/store.ts";

@@ -1,7 +1,7 @@
 // The connector's §6.6 half: `history_req` becomes a windowed `history_chunk` stream —
 // ≤ 2 chunks in flight, browser acks (relayed by the DO) release the next, chunks stay under
 // 256 KiB, failed loads answer `error{re}`, and an idle stream dies with the 60 s TTL.
-import { HISTORY_MAX_BYTES, type HistoryEntry, type HistoryPage } from "@nightboats/protocol";
+import { HISTORY_MAX_BYTES, type HistoryEntry, type HistoryPage } from "@alexlikevibe/protocol";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { HistoryStreams, chunkPage } from "../src/history-stream.ts";
 

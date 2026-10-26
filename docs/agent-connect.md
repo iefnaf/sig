@@ -15,10 +15,10 @@ Do not read credential stores or ask the owner to paste SERVER_KEY, model keys, 
 
 ## 1 · Install the connector
 
-If the public npm package is available (`npm view @nightboats/sig version`), install it to a stable location:
+If the public npm package is available (`npm view @alexlikevibe/sig version`), install it to a stable location:
 
 ```sh
-npm install --global @nightboats/sig
+npm install --global @alexlikevibe/sig
 sig --version
 ```
 
@@ -31,10 +31,10 @@ An npm 404 is not a successful installation. Use an accessible checkout of [iefn
 ```sh
 git clone https://github.com/iefnaf/sig && cd sig   # or use an existing checkout
 pnpm install
-pnpm --filter @nightboats/sig build
+pnpm --filter @alexlikevibe/sig build
 sig_package_dir="$(mktemp -d)"
 npm pack ./apps/connector --ignore-scripts --pack-destination "$sig_package_dir"
-npm install --global "$sig_package_dir"/nightboats-sig-*.tgz
+npm install --global "$sig_package_dir"/alexlikevibe-sig-*.tgz
 sig --version
 ```
 
@@ -47,7 +47,7 @@ Have the owner open the existing Sig web workspace and go to **Machines → Add 
 The workspace generates a command shaped like:
 
 ```sh
-npx @nightboats/sig connect https://sig.example.com <pairing-code>
+npx @alexlikevibe/sig connect https://sig.example.com <pairing-code>
 ```
 
 Use the installed CLI with the URL and code from that command (append `--proxy <url>` on filtered networks — see step 0):

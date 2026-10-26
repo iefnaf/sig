@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// `npx @nightboats/sig <command>` (ADR-0002; npm scope: ADR-0008).
+// `npx @alexlikevibe/sig <command>` (ADR-0002; npm scope: ADR-0008).
 //
 //   connect <url> <code>   redeem a pairing code, then install + start the background
 //                          service (launchd agent on macOS, systemd --user unit on Linux);
@@ -12,7 +12,7 @@
 //   logs [-n N] [name]     tail ~/.sig/logs/<name> (default connector.log)
 //   start | stop | restart control the background service (stop also disables start-at-login)
 //   uninstall              stop the service and remove its unit (keeps ~/.sig data)
-//   upgrade [--version V]  npm-install @nightboats/sig (default @latest) and restart the
+//   upgrade [--version V]  npm-install @alexlikevibe/sig (default @latest) and restart the
 //                          service; the fresh daemon rewrites the versioned pi assets
 //   repo-config <path> [--isolation worktree|in-place] [--concurrency parallel|serial]
 //                          [--approve|--no-approve]
@@ -45,7 +45,7 @@ import { identifyWorkspace } from "./worktree.ts";
 import { runUpgrade } from "./upgrade.ts";
 import { VERSION } from "./version.ts";
 import { isConcurrency, isIsolation } from "./write-policy.ts";
-import type { RepoCapability } from "@nightboats/protocol";
+import type { RepoCapability } from "@alexlikevibe/protocol";
 
 const exec = promisify(execFile);
 

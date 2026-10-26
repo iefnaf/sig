@@ -31,7 +31,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm -r typecheck
       - run: pnpm -r test
-      # Issue #26: the connector must ship as a self-contained `@nightboats/sig` tarball —
+      # Issue #26: the connector must ship as a self-contained `@alexlikevibe/sig` tarball —
       # bundled dist, bin wrapper, zero runtime dependencies (workspace deps stay in dev).
       # Fail the build if the layout regresses.
       - name: connector tarball layout
@@ -92,7 +92,7 @@ jobs:
               "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/workers/$worker_name/previews/$preview_name")"
             case "$status" in
               200)
-                pnpm --filter @nightboats/steward exec wrangler preview delete \
+                pnpm --filter @alexlikevibe/steward exec wrangler preview delete \
                   --config "$config" \
                   --name "$preview_name" \
                   --skip-confirmation
@@ -285,7 +285,7 @@ jobs:
               "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/workers/$worker_name/previews/$preview_name")"
             case "$status" in
               200)
-                pnpm --filter @nightboats/steward exec wrangler preview delete \
+                pnpm --filter @alexlikevibe/steward exec wrangler preview delete \
                   --config "$config" \
                   --name "$preview_name" \
                   --skip-confirmation

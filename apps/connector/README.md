@@ -6,7 +6,7 @@
 
 **English** · [简体中文](#sig-connector-简体中文)
 
-`@nightboats/sig` installs the `sig` command. Sig is a self-hosted personal agent that runs in your Cloudflare account; the connector runs on a macOS or Linux computer and connects that computer to Sig. It keeps a WebSocket connection to your deployment, starts local coding agents such as pi and Claude Code, and reports their progress back to your personal agent.
+`@alexlikevibe/sig` installs the `sig` command. Sig is a self-hosted personal agent that runs in your Cloudflare account; the connector runs on a macOS or Linux computer and connects that computer to Sig. It keeps a WebSocket connection to your deployment, starts local coding agents such as pi and Claude Code, and reports their progress back to your personal agent.
 
 The connector makes only an outbound connection. You do not need to open an inbound port on your computer.
 
@@ -23,7 +23,7 @@ The connector makes only an outbound connection. You do not need to open an inbo
 Install the connector globally on the machine that will run your coding agents:
 
 ```sh
-npm install --global @nightboats/sig
+npm install --global @alexlikevibe/sig
 sig --version
 ```
 
@@ -34,7 +34,7 @@ Use a user-writable npm prefix. Do not use `sudo` to work around an npm permissi
 Open your Sig web workspace and go to **Machines → Add a machine → Create pairing command**. The workspace creates a one-time command:
 
 ```sh
-npx @nightboats/sig connect https://sig.example.com <pairing-code>
+npx @alexlikevibe/sig connect https://sig.example.com <pairing-code>
 ```
 
 If the connector is already installed globally, use the shorter form:
@@ -89,7 +89,7 @@ The deployment and connector runbooks live in the [Sig repository](https://githu
 
 # Sig connector 简体中文
 
-`@nightboats/sig` 会安装 `sig` 命令。Sig 是部署在你 Cloudflare 账号里的 personal agent；connector 运行在 macOS 或 Linux 电脑上，把这台电脑接入 Sig。它保持到你部署地址的 WebSocket 连接，启动本地的 pi、Claude Code 等 coding agent，并把进展回传给 personal agent。
+`@alexlikevibe/sig` 会安装 `sig` 命令。Sig 是部署在你 Cloudflare 账号里的 personal agent；connector 运行在 macOS 或 Linux 电脑上，把这台电脑接入 Sig。它保持到你部署地址的 WebSocket 连接，启动本地的 pi、Claude Code 等 coding agent，并把进展回传给 personal agent。
 
 Connector 只主动发起出站连接，不需要在电脑上开放入站端口。
 
@@ -106,7 +106,7 @@ Connector 只主动发起出站连接，不需要在电脑上开放入站端口�
 在需要运行 coding agent 的电脑上全局安装：
 
 ```sh
-npm install --global @nightboats/sig
+npm install --global @alexlikevibe/sig
 sig --version
 ```
 
@@ -117,7 +117,7 @@ sig --version
 打开 Sig 网页工作台，进入 **机器 → 添加机器 → 生成配对命令**。工作台会生成一次性命令：
 
 ```sh
-npx @nightboats/sig connect https://sig.example.com <pairing-code>
+npx @alexlikevibe/sig connect https://sig.example.com <pairing-code>
 ```
 
 如果已经全局安装 connector，可以直接运行：
