@@ -1,7 +1,10 @@
 // Password screening is deliberately tested without the network: the range response shape is
 // the security boundary, and a malformed or unavailable service must keep password setup closed.
 import { describe, expect, it, vi } from "vitest";
-import { passwordDigest, screenPassword } from "../src/deployment-auth.ts";
+import { SELF, env, runInDurableObject } from "cloudflare:test";
+import { MIGRATIONS, runMigrations } from "../src/schema.ts";
+import type { Steward } from "../src/steward.ts";
+import { DeploymentAuth, passwordDigest, screenPassword } from "../src/deployment-auth.ts";
 
 async function sha1(password: string): Promise<string> {
   const bytes = await crypto.subtle.digest("SHA-1", new TextEncoder().encode(password));
@@ -38,3 +41,73 @@ describe("deployment password screening", () => {
     expect(digest).not.toContain("unique local");
   });
 });
+
+describe("deployment password availability", () => {
+  it("returns actionable missing configuration without opening a session", async () => {
+    const response = await SELF.fetch("https://example.com/auth/password", {
+      method: "POST",
+      headers: { origin: "https://example.com", "content-type": "application/json", "CF-Connecting-IP": "203.0.113.51" },
+      body: JSON.stringify({ password: "12345" }),
+    });
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: "password_not_configured" });
+    expect(response.headers.has("set-cookie")).toBe(false);
+  });
+
+  it("rejects a short configured password without storing a verifier", async () => {
+    await withAuthStorage(async (input) => {
+      const auth = new DeploymentAuth({ ...input, env: { LOGIN_PASSWORD: "12345" } });
+      expect(await auth.verifyPassword("12345", "weak")).toBe("password_rejected");
+      expect(input.sql`SELECT id FROM sh_auth_password`).toEqual([]);
+    });
+  });
+
+  it("identifies a missing deployment password", async () => {
+    await withAuthStorage(async (input) => {
+      const auth = new DeploymentAuth({ ...input, env: {} });
+      expect(await auth.verifyPassword("12345", "missing")).toBe("password_not_configured");
+    });
+  });
+
+  it("retries a temporary screening outage without requiring a new password", async () => {
+    await withAuthStorage(async (input) => {
+      const screen = vi.fn<(password: string) => Promise<boolean>>()
+        .mockRejectedValueOnce(new Error("offline"))
+        .mockResolvedValue(true);
+      const auth = new DeploymentAuth({ ...input, env: { LOGIN_PASSWORD: "a unique deployment password 94!" }, screenPassword: screen });
+      expect(await auth.verifyPassword("a unique deployment password 94!", "outage")).toBe("password_screening_unavailable");
+      expect(await auth.verifyPassword("a unique deployment password 94!", "outage")).toBe("password_screening_unavailable");
+      expect(screen).toHaveBeenCalledTimes(1);
+      const now = Date.now();
+      const clock = vi.spyOn(Date, "now").mockReturnValue(now + 60_001);
+      try {
+        expect(await auth.verifyPassword("a unique deployment password 94!", "outage")).toBe("valid");
+        expect(await auth.verifyPassword("wrong password", "outage")).toBe("invalid");
+        expect(screen).toHaveBeenCalledTimes(2);
+      } finally {
+        clock.mockRestore();
+      }
+    });
+  });
+
+  it("revokes the previous browser authority when a replacement is rejected", async () => {
+    await withAuthStorage(async (input) => {
+      const original = new DeploymentAuth({ ...input, env: { LOGIN_PASSWORD: "a unique deployment password 95!" }, screenPassword: async () => true });
+      expect(await original.verifyPassword("a unique deployment password 95!", "original")).toBe("valid");
+      const revoked = vi.fn();
+      const replacement = new DeploymentAuth({ ...input, env: { LOGIN_PASSWORD: "12345" }, sessionsRevoked: revoked });
+      expect(await replacement.verifyPassword("12345", "replacement")).toBe("password_rejected");
+      expect(input.sql`SELECT id FROM sh_auth_password`).toEqual([]);
+      expect(revoked).toHaveBeenCalledOnce();
+    });
+  });
+});
+
+async function withAuthStorage(run: (input: Pick<ConstructorParameters<typeof DeploymentAuth>[0], "sql" | "transaction" | "sessionsRevoked">) => Promise<void>): Promise<void> {
+  const stub = env.Steward.get(env.Steward.idFromName(`password-availability-${crypto.randomUUID()}`));
+  await runInDurableObject(stub, async (instance: Steward, state: DurableObjectState) => {
+    const sql = instance.sql.bind(instance);
+    runMigrations(sql, MIGRATIONS, (operation) => state.storage.transactionSync(operation));
+    await run({ sql, transaction: (operation) => state.storage.transactionSync(operation), sessionsRevoked: () => {} });
+  });
+}

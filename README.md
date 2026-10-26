@@ -26,9 +26,13 @@ Deploy Sig into your Cloudflare account first, then connect a machine where you 
 
 **One click.** The button clones this repository into your Cloudflare account, builds, and deploys:
 
+Before you start, generate and save a unique password of **at least 15 characters** in your password manager. Enter it as `LOGIN_PASSWORD`. Sig rejects shorter, common, or compromised passwords when it starts, even if Cloudflare accepts them in the deployment form.
+
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/iefnaf/sig)
 
 Give the Worker a name and set your login password in the form. When the build finishes, open the Worker URL and sign in; the setup wizard asks for your model provider's API key.
+
+If deployment reports expired GitHub authorization, follow the [deployment troubleshooting guide](docs/deploy.md#deployment-troubleshooting). Changing the login password does not repair the GitHub connection.
 
 **Or hand it to your coding agent.** Copy this into an agent that can run terminal commands on your computer:
 
