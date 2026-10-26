@@ -1,5 +1,5 @@
 {
-  "name": "@nightboats/preview-machine",
+  "name": "@alexlikevibe/preview-machine",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -9,7 +9,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@nightboats/protocol": "workspace:*",
+    "@alexlikevibe/protocol": "workspace:*",
     "agents": "0.28.1"
   },
   "devDependencies": {

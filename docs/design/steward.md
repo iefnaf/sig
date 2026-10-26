@@ -287,7 +287,7 @@ Re-run this evaluation set whenever the model, prompts, or candidate-assembly ru
 > **Implemented (issue #7).** The 106-case set was ported verbatim from `spike-final`
 > (ADR-0001 decision 1) into `apps/steward/eval/` with a runner over the real extension
 > (fresh in-memory world per case, node:sqlite + the trigram FTS index, the confidence gate
-> live). `pnpm --filter @nightboats/steward eval:routing` enforces the thresholds as the exit
+> live). `pnpm --filter @alexlikevibe/steward eval:routing` enforces the thresholds as the exit
 > code — the required merge check for routing changes per ADR-0001 decision 14. Recorded
 > runs, the key handling, and the OpenAI-compatible `--endpoint` override: [routing-eval.md](../routing-eval.md).
 

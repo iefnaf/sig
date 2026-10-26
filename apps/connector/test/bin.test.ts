@@ -1,5 +1,5 @@
 // Subprocess tests against the built bin (bin/sig.js → dist/cli.js), which pretest
-// builds. This is the `npx @nightboats/sig` surface: the Node gate, --version, usage, and
+// builds. This is the `npx @alexlikevibe/sig` surface: the Node gate, --version, usage, and
 // the read-only subcommands on a clean SIG_HOME.
 import { execFile } from "node:child_process";
 import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";

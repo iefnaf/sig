@@ -14,11 +14,11 @@ import {
   type CmdMessage,
   type DirectoryListingMessage,
   type WelcomeMessage,
-} from "@nightboats/protocol";
+} from "@alexlikevibe/protocol";
 import { CommandLog, type CommandResult } from "./commands.ts";
 import { EventLog, type StoredEvent } from "./events.ts";
 import { HistoryStreams } from "./history-stream.ts";
-import type { HistoryPage } from "@nightboats/protocol";
+import type { HistoryPage } from "@alexlikevibe/protocol";
 import type { Agent } from "node:http";
 import type { LocalStore } from "./store.ts";
 import { VERSION } from "./version.ts";

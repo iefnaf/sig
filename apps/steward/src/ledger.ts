@@ -5,8 +5,8 @@
 // knowledge half, issue #18) live in notes.ts behind the `notes` handle below — same rule:
 // sh_note* is reached only through the memory module. The situation brief's character
 // budget is brief.ts's.
-import { ulid } from "@nightboats/protocol";
-import type { GitFacts, HelloMessage } from "@nightboats/protocol";
+import { ulid } from "@alexlikevibe/protocol";
+import type { GitFacts, HelloMessage } from "@alexlikevibe/protocol";
 import { createBudget } from "./budget.ts";
 import { createNotes, type NoteRow } from "./notes.ts";
 import { assembleBrief, type BriefDecision, type HandoffBrief } from "./handoff.ts";
@@ -118,7 +118,7 @@ export interface ReportRow {
 }
 
 /** Git facts merged into the report event by the connector (connector-pi.md §7.2).
- *  Imported from @nightboats/protocol so both ends share one shape (issue #8 adds the
+ *  Imported from @alexlikevibe/protocol so both ends share one shape (issue #8 adds the
  *  pointer fields; they are optional for connectors predating relay briefs). */
 export type { GitFacts };
 

@@ -9,7 +9,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { createLedger, type Ledger, type LedgerSql } from "../src/ledger.ts";
 import { MIGRATIONS, runMigrations, type SqlExecutor } from "../src/schema.ts";
-import type { WorkerEvent } from "@nightboats/protocol";
+import type { WorkerEvent } from "@alexlikevibe/protocol";
 import { CASES, THREADS, type Case } from "./dataset.ts";
 import { buildSituationBrief } from "../src/llm/brief.ts";
 import type { StewardExtensionContext } from "../src/llm/extension.ts";

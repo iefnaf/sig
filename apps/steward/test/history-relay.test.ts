@@ -4,7 +4,7 @@
 // connector's window. Offline machines answer machine_offline directly (spec §7.4 / §11.4),
 // an unanswered relay dies with the 60 s TTL, and role crossing is refused (protocol §5.3).
 import { SELF, runInDurableObject } from "cloudflare:test";
-import { CloseCode } from "@nightboats/protocol";
+import { CloseCode } from "@alexlikevibe/protocol";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { Steward } from "../src/steward.ts";
 import { sessionCookieValue } from "../src/web.ts";

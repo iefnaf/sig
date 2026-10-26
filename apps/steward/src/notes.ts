@@ -16,7 +16,7 @@
 //
 // All SQL here is owned by this module (sh_note, sh_note_fts, sh_note_log); callers reach
 // notes only through the ledger's `notes` handle, like every other sh_* table.
-import { ulid } from "@nightboats/protocol";
+import { ulid } from "@alexlikevibe/protocol";
 import type { LedgerSql } from "./ledger.ts";
 
 /** steward.md §2.3: resident-layer hard cap (characters of normalized text). */

@@ -3,7 +3,7 @@
 // the workspace snapshot, `views.workspace`); the machine page lists devices with live online state; its revoke button bumps the device
 // epoch and closes the live connector connection with 4403 (protocol §5.1); /加机器 in chat
 // issues the pairing code and answers with the npx connect command, redeemable exactly once.
-import { CloseCode } from "@nightboats/protocol";
+import { CloseCode } from "@alexlikevibe/protocol";
 import { SELF, runInDurableObject } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { ShOutboundRow, Steward } from "../src/steward.ts";
@@ -147,10 +147,10 @@ describe("report cards carry the one-time 查看详情 link", () => {
 });
 
 describe("/加机器: chat-issued pairing (protocol §5.2)", () => {
-  it("replies with npx @nightboats/sig connect <url> <code>, single-use", async () => {
+  it("replies with npx @alexlikevibe/sig connect <url> <code>, single-use", async () => {
     await ownerDm("/加机器");
     const text = (await sentTexts()).join("\n");
-    const match = text.match(/npx @nightboats\/sig connect (\S+) (\w{8})/);
+    const match = text.match(/npx @alexlikevibe\/sig connect (\S+) (\w{8})/);
     expect(match).not.toBeNull();
     expect(match![1]).toBe("https://example.com"); // origin learned from the webhook hit
 

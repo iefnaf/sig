@@ -6,7 +6,7 @@
 import { isThinkingLevel, type ComposerModelInput, type ModelSwitchInput } from "./llm/models.ts";
 import type { ConnectionTestResult } from "./llm/connection-test.ts";
 import type { BudgetState } from "./budget.ts";
-import { DirectoryBrowseArgsSchema, RegisterRepoArgsSchema, type DirectoryBrowseArgs, type DirectoryListing, type RegisterRepoResult } from "@nightboats/protocol";
+import { DirectoryBrowseArgsSchema, RegisterRepoArgsSchema, type DirectoryBrowseArgs, type DirectoryListing, type RegisterRepoResult } from "@alexlikevibe/protocol";
 import type { Ledger } from "./ledger.ts";
 import {
   WorkspaceError,
@@ -182,7 +182,7 @@ export async function handleWorkspaceApi(request: Request, url: URL, session: Ap
       const { id } = await readJson(request);
       if (typeof id !== "string" || !REQUEST_ID.test(id)) return json({ error: "bad_request" }, 400);
       const pair = await deps.pairing(id);
-      return json({ ...pair, command: `npx @nightboats/sig connect ${url.origin} ${pair.code}` });
+      return json({ ...pair, command: `npx @alexlikevibe/sig connect ${url.origin} ${pair.code}` });
     }
     if (url.pathname === "/app/api/settings/model/selection" && deps.selectModel) {
       const input = parseModelSwitch(await readJson(request));

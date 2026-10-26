@@ -1,4 +1,4 @@
-import { HelloMessageSchema } from "@nightboats/protocol";
+import { HelloMessageSchema } from "@alexlikevibe/protocol";
 import { describe, expect, it } from "vitest";
 import { browseDirectory, buildHello, registerRepository, scriptForStartWorker, workerEvent } from "../src/protocol.ts";
 

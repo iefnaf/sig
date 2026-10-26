@@ -20,7 +20,7 @@ import { ProgressThrottle } from "./progress.ts";
 import { inspectSessionTail, type SessionTail } from "./session-tail.ts";
 import { readSessionHistory } from "./session-history.ts";
 import { readFullSessionHistory, claudeSessionPath } from "./full-session-history.ts";
-import type { HistoryPage } from "@nightboats/protocol";
+import type { HistoryPage } from "@alexlikevibe/protocol";
 import type { LocalStore, RegisteredRepo, WorkerRow } from "./store.ts";
 import { StallWatchdog, stallContinueNote, type StallWatchdogOptions, type WatchdogCandidate } from "./watchdog.ts";
 import { WorktreeManager, createReadonlyWorktree } from "./worktree.ts";

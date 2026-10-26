@@ -21,7 +21,7 @@ import { installAssets, type InstalledAssets } from "./install.ts";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { PiProcess } from "./pi-process.ts";
-import type { HistoryPage } from "@nightboats/protocol";
+import type { HistoryPage } from "@alexlikevibe/protocol";
 
 /** Must match COMMAND_NAME in ./ext/sig-pi.ts (locked together by a test). */
 const SIG_COMMAND = "sig";

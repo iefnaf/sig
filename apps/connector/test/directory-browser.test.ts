@@ -3,7 +3,7 @@ import { chmodSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync 
 import os from "node:os";
 import { dirname, join, parse } from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
-import { DIRECTORY_MAX_BYTES, DIRECTORY_MAX_ENTRIES, DirectoryListingMessageSchema, DirectoryListingSchema } from "@nightboats/protocol";
+import { DIRECTORY_MAX_BYTES, DIRECTORY_MAX_ENTRIES, DirectoryListingMessageSchema, DirectoryListingSchema } from "@alexlikevibe/protocol";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { browseDirectory } from "../src/directory-browser.ts";
 import { ConnectorClient } from "../src/client.ts";

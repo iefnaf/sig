@@ -8,7 +8,7 @@
 // existed — is tried against every configured key. Callers are encouraged to re-seal under the
 // primary key after a non-primary open (the steward does this lazily on read), so ciphertexts
 // converge onto the current key and the window can close.
-import { deriveKeyId, type ServerKey } from "@nightboats/protocol";
+import { deriveKeyId, type ServerKey } from "@alexlikevibe/protocol";
 
 const enc = new TextEncoder();
 

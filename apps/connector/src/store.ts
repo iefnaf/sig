@@ -11,7 +11,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { chmodSync, existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import type { GitCapability, PlainCapability, RepoCapability } from "@nightboats/protocol";
+import type { GitCapability, PlainCapability, RepoCapability } from "@alexlikevibe/protocol";
 import type { ProcRef } from "./descendants.ts";
 import { normalizeProxyConfig, type ProxyConfig } from "./proxy.ts";
 import {

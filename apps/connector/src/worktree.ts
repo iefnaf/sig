@@ -10,7 +10,7 @@ import { existsSync } from "node:fs";
 import { realpath } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
-import type { RepoCapability } from "@nightboats/protocol";
+import type { RepoCapability } from "@alexlikevibe/protocol";
 
 const exec = promisify(execFile);
 

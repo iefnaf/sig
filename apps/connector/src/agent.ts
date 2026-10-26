@@ -2,7 +2,7 @@
 // minimal set every agent implements; the rest is expressed through capability declarations
 // and the WorkerManager degrades (and tells the steward) when a capability is missing.
 
-import type { HistoryPage } from "@nightboats/protocol";
+import type { HistoryPage } from "@alexlikevibe/protocol";
 
 export type AgentKind = "pi" | "claude-code" | "codex";
 
