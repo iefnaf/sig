@@ -1,0 +1,12 @@
+# ADR-0012: The Deploy-to-Cloudflare button is the primary deployment channel
+
+Supersedes [ADR-0007](0007-agent-driven-deploy.md)'s channel ordering. The runbook keeps its role as the agent-guided channel, with its secret discipline unchanged.
+
+Both premises behind ADR-0007's agent-first choice have expired. First, the button form now collects Worker secrets: it reads declarations from `.dev.vars.example` (2025-07 platform changelog) and field descriptions from `package.json`'s `cloudflare.bindings`, so the post-deploy terminal step the old button lacked is gone — and [ADR-0010](0010-browser-password-authentication.md) moved everything else off the terminal: the login password into the deployment form, the model key into the workspace's Settings. Second, live click-throughs on a public mirror showed the form pre-fills each field with the example file's value, which fixes the shape the template files must take. Against that, agent-driven deploy keeps its real variance: name collisions, proxy handling, and heterogeneous agents improvising around the runbook.
+
+- **The README's Get started leads with the button.** The agent prompt stays as the documented alternative for unreachable workers.dev (custom domains), end-to-end verification, and owners who operate through their agent. `docs/agent-deploy.md` is unchanged in role.
+- **The deploy form asks for exactly one secret.** `LOGIN_PASSWORD` ships with an empty example value: the form pre-fills whatever the example carries, so a non-empty example would ship every button deployment with a login password that is public knowledge in the repository. The model key has one channel now — the workspace's Settings after sign-in.
+- **The form cannot enforce the password policy** (minimum length, breach screening). A rejected password surfaces at sign-in with the dashboard remedy named on the login page; an on-load status probe that catches rejection before a failed submit is tracked as follow-up.
+- Terminal and agent deployments keep `MODEL_KEY` support; its seed-once semantics are unchanged.
+
+Consequences: the button activates when the repository goes public, and ADR-0007's open-source blockers (public repo, connector on npm) stand; the button path is re-validated live whenever the deploy surface changes — the pnpm-monorepo build through Workers Builds is the current open check; and the connector prompt (README step 2) stays agent-driven, because installing and pairing on the target machine needs local judgment a form cannot replace.

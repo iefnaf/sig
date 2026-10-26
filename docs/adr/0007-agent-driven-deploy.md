@@ -1,6 +1,6 @@
 # ADR-0007: Agent-driven deployment
 
-The password setup and browser handoff are superseded by [ADR-0010](0010-browser-password-authentication.md). Agent-guided deployment remains supported without requiring a one-time login link.
+The password setup and browser handoff are superseded by [ADR-0010](0010-browser-password-authentication.md). Agent-guided deployment remains supported without requiring a one-time login link. The channel ordering — the runbook as the primary deployment channel — is superseded by [ADR-0012](0012-deploy-button-primary.md); the runbook remains the agent-guided channel.
 
 The Deploy-to-Cloudflare button only covered `wrangler deploy`; everything that makes a deployment usable — a reachable hostname, the secrets, the first machine, browser sign-in, a model key — still happened in a terminal afterwards. And the button's default address is unusable in mainland China (`*.workers.dev` is blocked there), which the button flow could not fix without dashboard work. We decided the primary deployment channel is a runbook the owner's own coding agent executes: the owner hands their agent one paragraph pointing at `docs/agent-deploy.md`, and the agent deploys, verifies, sets up the secrets, and guides the steps that must stay human. Initialization follows ADR-0003's design: the agent generates and sets SERVER_KEY (and optionally MODEL_KEY), then verifies the owner API with it.
 
