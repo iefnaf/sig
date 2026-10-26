@@ -85,19 +85,6 @@ Keep `LOGIN_PASSWORD` configured as the dashboard-managed source of truth. The a
 
 Deploy authentication changes to the whole Worker version. Do not use gradual deployments with different password Secrets, because old and new versions must not alternate password configuration.
 
-## Pull request previews
-
-CI deploys a Cloudflare Worker Preview for every pull request from this repository. Add these repository secrets before opening the first preview:
-
-| Secret | Value |
-|---|---|
-| `CLOUDFLARE_API_TOKEN` | A token created from Cloudflare's **Edit Cloudflare Workers** template. |
-| `CLOUDFLARE_ACCOUNT_ID` | The Cloudflare account ID. |
-
-After CI passes, it comments on the pull request with a `*.previews.iefnaf.cc` URL and a reusable sign-in link. The preview link expires after 24 hours. CI generates a new preview `SERVER_KEY` for every deployment, so an older sign-in link or browser session stops working after a new push.
-
-Previews use the zero-cost `faux` model and get separate Durable Object storage. Pull requests from forks do not receive a Preview because they cannot access the repository secrets. Closing a pull request deletes its Preview and that storage.
-
 ## Custom domain
 
 Not required for function anymore (there is no chat platform that must reach you), but **mainland users should bind one**: `*.workers.dev` is blocked there outright (DNS pollution + SNI reset, live-tested in the spike), and the API, the web app, and the connector's WebSocket all need to reach the deployment. The agent runbook keeps this as an appendix attached only when workers.dev is unreachable.
