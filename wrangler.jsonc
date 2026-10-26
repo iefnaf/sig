@@ -5,7 +5,9 @@
 // instead of apps/steward/. Local dev/tests pass `--config ../../wrangler.jsonc` from
 // apps/steward.
 //
-// LOGIN_PASSWORD and MODEL_KEY are secrets, deliberately NOT declared here. New deployments
+// LOGIN_PASSWORD is the deploy-form secret, deliberately NOT declared here (the Deploy-button
+// form reads .dev.vars.example). The model API key is set in the workspace's Settings after
+// sign-in; a MODEL_KEY secret still seeds it for terminal deployments. New deployments
 // generate their signing key inside the owner Durable Object. Existing explicit-key deployments
 // retain SERVER_KEY and SERVER_KEY_PREVIOUS. See docs/deploy.md and ADR-0010.
 //

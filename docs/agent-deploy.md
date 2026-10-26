@@ -50,7 +50,7 @@ npx wrangler deploy --name <name>
 
 Deploy the version containing the new Secret before continuing. New deployments generate internal keys automatically. For an existing deployment, preserve `SERVER_KEY` and `SERVER_KEY_PREVIOUS`; adding a browser password does not rotate those keys.
 
-`MODEL_KEY` is optional here — the owner can paste the model key into the workspace's Settings at step 5 instead, which is the preferred channel.
+`MODEL_KEY` no longer rides in the deployment form or the secrets. The model key has exactly one channel now: the owner pastes it into the workspace's Settings at step 5.
 
 Verify the unauthenticated gates against the printed URL:
 
@@ -71,11 +71,7 @@ If the configured password is rejected or unavailable, follow [browser access re
 
 ## 5 · Model key — the owner's hands only
 
-Ask the owner for a model provider API key (default provider DeepSeek: [platform.deepseek.com](https://platform.deepseek.com) → API Keys). **The owner pastes it into the workspace**: Settings (the avatar, top right). If the owner offers the key in the chat, decline and point back at the Settings page — a rejected key is diagnosed there with a clear notice, too. Terminal-only alternative the owner runs in their own shell, never through you:
-
-```sh
-printf %s 'sk-…' | npx wrangler secret put MODEL_KEY --name <name>
-```
+Ask the owner for a model provider API key (default provider DeepSeek: [platform.deepseek.com](https://platform.deepseek.com) → API Keys). **The owner pastes it into the workspace**: Settings (the avatar, top right). If the owner offers the key in the chat, decline and point back at the Settings page — a rejected key is diagnosed there with a clear notice, too.
 
 ## 6 · First message and handoff
 

@@ -1,4 +1,8 @@
-# Copy this file to .dev.vars (repo root) for local development. Pick a unique local password
-# of at least 15 characters; the deployment stores only a salted verifier. MODEL_KEY is optional.
-LOGIN_PASSWORD=replace-with-a-long-local-password
-MODEL_KEY=
+# Copy this file to .dev.vars (repo root) for local development and pick your own
+# password of at least 15 characters; the deployment stores only a salted verifier.
+# The model API key belongs in the workspace's Settings after sign-in, not in this file.
+#
+# Keep the value below EMPTY. The Deploy-to-Cloudflare form pre-fills its field with
+# whatever sits after the equals sign; a non-empty example would ship every button
+# deployment with a login password that is public knowledge in this repository.
+LOGIN_PASSWORD=
