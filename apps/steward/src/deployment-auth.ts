@@ -17,7 +17,9 @@ type PasswordVerification = "valid" | "invalid" | PasswordUnavailable;
 
 export type Admission = { allowed: true } | { allowed: false; retryAfterSec: number };
 
-const PBKDF2_ITERATIONS = 600_000;
+// Cloudflare Workers rejects PBKDF2 above 100,000 iterations (NotSupportedError), while local
+// workerd accepts more. Raising this breaks password setup on every real deployment.
+export const PBKDF2_ITERATIONS = 100_000;
 const PASSWORD_MAX_CODE_POINTS = 128;
 const PASSWORD_MAX_BYTES = 1024;
 const LIMIT_WINDOW_MS = 60_000;
@@ -161,11 +163,10 @@ export class DeploymentAuth {
     let replacement: PasswordRow | undefined;
     let unavailable: PasswordUnavailable = "password_not_configured";
     if (configured) {
+      let accepted = false;
       try {
-        if (await this.#screenPassword(configured)) {
-          const salt = randomBytes(16).toString("hex");
-          replacement = { salt, digest: await passwordDigest(configured, salt), revision: crypto.randomUUID() };
-        } else {
+        accepted = await this.#screenPassword(configured);
+        if (!accepted) {
           unavailable = "password_rejected";
           console.error("Browser password rejected by the deployment password policy");
           this.#audit("browser_password_rejected", "configured_secret");
@@ -175,6 +176,18 @@ export class DeploymentAuth {
         this.#screeningRetryAt = Date.now() + SCREENING_RETRY_MS;
         console.error("Browser password screening unavailable", error instanceof Error ? error.message : String(error));
         this.#audit("browser_password_screening_unavailable", "retry_scheduled");
+      }
+      // Deriving the verifier is local work, not the screening service: report its failure as
+      // its own fault instead of telling the owner to wait for an outage that does not exist.
+      if (accepted) {
+        try {
+          const salt = randomBytes(16).toString("hex");
+          replacement = { salt, digest: await passwordDigest(configured, salt), revision: crypto.randomUUID() };
+        } catch (error) {
+          unavailable = "password_unavailable";
+          console.error("Browser password verifier derivation failed", error instanceof Error ? error.message : String(error));
+          this.#audit("browser_password_verifier_failed", "configured_secret");
+        }
       }
     }
 

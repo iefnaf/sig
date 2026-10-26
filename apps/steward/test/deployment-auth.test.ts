@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import { SELF, env, runInDurableObject } from "cloudflare:test";
 import { MIGRATIONS, runMigrations } from "../src/schema.ts";
 import type { Steward } from "../src/steward.ts";
-import { DeploymentAuth, passwordDigest, screenPassword } from "../src/deployment-auth.ts";
+import { DeploymentAuth, PBKDF2_ITERATIONS, passwordDigest, screenPassword } from "../src/deployment-auth.ts";
 
 async function sha1(password: string): Promise<string> {
   const bytes = await crypto.subtle.digest("SHA-1", new TextEncoder().encode(password));
@@ -37,8 +37,14 @@ describe("deployment password screening", () => {
 
   it("stores an algorithm-tagged verifier rather than the password", async () => {
     const digest = await passwordDigest("a unique local deployment password 93!", "00112233445566778899aabbccddeeff");
-    expect(digest).toMatch(/^pbkdf2-sha256\$600000\$[0-9a-f]{64}$/);
+    expect(digest).toMatch(/^pbkdf2-sha256\$100000\$[0-9a-f]{64}$/);
     expect(digest).not.toContain("unique local");
+  });
+
+  it("stays within the PBKDF2 iteration limit of deployed Workers", () => {
+    // Local workerd accepts larger counts, so only this assertion catches a regression that
+    // makes every real deployment fail password setup with NotSupportedError.
+    expect(PBKDF2_ITERATIONS).toBeLessThanOrEqual(100_000);
   });
 });
 
@@ -86,6 +92,21 @@ describe("deployment password availability", () => {
         expect(screen).toHaveBeenCalledTimes(2);
       } finally {
         clock.mockRestore();
+      }
+    });
+  });
+
+  it("does not report a verifier derivation failure as a screening outage", async () => {
+    await withAuthStorage(async (input) => {
+      const derive = vi.spyOn(crypto.subtle, "deriveBits").mockRejectedValue(
+        new DOMException("Pbkdf2 failed: iteration counts above 100000 are not supported", "NotSupportedError"),
+      );
+      try {
+        const auth = new DeploymentAuth({ ...input, env: { LOGIN_PASSWORD: "a unique deployment password 96!" }, screenPassword: async () => true });
+        expect(await auth.verifyPassword("a unique deployment password 96!", "derive")).toBe("password_unavailable");
+        expect(input.sql`SELECT id FROM sh_auth_password`).toEqual([]);
+      } finally {
+        derive.mockRestore();
       }
     });
   });
