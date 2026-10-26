@@ -10,7 +10,7 @@ const STRINGS = {
   cancelled: ['Passkey sign-in was cancelled. Try again, or use your password.', '已取消通行密钥登录，可以重试或使用密码。'],
   unsupported: ['Passkeys aren’t available in this browser. You can sign in with your password.', '当前浏览器无法使用通行密钥，你可以使用密码登录。'],
   invalid: ['Incorrect password. Try again.', '密码错误，请重试。'],
-  unavailable: ['Password sign-in isn’t available. Use a passkey, check the deployment password policy, or retry shortly.', '密码登录暂不可用。请使用通行密钥、检查部署密码规则，或稍后重试。'],
+  unavailable: ['Password sign-in is unavailable. The configured password may have been rejected by the policy; open "Forgot your password?" below for the dashboard fix. Temporary outages clear on retry.', '密码登录暂不可用。配置的密码可能未通过规则检查，请按下方「忘记密码？」的步骤在 Cloudflare 控制台修复。临时故障稍后重试即可。'],
   network: ['Couldn’t reach Sig. Check your connection and try again.', '无法连接 Sig，请检查网络后重试。'],
   retry: ['Too many attempts. Try again in {seconds}s, or use a passkey.', '尝试次数过多，请在 {seconds} 秒后重试，或使用通行密钥。'],
   retryPasskey: ['Too many passkey attempts. Try again in {seconds}s, or use your password.', '通行密钥尝试次数过多，请在 {seconds} 秒后重试，或使用密码。'],
