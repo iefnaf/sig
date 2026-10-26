@@ -11,6 +11,9 @@ const STRINGS = {
   unsupported: ['Passkeys aren’t available in this browser. You can sign in with your password.', '当前浏览器无法使用通行密钥，你可以使用密码登录。'],
   invalid: ['Incorrect password. Try again.', '密码错误，请重试。'],
   unavailable: ['Password sign-in is unavailable. The configured password may have been rejected by the policy; open "Forgot your password?" below for the dashboard fix. Temporary outages clear on retry.', '密码登录暂不可用。配置的密码可能未通过规则检查，请按下方「忘记密码？」的步骤在 Cloudflare 控制台修复。临时故障稍后重试即可。'],
+  rejected: ['The deployment password does not meet the password requirements. Set LOGIN_PASSWORD to a new, unique password of at least 15 characters in Cloudflare, then deploy the change. Follow the steps below.', '部署密码未通过 Sig 的规则检查。请在 Cloudflare 中将 LOGIN_PASSWORD 改为新的独立密码（至少 15 个字符），然后部署更新。操作步骤已在下方展开。'],
+  notConfigured: ['No deployment password is configured. Set LOGIN_PASSWORD in Cloudflare to a new, unique password of at least 15 characters, then deploy the change. Follow the steps below.', '尚未配置部署密码。请在 Cloudflare 中设置 LOGIN_PASSWORD，使用新的独立密码（至少 15 个字符），然后部署更新。操作步骤已在下方展开。'],
+  screeningUnavailable: ['Password safety checks are temporarily unavailable. Try again in a minute, or use a passkey. You do not need to change your password for this error.', '密码安全检查服务暂时不可用。请一分钟后重试，或使用通行密钥。此错误不需要修改密码。'],
   network: ['Couldn’t reach Sig. Check your connection and try again.', '无法连接 Sig，请检查网络后重试。'],
   retry: ['Too many attempts. Try again in {seconds}s, or use a passkey.', '尝试次数过多，请在 {seconds} 秒后重试，或使用通行密钥。'],
   retryPasskey: ['Too many passkey attempts. Try again in {seconds}s, or use your password.', '通行密钥尝试次数过多，请在 {seconds} 秒后重试，或使用密码。'],
@@ -103,8 +106,19 @@ passwordForm.addEventListener('submit', async (event) => {
       location.assign(nextPath);
     } else if (response.status === 429) {
       startCooldown(response.headers.get('retry-after'));
+    } else if (response.status === 503) {
+      const body = await response.json().catch(() => null);
+      const error = body?.error;
+      const copy = error === 'password_rejected' ? 'rejected'
+        : error === 'password_not_configured' ? 'notConfigured'
+        : error === 'password_screening_unavailable' ? 'screeningUnavailable'
+        : 'unavailable';
+      showStatus(passwordStatus, t(copy));
+      if (error === 'password_rejected' || error === 'password_not_configured') {
+        document.querySelector('details.recovery').open = true;
+      }
     } else {
-      showStatus(passwordStatus, t(response.status === 401 ? 'invalid' : response.status === 503 ? 'unavailable' : 'network'));
+      showStatus(passwordStatus, t(response.status === 401 ? 'invalid' : 'network'));
     }
   } catch {
     showStatus(passwordStatus, t('network'));

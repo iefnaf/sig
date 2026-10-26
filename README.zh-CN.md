@@ -26,9 +26,13 @@ Sig 是一个可自行部署的 **Personal Agent（个人智能体）**，基于
 
 **一键部署。** 点击按钮，Cloudflare 会把这个仓库克隆到你的账号并完成构建部署：
 
+开始前，请用密码管理器生成并保存一个**至少 15 个字符**的独立密码，填写到 `LOGIN_PASSWORD`。即使 Cloudflare 表单接受了短密码、常见密码或已泄露密码，Sig 启动后也会拒绝使用它们登录。
+
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/iefnaf/sig)
 
 给 Worker 起个名字，在表单里设置登录密码。构建完成后打开 Worker 地址登录，向导会引导你填写模型 API key。
+
+如果部署时提示 GitHub 授权过期，请按[部署排错指南](docs/deploy.md#deployment-troubleshooting)恢复连接。修改登录密码无法修复 GitHub 授权。
 
 **或交给你的 coding agent。** 复制这段，发给你的 coding agent：
 

@@ -1242,9 +1242,9 @@ export class Steward extends Agent<Env> {
       return Response.json({ error: "bad_request" }, { status: 400, headers: { "cache-control": "no-store" } });
     }
     const result = await this.deploymentAuth.verifyPassword(password, ip);
-    if (result === "unavailable") {
-      this.logChannel("browser_password_unavailable", "verifier_unavailable");
-      return Response.json({ error: "password_unavailable" }, { status: 503, headers: { "cache-control": "no-store" } });
+    if (result !== "valid" && result !== "invalid") {
+      this.logChannel("browser_password_unavailable", result);
+      return Response.json({ error: result }, { status: 503, headers: { "cache-control": "no-store" } });
     }
     if (result === "invalid") {
       this.logChannel("browser_password_failed", "invalid_credential");

@@ -11,6 +11,8 @@ Open the deployment URL to use the web workspace. Sign in with your deployment p
 
 ## One-click deploy
 
+Generate and save a unique password of **at least 15 characters** in your password manager before opening the form.
+
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/iefnaf/sig)
 
 The form clones the repo into your own account and asks for one secret:
@@ -20,6 +22,8 @@ The form clones the repo into your own account and asks for one secret:
 | `LOGIN_PASSWORD` | Your Sig login password. Use at least 15 characters and save it in a password manager. Common and compromised passwords are rejected. |
 
 Your model provider's API key (default provider: DeepSeek — [platform.deepseek.com](https://platform.deepseek.com)) is not part of the form. After the build, open the Worker URL and sign in; the setup wizard, or the workspace's **Settings** page, takes the key.
+
+The form collects a Cloudflare Secret. Sig checks the password when the application starts, so a completed deployment does not mean the password passed its policy. A rejected password cannot create a browser session. Follow the recovery instructions on the login page to replace it.
 
 From a terminal instead:
 
@@ -41,6 +45,20 @@ curl -X POST https://<your-worker>.workers.dev/api/messages \
   -d '{"text": "你好"}'
 curl "https://<your-worker>.workers.dev/api/messages?limit=5" -H "Authorization: Bearer $SERVER_KEY"
 ```
+
+## Deployment troubleshooting
+
+### GitHub authorization expired
+
+If Cloudflare reports `Your GitHub authorization has expired`, repair the Cloudflare GitHub connection using the [official reauthorization instructions](https://developers.cloudflare.com/pages/configuration/git-integration/github-integration/#reinstall-the-cloudflare-github-app), then retry deployment. This error concerns repository access, not `LOGIN_PASSWORD`.
+
+The Cloudflare Workers and Pages GitHub App serves both products. Reinstalling it temporarily interrupts new builds for connected repositories, while existing deployments remain hosted. Restore the repository access needed by your existing projects.
+
+### Deployment succeeds but password sign-in fails
+
+If Sig reports a rejected deployment password, open your Worker in Cloudflare, then **Settings > Variables and Secrets**. Replace `LOGIN_PASSWORD` with a unique password of at least 15 characters and deploy the change. Merely entering a different password on Sig's login page does not change the configured Secret.
+
+If the login page reports that password checking is temporarily unavailable, wait a minute and retry. A checking-service outage does not mean your password failed policy. Existing passkeys remain available.
 
 ## Opening the web workspace
 

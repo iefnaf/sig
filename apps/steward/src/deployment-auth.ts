@@ -11,6 +11,9 @@ type PasswordRow = { salt: string; digest: string; revision: string };
 type LimitRow = { attempts: number; windowStart: number; failures: number; blockedUntil: number };
 type PasswordPurpose = "password" | "passkey";
 type PasswordScreening = (password: string) => Promise<boolean>;
+type PasswordUnavailable = "password_not_configured" | "password_rejected" | "password_screening_unavailable" | "password_unavailable";
+type PasswordAvailability = "ready" | PasswordUnavailable;
+type PasswordVerification = "valid" | "invalid" | PasswordUnavailable;
 
 export type Admission = { allowed: true } | { allowed: false; retryAfterSec: number };
 
@@ -109,7 +112,7 @@ export class DeploymentAuth {
   readonly #screenPassword: PasswordScreening;
   #ready: Promise<void> | undefined;
   #screeningRetryAt = 0;
-  #available = false;
+  #availability: PasswordAvailability = "password_unavailable";
   #configuredOverride: string | undefined;
 
   constructor(input: {
@@ -151,21 +154,24 @@ export class DeploymentAuth {
     const configured = (this.#configuredOverride ?? this.#env.LOGIN_PASSWORD)?.normalize("NFC");
     const previous = this.#sql<PasswordRow>`SELECT salt, digest, revision FROM sh_auth_password WHERE id = 0`[0];
     if (configured && previous && await matches(configured, previous)) {
-      this.#available = true;
+      this.#availability = "ready";
       return;
     }
 
     let replacement: PasswordRow | undefined;
+    let unavailable: PasswordUnavailable = "password_not_configured";
     if (configured) {
       try {
         if (await this.#screenPassword(configured)) {
           const salt = randomBytes(16).toString("hex");
           replacement = { salt, digest: await passwordDigest(configured, salt), revision: crypto.randomUUID() };
         } else {
+          unavailable = "password_rejected";
           console.error("Browser password rejected by the deployment password policy");
           this.#audit("browser_password_rejected", "configured_secret");
         }
       } catch (error) {
+        unavailable = "password_screening_unavailable";
         this.#screeningRetryAt = Date.now() + SCREENING_RETRY_MS;
         console.error("Browser password screening unavailable", error instanceof Error ? error.message : String(error));
         this.#audit("browser_password_screening_unavailable", "retry_scheduled");
@@ -190,7 +196,7 @@ export class DeploymentAuth {
         }
       });
     }
-    this.#available = replacement !== undefined;
+    this.#availability = replacement ? "ready" : unavailable;
     if (previous) {
       this.#audit("browser_password_reset", replacement ? "replaced" : "removed");
       this.#sessionsRevoked();
@@ -214,7 +220,7 @@ export class DeploymentAuth {
       this.#sql`DELETE FROM sh_auth_limit`;
     });
     this.#configuredOverride = normalized;
-    this.#available = true;
+    this.#availability = "ready";
     this.#screeningRetryAt = 0;
     this.#ready = undefined;
     if (previous) {
@@ -258,10 +264,11 @@ export class DeploymentAuth {
     });
   }
 
-  async verifyPassword(password: string, ip: string): Promise<"valid" | "invalid" | "unavailable"> {
+  async verifyPassword(password: string, ip: string): Promise<PasswordVerification> {
     await this.ready();
     const row = this.#sql<PasswordRow>`SELECT salt, digest, revision FROM sh_auth_password WHERE id = 0`[0];
-    if (!this.#available || !row) return "unavailable";
+    if (this.#availability !== "ready") return this.#availability;
+    if (!row) return "password_unavailable";
     const valid = await matches(password.normalize("NFC"), row);
     if (this.#sql<{ revision: string }>`SELECT revision FROM sh_auth_password WHERE id = 0`[0]?.revision !== row.revision) {
       return "invalid";
