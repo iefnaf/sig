@@ -113,6 +113,8 @@ export class DeploymentAuth {
   readonly #audit: (reason: string, detail: string) => void;
   readonly #screenPassword: PasswordScreening;
   #ready: Promise<void> | undefined;
+  // Binding-only deployments can update env without replacing this isolate.
+  #readyConfigured: string | undefined;
   #screeningRetryAt = 0;
   #availability: PasswordAvailability = "password_unavailable";
   #configuredOverride: string | undefined;
@@ -133,12 +135,17 @@ export class DeploymentAuth {
     this.#screenPassword = input.screenPassword ?? screenPassword;
   }
 
-  /** Reconcile the Cloudflare Secret once per isolate and revoke stale browser authority. */
+  /** Reconcile a Cloudflare Secret while it is unchanged and revoke stale browser authority. */
   ready(): Promise<void> {
-    if (this.#ready) return this.#ready;
-    if (Date.now() < this.#screeningRetryAt) return Promise.resolve();
-    const pending = this.#synchronize();
+    const configured = (this.#configuredOverride ?? this.#env.LOGIN_PASSWORD)?.normalize("NFC");
+    if (this.#ready && this.#readyConfigured === configured) return this.#ready;
+    if (this.#readyConfigured === configured && Date.now() < this.#screeningRetryAt) return Promise.resolve();
+    const previous = this.#ready;
+    const pending = previous
+      ? previous.catch(() => {}).then(() => this.#synchronize(configured))
+      : this.#synchronize(configured);
     this.#ready = pending;
+    this.#readyConfigured = configured;
     pending.then(
       () => {
         // A temporary screening outage leaves no verifier. Allow a later attempt instead of
@@ -152,8 +159,7 @@ export class DeploymentAuth {
     return pending;
   }
 
-  async #synchronize(): Promise<void> {
-    const configured = (this.#configuredOverride ?? this.#env.LOGIN_PASSWORD)?.normalize("NFC");
+  async #synchronize(configured: string | undefined): Promise<void> {
     const previous = this.#sql<PasswordRow>`SELECT salt, digest, revision FROM sh_auth_password WHERE id = 0`[0];
     if (configured && previous && await matches(configured, previous)) {
       this.#availability = "ready";
@@ -236,6 +242,7 @@ export class DeploymentAuth {
     this.#availability = "ready";
     this.#screeningRetryAt = 0;
     this.#ready = undefined;
+    this.#readyConfigured = normalized;
     if (previous) {
       this.#audit("browser_password_reset", "replaced");
       this.#sessionsRevoked();

@@ -122,6 +122,54 @@ describe("deployment password availability", () => {
       expect(revoked).toHaveBeenCalledOnce();
     });
   });
+
+  it("reconciles a changed deployment secret within the same isolate", async () => {
+    await withAuthStorage(async (input) => {
+      const env = { LOGIN_PASSWORD: "12345" };
+      const revoked = vi.fn();
+      const screen = vi.fn<(password: string) => Promise<boolean>>()
+        .mockImplementation(async (password) => password !== "12345");
+      const auth = new DeploymentAuth({ ...input, env, sessionsRevoked: revoked, screenPassword: screen });
+      expect(await auth.verifyPassword("12345", "rejected-original")).toBe("password_rejected");
+
+      env.LOGIN_PASSWORD = "a unique deployment password 97!";
+      expect(await auth.verifyPassword("a unique deployment password 97!", "original")).toBe("valid");
+
+      env.LOGIN_PASSWORD = "a unique deployment password 98!";
+      expect(await auth.verifyPassword("a unique deployment password 98!", "replacement")).toBe("valid");
+      expect(await auth.verifyPassword("a unique deployment password 97!", "replacement-old")).toBe("invalid");
+
+      env.LOGIN_PASSWORD = "12345";
+      expect(await auth.verifyPassword("12345", "rejected-replacement")).toBe("password_rejected");
+      expect(input.sql`SELECT id FROM sh_auth_password`).toEqual([]);
+      expect(revoked).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it("lets a newer deployment secret synchronization win", async () => {
+    await withAuthStorage(async (input) => {
+      const original = "a unique deployment password 99!";
+      const replacement = "a unique deployment password 100!";
+      const env = { LOGIN_PASSWORD: original };
+      let releaseOriginal: (accepted: boolean) => void = () => {};
+      const originalScreen = new Promise<boolean>((resolve) => {
+        releaseOriginal = resolve;
+      });
+      const screen = vi.fn<(password: string) => Promise<boolean>>()
+        .mockImplementation(async (password) => password === original ? originalScreen : true);
+      const auth = new DeploymentAuth({ ...input, env, screenPassword: screen });
+
+      const originalVerification = auth.verifyPassword(original, "concurrent");
+      env.LOGIN_PASSWORD = replacement;
+      const replacementVerification = auth.verifyPassword(replacement, "concurrent");
+      releaseOriginal(true);
+
+      await expect(originalVerification).resolves.toBe("valid");
+      await expect(replacementVerification).resolves.toBe("valid");
+      expect(await auth.verifyPassword(replacement, "concurrent-after")).toBe("valid");
+      expect(screen).toHaveBeenCalledTimes(2);
+    });
+  });
 });
 
 async function withAuthStorage(run: (input: Pick<ConstructorParameters<typeof DeploymentAuth>[0], "sql" | "transaction" | "sessionsRevoked">) => Promise<void>): Promise<void> {
