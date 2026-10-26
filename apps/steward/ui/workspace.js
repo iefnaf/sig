@@ -18,6 +18,8 @@ import {
 const $ = (selector) => document.querySelector(selector);
 const cap = (word) => word.charAt(0).toUpperCase() + word.slice(1);
 const uuid = () => globalThis.crypto?.randomUUID?.() ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+const detailsMedia = matchMedia('(max-width: 1180px)');
+let detailsOverlay = null;
 
 const state = {
   snapshot: null,
@@ -144,11 +146,13 @@ function renderTop() {
   $('#machine-dot').className = `status-dot ${summary.machinesTotal === 0 ? 'gray' : summary.machinesOnline > 0 ? 'green' : 'amber'}`;
   $('#running-count').textContent = String(summary.running);
   $('#running-dot').className = `status-dot ${summary.running ? 'green pulse' : 'gray'}`;
-  $('#waiting-count').textContent = String(summary.needs);
+  $('#waiting-count').textContent = t(summary.needs === 1 ? 'decisionCountOne' : 'decisionCount', { count: summary.needs });
   $('.waiting-status').classList.toggle('all-clear', summary.needs === 0);
   const mobile = $('#mobile-count');
-  mobile.textContent = String(summary.needs);
-  mobile.hidden = summary.needs === 0;
+  const waitingThreads = snapshot.threads.filter((thread) => thread.state === 'waiting_you').length;
+  mobile.textContent = String(waitingThreads);
+  mobile.parentElement.setAttribute('aria-label', t('threadsNeedYou', { count: waitingThreads }));
+  mobile.hidden = waitingThreads === 0;
   const spend = $('#spend');
   spend.hidden = false;
   spend.classList.toggle('over', snapshot.budget.over);
@@ -176,7 +180,7 @@ function renderSidebar() {
       return;
     }
     list.replaceChildren(...groups.map((group) => h('section', { class: 'thread-group' },
-      h('h2', { class: 'group-label' }, h('span', { class: `status-dot ${stateColor(group.state)}` }), stateLabel(group.state), h('span', { class: 'group-count' }, String(group.threads.length))),
+      h('h2', { class: 'group-label' }, h('span', { class: `status-dot ${stateColor(group.state)}` }), stateLabel(group.state), h('span', { class: 'group-count' }, t(group.threads.length === 1 ? 'threadCountOne' : 'threadCount', { count: group.threads.length }))),
       group.threads.map((thread) => {
         const active = state.selected === thread.id;
         const meta = [[...new Set(thread.workers.map((worker) => worker.agent))].join(', '), thread.machine].filter(Boolean).join(' · ');
@@ -186,7 +190,7 @@ function renderSidebar() {
         },
         h('div', { class: 'thread-title' }, h('span', null, thread.title), thread.unread ? h('span', { class: 'unread', 'aria-label': t('unread') }) : null),
         h('div', { class: 'thread-preview' }, previewOf(thread, snapshot.messages)),
-        h('div', { class: 'thread-meta' }, h('span', null, meta), h('span', null, ago(thread.lastActivityAt))));
+        h('div', { class: 'thread-meta' }, h('span', { title: meta }, meta), h('span', null, ago(thread.lastActivityAt))));
       }))));
   }));
   $('.all-conversation').classList.toggle('active', !state.selected);
@@ -526,14 +530,14 @@ function renderContext() {
     snapshot.attention, snapshot.activity, snapshot.messages.map((message) => message.id), [...state.busyCards], minuteBucket()];
   redraw('context', signature, () => {
     const top = panel.scrollTop;
-    const close = h('button', { type: 'button', class: 'icon-button close-context', dataset: { action: 'close-details' }, 'aria-label': t('closeDetails') }, icon('close'));
+    const close = h('button', { type: 'button', class: 'icon-button close-context', dataset: { action: 'close-details', focus: 'close-details' }, 'aria-label': t('closeDetails') }, icon('close'));
     const sections = [];
     if (!thread) {
       const running = snapshot.threads.filter((entry) => entry.state === 'running');
       sections.push(
         h('header', { class: 'context-header' }, h('h2', null, t('workspace')), h('span', { class: 'overline' }, dayLabel(serverNow())), close),
         h('section', { class: 'context-section' },
-          h('h3', { class: 'section-title' }, t('needsYou'), h('strong', { class: snapshot.attention.length ? '' : 'clear-count' }, String(snapshot.attention.length))),
+          h('h3', { class: 'section-title' }, t('needsYou'), h('strong', { class: snapshot.attention.length ? '' : 'clear-count' }, t(snapshot.attention.length === 1 ? 'decisionCountOne' : 'decisionCount', { count: snapshot.attention.length }))),
           snapshot.attention.length ? snapshot.attention.map(attentionNode)
             : h('div', { class: 'empty-state compact' }, icon('check'), h('strong', null, t('allClear')), h('p', null, t('allClearHelp')))),
         h('section', { class: 'context-section' },
@@ -547,23 +551,28 @@ function renderContext() {
     } else {
       const waiting = attentionFor(snapshot, thread.id);
       const workers = [...thread.workers].reverse();
+      const previousSummary = panel.querySelector('details[data-summary-thread]');
+      const summaryOpen = previousSummary?.dataset.summaryThread === thread.id && previousSummary.open;
       sections.push(
         h('header', { class: 'context-header' }, h('h2', null, t('threadDetails')), close),
         h('section', { class: 'context-section' },
           h('h2', { class: 'thread-detail-title' }, thread.title), stateBadge(thread.state),
-          thread.summary ? h('p', { class: 'detail-summary' }, thread.summary) : null,
           thread.goal && thread.goal !== thread.summary ? h('p', { class: 'detail-goal' }, `${t('goal')}: ${thread.goal}`) : null,
           thread.repos.length ? h('div', { class: 'repo-label' }, icon('folder'), thread.repos.join(', ')) : null),
-        waiting.length ? h('section', { class: 'context-section' }, h('h3', { class: 'section-title' }, t('needsYou'), h('strong', null, String(waiting.length))), waiting.map(attentionNode)) : null,
+        waiting.length ? h('section', { class: 'context-section' }, h('h3', { class: 'section-title' }, t('needsYou'), h('strong', null, t(waiting.length === 1 ? 'decisionCountOne' : 'decisionCount', { count: waiting.length }))), waiting.map(attentionNode)) : null,
         h('section', { class: 'context-section' },
           h('h3', { class: 'section-title' }, t(workers.length ? 'agent' : 'execution'), h('span', null, workers.length ? '' : t('noWorkers'))),
           workers.map((worker) => workerNode(thread, worker))),
+        thread.summary ? h('details', { class: 'context-section thread-summary', dataset: { summaryThread: thread.id }, open: summaryOpen },
+          h('summary', { dataset: { focus: `summary:${thread.id}` } }, t('threadSummary')),
+          h('p', { class: 'detail-summary' }, thread.summary)) : null,
         h('section', { class: 'context-section' },
           h('h3', { class: 'section-title' }, t('timeline')),
           thread.timeline.length ? [...thread.timeline].reverse().map((entry) => activityItem({ ...entry, threadId: null })) : h('p', { class: 'muted-copy' }, t('noTimeline'))));
     }
     preservingFocus(panel, () => panel.replaceChildren(...sections.filter(Boolean)));
     panel.scrollTop = top;
+    if (detailsOverlay && !$('#dialog').open && !panel.contains(document.activeElement)) focusDetails();
   });
 }
 
@@ -970,6 +979,7 @@ function openProvider(id) {
 function renderOnboarding() {
   const page = $('#onboarding');
   const active = !state.setupChecked || state.onboarding !== null;
+  if (active) releaseDetailsOverlay({ restoreFocus: false });
   page.hidden = !active;
   const wasHidden = $('#workspace').hidden;
   $('#workspace').hidden = active;
@@ -1120,6 +1130,7 @@ function renderFatal() {
     current?.remove();
     return;
   }
+  releaseDetailsOverlay({ restoreFocus: false });
   const [title, body] = FATAL_COPY[state.fatal];
   const next = h('div', { class: 'fatal', id: 'fatal', role: 'alertdialog', 'aria-labelledby': 'fatal-title' },
     h('div', { class: 'fatal-box' }, h('img', { src: '/brand/sig.svg', alt: '' }), h('h2', { id: 'fatal-title' }, t(title)), h('p', null, t(body))));
@@ -1688,7 +1699,7 @@ function go({ thread = null, worker = null } = {}, { push = true } = {}) {
   $('#send-button').disabled = !input.value.trim();
   if (push && changed) history.pushState(null, '', urlFor(next, nextWorker));
   setMobile('chat');
-  $('#workspace').classList.remove('context-overlay');
+  releaseDetailsOverlay({ restoreFocus: false });
   resizeInput();
   renderAll({ stick: true });
   markSelectedRead();
@@ -1727,7 +1738,7 @@ function toggleSidebar() {
 
 function detailsOpen() {
   const workspace = $('#workspace');
-  return matchMedia('(max-width: 990px)').matches ? workspace.classList.contains('context-overlay') : !workspace.classList.contains('context-hidden');
+  return detailsMedia.matches ? detailsOverlay !== null : !workspace.classList.contains('context-hidden');
 }
 
 function syncDetailButton() {
@@ -1735,9 +1746,41 @@ function syncDetailButton() {
   for (const button of document.querySelectorAll('.detail-toggle')) button.setAttribute('aria-expanded', String(detailsOpen()));
 }
 
+function detailControls() {
+  return [...$('#context-panel').querySelectorAll('a[href], button, input, select, textarea, summary, [tabindex]')]
+    .filter((element) => element.tabIndex >= 0 && !element.disabled && !element.closest('[hidden], [inert]') && element.getClientRects().length);
+}
+
+function focusDetails() {
+  (detailControls()[0] ?? $('#context-panel')).focus({ preventScroll: true });
+}
+
+function releaseDetailsOverlay({ restoreFocus = true } = {}) {
+  if (!detailsOverlay) return;
+  const { returnFocus, background } = detailsOverlay;
+  detailsOverlay = null;
+  $('#workspace').classList.remove('context-overlay');
+  const panel = $('#context-panel');
+  panel.removeAttribute('role');
+  panel.removeAttribute('aria-modal');
+  for (const element of background) element.inert = false;
+  syncDetailButton();
+  if (restoreFocus && returnFocus?.isConnected && returnFocus.getClientRects().length && !returnFocus.closest('[inert]')) returnFocus.focus({ preventScroll: true });
+}
+
 function openDetails() {
-  if (matchMedia('(max-width: 990px)').matches) $('#workspace').classList.add('context-overlay');
-  else {
+  if (detailsMedia.matches) {
+    if (detailsOverlay) return;
+    const panel = $('#context-panel');
+    for (const popover of document.querySelectorAll(':popover-open')) if (!panel.contains(popover)) popover.hidePopover();
+    const background = [...$('#workspace').children].filter((element) => element !== panel && !element.classList.contains('panel-scrim') && !element.inert);
+    detailsOverlay = { returnFocus: document.activeElement, background };
+    $('#workspace').classList.add('context-overlay');
+    panel.setAttribute('role', 'dialog');
+    panel.setAttribute('aria-modal', 'true');
+    for (const element of background) element.inert = true;
+    focusDetails();
+  } else {
     $('#workspace').classList.remove('context-hidden');
     try { localStorage.setItem('sig.context.hidden', 'false'); } catch { /* Storage may be unavailable. */ }
   }
@@ -1745,8 +1788,8 @@ function openDetails() {
 }
 
 function closeDetails() {
-  $('#workspace').classList.remove('context-overlay');
-  if (!matchMedia('(max-width: 990px)').matches) {
+  releaseDetailsOverlay();
+  if (!detailsMedia.matches) {
     $('#workspace').classList.add('context-hidden');
     try { localStorage.setItem('sig.context.hidden', 'true'); } catch { /* Storage may be unavailable. */ }
   }
@@ -1765,7 +1808,7 @@ function jumpTo(messageId) {
   if (!message) return;
   if (state.selected && message.threadId !== state.selected) select(message.threadId);
   setMobile('chat');
-  $('#workspace').classList.remove('context-overlay');
+  releaseDetailsOverlay({ restoreFocus: false });
   const target = document.getElementById(messageId);
   if (!target) return;
   target.scrollIntoView({ behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'center' });
@@ -1798,6 +1841,10 @@ window.addEventListener('resize', () => {
   syncDetailButton();
   resizeInput();
 });
+detailsMedia.addEventListener('change', () => {
+  releaseDetailsOverlay();
+  syncDetailButton();
+});
 window.addEventListener('storage', (event) => {
   if (event.key === 'pip.locale') changeLanguage(event.newValue === 'zh' ? 'zh' : 'en');
 });
@@ -1816,11 +1863,26 @@ $('#dialog').addEventListener('click', (event) => {
 document.addEventListener('keydown', (event) => {
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k' && !$('#dialog').open && !state.onboarding) {
     event.preventDefault();
+    releaseDetailsOverlay({ restoreFocus: false });
     if (!matchMedia('(max-width: 650px)').matches && !sidebarOpen()) toggleSidebar();
     setMobile('threads');
     $('#thread-search').focus();
   }
-  if (event.key === 'Escape' && !$('#dialog').open && $('#workspace').classList.contains('context-overlay')) closeDetails();
+  if (!detailsOverlay || $('#dialog').open) return;
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    closeDetails();
+  } else if (event.key === 'Tab') {
+    const controls = detailControls();
+    const edge = event.shiftKey ? controls[0] : controls.at(-1);
+    if (!controls.length || document.activeElement === edge || !$('#context-panel').contains(document.activeElement)) {
+      event.preventDefault();
+      ((event.shiftKey ? controls.at(-1) : controls[0]) ?? $('#context-panel')).focus();
+    }
+  }
+});
+document.addEventListener('focusin', (event) => {
+  if (detailsOverlay && !$('#dialog').open && !$('#context-panel').contains(event.target)) focusDetails();
 });
 
 document.addEventListener('click', (event) => {
@@ -1845,6 +1907,8 @@ document.addEventListener('click', (event) => {
     return worker ? go({ thread: thread.id, worker: worker.id }) : undefined;
   }
   if (dataset.reply) {
+    releaseDetailsOverlay({ restoreFocus: false });
+    setMobile('chat');
     state.replyTo = dataset.reply;
     renderComposer();
     $('#message-input').focus();

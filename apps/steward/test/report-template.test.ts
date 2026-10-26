@@ -4,6 +4,7 @@
 import { describe, expect, it } from "vitest";
 import type { ReportRow, WorkerRow } from "../src/ledger.ts";
 import {
+  askUserCard,
   askUserText,
   byteLength,
   clipBytes,
@@ -22,6 +23,15 @@ import {
   reportCardFor,
   toneOfReport,
 } from "../src/report-template.ts";
+
+it("keeps the complete question option so paths with the same prefix remain distinguishable", () => {
+  const labels = [
+    "读取 ~/monorepo/deepseek-harmony-bot/packages/server 的实现",
+    "读取 ~/monorepo/deepseek-harmony-bot/packages/client 的实现",
+  ];
+  const buttons = labels.map((label, index) => ({ label, action: `ask:q_paths:${index}` }));
+  expect(askUserCard({ question: "分析哪个目录？", buttons }).buttons).toEqual(buttons);
+});
 
 function report(overrides: Partial<ReportRow> = {}): ReportRow {
   return {
