@@ -18,15 +18,19 @@ Sig 是一个可自行部署的 **Personal Agent（个人智能体）**，基于
 - **用你自己的电脑和 agent。** 支持 pi，以及已安装的 Claude Code；由你选择开放哪些仓库。
 - **上下文持续保留。** 对话和任务状态保存在 Durable Object 中；coding agent 的完整会话记录留在本机，机器在线时可以查看。
 
-## 两段 prompt，开始使用
+## 开始使用
 
-把下面的 prompt 交给一个能在你电脑上执行终端命令的 coding agent。第一段把 Sig 部署到云端，第二段连接实际执行任务的电脑。
-
-你需要准备：Cloudflare 账号、供 Sig 使用的模型 API key，以及 **Node.js 22.18+**。Connector 支持 **macOS 和 Linux**，本地 coding agent 也需要安装并完成它自己的登录或模型配置。
+先把 Sig 部署到你的 Cloudflare 账号，再连接实际执行任务的电脑。你需要准备：Cloudflare 账号和供 Sig 使用的模型 API key；**Node.js 22.18+** 只有下面的 agent 路径和 connector 需要。Connector 支持 **macOS 和 Linux**，本地 coding agent 也需要安装并完成它自己的登录或模型配置。
 
 ### 1. 部署你的 Personal Agent
 
-复制这段，发给你的 coding agent：
+**一键部署。** 点击按钮，Cloudflare 会把这个仓库克隆到你的账号并完成构建部署：
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/iefnaf/sig)
+
+给 Worker 起个名字，在表单里设置登录密码。构建完成后打开 Worker 地址登录，向导会引导你填写模型 API key。
+
+**或交给你的 coding agent。** 复制这段，发给你的 coding agent：
 
 ```text
 帮我把 Sig 这个 personal agent 部署到我自己的 Cloudflare 账号。

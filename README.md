@@ -18,15 +18,19 @@ Talk to Sig in its web workspace. Ask it to work on a repository, follow up on a
 - **Your agents, on your computers.** Use pi, or Claude Code when installed, in repositories you choose to connect.
 - **Context that lasts.** Conversation and task state persist in the Durable Object. Full coding-agent session records stay on the machine and can be viewed while it is online.
 
-## Get started with two prompts
+## Get started
 
-Give these prompts to a coding agent that can run terminal commands on your computer. The first sets up Sig in the cloud; the second connects a machine where you want work to run.
-
-You will need a Cloudflare account, a model-provider API key for Sig, and Node.js **22.18+**. The connector supports **macOS and Linux** and needs a local coding agent with its own authentication configured.
+Deploy Sig into your Cloudflare account first, then connect a machine where you want work to run. You will need a Cloudflare account and a model-provider API key for Sig; Node.js **22.18+** is needed only for the agent path below and for the connector. The connector supports **macOS and Linux** and needs a local coding agent with its own authentication configured.
 
 ### 1. Deploy your personal agent
 
-Copy this into your coding agent:
+**One click.** The button clones this repository into your Cloudflare account, builds, and deploys:
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/iefnaf/sig)
+
+Give the Worker a name and set your login password in the form. When the build finishes, open the Worker URL and sign in; the setup wizard asks for your model provider's API key.
+
+**Or hand it to your coding agent.** Copy this into an agent that can run terminal commands on your computer:
 
 ```text
 Deploy Sig, my personal agent, to my Cloudflare account.

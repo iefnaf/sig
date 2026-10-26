@@ -6,8 +6,8 @@ Open the deployment URL to use the web workspace. Sign in with your deployment p
 
 ## Two ways to deploy
 
-- **With your coding agent** — the primary channel ([ADR-0007](adr/0007-agent-driven-deploy.md)). Use the [two prompts in the README](../README.md#get-started-with-two-prompts): [agent-deploy.md](agent-deploy.md) deploys Sig, configures the secrets, and opens the workspace; [agent-connect.md](agent-connect.md) installs and pairs each machine separately. `npm run deploy -- --name <name>` wraps the deploy step.
-- **One-click / by hand** — the Deploy-to-Cloudflare button or a terminal, below.
+- **One click** — the primary channel ([ADR-0012](adr/0012-deploy-button-primary.md)). The [Deploy-to-Cloudflare button in the README](../README.md#get-started) builds and deploys into your own account and asks for the login password.
+- **With your coding agent** — the guided channel ([ADR-0007](adr/0007-agent-driven-deploy.md)): end-to-end verification, custom domains where workers.dev is unreachable, and agent-operated setups. Use the [prompts in the README](../README.md#get-started): [agent-deploy.md](agent-deploy.md) deploys Sig, configures the secrets, and opens the workspace; [agent-connect.md](agent-connect.md) installs and pairs each machine separately. `npm run deploy -- --name <name>` wraps the deploy step.
 
 ## One-click deploy
 
