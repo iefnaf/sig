@@ -386,7 +386,7 @@ export function askUserCard(input: { question: string; threadTitle?: string; but
   if (input.buttons.length > 0) lines.push("", "点按钮即可回答；也可以直接回复这条消息。");
   else lines.push("", "直接回复这条消息即可回答。");
   const buttons = input.buttons.map((button) => ({
-    label: clip(button.label, 24),
+    label: button.label,
     action: button.action,
     ...(button.primary ? { primary: true } : {}),
   }));
